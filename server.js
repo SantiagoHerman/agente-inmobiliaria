@@ -11,7 +11,7 @@ const twilioClient = twilio(
     );
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY });
 
-const conversations = new Map();h
+const conversations = new Map();
 
 const SYSTEM_PROMPT = `Sos Valentina, asesora virtual de Anton Bienes Raíces, inmobiliaria líder en Villa Gesell y la costa atlántica. Tu dueño es Francisco E. Yakoncic Antón, Corredor Público Matrícula 1303.
 

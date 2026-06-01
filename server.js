@@ -6,7 +6,6 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
 
-// CORS abierto para que el frontend (Vercel) pueda llamar
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -29,6 +28,19 @@ const AUTONOMIA = {
   equilibrado: 'Orienta al cliente con la info disponible, pero aclara lo que debe confirmarse con un humano. No inventes datos.',
   comercial: 'Avanza hacia la conversion ofreciendo opciones y proximos pasos, pero sin inventar datos que no esten en la base de conocimiento.'
 };
+const OBJETIVO = {
+  informar: 'Tu objetivo es responder consultas e informar. Para cualquier avance concreto (visita, reserva, sena), deriva a un asesor humano.',
+  agendar_visita: 'Tu objetivo es informar y coordinar una visita o cita a la propiedad. Tomas el interes y los datos para la visita, y deriva a un asesor humano para confirmarla.',
+  avanzar_reserva: 'Tu objetivo es avanzar hacia una reserva o sena: tomas el interes concreto y los datos necesarios, y deriva a un asesor humano para cerrar y cobrar.',
+  precalificar: 'Tu objetivo es pre-calificar al cliente recopilando sus datos (presupuesto, requisitos, garantia) antes de derivar a un asesor humano.',
+  ver_disponibilidad: 'Tu objetivo es informar disponibilidad y precios y ofrecer opciones de fechas. Para concretar la reserva, deriva a un asesor humano.',
+  avanzar_reserva_hotel: 'Tu objetivo es tomar los datos de la reserva (fechas, cantidad de personas) y deriva a un asesor humano para confirmar y cobrar.'
+};
+const LARGO = {
+  corto: 'Responde breve y simple, en pocas frases, como en un chat de WhatsApp real.',
+  normal: 'Responde con un largo equilibrado, ni muy corto ni muy extenso.',
+  detallado: 'Podes dar respuestas mas completas y detalladas cuando ayude.'
+};
 
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
@@ -44,6 +56,9 @@ app.post('/api/agent/respond', async (req, res) => {
     const agentName = (settings && settings.agent_name) || 'Asistente';
     const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
     const autonomia = AUTONOMIA[(settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
+    const objetivo = OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar;
+    const largo = LARGO[(settings && settings.response_length) || 'corto'] || LARGO.corto;
+    const usaEmojis = settings && settings.use_emojis === true;
     const rubro = (settings && settings.rubro) || 'inmobiliaria';
     const company = (settings && settings.company_name) || 'la empresa';
     const instructions = (settings && settings.instructions) || '';
@@ -53,20 +68,32 @@ app.post('/api/agent/respond', async (req, res) => {
       kb = knowledge.map(function(k){ return '- [' + k.category + '] ' + k.question + ' => ' + k.answer; }).join('\n');
     }
 
+    // Memoria: historial previo de la conversacion
+    let historial = [];
+    if (conversation_id) {
+      const { data: prev } = await supabase.from('messages').select('role, content').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
+      if (prev && prev.length > 0) {
+        historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: m.content }; });
+      }
+    }
+
     const systemPrompt = [
       'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
       'Respondes consultas de clientes por WhatsApp.',
-      tono, autonomia,
+      tono, autonomia, objetivo, largo,
+      usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'NO uses emojis.',
       instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
       '', 'Base de conocimiento de la empresa:', kb, '',
-      'Responde breve y natural, como en un chat de WhatsApp. No inventes datos que no esten en la base de conocimiento.'
+      'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
     ].filter(Boolean).join('\n');
+
+    const mensajesParaIA = historial.concat([{ role: 'user', content: message }]);
 
     const completion = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 500,
       system: systemPrompt,
-      messages: [{ role: 'user', content: message }]
+      messages: mensajesParaIA
     });
 
     const block = completion.content[0];

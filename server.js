@@ -52,6 +52,7 @@ app.post('/api/agent/respond', async (req, res) => {
 
     const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
     const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
+    const { data: properties } = await supabase.from('properties').select('title, type, operation, zone, price, rooms, capacity, amenities, status').eq('user_id', user_id).eq('status', 'disponible');
 
     const agentName = (settings && settings.agent_name) || 'Asistente';
     const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
@@ -66,6 +67,11 @@ app.post('/api/agent/respond', async (req, res) => {
     let kb = 'No hay informacion cargada todavia.';
     if (knowledge && knowledge.length > 0) {
       kb = knowledge.map(function(k){ return '- [' + k.category + '] ' + k.question + ' => ' + k.answer; }).join('\n');
+    }
+
+    let inventario = 'No hay propiedades cargadas todavia.';
+    if (properties && properties.length > 0) {
+      inventario = properties.map(function(p){ return '- ' + p.title + ' | ' + (p.type||'') + ' | ' + (p.operation||'') + ' | zona: ' + (p.zone||'-') + ' | precio: ' + (p.price||'-') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.amenities ? ' | ' + p.amenities : ''); }).join('\n');
     }
 
     // Memoria: historial previo de la conversacion
@@ -84,6 +90,7 @@ app.post('/api/agent/respond', async (req, res) => {
       usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'NO uses emojis.',
       instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
       '', 'Base de conocimiento de la empresa:', kb, '',
+      'Propiedades disponibles (usalas para recomendar; no ofrezcas las que no esten aca):', inventario, '',
       'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
     ].filter(Boolean).join('\n');
 

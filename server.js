@@ -1,10 +1,10 @@
-// Raices CRM - Backend del Agente IA
+// Raices CRM - Backend del Agente IA + Webhook WhatsApp
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -17,6 +17,8 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3001;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '' });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');
+const EVOLUTION_URL = process.env.EVOLUTION_URL || '';
+const EVOLUTION_KEY = process.env.EVOLUTION_KEY || '';
 
 const TONO = {
   formal: 'Usa un tono formal y profesional, tratando de usted.',
@@ -42,83 +44,164 @@ const LARGO = {
   detallado: 'Podes dar respuestas mas completas y detalladas cuando ayude.'
 };
 
+// ============ FUNCION REUTILIZABLE: genera la respuesta del agente ============
+async function generarRespuestaAgente(user_id, conversation_id, message) {
+  const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
+  const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
+  const { data: properties } = await supabase.from('properties').select('title, type, operation, zone, price, rooms, capacity, amenities, status').eq('user_id', user_id).eq('status', 'disponible');
+
+  const agentName = (settings && settings.agent_name) || 'Asistente';
+  const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
+  const autonomia = AUTONOMIA[(settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
+  const objetivo = OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar;
+  const largo = LARGO[(settings && settings.response_length) || 'corto'] || LARGO.corto;
+  const usaEmojis = settings && settings.use_emojis === true;
+  const rubro = (settings && settings.rubro) || 'inmobiliaria';
+  const company = (settings && settings.company_name) || 'la empresa';
+  const instructions = (settings && settings.instructions) || '';
+
+  let kb = 'No hay informacion cargada todavia.';
+  if (knowledge && knowledge.length > 0) {
+    kb = knowledge.map(function(k){ return '- [' + k.category + '] ' + k.question + ' => ' + k.answer; }).join('\n');
+  }
+
+  let inventario = 'No hay propiedades cargadas todavia.';
+  if (properties && properties.length > 0) {
+    inventario = properties.map(function(p){ return '- ' + p.title + ' | ' + (p.type||'') + ' | ' + (p.operation||'') + ' | zona: ' + (p.zone||'-') + ' | precio: ' + (p.price||'-') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.amenities ? ' | ' + p.amenities : ''); }).join('\n');
+  }
+
+  let historial = [];
+  if (conversation_id) {
+    const { data: prev } = await supabase.from('messages').select('role, content').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
+    if (prev && prev.length > 0) {
+      historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: m.content }; });
+    }
+  }
+
+  const systemPrompt = [
+    'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
+    'Respondes consultas de clientes por WhatsApp.',
+    tono, autonomia, objetivo, largo,
+    usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'NO uses emojis.',
+    instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
+    '', 'Base de conocimiento de la empresa:', kb, '',
+    'Propiedades disponibles (usalas para recomendar; no ofrezcas las que no esten aca):', inventario, '',
+    'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
+  ].filter(Boolean).join('\n');
+
+  const mensajesParaIA = historial.concat([{ role: 'user', content: message }]);
+
+  const completion = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 500,
+    system: systemPrompt,
+    messages: mensajesParaIA
+  });
+
+  const block = completion.content[0];
+  const reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
+
+  if (conversation_id) {
+    await supabase.from('messages').insert([
+      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply }
+    ]);
+    await supabase.from('conversations').update({ last_message: reply, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+  }
+
+  return { reply: reply, usage: completion.usage };
+}
+
+// Enviar mensaje de WhatsApp via Evolution
+async function enviarWhatsapp(instancia, numero, texto) {
+  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); return; }
+  try {
+    const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({ number: numero, text: texto })
+    });
+    if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); }
+  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); }
+}
+
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
 
+// Endpoint para probar el agente desde el CRM (escribir como cliente)
 app.post('/api/agent/respond', async (req, res) => {
   try {
     const { user_id, conversation_id, message } = req.body || {};
     if (!user_id || !message) return res.status(400).json({ error: 'Faltan user_id o message' });
-
-    const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
-    const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
-    const { data: properties } = await supabase.from('properties').select('title, type, operation, zone, price, rooms, capacity, amenities, status').eq('user_id', user_id).eq('status', 'disponible');
-
-    const agentName = (settings && settings.agent_name) || 'Asistente';
-    const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
-    const autonomia = AUTONOMIA[(settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
-    const objetivo = OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar;
-    const largo = LARGO[(settings && settings.response_length) || 'corto'] || LARGO.corto;
-    const usaEmojis = settings && settings.use_emojis === true;
-    const rubro = (settings && settings.rubro) || 'inmobiliaria';
-    const company = (settings && settings.company_name) || 'la empresa';
-    const instructions = (settings && settings.instructions) || '';
-
-    let kb = 'No hay informacion cargada todavia.';
-    if (knowledge && knowledge.length > 0) {
-      kb = knowledge.map(function(k){ return '- [' + k.category + '] ' + k.question + ' => ' + k.answer; }).join('\n');
-    }
-
-    let inventario = 'No hay propiedades cargadas todavia.';
-    if (properties && properties.length > 0) {
-      inventario = properties.map(function(p){ return '- ' + p.title + ' | ' + (p.type||'') + ' | ' + (p.operation||'') + ' | zona: ' + (p.zone||'-') + ' | precio: ' + (p.price||'-') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.amenities ? ' | ' + p.amenities : ''); }).join('\n');
-    }
-
-    // Memoria: historial previo de la conversacion
-    let historial = [];
+    // Guardar el mensaje del contacto (cuando se prueba desde el CRM)
     if (conversation_id) {
-      const { data: prev } = await supabase.from('messages').select('role, content').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
-      if (prev && prev.length > 0) {
-        historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: m.content }; });
-      }
+      await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'contact', content: message });
     }
-
-    const systemPrompt = [
-      'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
-      'Respondes consultas de clientes por WhatsApp.',
-      tono, autonomia, objetivo, largo,
-      usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'NO uses emojis.',
-      instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
-      '', 'Base de conocimiento de la empresa:', kb, '',
-      'Propiedades disponibles (usalas para recomendar; no ofrezcas las que no esten aca):', inventario, '',
-      'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
-    ].filter(Boolean).join('\n');
-
-    const mensajesParaIA = historial.concat([{ role: 'user', content: message }]);
-
-    const completion = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 500,
-      system: systemPrompt,
-      messages: mensajesParaIA
-    });
-
-    const block = completion.content[0];
-    const reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
-
-    if (conversation_id) {
-      await supabase.from('messages').insert([
-        { conversation_id: conversation_id, user_id: user_id, role: 'contact', content: message },
-        { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply }
-      ]);
-      await supabase.from('conversations').update({ last_message: reply, updated_at: new Date().toISOString() }).eq('id', conversation_id);
-    }
-
-    res.json({ reply: reply, usage: completion.usage });
+    const resultado = await generarRespuestaAgente(user_id, conversation_id, message);
+    res.json(resultado);
   } catch (err) {
     console.error('Error en /api/agent/respond:', err && err.message);
     res.status(500).json({ error: (err && err.message) || 'Error interno' });
   }
+});
+
+// ============ WEBHOOK ENTRANTE DE WHATSAPP (Evolution API) ============
+app.post('/api/webhook/whatsapp', async (req, res) => {
+  res.json({ received: true });
+  try {
+    const body = req.body || {};
+    const evento = body.event || '';
+    if (evento !== 'messages.upsert') return;
+
+    const data = body.data || {};
+    const instanciaNombre = body.instance || data.instanceName || '';
+    if (!instanciaNombre) return;
+
+    const key = data.key || {};
+    if (key.fromMe === true) return; // ignorar mensajes propios (solo respondemos a quien escribe primero)
+
+    const remoteJid = key.remoteJid || '';
+    if (!remoteJid || remoteJid.includes('@g.us')) return; // ignorar grupos
+    const telefono = remoteJid.split('@')[0];
+
+    const msg = data.message || {};
+    const texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
+    if (!texto) return;
+
+    // 1) Identificar el user_id dueno de esta instancia (multi-cliente)
+    const { data: inst } = await supabase.from('whatsapp_instancias').select('user_id').eq('instancia_nombre', instanciaNombre).maybeSingle();
+    if (!inst) { console.error('Instancia sin user_id:', instanciaNombre); return; }
+    const user_id = inst.user_id;
+
+    // 2) Buscar contacto por telefono dentro del user_id (persistencia: no duplicar)
+    let contacto;
+    const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
+    if (existente) { contacto = existente; }
+    else {
+      const pushName = data.pushName || ('Cliente ' + telefono.slice(-4));
+      const { data: nuevo } = await supabase.from('contacts').insert({ user_id: user_id, name: pushName, phone: telefono, channel: 'whatsapp' }).select('id').single();
+      contacto = nuevo;
+    }
+    if (!contacto) return;
+
+    // 3) Buscar o crear conversacion
+    let conv;
+    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
+    if (convExistente) { conv = convExistente; }
+    else {
+      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'nuevo', ai_enabled: true }).select('id, ai_enabled').single();
+      conv = convNueva;
+    }
+    if (!conv) return;
+
+    // 4) Guardar SIEMPRE el mensaje entrante (no se pierde nada)
+    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto });
+    await supabase.from('conversations').update({ last_message: texto, updated_at: new Date().toISOString() }).eq('id', conv.id);
+
+    // 5) Si la IA esta activa, responder por WhatsApp
+    if (conv.ai_enabled === false) return;
+    const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
+    if (resultado && resultado.reply) { await enviarWhatsapp(instanciaNombre, telefono, resultado.reply); }
+  } catch (e) { console.error('Error en webhook whatsapp:', e && e.message); }
 });
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

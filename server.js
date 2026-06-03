@@ -276,4 +276,101 @@ app.post('/api/whatsapp/send', async (req, res) => {
   }
 });
 
+// ============ MULTI-CLIENTE: conectar WhatsApp propio de cada inmobiliaria ============
+// La URL publica del backend (para configurar el webhook de cada instancia automaticamente)
+const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || 'https://agente-inmobiliaria-production-7e1c.up.railway.app';
+
+// Nombre de instancia unico y estable por usuario
+function nombreInstancia(user_id) {
+  return 'cliente_' + String(user_id).replace(/-/g, '').substring(0, 16);
+}
+
+// Configura el webhook de una instancia para que apunte a nuestro backend
+async function configurarWebhookInstancia(instancia) {
+  try {
+    await fetch(EVOLUTION_URL + '/webhook/set/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({
+        webhook: {
+          enabled: true,
+          url: BACKEND_PUBLIC_URL + '/api/webhook/whatsapp',
+          events: ['MESSAGES_UPSERT']
+        }
+      })
+    });
+  } catch (e) { console.error('Error configurando webhook:', e && e.message); }
+}
+
+// POST /api/whatsapp/conectar -> crea (o reusa) la instancia del user y devuelve el QR
+app.post('/api/whatsapp/conectar', async (req, res) => {
+  try {
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
+
+    const instancia = nombreInstancia(user_id);
+
+    // Intentar crear la instancia (si ya existe, Evolution devuelve error y lo ignoramos)
+    let qr = null;
+    try {
+      const crear = await fetch(EVOLUTION_URL + '/instance/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+        body: JSON.stringify({ instanceName: instancia, qrcode: true, integration: 'WHATSAPP-BAILEYS' })
+      });
+      const data = await crear.json();
+      if (data && data.qrcode && data.qrcode.base64) { qr = data.qrcode.base64; }
+    } catch (e) { console.error('Error creando instancia:', e && e.message); }
+
+    // Configurar el webhook de esa instancia hacia nuestro backend
+    await configurarWebhookInstancia(instancia);
+
+    // Si no obtuvimos QR al crear (instancia ya existia), pedir el connect para regenerar QR
+    if (!qr) {
+      try {
+        const conn = await fetch(EVOLUTION_URL + '/instance/connect/' + instancia, {
+          method: 'GET',
+          headers: { 'apikey': EVOLUTION_KEY }
+        });
+        const cdata = await conn.json();
+        if (cdata && cdata.base64) { qr = cdata.base64; }
+      } catch (e) { console.error('Error en connect:', e && e.message); }
+    }
+
+    // Guardar/actualizar la instancia en la base, ligada al user_id
+    const { data: existente } = await supabase.from('whatsapp_instancias').select('id').eq('user_id', user_id).eq('instancia_nombre', instancia).maybeSingle();
+    if (!existente) {
+      await supabase.from('whatsapp_instancias').insert({ user_id: user_id, instancia_nombre: instancia, estado: 'conectando' });
+    } else {
+      await supabase.from('whatsapp_instancias').update({ estado: 'conectando' }).eq('id', existente.id);
+    }
+
+    res.json({ instancia: instancia, qr: qr });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/conectar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// GET /api/whatsapp/estado?user_id=... -> dice si la instancia ya esta conectada
+app.get('/api/whatsapp/estado', async (req, res) => {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const instancia = nombreInstancia(user_id);
+    const r = await fetch(EVOLUTION_URL + '/instance/connectionState/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } });
+    const data = await r.json();
+    const estado = (data && data.instance && data.instance.state) || 'desconocido';
+    // Si esta conectada (open), actualizar la base
+    if (estado === 'open') {
+      await supabase.from('whatsapp_instancias').update({ estado: 'conectado', conectado_at: new Date().toISOString() }).eq('user_id', user_id).eq('instancia_nombre', instancia);
+    }
+    res.json({ estado: estado, conectado: estado === 'open' });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/estado:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

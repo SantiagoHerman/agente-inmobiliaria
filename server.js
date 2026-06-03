@@ -386,28 +386,145 @@ app.get('/api/whatsapp/estado', async (req, res) => {
 });
 
 // ============ CRON: pasar a Recontacto las conversaciones inactivas (3 dias sin respuesta) ============
+// ---- Helpers de recontacto ----
+
+// Devuelve true si AHORA estamos dentro del horario de oficina del user (segun su config).
+// Fail-safe: si no hay config o falla, devuelve false (no enviar).
+function dentroHorarioOficina(horario) {
+  try {
+    if (!horario) return false;
+    // Hora local Argentina (UTC-3)
+    const ahora = new Date();
+    const utc = ahora.getTime() + ahora.getTimezoneOffset() * 60000;
+    const arg = new Date(utc - 3 * 60 * 60000);
+    const dias = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
+    const nombreDia = dias[arg.getDay()];
+    const cfg = horario[nombreDia];
+    if (!cfg || cfg.cerrado) return false;
+    const minutosAhora = arg.getHours() * 60 + arg.getMinutes();
+    const [hDesde, mDesde] = (cfg.desde || '09:00').split(':').map(Number);
+    const [hHasta, mHasta] = (cfg.hasta || '18:00').split(':').map(Number);
+    const desde = hDesde * 60 + mDesde;
+    const hasta = hHasta * 60 + mHasta;
+    return minutosAhora >= desde && minutosAhora <= hasta;
+  } catch (e) { return false; }
+}
+
+// Plantillas variadas de primer recontacto (anti-baneo: nunca el mismo texto).
+function mensajeRecontacto(nombre) {
+  const n = nombre ? (' ' + nombre) : '';
+  const opciones = [
+    'Hola' + n + ', ¿seguís interesado/a? Quedo a disposición por si querés que avancemos.',
+    'Hola' + n + ', ¿cómo va? Por si te quedó alguna duda sobre lo que veníamos hablando, decime y te ayudo.',
+    'Buenas' + n + ', ¿retomamos? Si todavía estás buscando, con gusto te paso más info.',
+    'Hola' + n + ', te escribo para saber si seguís interesado/a. Cualquier cosa me decís y seguimos.',
+    '¿Cómo andás' + n + '? Quedé con ganas de ayudarte. Si querés seguir viendo opciones, avisame.'
+  ];
+  return opciones[Math.floor(Math.random() * opciones.length)];
+}
+
 async function revisarInactividad() {
   try {
     const TRES_DIAS_MS = 3 * 24 * 60 * 60 * 1000;
-    const limite = new Date(Date.now() - TRES_DIAS_MS).toISOString();
-    const { data: inactivas } = await supabase
+    const ahoraMs = Date.now();
+    // Conversaciones activas que podrian estar inactivas
+    const { data: activas } = await supabase
       .from('conversations')
-      .select('id, status')
-      .in('status', ['en_conversacion', 'interesado'])
-      .lt('updated_at', limite);
-    if (!inactivas || inactivas.length === 0) return;
-    for (const conv of inactivas) {
+      .select('id, status, user_id, contact_id')
+      .in('status', ['en_conversacion', 'interesado']);
+    if (!activas || activas.length === 0) return;
+    for (const conv of activas) {
+      // Buscar el ULTIMO mensaje de la IA en esta conversacion
+      const { data: ultimoAi } = await supabase
+        .from('messages')
+        .select('created_at')
+        .eq('conversation_id', conv.id)
+        .eq('role', 'ai')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!ultimoAi || !ultimoAi.created_at) continue;
+      // Verificar que despues de ese mensaje de la IA el contacto NO haya respondido
+      const { data: respuestaPosterior } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('conversation_id', conv.id)
+        .eq('role', 'contact')
+        .gt('created_at', ultimoAi.created_at)
+        .limit(1)
+        .maybeSingle();
+      if (respuestaPosterior) continue; // el lead ya respondio, no aplica
+      // Pasaron 72hs desde el ultimo mensaje de la IA?
+      const transcurrido = ahoraMs - new Date(ultimoAi.created_at).getTime();
+      if (transcurrido < TRES_DIAS_MS) continue;
+      // -> pasa a recontacto guardando el estado previo
       await supabase.from('conversations').update({
         status: 'recontacto',
         estado_previo: conv.status,
         updated_at: new Date().toISOString()
       }).eq('id', conv.id);
+      console.log('Recontacto: conversacion ' + conv.id + ' paso a recontacto (72hs sin respuesta)');
     }
-    console.log('Recontacto: ' + inactivas.length + ' conversaciones pasaron a recontacto por inactividad');
   } catch (e) { console.error('Error en revisarInactividad:', e && e.message); }
+}
+
+// ---- Envio del primer recontacto, solo en horario de oficina, con salvaguardas ----
+async function enviarRecontactosPendientes() {
+  try {
+    const ahoraMs = Date.now();
+    const UN_DIA_MS = 24 * 60 * 60 * 1000;
+    // Conversaciones en recontacto
+    const { data: enRecontacto } = await supabase
+      .from('conversations')
+      .select('id, user_id, contact_id, recontacto_count, recontacto_max')
+      .eq('status', 'recontacto');
+    if (!enRecontacto || enRecontacto.length === 0) return;
+    for (const conv of enRecontacto) {
+      // SALVAGUARDA 1: respetar el maximo de recontactos
+      const maxRec = (conv.recontacto_max != null) ? conv.recontacto_max : 5;
+      const countRec = conv.recontacto_count || 0;
+      if (countRec >= maxRec) continue;
+      // SALVAGUARDA 2: no mas de 1 recontacto por dia. Ver el ultimo recontacto enviado.
+      const { data: ultimoRec } = await supabase
+        .from('recontactos')
+        .select('enviado_at')
+        .eq('conversation_id', conv.id)
+        .order('enviado_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (ultimoRec && ultimoRec.enviado_at) {
+        const desdeUltimo = ahoraMs - new Date(ultimoRec.enviado_at).getTime();
+        if (desdeUltimo < UN_DIA_MS) continue; // ya se mando uno hoy
+      }
+      // Leer config de horario del user (fail-safe: si no hay, no enviar)
+      const { data: settings } = await supabase
+        .from('business_settings')
+        .select('horario_oficina')
+        .eq('user_id', conv.user_id)
+        .maybeSingle();
+      if (!settings || !dentroHorarioOficina(settings.horario_oficina)) continue;
+      // Datos del contacto + instancia conectada
+      const { data: contacto } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle();
+      if (!contacto || !contacto.phone) continue;
+      const { data: inst } = await supabase.from('whatsapp_instancias').select('instancia_nombre').eq('user_id', conv.user_id).eq('estado', 'conectado').maybeSingle();
+      if (!inst) continue;
+      // Enviar el mensaje variado
+      const texto = mensajeRecontacto(contacto.name);
+      await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);
+      // Registrar: en messages (como ai), en recontactos, y actualizar contador
+      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto });
+      await supabase.from('conversations').update({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: texto, enviado_at: new Date().toISOString() });
+      await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
+      console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
+    }
+  } catch (e) { console.error('Error en enviarRecontactosPendientes:', e && e.message); }
 }
 
 setInterval(revisarInactividad, 60 * 60 * 1000);
 setTimeout(revisarInactividad, 30 * 1000);
+// Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)
+setInterval(enviarRecontactosPendientes, 15 * 60 * 1000);
+setTimeout(enviarRecontactosPendientes, 60 * 1000);
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

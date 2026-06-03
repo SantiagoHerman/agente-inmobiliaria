@@ -204,4 +204,36 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
   } catch (e) { console.error('Error en webhook whatsapp:', e && e.message); }
 });
 
+// ============ ENVIO MANUAL DE WHATSAPP (cuando el humano escribe desde el CRM) ============
+app.post('/api/whatsapp/send', async (req, res) => {
+  try {
+    const { user_id, conversation_id, texto } = req.body || {};
+    if (!user_id || !conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
+
+    // 1) Buscar la conversacion para obtener el contacto
+    const { data: conv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).eq('user_id', user_id).maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+
+    // 2) Buscar el telefono del contacto
+    const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+    if (!contacto || !contacto.phone) return res.status(400).json({ error: 'El contacto no tiene telefono (no es WhatsApp)' });
+
+    // 3) Buscar la instancia de WhatsApp de este user (la conectada)
+    const { data: inst } = await supabase.from('whatsapp_instancias').select('instancia_nombre').eq('user_id', user_id).eq('estado', 'conectado').maybeSingle();
+    if (!inst) return res.status(400).json({ error: 'No hay instancia de WhatsApp conectada para este usuario' });
+
+    // 4) Guardar el mensaje como 'human' y actualizar la conversacion
+    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'human', content: texto });
+    await supabase.from('conversations').update({ last_message: texto, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+
+    // 5) Enviar por WhatsApp via Evolution
+    await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);
+
+    res.json({ sent: true });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/send:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

@@ -111,6 +111,27 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   return { reply: reply, usage: completion.usage };
 }
 
+// Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
+// Conservador: solo devuelve un estado nuevo cuando la senal es clara; si no, devuelve null.
+async function clasificarEstado(mensajeCliente) {
+  try {
+    const prompt = [
+      'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
+      'Segun el mensaje del cliente, responde UNA sola palabra exacta:',
+      '- listo_humano  => si pide hablar con una persona/asesor, o quiere reservar, senar, o avanzar una compra/alquiler concreto.',
+      '- interesado    => si pide ir a ver la propiedad personalmente, agendar visita, o coordinar una visita/cita.',
+      '- sin_cambio    => en cualquier otro caso (consulta general, saludo, pregunta de info).',
+      'Responde SOLO una de esas tres palabras, sin nada mas.',
+      'Mensaje del cliente: ' + mensajeCliente
+    ].join('\n');
+    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
+    const out = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim().toLowerCase() : '';
+    if (out.includes('listo_humano')) return 'listo_humano';
+    if (out.includes('interesado')) return 'interesado';
+    return null;
+  } catch (e) { console.error('Error clasificando estado:', e && e.message); return null; }
+}
+
 // Enviar mensaje de WhatsApp via Evolution
 async function enviarWhatsapp(instancia, numero, texto) {
   if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); return; }
@@ -188,7 +209,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
-      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'nuevo', ai_enabled: true }).select('id, ai_enabled').single();
+      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true }).select('id, ai_enabled').single();
       conv = convNueva;
     }
     if (!conv) return;
@@ -201,6 +222,22 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (conv.ai_enabled === false) return;
     const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
     if (resultado && resultado.reply) { await enviarWhatsapp(instanciaNombre, telefono, resultado.reply); }
+
+    // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
+    const nuevoEstado = await clasificarEstado(texto);
+    if (nuevoEstado) {
+      // Leer el estado actual para no 'bajar' de nivel
+      const { data: convActual } = await supabase.from('conversations').select('status').eq('id', conv.id).maybeSingle();
+      const estadoActual = (convActual && convActual.status) || 'en_conversacion';
+      // Orden de prioridad: en_conversacion < interesado < listo_humano
+      const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
+      if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
+        const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
+        // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
+        if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
+        await supabase.from('conversations').update(update).eq('id', conv.id);
+      }
+    }
   } catch (e) { console.error('Error en webhook whatsapp:', e && e.message); }
 });
 

@@ -224,18 +224,21 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (resultado && resultado.reply) { await enviarWhatsapp(instanciaNombre, telefono, resultado.reply); }
 
     // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
-    const nuevoEstado = await clasificarEstado(texto);
-    if (nuevoEstado) {
-      // Leer el estado actual para no 'bajar' de nivel
-      const { data: convActual } = await supabase.from('conversations').select('status').eq('id', conv.id).maybeSingle();
-      const estadoActual = (convActual && convActual.status) || 'en_conversacion';
-      // Orden de prioridad: en_conversacion < interesado < listo_humano
-      const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
-      if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
-        const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
-        // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
-        if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
-        await supabase.from('conversations').update(update).eq('id', conv.id);
+    // Leer el estado actual ANTES de clasificar
+    const { data: convActual } = await supabase.from('conversations').select('status').eq('id', conv.id).maybeSingle();
+    const estadoActual = (convActual && convActual.status) || 'en_conversacion';
+    // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
+    if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
+      const nuevoEstado = await clasificarEstado(texto);
+      if (nuevoEstado) {
+        // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
+        const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
+        if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
+          const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
+          // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
+          if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
+          await supabase.from('conversations').update(update).eq('id', conv.id);
+        }
       }
     }
   } catch (e) { console.error('Error en webhook whatsapp:', e && e.message); }

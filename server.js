@@ -45,6 +45,23 @@ const LARGO = {
 };
 
 // ============ FUNCION REUTILIZABLE: genera la respuesta del agente ============
+async function guardarMensajeSaliente(remoteJid, texto) {
+  try {
+    if (!texto) return;
+    const telefono = remoteJid.split('@')[0];
+    const { data: contacto } = await supabase.from('contacts').select('id, user_id').eq('phone', telefono).maybeSingle();
+    if (!contacto) return;
+    const { data: conv } = await supabase.from('conversations').select('id, user_id').eq('contact_id', contacto.id).maybeSingle();
+    if (!conv) return;
+    const hace2min = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const { data: reciente } = await supabase.from('messages').select('id').eq('conversation_id', conv.id).eq('content', texto).gte('created_at', hace2min).limit(1).maybeSingle();
+    if (reciente) return;
+    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular' });
+    await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    console.log('Mensaje saliente (celular) guardado en conversacion ' + conv.id);
+  } catch (e) { console.error('Error en guardarMensajeSaliente:', e && e.message); }
+}
+
 async function generarRespuestaAgente(user_id, conversation_id, message) {
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
@@ -178,7 +195,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (!instanciaNombre) return;
 
     const key = data.key || {};
-    if (key.fromMe === true) return; // ignorar mensajes propios (solo respondemos a quien escribe primero)
+    const esFromMe = key.fromMe === true; // mensaje saliente propio: se maneja tras extraer el texto
 
     const remoteJid = key.remoteJid || '';
     if (!remoteJid || remoteJid.includes('@g.us')) return; // ignorar grupos
@@ -187,6 +204,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const msg = data.message || {};
     const texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
     if (!texto) return;
+
+    // Mensaje saliente escrito por un humano desde su WhatsApp: guardarlo con marca y cortar.
+    if (esFromMe) {
+      await guardarMensajeSaliente(remoteJid, texto);
+      return;
+    }
 
     // 1) Identificar el user_id dueno de esta instancia (multi-cliente)
     const { data: inst } = await supabase.from('whatsapp_instancias').select('user_id').eq('instancia_nombre', instanciaNombre).maybeSingle();

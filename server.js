@@ -206,7 +206,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     // 3) Buscar o crear conversacion
     let conv;
-    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
+    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
       const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true }).select('id, ai_enabled').single();
@@ -217,6 +217,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // 4) Guardar SIEMPRE el mensaje entrante (no se pierde nada)
     await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+
+    // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
+    // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos
+    if (convExistente && convExistente.status === 'recontacto') {
+      const volverA = convExistente.estado_previo || 'en_conversacion';
+      await supabase.from('conversations').update({
+        status: volverA,
+        estado_previo: null,
+        recontacto_count: 0,
+        updated_at: new Date().toISOString()
+      }).eq('id', conv.id);
+    }
 
     // 5) Si la IA esta activa, responder por WhatsApp
     if (conv.ai_enabled === false) return;
@@ -372,5 +384,30 @@ app.get('/api/whatsapp/estado', async (req, res) => {
     res.status(500).json({ error: (err && err.message) || 'Error interno' });
   }
 });
+
+// ============ CRON: pasar a Recontacto las conversaciones inactivas (3 dias sin respuesta) ============
+async function revisarInactividad() {
+  try {
+    const TRES_DIAS_MS = 3 * 24 * 60 * 60 * 1000;
+    const limite = new Date(Date.now() - TRES_DIAS_MS).toISOString();
+    const { data: inactivas } = await supabase
+      .from('conversations')
+      .select('id, status')
+      .in('status', ['en_conversacion', 'interesado'])
+      .lt('updated_at', limite);
+    if (!inactivas || inactivas.length === 0) return;
+    for (const conv of inactivas) {
+      await supabase.from('conversations').update({
+        status: 'recontacto',
+        estado_previo: conv.status,
+        updated_at: new Date().toISOString()
+      }).eq('id', conv.id);
+    }
+    console.log('Recontacto: ' + inactivas.length + ' conversaciones pasaron a recontacto por inactividad');
+  } catch (e) { console.error('Error en revisarInactividad:', e && e.message); }
+}
+
+setInterval(revisarInactividad, 60 * 60 * 1000);
+setTimeout(revisarInactividad, 30 * 1000);
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

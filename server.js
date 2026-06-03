@@ -105,7 +105,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
     await supabase.from('messages').insert([
       { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply }
     ]);
-    await supabase.from('conversations').update({ last_message: reply, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    await supabase.from('conversations').update({ last_message: reply, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }
 
   return { reply: reply, usage: completion.usage };
@@ -216,7 +216,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     // 4) Guardar SIEMPRE el mensaje entrante (no se pierde nada)
     await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto });
-    await supabase.from('conversations').update({ last_message: texto, updated_at: new Date().toISOString() }).eq('id', conv.id);
+    await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
 
     // 5) Si la IA esta activa, responder por WhatsApp
     if (conv.ai_enabled === false) return;
@@ -261,7 +261,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
 
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
     await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'human', content: texto });
-    await supabase.from('conversations').update({ last_message: texto, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
 
     // 5) Enviar por WhatsApp via Evolution
     await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);

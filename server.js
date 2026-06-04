@@ -604,7 +604,7 @@ setTimeout(hacerBackup, 90 * 1000);
 // Crear un asesor: crea el usuario en Auth (con la service key) y la fila en asesores.
 app.post('/api/asesores/crear', async (req, res) => {
   try {
-    const { admin_id, nombre, usuario, clave } = req.body || {};
+    const { admin_id, nombre, usuario, clave, cargo } = req.body || {};
     if (!admin_id || !nombre || !usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
     // Limite de 5 asesores por admin
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
@@ -620,7 +620,7 @@ app.post('/api/asesores/crear', async (req, res) => {
     const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: 'asesor', admin_id: admin_id, nombre: nombre } });
     if (errAuth) return res.status(400).json({ error: errAuth.message });
     const authId = created && created.user ? created.user.id : null;
-    const { error: errIns } = await supabase.from('asesores').insert({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, estado: 'activo', activo: true });
+    const { error: errIns } = await supabase.from('asesores').insert({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : 'Asesor', estado: 'activo', activo: true });
     if (errIns) { if (authId) { try { await supabase.auth.admin.deleteUser(authId); } catch (e) {} } return res.status(400).json({ error: errIns.message }); }
     return res.json({ ok: true, email: email });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }

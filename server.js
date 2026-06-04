@@ -92,6 +92,22 @@ async function hacerBackup() {
   } catch (e) { console.error('Error en hacerBackup:', e && e.message); }
 }
 
+// Elige el asesor ACTIVO con menos leads asignados (reparto equitativo). Devuelve su id o null.
+async function elegirAsesorActivo(admin_id) {
+  try {
+    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true);
+    if (!activos || activos.length === 0) return null;
+    // contar leads asignados a cada asesor activo
+    let mejor = null; let menos = Infinity;
+    for (const a of activos) {
+      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', a.id);
+      const n = count || 0;
+      if (n < menos) { menos = n; mejor = a.id; }
+    }
+    return mejor;
+  } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
+}
+
 async function generarRespuestaAgente(user_id, conversation_id, message) {
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
@@ -262,7 +278,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
-      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true }).select('id, ai_enabled').single();
+      const asesorAsignado = await elegirAsesorActivo(user_id);
+      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true, asesor_id: asesorAsignado, ultimo_asesor_id: asesorAsignado }).select('id, ai_enabled').single();
       conv = convNueva;
     }
     if (!conv) return;

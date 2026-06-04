@@ -62,6 +62,36 @@ async function guardarMensajeSaliente(remoteJid, texto) {
   } catch (e) { console.error('Error en guardarMensajeSaliente:', e && e.message); }
 }
 
+// Backup automatico: junta todos los datos de cada user y guarda una foto en la tabla backups.
+// Mantiene las ultimas 48 copias por user (24 hs a razon de 1 cada 30 min) y borra las viejas.
+async function hacerBackup() {
+  try {
+    // Obtener todos los user_id que tienen configuracion (clientes activos)
+    const { data: settings } = await supabase.from('business_settings').select('user_id');
+    if (!settings || settings.length === 0) return;
+    const userIds = [...new Set(settings.map(function(s){ return s.user_id; }))];
+    for (const uid of userIds) {
+      try {
+        const tablas = ['conversations','messages','contacts','recontactos','business_settings','properties','knowledge_base','whatsapp_instancias'];
+        const contenido = {};
+        for (const t of tablas) {
+          const { data } = await supabase.from(t).select('*').eq('user_id', uid);
+          contenido[t] = data || [];
+        }
+        const resumen = 'conv:' + (contenido.conversations.length) + ' msg:' + (contenido.messages.length) + ' cont:' + (contenido.contacts.length);
+        await supabase.from('backups').insert({ user_id: uid, contenido: contenido, resumen: resumen });
+        // Limpieza: dejar solo las ultimas 48 copias de este user
+        const { data: viejos } = await supabase.from('backups').select('id').eq('user_id', uid).order('created_at', { ascending: false }).range(48, 1000);
+        if (viejos && viejos.length > 0) {
+          const ids = viejos.map(function(v){ return v.id; });
+          await supabase.from('backups').delete().in('id', ids);
+        }
+        console.log('Backup hecho para user ' + uid + ' (' + resumen + ')');
+      } catch (e2) { console.error('Error backup user ' + uid + ':', e2 && e2.message); }
+    }
+  } catch (e) { console.error('Error en hacerBackup:', e && e.message); }
+}
+
 async function generarRespuestaAgente(user_id, conversation_id, message) {
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
@@ -549,5 +579,8 @@ setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)
 setInterval(enviarRecontactosPendientes, 15 * 60 * 1000);
 setTimeout(enviarRecontactosPendientes, 60 * 1000);
+// Backup automatico cada 30 minutos (foto completa de todos los datos por user)
+setInterval(hacerBackup, 30 * 60 * 1000);
+setTimeout(hacerBackup, 90 * 1000);
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

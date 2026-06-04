@@ -583,4 +583,37 @@ setTimeout(enviarRecontactosPendientes, 60 * 1000);
 setInterval(hacerBackup, 30 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
 
+// ===== ASESORES (gestionados por el admin) =====
+// Crear un asesor: crea el usuario en Auth (con la service key) y la fila en asesores.
+app.post('/api/asesores/crear', async (req, res) => {
+  try {
+    const { admin_id, nombre, usuario, clave } = req.body || {};
+    if (!admin_id || !nombre || !usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
+    // Limite de 5 asesores por admin
+    const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
+    if (existentes && existentes.length >= 5) return res.status(400).json({ error: 'Maximo 5 asesores' });
+    // El email interno se arma con el usuario (no se usa para login real, pero Auth lo requiere)
+    const email = usuario.toLowerCase().replace(/[^a-z0-9]/g, '') + '.' + admin_id.substring(0, 8) + '@asesor.raices';
+    const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: 'asesor', admin_id: admin_id, nombre: nombre } });
+    if (errAuth) return res.status(400).json({ error: errAuth.message });
+    const authId = created && created.user ? created.user.id : null;
+    const { error: errIns } = await supabase.from('asesores').insert({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, estado: 'activo', activo: true });
+    if (errIns) { if (authId) { try { await supabase.auth.admin.deleteUser(authId); } catch (e) {} } return res.status(400).json({ error: errIns.message }); }
+    return res.json({ ok: true, email: email });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Eliminar un asesor: borra el usuario de Auth y la fila. Los mensajes conservan enviado_por.
+app.post('/api/asesores/eliminar', async (req, res) => {
+  try {
+    const { admin_id, asesor_id } = req.body || {};
+    if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
+    const { data: ases } = await supabase.from('asesores').select('*').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
+    if (!ases) return res.status(404).json({ error: 'Asesor no encontrado' });
+    if (ases.auth_user_id) { try { await supabase.auth.admin.deleteUser(ases.auth_user_id); } catch (e) {} }
+    await supabase.from('asesores').delete().eq('id', asesor_id).eq('admin_id', admin_id);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

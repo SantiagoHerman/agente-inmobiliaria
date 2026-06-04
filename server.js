@@ -56,7 +56,7 @@ async function guardarMensajeSaliente(remoteJid, texto) {
     const hace2min = new Date(Date.now() - 2 * 60 * 1000).toISOString();
     const { data: reciente } = await supabase.from('messages').select('id').eq('conversation_id', conv.id).eq('content', texto).gte('created_at', hace2min).limit(1).maybeSingle();
     if (reciente) return;
-    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular' });
+    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)' });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conv.id);
     console.log('Mensaje saliente (celular) guardado en conversacion ' + conv.id);
   } catch (e) { console.error('Error en guardarMensajeSaliente:', e && e.message); }
@@ -166,7 +166,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
 
   if (conversation_id) {
     await supabase.from('messages').insert([
-      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply }
+      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply, enviado_por: 'Agente IA' }
     ]);
     await supabase.from('conversations').update({ last_message: reply, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }
@@ -329,7 +329,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 // ============ ENVIO MANUAL DE WHATSAPP (cuando el humano escribe desde el CRM) ============
 app.post('/api/whatsapp/send', async (req, res) => {
   try {
-    const { user_id, conversation_id, texto } = req.body || {};
+    const { user_id, conversation_id, texto, enviado_por } = req.body || {};
     if (!user_id || !conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
 
     // 1) Buscar la conversacion para obtener el contacto
@@ -345,7 +345,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!inst) return res.status(400).json({ error: 'No hay instancia de WhatsApp conectada para este usuario' });
 
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
-    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'human', content: texto });
+    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano' });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
 
     // 5) Enviar por WhatsApp via Evolution
@@ -582,7 +582,7 @@ async function enviarRecontactosPendientes() {
       const texto = mensajeRecontacto(contacto.name);
       await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);
       // Registrar: en messages (como ai), en recontactos, y actualizar contador
-      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto });
+      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto, enviado_por: 'Agente IA' });
       await supabase.from('conversations').update({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: texto, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);

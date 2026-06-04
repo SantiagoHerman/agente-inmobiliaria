@@ -610,7 +610,13 @@ app.post('/api/asesores/crear', async (req, res) => {
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
     if (existentes && existentes.length >= 5) return res.status(400).json({ error: 'Maximo 5 asesores' });
     // El email interno se arma con el usuario (no se usa para login real, pero Auth lo requiere)
-    const email = usuario.toLowerCase().replace(/[^a-z0-9]/g, '') + '.' + admin_id.substring(0, 8) + '@asesor.raices';
+    // Obtener el email del admin para derivar el del asesor (emailAdmin + alias)
+    const { data: adminData, error: errAdmin } = await supabase.auth.admin.getUserById(admin_id);
+    if (errAdmin || !adminData || !adminData.user || !adminData.user.email) return res.status(400).json({ error: 'No se pudo obtener el email del administrador' });
+    const adminEmail = adminData.user.email;
+    const aliasLimpio = usuario.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const partes = adminEmail.split('@');
+    const email = partes[0] + '+' + aliasLimpio + '@' + partes[1];
     const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: 'asesor', admin_id: admin_id, nombre: nombre } });
     if (errAuth) return res.status(400).json({ error: errAuth.message });
     const authId = created && created.user ? created.user.id : null;

@@ -343,7 +343,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!user_id || !conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
 
     // 1) Buscar la conversacion para obtener el contacto
-    const { data: conv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).eq('user_id', user_id).maybeSingle();
+    const { data: conv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).maybeSingle();
     if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
 
     // 2) Buscar el telefono del contacto

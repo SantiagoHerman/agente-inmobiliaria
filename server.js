@@ -453,6 +453,28 @@ app.post('/api/whatsapp/conectar', async (req, res) => {
 });
 
 // GET /api/whatsapp/estado?user_id=... -> dice si la instancia ya esta conectada
+app.post('/api/whatsapp/desconectar', async (req, res) => {
+  try {
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
+    const instancia = nombreInstancia(user_id);
+    // Cerrar la sesion de WhatsApp en Evolution (logout) - la instancia queda lista para reconectar
+    try {
+      await fetch(EVOLUTION_URL + '/instance/logout/' + instancia, {
+        method: 'DELETE',
+        headers: { 'apikey': EVOLUTION_KEY }
+      });
+    } catch (e) { console.error('Error logout evolution:', e.message); }
+    // Marcar la instancia como desconectada en la base
+    await supabase.from('whatsapp_instancias').update({ estado: 'desconectado' }).eq('user_id', user_id);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Error en desconectar:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/whatsapp/estado', async (req, res) => {
   try {
     const user_id = req.query.user_id;

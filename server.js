@@ -582,6 +582,7 @@ async function revisarInactividad() {
       await supabase.from('conversations').update({
         status: 'recontacto',
         estado_previo: conv.status,
+        ai_enabled: true,
         updated_at: new Date().toISOString()
       }).eq('id', conv.id);
       console.log('Recontacto: conversacion ' + conv.id + ' paso a recontacto (72hs sin respuesta)');

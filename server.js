@@ -320,6 +320,16 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
           if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
           await supabase.from('conversations').update(update).eq('id', conv.id);
+          // Si paso a listo_humano y no tiene asesor ni fue tomado por el admin, asignar automaticamente
+          if (nuevoEstado === 'listo_humano') {
+            const { data: cv } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', conv.id).single();
+            if (cv && !cv.asesor_id && !cv.admin_tomo) {
+              const asesorAuto = await elegirAsesorActivo(conv.user_id);
+              if (asesorAuto) {
+                await supabase.from('conversations').update({ asesor_id: asesorAuto, ultimo_asesor_id: asesorAuto }).eq('id', conv.id);
+              }
+            }
+          }
         }
       }
     }

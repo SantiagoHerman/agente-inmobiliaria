@@ -144,6 +144,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   const systemPrompt = [
     'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
     'Respondes consultas de clientes por WhatsApp.',
+    'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si es informal; Sr./Sra. y apellido si es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'NO uses emojis.',
     instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
@@ -182,8 +183,8 @@ async function clasificarEstado(mensajeCliente) {
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
       'Segun el mensaje del cliente, responde UNA sola palabra exacta:',
       '- listo_humano  => si pide hablar con una persona, asesor, vendedor o humano; o quiere reservar, senar, comprar, alquilar, o avanzar una operacion concreta; o pide que lo contacten/llamen.',
-      '- interesado    => si muestra interes real en una propiedad: pide ir a verla, agendar o coordinar una visita/cita, pide mas datos para decidir, pregunta precio/disponibilidad de una propiedad puntual, o dice que le interesa/le gusta.',
-      '- sin_cambio    => solo si es un saludo, una consulta muy general, o algo no relacionado a avanzar.',
+      '- interesado    => apenas consulta por una propiedad, alquiler o venta, pregunta precios/valores, disponibilidad, o (en hotel) alojamiento o disponibilidad en ciertas fechas; o pide datos para decidir, pide ir a ver/agendar visita, o dice que le interesa. Basta con que pregunte por algo concreto del negocio.',
+      '- sin_cambio    => SOLO si es un saludo inicial sin consulta (hola, buenas) o algo no relacionado al negocio. Si ya pregunto algo concreto, NO es sin_cambio.',
       'Ante la duda entre interesado y sin_cambio, elegi interesado. Ante la duda entre listo_humano e interesado, mira si pide contacto humano o avanzar (listo_humano) o solo ver/consultar (interesado).',
       'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.',
       'Mensaje del cliente: ' + mensajeCliente

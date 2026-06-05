@@ -355,7 +355,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!inst) return res.status(400).json({ error: 'No hay instancia de WhatsApp conectada para este usuario' });
 
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
-    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano' });
+    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano' });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
     // Si escribe el Administrador en un lead sin asignar, lo congela (admin_tomo) para que el bucle no lo reasigne
     if (enviado_por === 'Administrador') {

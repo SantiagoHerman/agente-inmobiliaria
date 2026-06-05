@@ -347,6 +347,13 @@ app.post('/api/whatsapp/send', async (req, res) => {
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
     await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano' });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // Si escribe el Administrador en un lead sin asignar, lo congela (admin_tomo) para que el bucle no lo reasigne
+    if (enviado_por === 'Administrador') {
+      const { data: convActual } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).single();
+      if (convActual && !convActual.asesor_id) {
+        await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id);
+      }
+    }
 
     // 5) Enviar por WhatsApp via Evolution
     await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);
@@ -627,6 +634,40 @@ app.post('/api/asesores/crear', async (req, res) => {
 });
 
 // Eliminar un asesor: borra el usuario de Auth y la fila. Los mensajes conservan enviado_por.
+app.post('/api/asesores/activar', async (req, res) => {
+  try {
+    const { admin_id, asesor_id } = req.body || {};
+    if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
+    // 1. Poner el asesor activo
+    await supabase.from('asesores').update({ activo: true, estado: 'activo' }).eq('id', asesor_id);
+    // 2. Buscar asesores activos de la inmobiliaria
+    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true);
+    if (!activos || activos.length === 0) return res.json({ ok: true, asignados: 0 });
+    // 3. Buscar leads en espera, sin asignar y no tomados por el admin
+    const { data: enEspera } = await supabase.from('conversations').select('id').eq('user_id', admin_id).is('asesor_id', null).eq('admin_tomo', false);
+    if (!enEspera || enEspera.length === 0) return res.json({ ok: true, asignados: 0 });
+    // 4. Contar carga actual de cada activo para repartir equitativo
+    const carga = {};
+    for (const a of activos) {
+      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', a.id);
+      carga[a.id] = count || 0;
+    }
+    // 5. Repartir cada lead en espera al activo con menos carga
+    let asignados = 0;
+    for (const lead of enEspera) {
+      let mejor = activos[0].id; let menos = carga[mejor];
+      for (const a of activos) { if (carga[a.id] < menos) { menos = carga[a.id]; mejor = a.id; } }
+      await supabase.from('conversations').update({ asesor_id: mejor, ultimo_asesor_id: mejor }).eq('id', lead.id);
+      carga[mejor] = (carga[mejor] || 0) + 1;
+      asignados++;
+    }
+    return res.json({ ok: true, asignados });
+  } catch (e) {
+    console.error('Error en activar asesor:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/asesores/eliminar', async (req, res) => {
   try {
     const { admin_id, asesor_id } = req.body || {};

@@ -384,6 +384,15 @@ function nombreInstancia(user_id) {
   return 'cliente_' + String(user_id).replace(/-/g, '').substring(0, 16);
 }
 
+// Devuelve el nombre de la instancia REALMENTE conectada en la base (o cae al nombre por defecto)
+async function instanciaActiva(user_id) {
+  try {
+    const { data } = await supabase.from('whatsapp_instancias').select('instancia_nombre').eq('user_id', user_id).eq('estado', 'conectado').maybeSingle();
+    if (data && data.instancia_nombre) return data.instancia_nombre;
+  } catch (e) { /* silencioso */ }
+  return nombreInstancia(user_id);
+}
+
 // Configura el webhook de una instancia para que apunte a nuestro backend
 async function configurarWebhookInstancia(instancia) {
   try {
@@ -458,7 +467,7 @@ app.post('/api/whatsapp/desconectar', async (req, res) => {
     const { user_id } = req.body || {};
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
-    const instancia = nombreInstancia(user_id);
+    const instancia = await instanciaActiva(user_id);
     // Cerrar la sesion de WhatsApp en Evolution (logout) - la instancia queda lista para reconectar
     try {
       await fetch(EVOLUTION_URL + '/instance/logout/' + instancia, {
@@ -479,7 +488,7 @@ app.get('/api/whatsapp/estado', async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
-    const instancia = nombreInstancia(user_id);
+    const instancia = await instanciaActiva(user_id);
     const r = await fetch(EVOLUTION_URL + '/instance/connectionState/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } });
     const data = await r.json();
     const estado = (data && data.instance && data.instance.state) || 'desconocido';

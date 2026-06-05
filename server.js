@@ -360,6 +360,13 @@ app.post('/api/whatsapp/send', async (req, res) => {
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
     await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano' });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // Si un humano (asesor o admin) escribe en un lead en recontacto o cerrado, pasa a listo_humano y se pausa la IA
+    {
+      const { data: convEstado } = await supabase.from('conversations').select('status').eq('id', conversation_id).maybeSingle();
+      if (convEstado && (convEstado.status === 'recontacto' || convEstado.status === 'cerrado')) {
+        await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+      }
+    }
     // Si escribe el Administrador en un lead sin asignar, lo congela (admin_tomo) para que el bucle no lo reasigne
     if (enviado_por === 'Administrador') {
       const { data: convActual } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).single();

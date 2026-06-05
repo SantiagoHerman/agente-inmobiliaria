@@ -181,14 +181,16 @@ async function clasificarEstado(mensajeCliente) {
     const prompt = [
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
       'Segun el mensaje del cliente, responde UNA sola palabra exacta:',
-      '- listo_humano  => si pide hablar con una persona/asesor, o quiere reservar, senar, o avanzar una compra/alquiler concreto.',
-      '- interesado    => si pide ir a ver la propiedad personalmente, agendar visita, o coordinar una visita/cita.',
-      '- sin_cambio    => en cualquier otro caso (consulta general, saludo, pregunta de info).',
-      'Responde SOLO una de esas tres palabras, sin nada mas.',
+      '- listo_humano  => si pide hablar con una persona, asesor, vendedor o humano; o quiere reservar, senar, comprar, alquilar, o avanzar una operacion concreta; o pide que lo contacten/llamen.',
+      '- interesado    => si muestra interes real en una propiedad: pide ir a verla, agendar o coordinar una visita/cita, pide mas datos para decidir, pregunta precio/disponibilidad de una propiedad puntual, o dice que le interesa/le gusta.',
+      '- sin_cambio    => solo si es un saludo, una consulta muy general, o algo no relacionado a avanzar.',
+      'Ante la duda entre interesado y sin_cambio, elegi interesado. Ante la duda entre listo_humano e interesado, mira si pide contacto humano o avanzar (listo_humano) o solo ver/consultar (interesado).',
+      'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.',
       'Mensaje del cliente: ' + mensajeCliente
     ].join('\n');
-    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
+    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 20, messages: [{ role: 'user', content: prompt }] });
     const out = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim().toLowerCase() : '';
+    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> respuesta IA:', JSON.stringify(out));
     if (out.includes('listo_humano')) return 'listo_humano';
     if (out.includes('interesado')) return 'interesado';
     return null;

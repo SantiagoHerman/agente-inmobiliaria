@@ -111,7 +111,7 @@ async function elegirAsesorActivo(admin_id) {
 async function generarRespuestaAgente(user_id, conversation_id, message) {
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
-  const { data: properties } = await supabase.from('properties').select('title, type, operation, zone, price, rooms, capacity, amenities, status').eq('user_id', user_id).eq('status', 'disponible');
+  const { data: properties } = await supabase.from('properties').select('title, type, operation, zone, price, rooms, capacity, amenities, status, link').eq('user_id', user_id).eq('status', 'disponible');
 
   const agentName = (settings && settings.agent_name) || 'Asistente';
   const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
@@ -130,7 +130,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
 
   let inventario = 'No hay propiedades cargadas todavia.';
   if (properties && properties.length > 0) {
-    inventario = properties.map(function(p){ return '- ' + p.title + ' | ' + (p.type||'') + ' | ' + (p.operation||'') + ' | zona: ' + (p.zone||'-') + ' | precio: ' + (p.price||'-') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.amenities ? ' | ' + p.amenities : ''); }).join('\n');
+    inventario = properties.map(function(p){ return '- ' + p.title + ' | ' + (p.type||'') + ' | ' + (p.operation||'') + ' | zona: ' + (p.zone||'-') + ' | precio: ' + (p.price||'-') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.amenities ? ' | ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : ''); }).join('\n');
   }
 
   let historial = [];
@@ -148,7 +148,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'NO uses emojis.',
     instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
-    'Propiedades disponibles (usalas para recomendar; no ofrezcas las que no esten aca):', inventario, '',
+    'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:', inventario, '',
     'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
   ].filter(Boolean).join('\n');
 

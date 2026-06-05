@@ -343,7 +343,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!user_id || !conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
 
     // 1) Buscar la conversacion para obtener el contacto
-    const { data: conv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).maybeSingle();
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', conversation_id).maybeSingle();
     if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
 
     // 2) Buscar el telefono del contacto
@@ -351,7 +351,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!contacto || !contacto.phone) return res.status(400).json({ error: 'El contacto no tiene telefono (no es WhatsApp)' });
 
     // 3) Buscar la instancia de WhatsApp de este user (la conectada)
-    const { data: inst } = await supabase.from('whatsapp_instancias').select('instancia_nombre').eq('user_id', user_id).eq('estado', 'conectado').maybeSingle();
+    const { data: inst } = await supabase.from('whatsapp_instancias').select('instancia_nombre').eq('user_id', conv.user_id).eq('estado', 'conectado').maybeSingle();
     if (!inst) return res.status(400).json({ error: 'No hay instancia de WhatsApp conectada para este usuario' });
 
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion

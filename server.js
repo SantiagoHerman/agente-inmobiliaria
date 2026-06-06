@@ -221,11 +221,16 @@ async function instanciaConectada(instancia) {
 
 // Envia mensaje de WhatsApp via Evolution. Devuelve true si salio, false si fallo.
 // Verifica la conexion ANTES de enviar para no dar por enviado algo que no salio.
-async function enviarWhatsapp(instancia, numero, texto) {
-  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); return false; }
+async function enviarWhatsapp(instancia, numero, texto, messageId) {
+  // Helper interno: registra el estado de envio del mensaje si se paso un messageId
+  async function registrar(ok) {
+    if (!messageId) return;
+    try { await supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', messageId); } catch (e) { console.error('No se pudo registrar estado_envio:', e && e.message); }
+  }
+  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); await registrar(false); return false; }
   // 1) verificar que la instancia este conectada
   const conectada = await instanciaConectada(instancia);
-  if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); return false; }
+  if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); await registrar(false); return false; }
   // 2) enviar y verificar la respuesta
   try {
     const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
@@ -233,9 +238,10 @@ async function enviarWhatsapp(instancia, numero, texto) {
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify({ number: numero, text: texto })
     });
-    if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); return false; }
+    if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); await registrar(false); return false; }
+    await registrar(true);
     return true;
-  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); return false; }
+  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar(false); return false; }
 }
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });

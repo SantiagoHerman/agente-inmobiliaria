@@ -1011,19 +1011,33 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
     const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
     const chatsRaw = await rch.json();
     const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
-    // desglosar por tipo de jid
-    const tipos = { sWhatsapp: 0, lid: 0, grupo: 0, broadcast: 0, otro: 0 };
-    const clavesChat = chats[0] ? Object.keys(chats[0]) : [];
-    const ejemplosLid = [];
+    // mapa de nombres desde contactos
+    const mapaNombre = {};
+    try {
+      const rc = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+      if (rc.ok) { const cr = await rc.json(); const cs = Array.isArray(cr)?cr:(cr&&cr.contacts?cr.contacts:[]); for (const ct of cs) { const j=String(ct.remoteJid||''); if(j.indexOf('@s.whatsapp.net')<0) continue; const t=j.replace(/@.*/,'').replace(/[^0-9]/g,''); if(t&&ct.pushName) mapaNombre[t]=ct.pushName; } }
+    } catch (e) {}
+    // funcion: extraer telefono real de un chat probando todas las fuentes
+    function telDeChat(ch) {
+      const jid = String(ch.remoteJid || '');
+      if (jid.indexOf('@g.us') >= 0 || jid.indexOf('broadcast') >= 0) return null;
+      if (jid.indexOf('@s.whatsapp.net') >= 0) return jid.replace(/@.*/,'').replace(/[^0-9]/g,'');
+      // es LID: buscar en lastMessage.key
+      const k = ch.lastMessage && ch.lastMessage.key ? ch.lastMessage.key : {};
+      const cand = [k.remoteJidAlt, k.participantAlt, k.participant, ch.lastMessage && ch.lastMessage.participant];
+      for (const x of cand) { const s = String(x||''); if (s.indexOf('@s.whatsapp.net') >= 0) return s.replace(/@.*/,'').replace(/[^0-9]/g,''); }
+      return null;
+    }
+    let resueltos = 0, noResueltos = 0, grupos = 0, conNombre = 0;
+    const vistos = {};
     for (const ch of chats) {
       const jid = String(ch.remoteJid || '');
-      if (jid.indexOf('@s.whatsapp.net') >= 0) tipos.sWhatsapp++;
-      else if (jid.indexOf('@lid') >= 0) { tipos.lid++; if (ejemplosLid.length < 3) ejemplosLid.push(Object.assign({}, ch)); }
-      else if (jid.indexOf('@g.us') >= 0) tipos.grupo++;
-      else if (jid.indexOf('broadcast') >= 0) tipos.broadcast++;
-      else tipos.otro++;
+      if (jid.indexOf('@g.us') >= 0 || jid.indexOf('broadcast') >= 0) { grupos++; continue; }
+      const tel = telDeChat(ch);
+      if (tel && tel.length >= 8 && tel.length <= 15) { if(!vistos[tel]){ vistos[tel]=1; resueltos++; if (ch.pushName || mapaNombre[tel]) conNombre++; } }
+      else noResueltos++;
     }
-    return res.json({ chats_total: chats.length, tipos: tipos, clavesChat: clavesChat, ejemplosLid: ejemplosLid });
+    return res.json({ chats_total: chats.length, grupos: grupos, leads_resueltos: resueltos, leads_conNombre: conNombre, lid_no_resueltos: noResueltos });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

@@ -303,9 +303,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos
     if (convExistente && convExistente.status === 'recontacto') {
-      const volverA = convExistente.estado_previo || 'en_conversacion';
+      const tempLead = await clasificarTemperatura(texto);
+      let volverA = convExistente.estado_previo || 'en_conversacion';
+      // Si el lead muestra interes (caliente), pasa a 'interesado' (sale de recontacto)
+      if (tempLead === 'caliente') volverA = 'interesado';
       await supabase.from('conversations').update({
         status: volverA,
+        temperatura: tempLead || convExistente.temperatura || null,
         estado_previo: null,
         recontacto_count: 0,
         updated_at: new Date().toISOString()

@@ -990,4 +990,30 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     return res.json({ ok: true, creados: creados, yaExistian: yaExistian, errores: errores });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+app.get('/api/whatsapp/debug-diag', async function(req, res) {
+  try {
+    const user_id = req.query.user_id;
+    const instancia = await instanciaActiva(user_id);
+    const out = {};
+    // 1) findContacts
+    try {
+      const rc = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+      const jc = await rc.json();
+      const lista = Array.isArray(jc) ? jc : (jc && jc.contacts ? jc.contacts : []);
+      out.contactos_total = lista.length;
+      out.contactos_conNombre = lista.filter(function(x){ return x.pushName || x.name || x.verifiedName; }).length;
+      out.contactos_claves = lista[0] ? Object.keys(lista[0]) : [];
+      out.contactos_ejemplo = lista.slice(0,3).map(function(x){ return { jidLen: String(x.remoteJid||x.id||'').length, tienePush: !!x.pushName, tieneName: !!x.name }; });
+    } catch (e) { out.contactos_error = e && e.message; }
+    // 2) findMessages (historial) - probar con un numero
+    try {
+      const rm = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: {} }) });
+      const jm = await rm.json();
+      const msgs = Array.isArray(jm) ? jm : (jm && jm.messages && jm.messages.records ? jm.messages.records : (jm && jm.messages ? jm.messages : []));
+      out.mensajes_total = Array.isArray(msgs) ? msgs.length : 'formato: ' + JSON.stringify(Object.keys(jm||{}));
+      out.mensajes_claves = (Array.isArray(msgs) && msgs[0]) ? Object.keys(msgs[0]) : [];
+    } catch (e) { out.mensajes_error = e && e.message; }
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

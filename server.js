@@ -1008,24 +1008,28 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
   try {
     const user_id = req.query.user_id;
     const instancia = await instanciaActiva(user_id);
-    // tomar un chat LID
+    const out = {};
+    // tomar un LID de los chats
     const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
     const chatsRaw = await rch.json();
     const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
     const lid = chats.find(function(ch){ return String(ch.remoteJid||'').indexOf('@lid') >= 0; });
-    if (!lid) return res.json({ nota: 'no hay LID' });
-    const jidLid = lid.remoteJid;
-    // pedir mensajes de ese LID
-    const rm = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: { key: { remoteJid: jidLid } } }) });
-    const jm = await rm.json();
-    const msgs = Array.isArray(jm) ? jm : (jm && jm.messages && jm.messages.records ? jm.messages.records : (jm && jm.messages ? jm.messages : []));
-    // buscar @s.whatsapp.net en TODA la estructura de los mensajes (JSON completo)
-    const dump = JSON.stringify(msgs);
-    const telefonos = [];
-    const re = /(\d{8,15})@s\.whatsapp\.net/g;
-    let m;
-    while ((m = re.exec(dump)) !== null) { if (telefonos.indexOf(m[1]) < 0) telefonos.push(m[1]); }
-    return res.json({ lid_jid_len: String(jidLid).length, mensajes_encontrados: Array.isArray(msgs)?msgs.length:0, telefonos_reales_en_historial: telefonos, claves_primer_msg: (Array.isArray(msgs)&&msgs[0])?Object.keys(msgs[0]):[] });
+    out.lid_jid = lid ? lid.remoteJid : null;
+    const numeroLid = lid ? String(lid.remoteJid).replace(/@.*/,'') : '';
+    // VIA 1: buscar en findContacts un contacto cuyo remoteJid sea el LID y ver TODAS sus claves/valores
+    try {
+      const rc = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: { remoteJid: lid.remoteJid } }) });
+      const cr = await rc.json();
+      const cs = Array.isArray(cr)?cr:(cr&&cr.contacts?cr.contacts:[]);
+      out.contacto_del_lid = cs[0] ? cs[0] : 'no encontrado';
+    } catch (e) { out.via1_error = e && e.message; }
+    // VIA 2: endpoint de lookup de numero (whatsappNumbers) - probar si existe
+    try {
+      const rn = await fetch(EVOLUTION_URL + '/chat/whatsappNumbers/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ numbers: [numeroLid] }) });
+      out.via2_status = rn.status;
+      if (rn.ok) out.via2_resultado = await rn.json();
+    } catch (e) { out.via2_error = e && e.message; }
+    return res.json(out);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

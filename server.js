@@ -1008,27 +1008,20 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
   try {
     const user_id = req.query.user_id;
     const instancia = await instanciaActiva(user_id);
-    const out = {};
-    // tomar un LID de los chats
+    const buscar = String(req.query.q || '2392');
+    const out = { buscar: buscar };
+    // buscar en CHATS
     const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
     const chatsRaw = await rch.json();
     const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
-    const lid = chats.find(function(ch){ return String(ch.remoteJid||'').indexOf('@lid') >= 0; });
-    out.lid_jid = lid ? lid.remoteJid : null;
-    const numeroLid = lid ? String(lid.remoteJid).replace(/@.*/,'') : '';
-    // VIA 1: buscar en findContacts un contacto cuyo remoteJid sea el LID y ver TODAS sus claves/valores
-    try {
-      const rc = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: { remoteJid: lid.remoteJid } }) });
-      const cr = await rc.json();
-      const cs = Array.isArray(cr)?cr:(cr&&cr.contacts?cr.contacts:[]);
-      out.contacto_del_lid = cs[0] ? cs[0] : 'no encontrado';
-    } catch (e) { out.via1_error = e && e.message; }
-    // VIA 2: endpoint de lookup de numero (whatsappNumbers) - probar si existe
-    try {
-      const rn = await fetch(EVOLUTION_URL + '/chat/whatsappNumbers/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ numbers: [numeroLid] }) });
-      out.via2_status = rn.status;
-      if (rn.ok) out.via2_resultado = await rn.json();
-    } catch (e) { out.via2_error = e && e.message; }
+    out.chats_total = chats.length;
+    out.chats_match = chats.filter(function(ch){ return JSON.stringify(ch).indexOf(buscar) >= 0; }).map(function(ch){ return { remoteJid: ch.remoteJid, pushName: ch.pushName || '' }; });
+    // buscar en CONTACTOS
+    const rco = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    const contRaw = await rco.json();
+    const contactos = Array.isArray(contRaw) ? contRaw : (contRaw && contRaw.contacts ? contRaw.contacts : []);
+    out.contactos_total = contactos.length;
+    out.contactos_match = contactos.filter(function(ct){ return JSON.stringify(ct).indexOf(buscar) >= 0; }).map(function(ct){ return { remoteJid: ct.remoteJid, pushName: ct.pushName || '' }; });
     return res.json(out);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

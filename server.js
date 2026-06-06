@@ -1011,29 +1011,19 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
     const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
     const chatsRaw = await rch.json();
     const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
-    const rco = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-    const contRaw = await rco.json();
-    const contactos = Array.isArray(contRaw) ? contRaw : (contRaw && contRaw.contacts ? contRaw.contacts : []);
-    const mapaNombre = {};
-    for (const ct of contactos) {
-      const cjid = String(ct.remoteJid || '');
-      if (cjid.indexOf('@s.whatsapp.net') < 0) continue;
-      const ctel = cjid.replace(/@.*/, '').replace(/[^0-9]/g, '');
-      if (ctel && ct.pushName) mapaNombre[ctel] = ct.pushName;
+    // desglosar por tipo de jid
+    const tipos = { sWhatsapp: 0, lid: 0, grupo: 0, broadcast: 0, otro: 0 };
+    const clavesChat = chats[0] ? Object.keys(chats[0]) : [];
+    const ejemplosLid = [];
+    for (const ch of chats) {
+      const jid = String(ch.remoteJid || '');
+      if (jid.indexOf('@s.whatsapp.net') >= 0) tipos.sWhatsapp++;
+      else if (jid.indexOf('@lid') >= 0) { tipos.lid++; if (ejemplosLid.length < 3) ejemplosLid.push(Object.assign({}, ch)); }
+      else if (jid.indexOf('@g.us') >= 0) tipos.grupo++;
+      else if (jid.indexOf('broadcast') >= 0) tipos.broadcast++;
+      else tipos.otro++;
     }
-    let chatsConTel = 0, conNombre = 0, sinNombre = 0;
-    const ejemplos = [];
-    for (const chItem of chats) {
-      const hjid = String(chItem.remoteJid || '');
-      if (hjid.indexOf('@s.whatsapp.net') < 0) continue;
-      const htel = hjid.replace(/@.*/, '').replace(/[^0-9]/g, '');
-      if (!htel || htel.length < 8) continue;
-      chatsConTel++;
-      const nombre = chItem.pushName || mapaNombre[htel] || '';
-      if (nombre) { conNombre++; if (ejemplos.length < 5) ejemplos.push({ ult4: htel.slice(-4), nombre: nombre, fuente: chItem.pushName ? 'chat' : 'contacto' }); }
-      else sinNombre++;
-    }
-    return res.json({ chats_total: chats.length, chatsConTelefono: chatsConTel, conNombre: conNombre, sinNombre: sinNombre, contactos_en_mapa: Object.keys(mapaNombre).length, ejemplos: ejemplos });
+    return res.json({ chats_total: chats.length, tipos: tipos, clavesChat: clavesChat, ejemplosLid: ejemplosLid });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

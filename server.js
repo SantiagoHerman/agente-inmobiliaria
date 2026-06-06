@@ -737,4 +737,40 @@ app.post('/api/asesores/eliminar', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress) =====
+app.get('/api/scrape/lista', async function(req, res) {
+  try {
+    let sitio = (req.query.url || '').trim();
+    if (!sitio) return res.status(400).json({ error: 'Falta el parametro url' });
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    // normalizar a dominio base
+    let base;
+    try { const u = new URL(sitio); base = u.protocol + '//' + u.host; } catch(e){ return res.status(400).json({ error: 'URL invalida' }); }
+    // 1) intentar el sitemap de propiedades de Houzez
+    const candidatos = [base + '/wp-sitemap-posts-property-1.xml', base + '/property-sitemap.xml', base + '/wp-sitemap.xml'];
+    let urls = [];
+    for (const sm of candidatos) {
+      try {
+        const r = await fetch(sm, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        if (!r.ok) continue;
+        const xml = await r.text();
+        const matches = xml.match(/<loc>([^<]+)<\/loc>/g) || [];
+        const locs = matches.map(function(m){ return m.replace(/<\/?loc>/g, ''); });
+        // filtrar solo las de propiedades
+        const props = locs.filter(function(u){ return /\/propiedad|\/property|\/propiedades\//i.test(u); });
+        if (props.length > 0) { urls = props; break; }
+        // si era el indice de sitemaps, buscar el de property y seguir
+        const subProperty = locs.find(function(u){ return /property/i.test(u) && u.endsWith('.xml'); });
+        if (subProperty) {
+          const r2 = await fetch(subProperty, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+          if (r2.ok) { const xml2 = await r2.text(); const m2 = xml2.match(/<loc>([^<]+)<\/loc>/g) || []; urls = m2.map(function(m){ return m.replace(/<\/?loc>/g, ''); }); break; }
+        }
+      } catch(e) { /* probar siguiente */ }
+    }
+    if (urls.length === 0) return res.json({ ok: true, total: 0, urls: [], nota: 'No se encontro sitemap de propiedades. La web puede no ser compatible.' });
+    // extraer id de cada url (patron -id-NUMERO o idNUMERO)
+    const items = urls.map(function(u){ const m = u.match(/id-?(\d+)/i); return { url: u, numero: m ? m[1] : '' }; });
+    return res.json({ ok: true, total: items.length, urls: items });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

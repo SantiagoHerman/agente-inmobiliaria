@@ -897,4 +897,39 @@ app.get('/api/whatsapp/debug-chat', async function(req, res) {
     return res.json({ total: lista.length, claves: lista[0] ? Object.keys(lista[0]) : [], ejemplos: lista.slice(0,3) });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+// Paso 2: importar los leads listados a la base (contactos + conversaciones), con duplicados por telefono
+app.post('/api/whatsapp/importar-leads', async function(req, res) {
+  try {
+    const user_id = req.body && req.body.user_id;
+    const leads = (req.body && req.body.leads) || [];
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    if (!Array.isArray(leads) || leads.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });
+    let creados = 0; let yaExistian = 0; let errores = 0;
+    for (const lead of leads) {
+      const telefono = String(lead.telefono || '').replace(/[^0-9]/g, '');
+      if (!telefono || telefono.length < 8) { errores++; continue; }
+      try {
+        // buscar contacto por telefono (duplicados por telefono)
+        const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
+        let contactoId;
+        if (existente) {
+          contactoId = existente.id;
+          yaExistian++;
+        } else {
+          const nombre = lead.nombre || ('Cliente ' + telefono.slice(-4));
+          const { data: nuevo, error: errC } = await supabase.from('contacts').insert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }).select('id').single();
+          if (errC || !nuevo) { errores++; continue; }
+          contactoId = nuevo.id;
+          creados++;
+        }
+        // crear conversacion solo si el contacto NO tiene ya una
+        const { data: convExistente } = await supabase.from('conversations').select('id').eq('contact_id', contactoId).maybeSingle();
+        if (!convExistente) {
+          await supabase.from('conversations').insert({ user_id: user_id, contact_id: contactoId, channel: 'whatsapp', status: 'recontacto', ai_enabled: true });
+        }
+      } catch (e) { errores++; }
+    }
+    return res.json({ ok: true, creados: creados, yaExistian: yaExistian, errores: errores });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

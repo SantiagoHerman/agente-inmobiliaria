@@ -811,4 +811,21 @@ app.post('/api/scrape/detalle', async function(req, res) {
     return res.json({ ok: true, resultados: resultados });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+// ===== TEMPERATURA DE LEADS =====
+// Clasifica un lead segun su ultimo mensaje: frio (no responde / sin interes), tibio (responde sin interes claro), caliente (muestra interes en ver propiedades)
+async function clasificarTemperatura(textoUsuario) {
+  try {
+    if (!textoUsuario || !textoUsuario.trim()) return null;
+    const prompt = 'Clasifica el interes de este mensaje de un posible cliente inmobiliario en UNA palabra: ' +
+      'caliente (muestra interes concreto en ver, visitar, precio, o avanzar con una propiedad), ' +
+      'tibio (responde pero sin interes claro), frio (no hay interes). ' +
+      'Responde SOLO con: caliente, tibio o frio. Mensaje: ' + JSON.stringify(textoUsuario);
+    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
+    const t = (r && r.content && r.content[0] && r.content[0].text ? r.content[0].text : '').toLowerCase().trim();
+    if (t.indexOf('caliente') >= 0) return 'caliente';
+    if (t.indexOf('tibio') >= 0) return 'tibio';
+    if (t.indexOf('frio') >= 0 || t.indexOf('frío') >= 0) return 'frio';
+    return null;
+  } catch (e) { console.log('clasificarTemperatura error:', e && e.message); return null; }
+}
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

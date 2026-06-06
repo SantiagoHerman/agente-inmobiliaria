@@ -874,16 +874,13 @@ app.get('/api/whatsapp/listar-chats', async function(req, res) {
     // normalizar: extraer telefono y nombre, filtrar grupos y no-leads
     const leads = [];
     for (const ch of lista) {
-      const jid = ch.remoteJid || ch.id || ch.jid || '';
-      // ignorar grupos (@g.us), broadcasts y status
-      if (!jid || jid.indexOf('@g.us') >= 0 || jid.indexOf('broadcast') >= 0 || jid.indexOf('status@') >= 0) continue;
-      // solo contactos individuales (@s.whatsapp.net)
+      const jid = ch.remoteJid || '';
+      if (jid.indexOf('@s.whatsapp.net') < 0) continue;
       const telefono = jid.replace(/@.*/, '').replace(/[^0-9]/g, '');
-      if (!telefono || telefono.length < 8) continue;
-      const nombre = ch.pushName || ch.name || (ch.contact && ch.contact.name) || '';
+      if (!telefono || telefono.length < 8 || telefono.length > 15) continue;
+      const nombre = ch.pushName || '';
       leads.push({ telefono: telefono, nombre: nombre });
     }
-    // deduplicar por telefono
     const vistos = {}; const unicos = [];
     for (const l of leads) { if (!vistos[l.telefono]) { vistos[l.telefono] = 1; unicos.push(l); } }
     return res.json({ ok: true, conectado: true, total: unicos.length, leads: unicos });

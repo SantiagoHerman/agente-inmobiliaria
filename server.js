@@ -1008,20 +1008,19 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
   try {
     const user_id = req.query.user_id;
     const instancia = await instanciaActiva(user_id);
-    const buscar = String(req.query.q || '2392');
-    const out = { buscar: buscar };
-    // buscar en CHATS
-    const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-    const chatsRaw = await rch.json();
-    const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
-    out.chats_total = chats.length;
-    out.chats_match = chats.filter(function(ch){ return JSON.stringify(ch).indexOf(buscar) >= 0; }).map(function(ch){ return { remoteJid: ch.remoteJid, pushName: ch.pushName || '' }; });
-    // buscar en CONTACTOS
+    const out = {};
+    // contacto Luis (5492392545167) entero
     const rco = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
     const contRaw = await rco.json();
     const contactos = Array.isArray(contRaw) ? contRaw : (contRaw && contRaw.contacts ? contRaw.contacts : []);
-    out.contactos_total = contactos.length;
-    out.contactos_match = contactos.filter(function(ct){ return JSON.stringify(ct).indexOf(buscar) >= 0; }).map(function(ct){ return { remoteJid: ct.remoteJid, pushName: ct.pushName || '' }; });
+    const luis = contactos.find(function(ct){ return String(ct.remoteJid||'').indexOf('2392545167') >= 0; });
+    out.contacto_luis = luis || 'no encontrado';
+    // todos los chats LID enteros (para ver si alguno matchea con Luis por algun campo)
+    const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    const chatsRaw = await rch.json();
+    const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
+    // buscar si algun chat tiene el nombre Luis o el numero en su estructura completa
+    out.chats_con_luis = chats.filter(function(ch){ var s = JSON.stringify(ch); return s.indexOf('Luis2011') >= 0 || s.indexOf('2392545167') >= 0; }).map(function(ch){ return ch; });
     return res.json(out);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

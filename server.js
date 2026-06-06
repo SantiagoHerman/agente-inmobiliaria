@@ -921,22 +921,36 @@ app.get('/api/whatsapp/listar-chats', async function(req, res) {
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     const instancia = await instanciaActiva(user_id);
     if (!instancia) return res.status(400).json({ error: 'No hay instancia para este usuario' });
-    // verificar conexion
     const conectada = await instanciaConectada(instancia);
     if (!conectada) return res.json({ ok: false, conectado: false, nota: 'El WhatsApp no esta conectado.' });
-    // pedir los chats a Evolution
+    // 1) traer los chats (la parte de Mensajes = leads reales que escribieron)
     const r = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
     if (!r.ok) { const t = await r.text(); return res.status(502).json({ error: 'Evolution respondio ' + r.status, detalle: t.substring(0,200) }); }
-    const chats = await r.json();
-    const lista = Array.isArray(chats) ? chats : (chats && chats.chats ? chats.chats : []);
-    // normalizar: extraer telefono y nombre, filtrar grupos y no-leads
+    const chatsRaw = await r.json();
+    const lista = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
+    // 2) traer contactos (agenda) para conseguir los nombres por telefono
+    const mapaNombre = {};
+    try {
+      const rc = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+      if (rc.ok) {
+        const contRaw = await rc.json();
+        const contactos = Array.isArray(contRaw) ? contRaw : (contRaw && contRaw.contacts ? contRaw.contacts : []);
+        for (const ct of contactos) {
+          const cjid = String(ct.remoteJid || '');
+          if (cjid.indexOf('@s.whatsapp.net') < 0) continue;
+          const ctel = cjid.replace(/@.*/, '').replace(/[^0-9]/g, '');
+          if (ctel && ct.pushName) mapaNombre[ctel] = ct.pushName;
+        }
+      }
+    } catch (e) { /* si falla, seguimos sin nombres de la agenda */ }
+    // 3) armar leads: solo chats con telefono real, con nombre cruzado
     const leads = [];
     for (const ch of lista) {
       const jid = ch.remoteJid || '';
       if (jid.indexOf('@s.whatsapp.net') < 0) continue;
       const telefono = jid.replace(/@.*/, '').replace(/[^0-9]/g, '');
       if (!telefono || telefono.length < 8 || telefono.length > 15) continue;
-      const nombre = ch.pushName || '';
+      const nombre = ch.pushName || mapaNombre[telefono] || '';
       leads.push({ telefono: telefono, nombre: nombre });
     }
     const vistos = {}; const unicos = [];

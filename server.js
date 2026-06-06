@@ -494,6 +494,30 @@ app.post('/api/whatsapp/desconectar', async (req, res) => {
   }
 });
 
+// DIAGNOSTICO TEMPORAL: estado real en Evolution de varias instancias (solo lectura)
+app.get('/api/whatsapp/diag-instancias', async (req, res) => {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
+    const user_id = req.query.user_id;
+    const nombres = ['principal', nombreInstancia(user_id)];
+    const out = [];
+    for (const nom of nombres) {
+      try {
+        const r = await fetch(EVOLUTION_URL + '/instance/connectionState/' + nom, { headers: { 'apikey': EVOLUTION_KEY } });
+        const d = await r.json();
+        out.push({ instancia: nom, http: r.status, estado: (d && d.instance && d.instance.state) || JSON.stringify(d).substring(0,120) });
+      } catch (e) { out.push({ instancia: nom, error: e.message }); }
+    }
+    // ademas, listar TODAS las instancias que conoce Evolution
+    try {
+      const ra = await fetch(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY } });
+      const da = await ra.json();
+      out.push({ todas: Array.isArray(da) ? da.map(function(x){ return { name: (x.instance && x.instance.instanceName) || x.name || x.instanceName, state: (x.instance && x.instance.state) || x.connectionStatus || x.state }; }) : JSON.stringify(da).substring(0,300) });
+    } catch (e) { out.push({ fetchInstances_error: e.message }); }
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/whatsapp/estado', async (req, res) => {
   try {
     const user_id = req.query.user_id;

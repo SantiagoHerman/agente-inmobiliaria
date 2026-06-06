@@ -994,28 +994,32 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
   try {
     const user_id = req.query.user_id;
     const instancia = await instanciaActiva(user_id);
-    const out = {};
-    // 1) findContacts
-    try {
-      const rc = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-      const jc = await rc.json();
-      const lista = Array.isArray(jc) ? jc : (jc && jc.contacts ? jc.contacts : []);
-      out.contactos_total = lista.length;
-      const conTel = lista.filter(function(x){ return String(x.remoteJid||'').indexOf('@s.whatsapp.net') >= 0; });
-      out.con_telefono_real = conTel.length;
-      out.con_telefono_y_nombre = conTel.filter(function(x){ return x.pushName; }).length;
-      out.con_lid = lista.filter(function(x){ return String(x.remoteJid||'').indexOf('@lid') >= 0; }).length;
-      out.muestra_validos = conTel.filter(function(x){ return x.pushName; }).slice(0,3).map(function(x){ return { tel_ult4: String(x.remoteJid).replace(/@.*/,'').slice(-4), nombre: x.pushName }; });
-        } catch (e) { out.contactos_error = e && e.message; }
-    // 2) findMessages (historial) - probar con un numero
-    try {
-      const rm = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: {} }) });
-      const jm = await rm.json();
-      const msgs = Array.isArray(jm) ? jm : (jm && jm.messages && jm.messages.records ? jm.messages.records : (jm && jm.messages ? jm.messages : []));
-      out.mensajes_total = Array.isArray(msgs) ? msgs.length : 'formato: ' + JSON.stringify(Object.keys(jm||{}));
-      out.mensajes_claves = (Array.isArray(msgs) && msgs[0]) ? Object.keys(msgs[0]) : [];
-    } catch (e) { out.mensajes_error = e && e.message; }
-    return res.json(out);
+    const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    const chatsRaw = await rch.json();
+    const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
+    const rco = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    const contRaw = await rco.json();
+    const contactos = Array.isArray(contRaw) ? contRaw : (contRaw && contRaw.contacts ? contRaw.contacts : []);
+    const mapaNombre = {};
+    for (const ct of contactos) {
+      const cjid = String(ct.remoteJid || '');
+      if (cjid.indexOf('@s.whatsapp.net') < 0) continue;
+      const ctel = cjid.replace(/@.*/, '').replace(/[^0-9]/g, '');
+      if (ctel && ct.pushName) mapaNombre[ctel] = ct.pushName;
+    }
+    let chatsConTel = 0, conNombre = 0, sinNombre = 0;
+    const ejemplos = [];
+    for (const chItem of chats) {
+      const hjid = String(chItem.remoteJid || '');
+      if (hjid.indexOf('@s.whatsapp.net') < 0) continue;
+      const htel = hjid.replace(/@.*/, '').replace(/[^0-9]/g, '');
+      if (!htel || htel.length < 8) continue;
+      chatsConTel++;
+      const nombre = chItem.pushName || mapaNombre[htel] || '';
+      if (nombre) { conNombre++; if (ejemplos.length < 5) ejemplos.push({ ult4: htel.slice(-4), nombre: nombre, fuente: chItem.pushName ? 'chat' : 'contacto' }); }
+      else sinNombre++;
+    }
+    return res.json({ chats_total: chats.length, chatsConTelefono: chatsConTel, conNombre: conNombre, sinNombre: sinNombre, contactos_en_mapa: Object.keys(mapaNombre).length, ejemplos: ejemplos });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

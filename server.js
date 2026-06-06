@@ -889,4 +889,15 @@ app.get('/api/whatsapp/listar-chats', async function(req, res) {
     return res.json({ ok: true, conectado: true, total: unicos.length, leads: unicos });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+app.get('/api/whatsapp/debug-chat', async function(req, res) {
+  try {
+    const user_id = req.query.user_id;
+    const instancia = await instanciaActiva(user_id);
+    const r = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    const chats = await r.json();
+    const lista = Array.isArray(chats) ? chats : (chats && chats.chats ? chats.chats : []);
+    // devolver las claves del primer chat y 3 ejemplos crudos
+    return res.json({ total: lista.length, claves: lista[0] ? Object.keys(lista[0]) : [], ejemplos: lista.slice(0,3) });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

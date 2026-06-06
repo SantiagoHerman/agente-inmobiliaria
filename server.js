@@ -270,25 +270,35 @@ function partirMensaje(texto) {
   return grupos.filter(Boolean);
 }
 async function enviarWhatsapp(instancia, numero, texto, messageId) {
-  // Helper interno: registra el estado de envio del mensaje si se paso un messageId
   async function registrar(ok) {
     if (!messageId) return;
     try { await supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', messageId); } catch (e) { console.error('No se pudo registrar estado_envio:', e && e.message); }
   }
   if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); await registrar(false); return false; }
-  // 1) verificar que la instancia este conectada
   const conectada = await instanciaConectada(instancia);
   if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); await registrar(false); return false; }
-  // 2) enviar y verificar la respuesta
+  // envio con realismo humano: partir en mensajes y simular escritura
   try {
-    const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-      body: JSON.stringify({ number: numero, text: texto })
-    });
-    if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); await registrar(false); return false; }
-    await registrar(true);
-    return true;
+    const partes = partirMensaje(texto);
+    let algunoFallo = false;
+    for (let i = 0; i < partes.length; i++) {
+      const parte = partes[i];
+      // tiempo de tipeo aleatorio segun largo: ~40-70ms por caracter, con tope y piso
+      const base = Math.min(6000, Math.max(1200, parte.length * aleatorio(40, 70)));
+      const tipeo = base + aleatorio(0, 800);
+      await mostrarEscribiendo(instancia, numero, tipeo);
+      await esperar(tipeo);
+      const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+        body: JSON.stringify({ number: numero, text: parte })
+      });
+      if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); algunoFallo = true; }
+      // pequena pausa entre mensajes (no en el ultimo)
+      if (i < partes.length - 1) await esperar(aleatorio(400, 1200));
+    }
+    await registrar(!algunoFallo);
+    return !algunoFallo;
   } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar(false); return false; }
 }
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });

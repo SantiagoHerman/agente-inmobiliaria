@@ -111,7 +111,7 @@ async function elegirAsesorActivo(admin_id) {
 async function generarRespuestaAgente(user_id, conversation_id, message) {
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
-  const { data: properties } = await supabase.from('properties').select('title, type, operation, zone, price, rooms, capacity, amenities, status, link').eq('user_id', user_id).eq('status', 'disponible');
+  const { data: properties } = await supabase.from('properties').select('numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia').eq('user_id', user_id).eq('activa', true);
 
   const agentName = (settings && settings.agent_name) || 'Asistente';
   const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
@@ -130,7 +130,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
 
   let inventario = 'No hay propiedades cargadas todavia.';
   if (properties && properties.length > 0) {
-    inventario = properties.map(function(p){ return '- ' + p.title + ' | ' + (p.type||'') + ' | ' + (p.operation||'') + ' | zona: ' + (p.zone||'-') + ' | precio: ' + (p.price||'-') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.amenities ? ' | ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : ''); }).join('\n');
+    inventario = properties.map(function(p){
+    var ops = [];
+    if (p.venta_activa && p.venta_estado !== 'vendida') ops.push('VENTA (' + (p.venta_estado||'disponible') + '): ' + (p.venta_precio ? 'USD ' + p.venta_precio : 'consultar'));
+    if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push('ALQUILER ANUAL (' + (p.anual_estado||'disponible') + '): ' + (p.anual_precio ? '$' + p.anual_precio + '/mes' : 'consultar'));
+    if (p.temporal_activa) ops.push('ALQUILER TEMPORAL: ' + (p.temporal_precio_dia ? '$' + p.temporal_precio_dia + '/dia (base)' : 'consultar') + ' (consultar fechas disponibles)');
+    if (ops.length === 0 && p.operation) ops.push(p.operation + (p.price ? ': ' + p.price : ''));
+    var enc = (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title||'');
+    var carac = [p.zone, p.caracteristicas].filter(Boolean).join(', ');
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '');
+  }).join(String.fromCharCode(10));
   }
 
   let historial = [];

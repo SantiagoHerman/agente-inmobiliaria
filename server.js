@@ -855,4 +855,38 @@ async function clasificarTemperatura(textoUsuario) {
     return null;
   } catch (e) { console.log('clasificarTemperatura error:', e && e.message); return null; }
 }
+// ===== FASE 2: IMPORTAR LEADS AL CONECTAR =====
+// Paso 1: listar los chats existentes en el WhatsApp (sin guardar)
+app.get('/api/whatsapp/listar-chats', async function(req, res) {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const instancia = await instanciaActiva(user_id);
+    if (!instancia) return res.status(400).json({ error: 'No hay instancia para este usuario' });
+    // verificar conexion
+    const conectada = await instanciaConectada(instancia);
+    if (!conectada) return res.json({ ok: false, conectado: false, nota: 'El WhatsApp no esta conectado.' });
+    // pedir los chats a Evolution
+    const r = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    if (!r.ok) { const t = await r.text(); return res.status(502).json({ error: 'Evolution respondio ' + r.status, detalle: t.substring(0,200) }); }
+    const chats = await r.json();
+    const lista = Array.isArray(chats) ? chats : (chats && chats.chats ? chats.chats : []);
+    // normalizar: extraer telefono y nombre, filtrar grupos y no-leads
+    const leads = [];
+    for (const ch of lista) {
+      const jid = ch.remoteJid || ch.id || ch.jid || '';
+      // ignorar grupos (@g.us), broadcasts y status
+      if (!jid || jid.indexOf('@g.us') >= 0 || jid.indexOf('broadcast') >= 0 || jid.indexOf('status@') >= 0) continue;
+      // solo contactos individuales (@s.whatsapp.net)
+      const telefono = jid.replace(/@.*/, '').replace(/[^0-9]/g, '');
+      if (!telefono || telefono.length < 8) continue;
+      const nombre = ch.pushName || ch.name || (ch.contact && ch.contact.name) || '';
+      leads.push({ telefono: telefono, nombre: nombre });
+    }
+    // deduplicar por telefono
+    const vistos = {}; const unicos = [];
+    for (const l of leads) { if (!vistos[l.telefono]) { vistos[l.telefono] = 1; unicos.push(l); } }
+    return res.json({ ok: true, conectado: true, total: unicos.length, leads: unicos });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

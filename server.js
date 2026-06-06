@@ -208,18 +208,35 @@ async function clasificarEstado(mensajeCliente) {
 }
 
 // Enviar mensaje de WhatsApp via Evolution
+// Verifica si una instancia esta conectada (estado 'open')
+async function instanciaConectada(instancia) {
+  try {
+    const r = await fetch(EVOLUTION_URL + '/instance/connectionState/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } });
+    if (!r.ok) return false;
+    const j = await r.json();
+    const estado = (j && j.instance && j.instance.state) ? j.instance.state : (j && j.state ? j.state : null);
+    return estado === 'open';
+  } catch (e) { console.error('Error verificando conexion:', e && e.message); return false; }
+}
+
+// Envia mensaje de WhatsApp via Evolution. Devuelve true si salio, false si fallo.
+// Verifica la conexion ANTES de enviar para no dar por enviado algo que no salio.
 async function enviarWhatsapp(instancia, numero, texto) {
-  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); return; }
+  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); return false; }
+  // 1) verificar que la instancia este conectada
+  const conectada = await instanciaConectada(instancia);
+  if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); return false; }
+  // 2) enviar y verificar la respuesta
   try {
     const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify({ number: numero, text: texto })
     });
-    if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); }
-  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); }
+    if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); return false; }
+    return true;
+  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); return false; }
 }
-
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
 

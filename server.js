@@ -787,20 +787,23 @@ app.post('/api/scrape/detalle', async function(req, res) {
         const html = await r.text();
         // extraer todos los pares <strong>Etiqueta:</strong> Valor
         const campos = {};
-        const re = /<strong>([^<:]+):<\/strong>\s*(?:<span[^>]*>([^<]*)<\/span>)?\s*([^<]*)<\/li>/g;
+        // lista blanca de campos tecnicos conocidos de Houzez (evita capturar la descripcion)
+        const KNOWN = ['Propiedad ID','Precio','Metros totales','Metros cubiertos','Ambientes','Plazas','Parking','Año de construcción','Tipo de propiedad','Estado','Habitaciones / Cuartos','Habitaciones','Cuartos','Baños','Acepta Permuta?','Vende Amueblado','Cantidad de plantas','Disposición','Cantidad de Pisos','Orientación','Puntaje','Acepta Mascota?','Ciudad/ Localidad','Ciudad / Localidad','Provincia','Barrio/ Zona','Barrio / Zona','País'];
+        const re = /<strong>([^<]+?):<\/strong>\s*(?:<span[^>]*>([^<]*)<\/span>)?\s*([^<]*)<\/li>/g;
         let m;
         while ((m = re.exec(html)) !== null) {
           const k = m[1].trim();
-          const v = ((m[2] || '') + ' ' + (m[3] || '')).trim();
+          if (KNOWN.indexOf(k) === -1) continue;
+          const v = ((m[2] || '') + ' ' + (m[3] || '')).trim().replace(/\s+/g, ' ');
           if (k && v) campos[k] = v;
         }
-        // titulo y descripcion desde meta og
-        const tituloM = html.match(/<meta property="og:title" content="([^"]*)"/);
-        const descM = html.match(/<meta property="og:description" content="([^"]*)"/);
+        // titulo y descripcion desde meta og (flexible al orden de atributos)
+        const tituloM = html.match(/og:title["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:title/i);
+        const descM = html.match(/og:description["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:description/i);
         resultados.push({
           url: u,
-          titulo: tituloM ? tituloM[1] : '',
-          descripcion: descM ? descM[1] : '',
+          titulo: tituloM ? tituloM[1].trim() : '',
+          descripcion: descM ? descM[1].trim().substring(0, 500) : '',
           campos: campos
         });
       } catch (e) { resultados.push({ url: u, error: e && e.message }); }

@@ -221,6 +221,54 @@ async function instanciaConectada(instancia) {
 
 // Envia mensaje de WhatsApp via Evolution. Devuelve true si salio, false si fallo.
 // Verifica la conexion ANTES de enviar para no dar por enviado algo que no salio.
+// ===== FASE 3: REALISMO HUMANO =====
+// Espera aleatoria (ms)
+function esperar(ms) { return new Promise(function(r){ setTimeout(r, ms); }); }
+function aleatorio(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+// Muestra el estado 'escribiendo...' en el chat del lead via Evolution
+async function mostrarEscribiendo(instancia, numero, ms) {
+  try {
+    await fetch(EVOLUTION_URL + '/chat/sendPresence/' + instancia, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({ number: numero, presence: 'composing', delay: ms })
+    });
+  } catch (e) { /* si falla, no rompe el envio */ }
+}
+
+// Marca como leidos los mensajes del lead (tildes azules)
+async function marcarLeido(instancia, numero) {
+  try {
+    await fetch(EVOLUTION_URL + '/chat/markMessageAsRead/' + instancia, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({ readMessages: [] })
+    });
+  } catch (e) { /* no rompe nada */ }
+}
+
+// Parte un texto en 1-3 mensajes de forma ALEATORIA, cortando por frases completas
+function partirMensaje(texto) {
+  const t = String(texto || '').trim();
+  if (!t) return [t];
+  // separar en frases por punto, signo de exclamacion/pregunta, o salto de linea
+  const frases = t.split(/(?<=[.!?\n])\s+/).map(function(f){ return f.trim(); }).filter(Boolean);
+  if (frases.length <= 1) return [t];
+  // decidir aleatoriamente en cuantos mensajes (1, 2 o 3, sin pasar la cant de frases)
+  const maxMsgs = Math.min(3, frases.length);
+  const cantMsgs = aleatorio(1, maxMsgs);
+  if (cantMsgs === 1) return [t];
+  // repartir las frases en 'cantMsgs' grupos de forma despareja pero natural
+  const grupos = []; let idx = 0;
+  const porGrupo = Math.ceil(frases.length / cantMsgs);
+  for (let i = 0; i < cantMsgs; i++) {
+    const trozo = frases.slice(idx, idx + porGrupo);
+    if (trozo.length) grupos.push(trozo.join(' '));
+    idx += porGrupo;
+  }
+  // si quedaron frases sueltas, agregarlas al ultimo grupo
+  if (idx < frases.length) grupos[grupos.length - 1] += ' ' + frases.slice(idx).join(' ');
+  return grupos.filter(Boolean);
+}
 async function enviarWhatsapp(instancia, numero, texto, messageId) {
   // Helper interno: registra el estado de envio del mensaje si se paso un messageId
   async function registrar(ok) {

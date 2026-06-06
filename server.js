@@ -1001,10 +1001,12 @@ app.get('/api/whatsapp/debug-diag', async function(req, res) {
       const jc = await rc.json();
       const lista = Array.isArray(jc) ? jc : (jc && jc.contacts ? jc.contacts : []);
       out.contactos_total = lista.length;
-      out.contactos_conNombre = lista.filter(function(x){ return x.pushName || x.name || x.verifiedName; }).length;
-      out.contactos_claves = lista[0] ? Object.keys(lista[0]) : [];
-      out.contactos_ejemplo = lista.slice(0,3).map(function(x){ return { jidLen: String(x.remoteJid||x.id||'').length, tienePush: !!x.pushName, tieneName: !!x.name }; });
-    } catch (e) { out.contactos_error = e && e.message; }
+      const conTel = lista.filter(function(x){ return String(x.remoteJid||'').indexOf('@s.whatsapp.net') >= 0; });
+      out.con_telefono_real = conTel.length;
+      out.con_telefono_y_nombre = conTel.filter(function(x){ return x.pushName; }).length;
+      out.con_lid = lista.filter(function(x){ return String(x.remoteJid||'').indexOf('@lid') >= 0; }).length;
+      out.muestra_validos = conTel.filter(function(x){ return x.pushName; }).slice(0,3).map(function(x){ return { tel_ult4: String(x.remoteJid).replace(/@.*/,'').slice(-4), nombre: x.pushName }; });
+        } catch (e) { out.contactos_error = e && e.message; }
     // 2) findMessages (historial) - probar con un numero
     try {
       const rm = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: {} }) });

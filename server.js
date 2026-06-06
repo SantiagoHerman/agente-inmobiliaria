@@ -773,4 +773,39 @@ app.get('/api/scrape/lista', async function(req, res) {
     return res.json({ ok: true, total: items.length, urls: items });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+app.post('/api/scrape/detalle', async function(req, res) {
+  try {
+    const urls = (req.body && req.body.urls) || [];
+    if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: 'Falta el array urls' });
+    if (urls.length > 15) return res.status(400).json({ error: 'Maximo 15 por lote' });
+    const resultados = [];
+    for (const item of urls) {
+      const u = typeof item === 'string' ? item : item.url;
+      try {
+        const r = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        if (!r.ok) { resultados.push({ url: u, error: 'status ' + r.status }); continue; }
+        const html = await r.text();
+        // extraer todos los pares <strong>Etiqueta:</strong> Valor
+        const campos = {};
+        const re = /<strong>([^<:]+):<\/strong>\s*(?:<span[^>]*>([^<]*)<\/span>)?\s*([^<]*)<\/li>/g;
+        let m;
+        while ((m = re.exec(html)) !== null) {
+          const k = m[1].trim();
+          const v = ((m[2] || '') + ' ' + (m[3] || '')).trim();
+          if (k && v) campos[k] = v;
+        }
+        // titulo y descripcion desde meta og
+        const tituloM = html.match(/<meta property="og:title" content="([^"]*)"/);
+        const descM = html.match(/<meta property="og:description" content="([^"]*)"/);
+        resultados.push({
+          url: u,
+          titulo: tituloM ? tituloM[1] : '',
+          descripcion: descM ? descM[1] : '',
+          campos: campos
+        });
+      } catch (e) { resultados.push({ url: u, error: e && e.message }); }
+    }
+    return res.json({ ok: true, resultados: resultados });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

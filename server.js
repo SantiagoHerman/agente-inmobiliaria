@@ -958,17 +958,7 @@ app.get('/api/whatsapp/listar-chats', async function(req, res) {
     return res.json({ ok: true, conectado: true, total: unicos.length, leads: unicos });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
-app.get('/api/whatsapp/debug-chat', async function(req, res) {
-  try {
-    const user_id = req.query.user_id;
-    const instancia = await instanciaActiva(user_id);
-    const r = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-    const chats = await r.json();
-    const lista = Array.isArray(chats) ? chats : (chats && chats.chats ? chats.chats : []);
-    // devolver las claves del primer chat y 3 ejemplos crudos
-    return res.json({ total: lista.length, claves: lista[0] ? Object.keys(lista[0]) : [], ejemplos: lista.slice(0,3) });
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
-});
+
 // Paso 2: importar los leads listados a la base (contactos + conversaciones), con duplicados por telefono
 app.post('/api/whatsapp/importar-leads', async function(req, res) {
   try {
@@ -1004,24 +994,5 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     return res.json({ ok: true, creados: creados, yaExistian: yaExistian, errores: errores });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
-app.get('/api/whatsapp/debug-diag', async function(req, res) {
-  try {
-    const user_id = req.query.user_id;
-    const instancia = await instanciaActiva(user_id);
-    const out = {};
-    // contacto Luis (5492392545167) entero
-    const rco = await fetch(EVOLUTION_URL + '/chat/findContacts/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-    const contRaw = await rco.json();
-    const contactos = Array.isArray(contRaw) ? contRaw : (contRaw && contRaw.contacts ? contRaw.contacts : []);
-    const luis = contactos.find(function(ct){ return String(ct.remoteJid||'').indexOf('2392545167') >= 0; });
-    out.contacto_luis = luis || 'no encontrado';
-    // todos los chats LID enteros (para ver si alguno matchea con Luis por algun campo)
-    const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-    const chatsRaw = await rch.json();
-    const chats = Array.isArray(chatsRaw) ? chatsRaw : (chatsRaw && chatsRaw.chats ? chatsRaw.chats : []);
-    // buscar si algun chat tiene el nombre Luis o el numero en su estructura completa
-    out.chats_con_luis = chats.filter(function(ch){ var s = JSON.stringify(ch); return s.indexOf('Luis2011') >= 0 || s.indexOf('2392545167') >= 0; }).map(function(ch){ return ch; });
-    return res.json(out);
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
-});
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

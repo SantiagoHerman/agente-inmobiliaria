@@ -872,6 +872,21 @@ app.post('/api/asesores/activar', async (req, res) => {
   }
 });
 
+app.post('/api/asesores/cambiar-clave', async (req, res) => {
+  try {
+    const { admin_id, asesor_id, clave_nueva } = req.body || {};
+    if (!admin_id || !asesor_id || !clave_nueva) return res.status(400).json({ error: 'Faltan datos' });
+    if (String(clave_nueva).length < 6) return res.status(400).json({ error: 'La clave debe tener al menos 6 caracteres' });
+    // verificar que el asesor pertenezca a este admin
+    const { data: ases } = await supabase.from('asesores').select('*').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
+    if (!ases) return res.status(404).json({ error: 'Asesor no encontrado' });
+    if (!ases.auth_user_id) return res.status(400).json({ error: 'El asesor no tiene usuario de acceso' });
+    // cambiar la clave en Supabase Auth
+    const { error: errUpd } = await supabase.auth.admin.updateUserById(ases.auth_user_id, { password: String(clave_nueva) });
+    if (errUpd) return res.status(500).json({ error: 'No se pudo cambiar la clave: ' + errUpd.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.post('/api/asesores/eliminar', async (req, res) => {
   try {
     const { admin_id, asesor_id } = req.body || {};

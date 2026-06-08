@@ -237,11 +237,12 @@ async function mostrarEscribiendo(instancia, numero, ms) {
 }
 
 // Marca como leidos los mensajes del lead (tildes azules)
-async function marcarLeido(instancia, numero) {
+async function marcarLeido(instancia, key) {
   try {
+    if (!key || !key.remoteJid || !key.id) return;
     await fetch(EVOLUTION_URL + '/chat/markMessageAsRead/' + instancia, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-      body: JSON.stringify({ readMessages: [] })
+      body: JSON.stringify({ readMessages: [ { remoteJid: key.remoteJid, fromMe: key.fromMe === true, id: key.id } ] })
     });
   } catch (e) { /* no rompe nada */ }
 }
@@ -349,6 +350,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       await guardarMensajeSaliente(remoteJid, texto);
       return;
     }
+
+    // Marcar el mensaje entrante como leido (tildes azules)
+    marcarLeido(instanciaNombre, key);
 
     // 1) Identificar el user_id dueno de esta instancia (multi-cliente)
     const { data: inst } = await supabase.from('whatsapp_instancias').select('user_id').eq('instancia_nombre', instanciaNombre).maybeSingle();

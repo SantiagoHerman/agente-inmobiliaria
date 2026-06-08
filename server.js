@@ -360,7 +360,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
     if (existente) { contacto = existente; }
     else {
-      const pushName = data.pushName || ('Cliente ' + telefono.slice(-4));
+      const pushName = data.pushName || telefono;
       const { data: nuevo } = await supabase.from('contacts').insert({ user_id: user_id, name: pushName, phone: telefono, channel: 'whatsapp' }).select('id').single();
       contacto = nuevo;
     }
@@ -1013,7 +1013,7 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
           contactoId = existente.id;
           yaExistian++;
         } else {
-          const nombre = lead.nombre || ('Cliente ' + telefono.slice(-4));
+          const nombre = lead.nombre || telefono;
           const { data: nuevo, error: errC } = await supabase.from('contacts').insert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }).select('id').single();
           if (errC || !nuevo) { errores++; continue; }
           contactoId = nuevo.id;

@@ -451,7 +451,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     const inst = { instancia_nombre: nombreInstancia(conv.user_id) };
 
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
-    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano' });
+    const { data: msgInsertado } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' }).select('id').single();
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
     // Si un humano (asesor o admin) escribe en un lead en recontacto o cerrado, pasa a listo_humano y se pausa la IA
     {
@@ -469,9 +469,10 @@ app.post('/api/whatsapp/send', async (req, res) => {
     }
 
     // 5) Enviar por WhatsApp via Evolution
-    await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);
+    const msgId = msgInsertado ? msgInsertado.id : null;
+    const salio = await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto, msgId);
 
-    res.json({ sent: true });
+    res.json({ sent: salio, estado_envio: salio ? 'enviado' : 'fallido' });
   } catch (err) {
     console.error('Error en /api/whatsapp/send:', err && err.message);
     res.status(500).json({ error: (err && err.message) || 'Error interno' });
@@ -740,6 +741,40 @@ async function enviarRecontactosPendientes() {
   } catch (e) { console.error('Error en enviarRecontactosPendientes:', e && e.message); }
 }
 
+// Reintenta automaticamente los mensajes que quedaron 'fallido' (WhatsApp estaba desconectado)
+async function reintentarFallidos() {
+  try {
+    // buscar mensajes fallidos (humanos / manuales) de las ultimas 24hs
+    const desde = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data: fallidos } = await supabase
+      .from('messages')
+      .select('id, conversation_id, content, created_at')
+      .eq('estado_envio', 'fallido')
+      .gte('created_at', desde)
+      .order('created_at', { ascending: true })
+      .limit(50);
+    if (!fallidos || fallidos.length === 0) return;
+    for (const msg of fallidos) {
+      try {
+        // conversacion -> user_id y contacto
+        const { data: conv } = await supabase.from('conversations').select('id, user_id, contact_id').eq('id', msg.conversation_id).maybeSingle();
+        if (!conv) continue;
+        const instancia = nombreInstancia(conv.user_id);
+        // solo reenviar si la instancia esta conectada ahora
+        const conectada = await instanciaConectada(instancia);
+        if (!conectada) continue;
+        const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+        if (!contacto || !contacto.phone) continue;
+        // reenviar; enviarWhatsapp actualiza estado_envio a 'enviado' si sale
+        const salio = await enviarWhatsapp(instancia, contacto.phone, msg.content, msg.id);
+        if (salio) console.log('Reintento OK del mensaje ' + msg.id);
+      } catch (e) { console.error('Error reintentando msg:', e && e.message); }
+    }
+  } catch (e) { console.error('Error en reintentarFallidos:', e && e.message); }
+}
+
+// Revisar fallidos cada 60 segundos (reenvia apenas WhatsApp vuelve a estar conectado)
+setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
 setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)

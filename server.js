@@ -173,8 +173,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
     }
   }
 
+    let instruccionesRubro = '';
+  if (rubro === 'hotel_cabanas') {
+    instruccionesRubro = 'RUBRO HOTEL, CABANAS O COMPLEJO. Hablas de alojamiento, no de venta de inmuebles. Vocabulario: noches, estadia, check-in y check-out, capacidad de personas, temporada alta o baja, tarifa por noche, servicios incluidos como pileta, parrilla, wifi, cochera y ropa de cama. Preguntas clave al huesped: fechas de entrada y salida, cuantas personas y cuantas noches. Al presentar opciones, deci capacidad, servicios y precio por noche. NUNCA hables de expensas, escrituras ni metros cuadrados.';
+  } else if (rubro === 'desarrolladora') {
+    instruccionesRubro = 'RUBRO DESARROLLADORA O EMPRENDIMIENTOS. Vendes unidades de emprendimientos, muchas veces en pozo o en construccion. Vocabulario: unidades, tipologias de 1, 2 o 3 ambientes, etapa de obra como pozo, en construccion o a estrenar, fecha estimada de entrega, financiacion, anticipo y cuotas, valor en pesos o dolares, ajuste por indice CAC. Preguntas clave: tipologia buscada, presupuesto o forma de pago, y si busca para vivienda o inversion. Resalta financiacion y avance de obra. Aclara que valores y entregas pueden estar sujetos a ajuste.';
+  } else {
+    instruccionesRubro = 'RUBRO INMOBILIARIA. Vocabulario: venta y alquiler, ambientes, dormitorios, metros cuadrados, expensas, zona o barrio, apto credito, escritura. Preguntas clave: si busca comprar o alquilar, zona, cantidad de ambientes y presupuesto. Al presentar, deci operacion, ambientes, zona y precio.';
+  }
+
   const systemPrompt = [
     'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
+    instruccionesRubro,
     'Respondes consultas de clientes por WhatsApp.',
     'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si es informal; Sr./Sra. y apellido si es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
     tono, autonomia, objetivo, largo,

@@ -1068,8 +1068,19 @@ async function recuperarHistorialLead(instancia, telefono, chatsCache) {
       else if (mm.imageMessage && mm.imageMessage.caption) texto = '[imagen] ' + mm.imageMessage.caption;
       else if (mm.imageMessage) texto = '[imagen]';
       else if (mm.audioMessage) texto = '[audio]';
+      else if (mm.videoMessage && mm.videoMessage.caption) texto = '[video] ' + mm.videoMessage.caption;
       else if (mm.videoMessage) texto = '[video]';
       else if (mm.documentMessage) texto = '[documento]';
+      else if (mm.templateMessage) {
+        var tm = mm.templateMessage.hydratedTemplate || mm.templateMessage.hydratedFourRowTemplate || (mm.templateMessage.fourRowTemplate) || {};
+        texto = (tm.hydratedContentText || tm.hydratedTitleText || (tm.content && tm.content.text) || (tm.title && tm.title.text) || '');
+        if (!texto) texto = '[mensaje con plantilla]';
+      }
+      else if (mm.buttonsMessage) texto = (mm.buttonsMessage.contentText || mm.buttonsMessage.text || '[mensaje con botones]');
+      else if (mm.listMessage) texto = (mm.listMessage.description || mm.listMessage.title || '[mensaje con lista]');
+      else if (mm.buttonsResponseMessage) texto = (mm.buttonsResponseMessage.selectedDisplayText || '[respuesta de boton]');
+      else if (mm.listResponseMessage) texto = ((mm.listResponseMessage.title) || '[respuesta de lista]');
+      else if (mm.ephemeralMessage && mm.ephemeralMessage.message && mm.ephemeralMessage.message.conversation) texto = mm.ephemeralMessage.message.conversation;
       if (!texto) continue;
       const ts = m.messageTimestamp ? new Date(Number(m.messageTimestamp) * 1000).toISOString() : new Date().toISOString();
       out.push({ role: esMio ? 'human' : 'contact', content: texto, created_at: ts });
@@ -1136,23 +1147,4 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
-app.get('/api/whatsapp/debug-hist', async function(req, res) {
-  try {
-    const user_id = req.query.user_id;
-    const tel = req.query.tel;
-    const instancia = nombreInstancia(user_id);
-    // traer chats y ubicar el del telefono
-    const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-    const jr = await rch.json();
-    const chats = Array.isArray(jr) ? jr : (jr && jr.chats ? jr.chats : []);
-    const chat = chats.find(function(ch){ return String(ch.remoteJid||'').indexOf(tel + '@s.whatsapp.net') >= 0; });
-    const out = { encontroChat: !!chat, jid: chat ? chat.remoteJid : null };
-    if (chat) {
-      const rm = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: { key: { remoteJid: chat.remoteJid } } }) });
-      out.findMessagesStatus = rm.status;
-      if (rm.ok) { const jm = await rm.json(); const msgs = Array.isArray(jm) ? jm : (jm && jm.messages && jm.messages.records ? jm.messages.records : (jm && jm.messages ? jm.messages : [])); out.totalMensajes = Array.isArray(msgs) ? msgs.length : ('formato: ' + JSON.stringify(Object.keys(jm||{}))); out.tiposMsg = (Array.isArray(msgs)?msgs:[]).slice(0,5).map(function(m){ return m.message ? Object.keys(m.message)[0] : 'sinMessage'; }); }
-    }
-    return res.json(out);
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
-});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

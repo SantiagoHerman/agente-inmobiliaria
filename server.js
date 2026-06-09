@@ -1136,4 +1136,23 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+app.get('/api/whatsapp/debug-hist', async function(req, res) {
+  try {
+    const user_id = req.query.user_id;
+    const tel = req.query.tel;
+    const instancia = nombreInstancia(user_id);
+    // traer chats y ubicar el del telefono
+    const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+    const jr = await rch.json();
+    const chats = Array.isArray(jr) ? jr : (jr && jr.chats ? jr.chats : []);
+    const chat = chats.find(function(ch){ return String(ch.remoteJid||'').indexOf(tel + '@s.whatsapp.net') >= 0; });
+    const out = { encontroChat: !!chat, jid: chat ? chat.remoteJid : null };
+    if (chat) {
+      const rm = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: { key: { remoteJid: chat.remoteJid } } }) });
+      out.findMessagesStatus = rm.status;
+      if (rm.ok) { const jm = await rm.json(); const msgs = Array.isArray(jm) ? jm : (jm && jm.messages && jm.messages.records ? jm.messages.records : (jm && jm.messages ? jm.messages : [])); out.totalMensajes = Array.isArray(msgs) ? msgs.length : ('formato: ' + JSON.stringify(Object.keys(jm||{}))); out.tiposMsg = (Array.isArray(msgs)?msgs:[]).slice(0,5).map(function(m){ return m.message ? Object.keys(m.message)[0] : 'sinMessage'; }); }
+    }
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

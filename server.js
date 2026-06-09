@@ -1037,18 +1037,67 @@ app.get('/api/whatsapp/listar-chats', async function(req, res) {
 });
 
 // Paso 2: importar los leads listados a la base (contactos + conversaciones), con duplicados por telefono
+// #9 - Recupera el historial de mensajes de un lead, cruzando todas las vias posibles
+async function recuperarHistorialLead(instancia, telefono, chatsCache) {
+  try {
+    // 1) ubicar el chat del lead: por telefono real (@s.whatsapp.net) en los chats
+    const chats = chatsCache || [];
+    let jidChat = null;
+    const directo = chats.find(function(ch){ return String(ch.remoteJid||'').indexOf(telefono + '@s.whatsapp.net') >= 0; });
+    if (directo) jidChat = directo.remoteJid;
+    if (!jidChat) return [];
+    // 2) pedir los mensajes de ese chat
+    const r = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ where: { key: { remoteJid: jidChat } } }) });
+    if (!r.ok) return [];
+    const jm = await r.json();
+    const msgs = Array.isArray(jm) ? jm : (jm && jm.messages && jm.messages.records ? jm.messages.records : (jm && jm.messages ? jm.messages : []));
+    if (!Array.isArray(msgs) || msgs.length === 0) return [];
+    // 3) ordenar por timestamp y tomar los ultimos 10
+    const ordenados = msgs.slice().sort(function(a,b){ return (a.messageTimestamp||0) - (b.messageTimestamp||0); });
+    const ultimos = ordenados.slice(-10);
+    // 4) mapear a {role, content, created_at}
+    const out = [];
+    for (const m of ultimos) {
+      const k = m.key || {};
+      const esMio = k.fromMe === true;
+      // extraer texto del mensaje (conversation o extendedTextMessage)
+      let texto = '';
+      const mm = m.message || {};
+      if (typeof mm.conversation === 'string') texto = mm.conversation;
+      else if (mm.extendedTextMessage && mm.extendedTextMessage.text) texto = mm.extendedTextMessage.text;
+      else if (mm.imageMessage && mm.imageMessage.caption) texto = '[imagen] ' + mm.imageMessage.caption;
+      else if (mm.imageMessage) texto = '[imagen]';
+      else if (mm.audioMessage) texto = '[audio]';
+      else if (mm.videoMessage) texto = '[video]';
+      else if (mm.documentMessage) texto = '[documento]';
+      if (!texto) continue;
+      const ts = m.messageTimestamp ? new Date(Number(m.messageTimestamp) * 1000).toISOString() : new Date().toISOString();
+      out.push({ role: esMio ? 'human' : 'contact', content: texto, created_at: ts });
+    }
+    return out;
+  } catch (e) { console.error('Error recuperando historial de lead:', e && e.message); return []; }
+}
 app.post('/api/whatsapp/importar-leads', async function(req, res) {
   try {
     const user_id = req.body && req.body.user_id;
     const leads = (req.body && req.body.leads) || [];
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     if (!Array.isArray(leads) || leads.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });
-    let creados = 0; let yaExistian = 0; let errores = 0;
+    let creados = 0; let yaExistian = 0; let errores = 0; let conHistorial = 0;
+    // traer los chats UNA sola vez para recuperar historial (cache)
+    const instancia = nombreInstancia(user_id);
+    let chatsCache = [];
+    try {
+      const conectada = await instanciaConectada(instancia);
+      if (conectada) {
+        const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
+        if (rch.ok) { const jr = await rch.json(); chatsCache = Array.isArray(jr) ? jr : (jr && jr.chats ? jr.chats : []); }
+      }
+    } catch (e) { /* si no hay chats, igual importamos sin historial */ }
     for (const lead of leads) {
       const telefono = String(lead.telefono || '').replace(/[^0-9]/g, '');
       if (!telefono || telefono.length < 8) { errores++; continue; }
       try {
-        // buscar contacto por telefono (duplicados por telefono)
         const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
         let contactoId;
         if (existente) {
@@ -1061,14 +1110,29 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
           contactoId = nuevo.id;
           creados++;
         }
-        // crear conversacion solo si el contacto NO tiene ya una
+        // crear conversacion solo si el contacto NO tiene una
         const { data: convExistente } = await supabase.from('conversations').select('id').eq('contact_id', contactoId).maybeSingle();
+        let convId;
         if (!convExistente) {
-          await supabase.from('conversations').insert({ user_id: user_id, contact_id: contactoId, channel: 'whatsapp', status: 'recontacto', ai_enabled: true });
+          const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contactoId, channel: 'whatsapp', status: 'recontacto', ai_enabled: true }).select('id').single();
+          convId = convNueva ? convNueva.id : null;
+        } else {
+          convId = convExistente.id;
+        }
+        // #9 - recuperar e insertar historial SOLO si la conversacion no tiene mensajes aun
+        if (convId) {
+          const { data: yaTiene } = await supabase.from('messages').select('id').eq('conversation_id', convId).limit(1);
+          if (!yaTiene || yaTiene.length === 0) {
+            const historial = await recuperarHistorialLead(instancia, telefono, chatsCache);
+            if (historial.length > 0) {
+              const filas = historial.map(function(h){ return { conversation_id: convId, user_id: user_id, role: h.role, content: h.content, origen: 'historial_importado', created_at: h.created_at }; });
+              try { await supabase.from('messages').insert(filas); conHistorial++; } catch (e) { /* si falla el historial, no rompe la importacion */ }
+            }
+          }
         }
       } catch (e) { errores++; }
     }
-    return res.json({ ok: true, creados: creados, yaExistian: yaExistian, errores: errores });
+    return res.json({ ok: true, creados: creados, yaExistian: yaExistian, errores: errores, conHistorial: conHistorial });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

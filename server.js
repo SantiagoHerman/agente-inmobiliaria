@@ -192,7 +192,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
     'NUNCA inventes datos, precios, caracteristicas ni beneficios. Si no tenes la info, decis que la consultas. Persuadir es conectar lo real con lo que el lead necesita, no exagerar ni presionar.',
     'PROGRESA la charla: en cada respuesta haces avanzar un paso (entender mejor su necesidad, mostrar una opcion que encaje, o proponer el siguiente paso). Evita respuestas que cierren la conversacion.',
     'AVANZA hacia el cierre SOLO hasta el limite que define tu objetivo configurado (ver arriba). Cuando llegues a ese punto (agendar visita, avanzar una reserva o sena, o precalificar segun corresponda), encaminalo y deriva a un asesor humano. No te pases de ese limite.',
-    'Sos empatico y persuasivo, nunca insistente ni manipulador. Si el lead no quiere avanzar, respetalo y dejas la puerta abierta.'
+    'Sos empatico y persuasivo, nunca insistente ni manipulador. Si el lead no quiere avanzar, respetalo y dejas la puerta abierta.',
+    'SI NO HAY CONVERSACION PREVIA con este contacto (no hablaron antes), tratalo como un primer contacto: presentate, genera confianza desde cero y NO asumas que ya venian hablando de algo. No digas cosas como lo que veniamos viendo si nunca hubo charla.'
   ].join(' ');
 
   const systemPrompt = [
@@ -682,14 +683,22 @@ function dentroHorarioOficina(horario) {
 }
 
 // Plantillas variadas de primer recontacto (anti-baneo: nunca el mismo texto).
-function mensajeRecontacto(nombre) {
+function mensajeRecontacto(nombre, esPrimerContacto, empresa) {
   const n = nombre ? (' ' + nombre) : '';
+  const emp = empresa ? (' de ' + empresa) : '';
+  if (esPrimerContacto) {
+    const nuevas = [
+      'Hola' + n + ', como estas? Soy Sofia' + emp + '. Te escribo para ponerme a disposicion por si estas buscando o pensando en algo. En que te puedo ayudar?',
+      'Hola' + n + '! Soy Sofia' + emp + '. Me sumo para acompanarte por si estas viendo opciones. Contame que es lo que estas necesitando y vemos como te puedo ayudar.',
+      'Hola' + n + ', un gusto! Soy Sofia' + emp + '. Te contacto por si te puedo dar una mano buscando algo que se ajuste a lo que necesitas. Que tenias en mente?'
+    ];
+    return nuevas[Math.floor(Math.random() * nuevas.length)];
+  }
   const opciones = [
-    'Hola' + n + ', ¿seguís interesado/a? Quedo a disposición por si querés que avancemos.',
-    'Hola' + n + ', ¿cómo va? Por si te quedó alguna duda sobre lo que veníamos hablando, decime y te ayudo.',
-    'Buenas' + n + ', ¿retomamos? Si todavía estás buscando, con gusto te paso más info.',
-    'Hola' + n + ', te escribo para saber si seguís interesado/a. Cualquier cosa me decís y seguimos.',
-    '¿Cómo andás' + n + '? Quedé con ganas de ayudarte. Si querés seguir viendo opciones, avisame.'
+    'Hola' + n + ', seguis interesado/a? Quedo a disposicion por si queres que avancemos.',
+    'Hola' + n + ', como va? Por si te quedo alguna duda sobre lo que veniamos hablando. Si todavia estas buscando, con gusto te paso mas info.',
+    'Hola' + n + ', te escribo para saber si seguis interesado/a. Cualquier cosa me decis y seguimos.',
+    'Como andas' + n + '? Quede con ganas de ayudarte. Si queres seguir viendo opciones, avisame.'
   ];
   return opciones[Math.floor(Math.random() * opciones.length)];
 }
@@ -780,7 +789,13 @@ async function enviarRecontactosPendientes() {
       if (!contacto || !contacto.phone) continue;
       const inst = { instancia_nombre: nombreInstancia(conv.user_id) };
       // Enviar el mensaje variado
-      const texto = mensajeRecontacto(contacto.name);
+      // Detectar si la conversacion tiene historial real (lead de agenda vs lead con charla previa)
+      const { data: msgsPrevios } = await supabase.from('messages').select('id, origen').eq('conversation_id', conv.id).neq('origen', 'historial_importado').limit(1);
+      const esPrimerContacto = !msgsPrevios || msgsPrevios.length === 0;
+      // nombre de la empresa para presentarse
+      const { data: bsRec } = await supabase.from('business_settings').select('company_name').eq('user_id', conv.user_id).maybeSingle();
+      const empresaRec = bsRec && bsRec.company_name ? bsRec.company_name : '';
+      const texto = mensajeRecontacto(contacto.name, esPrimerContacto, empresaRec);
       // Registrar primero en messages (con id) para poder marcar estado de envio
       const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
       // Enviar y registrar estado (enviado/fallido) en ese mensaje

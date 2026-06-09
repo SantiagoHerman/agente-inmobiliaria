@@ -757,9 +757,10 @@ async function enviarRecontactosPendientes() {
       const inst = { instancia_nombre: nombreInstancia(conv.user_id) };
       // Enviar el mensaje variado
       const texto = mensajeRecontacto(contacto.name);
-      await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto);
-      // Registrar: en messages (como ai), en recontactos, y actualizar contador
-      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto, enviado_por: 'Agente IA' });
+      // Registrar primero en messages (con id) para poder marcar estado de envio
+      const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
+      // Enviar y registrar estado (enviado/fallido) en ese mensaje
+      await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto, msgRec ? msgRec.id : null);
       await supabase.from('conversations').update({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: texto, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);

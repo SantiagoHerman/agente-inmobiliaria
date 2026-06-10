@@ -333,7 +333,7 @@ async function traducir(texto, idiomaDestino) {
     const comp = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 600,
-      system: 'Sos un traductor profesional. Traduci el texto del usuario al ' + destino + '. Reglas: devolve UNICAMENTE la traduccion, sin comillas, sin explicaciones, sin notas. Manten el tono, la intencion y el estilo informal o formal del original. No agregues ni quites informacion.',
+      system: 'Sos un traductor profesional. Traduci el texto del usuario al ' + destino + '. Reglas: devolve UNICAMENTE la traduccion, sin comillas, sin explicaciones, sin notas. Manten el tono, la intencion y el estilo informal o formal del original. No agregues ni quites informacion. Si el texto incluye una palabra o expresion dicha a proposito en otro idioma (un saludo, una marca, un termino comun), mantenela como esta en lugar de forzar su traduccion. Traduci el sentido natural, no palabra por palabra.',
       messages: [ { role: 'user', content: texto } ]
     });
     const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim() : '';
@@ -348,7 +348,7 @@ async function detectarIdioma(texto) {
     const comp = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 10,
-      system: 'Detecta el idioma del texto del usuario. Responde SOLO con el codigo de dos letras: es, en, pt, de, it o fr. Nada mas.',
+      system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Ignora palabras sueltas o expresiones que esten en otro idioma (ej. un saludo o una palabra prestada): lo que importa es el idioma dominante del mensaje. Responde SOLO con el codigo de dos letras: es, en, pt, de, it o fr. Nada mas.',
       messages: [ { role: 'user', content: texto } ]
     });
     const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : 'es';

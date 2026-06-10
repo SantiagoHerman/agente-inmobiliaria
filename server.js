@@ -167,9 +167,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
 
   let historial = [];
   if (conversation_id) {
-    const { data: prev } = await supabase.from('messages').select('role, content').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
+    const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
     if (prev && prev.length > 0) {
-      historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: m.content }; });
+      historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: (m.content_original || m.content) }; });
     }
   }
 
@@ -467,7 +467,20 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (!conv) return;
 
     // 4) Guardar SIEMPRE el mensaje entrante (no se pierde nada)
-    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto });
+    // Traduccion entrante: detectar idioma del lead y traducir al espanol para el asesor
+    let contentLead = texto;
+    let contentOrigLead = null;
+    let idiomaLeadMsg = null;
+    try {
+      const idiomaDetectado = await detectarIdioma(texto);
+      if (idiomaDetectado && idiomaDetectado !== 'es') {
+        const trad = await traducir(texto, 'es');
+        if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
+        // recordar el idioma del lead en la conversacion para el traductor saliente
+        await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
+      }
+    } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
+    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
 
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
@@ -529,7 +542,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!user_id || !conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
 
     // 1) Buscar la conversacion para obtener el contacto
-    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', conversation_id).maybeSingle();
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id, traductor_activo, idioma_lead').eq('id', conversation_id).maybeSingle();
     if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
 
     // 2) Buscar el telefono del contacto
@@ -540,7 +553,14 @@ app.post('/api/whatsapp/send', async (req, res) => {
     const inst = { instancia_nombre: nombreInstancia(conv.user_id) };
 
     // 4) Guardar el mensaje como 'human' y actualizar la conversacion
-    const { data: msgInsertado } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' }).select('id').single();
+    // Traduccion: si el traductor esta activo y el lead habla otro idioma, traducir antes de enviar
+    let textoEnviar = texto;
+    let idiomaMsg = null;
+    if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es') {
+      textoEnviar = await traducir(texto, conv.idioma_lead);
+      idiomaMsg = conv.idioma_lead;
+    }
+    const { data: msgInsertado } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, content_original: (textoEnviar !== texto ? textoEnviar : null), idioma: idiomaMsg, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' }).select('id').single();
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
     // Si un humano (asesor o admin) escribe en un lead en recontacto o cerrado, pasa a listo_humano y se pausa la IA
     {
@@ -559,7 +579,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
 
     // 5) Enviar por WhatsApp via Evolution
     const msgId = msgInsertado ? msgInsertado.id : null;
-    const salio = await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto, msgId);
+    const salio = await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgId);
 
     res.json({ sent: salio, estado_envio: salio ? 'enviado' : 'fallido' });
   } catch (err) {

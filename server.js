@@ -324,6 +324,37 @@ function partirMensaje(texto) {
   if (idx < frases.length) grupos[grupos.length - 1] += ' ' + frases.slice(idx).join(' ');
   return grupos.filter(Boolean);
 }
+// Traduce un texto a un idioma destino usando el modelo. Devuelve el texto traducido (o el original si falla).
+async function traducir(texto, idiomaDestino) {
+  try {
+    if (!texto || !idiomaDestino) return texto;
+    const NOMBRES = { es: 'espanol', en: 'ingles', pt: 'portugues', de: 'aleman', it: 'italiano', fr: 'frances' };
+    const destino = NOMBRES[idiomaDestino] || idiomaDestino;
+    const comp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 600,
+      system: 'Sos un traductor profesional. Traduci el texto del usuario al ' + destino + '. Reglas: devolve UNICAMENTE la traduccion, sin comillas, sin explicaciones, sin notas. Manten el tono, la intencion y el estilo informal o formal del original. No agregues ni quites informacion.',
+      messages: [ { role: 'user', content: texto } ]
+    });
+    const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim() : '';
+    return out || texto;
+  } catch (e) { console.error('Error traduciendo:', e && e.message); return texto; }
+}
+
+// Detecta el idioma de un texto. Devuelve un codigo (es/en/pt/de/it/fr) o 'es' por defecto.
+async function detectarIdioma(texto) {
+  try {
+    if (!texto || texto.trim().length < 2) return 'es';
+    const comp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 10,
+      system: 'Detecta el idioma del texto del usuario. Responde SOLO con el codigo de dos letras: es, en, pt, de, it o fr. Nada mas.',
+      messages: [ { role: 'user', content: texto } ]
+    });
+    const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : 'es';
+    return ['es','en','pt','de','it','fr'].indexOf(out) >= 0 ? out : 'es';
+  } catch (e) { return 'es'; }
+}
 async function enviarWhatsapp(instancia, numero, texto, messageId) {
   async function registrar(ok) {
     if (!messageId) return;

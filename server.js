@@ -196,10 +196,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
     'SI NO HAY CONVERSACION PREVIA con este contacto (no hablaron antes), tratalo como un primer contacto: presentate, genera confianza desde cero y NO asumas que ya venian hablando de algo. No digas cosas como lo que veniamos viendo si nunca hubo charla.'
   ].join(' ');
 
+    const idiomaBase = (settings && settings.idioma) || 'es';
+  const NOMBRE_IDIOMA = { es: 'espanol', en: 'ingles', pt: 'portugues', de: 'aleman', it: 'italiano', fr: 'frances' };
+  const idiomaNombre = NOMBRE_IDIOMA[idiomaBase] || 'espanol';
+  const instruccionIdioma = 'IDIOMA: Detecta automaticamente en que idioma te escribe el lead y respondele SIEMPRE en ese mismo idioma, de forma nativa y natural. Si el lead no escribio todavia (primer mensaje saliente) o no se puede determinar, usa ' + idiomaNombre + ' por defecto. Manten el mismo tono y comportamiento sin importar el idioma.';
+
   const systemPrompt = [
     'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
     instruccionesRubro,
     comportamientoSetter,
+    instruccionIdioma,
     'Respondes consultas de clientes por WhatsApp.',
     'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si es informal; Sr./Sra. y apellido si es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
     tono, autonomia, objetivo, largo,

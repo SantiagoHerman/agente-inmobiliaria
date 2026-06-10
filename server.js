@@ -197,7 +197,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   ].join(' ');
 
     const idiomaBase = (settings && settings.idioma) || 'es';
-  const NOMBRE_IDIOMA = { es: 'espanol', en: 'ingles', pt: 'portugues', de: 'aleman', it: 'italiano', fr: 'frances' };
+  const NOMBRE_IDIOMA = { es: 'espanol', en: 'ingles', pt: 'portugues', fr: 'frances', it: 'italiano', de: 'aleman', nl: 'holandes', ru: 'ruso', zh: 'chino mandarin', ja: 'japones', ko: 'coreano', ar: 'arabe', hi: 'hindi', tr: 'turco', pl: 'polaco' };
   const idiomaNombre = NOMBRE_IDIOMA[idiomaBase] || 'espanol';
   const instruccionIdioma = 'IDIOMA: Detecta automaticamente en que idioma te escribe el lead y respondele SIEMPRE en ese mismo idioma, de forma nativa y natural. Si el lead no escribio todavia (primer mensaje saliente) o no se puede determinar, usa ' + idiomaNombre + ' por defecto. Manten el mismo tono y comportamiento sin importar el idioma.';
 
@@ -328,7 +328,7 @@ function partirMensaje(texto) {
 async function traducir(texto, idiomaDestino) {
   try {
     if (!texto || !idiomaDestino) return texto;
-    const NOMBRES = { es: 'espanol', en: 'ingles', pt: 'portugues', de: 'aleman', it: 'italiano', fr: 'frances' };
+    const NOMBRES = { es: 'espanol', en: 'ingles', pt: 'portugues', fr: 'frances', it: 'italiano', de: 'aleman', nl: 'holandes', ru: 'ruso', zh: 'chino mandarin', ja: 'japones', ko: 'coreano', ar: 'arabe', hi: 'hindi', tr: 'turco', pl: 'polaco' };
     const destino = NOMBRES[idiomaDestino] || idiomaDestino;
     const comp = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
@@ -348,11 +348,11 @@ async function detectarIdioma(texto) {
     const comp = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 10,
-      system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Ignora palabras sueltas o expresiones que esten en otro idioma (ej. un saludo o una palabra prestada): lo que importa es el idioma dominante del mensaje. Responde SOLO con el codigo de dos letras: es, en, pt, de, it o fr. Nada mas.',
+      system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Ignora palabras sueltas o expresiones que esten en otro idioma (ej. un saludo o una palabra prestada): lo que importa es el idioma dominante del mensaje. Responde SOLO con el codigo de dos letras del idioma (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl, u otro codigo ISO 639-1 si corresponde). Nada mas.',
       messages: [ { role: 'user', content: texto } ]
     });
     const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : 'es';
-    return ['es','en','pt','de','it','fr'].indexOf(out) >= 0 ? out : 'es';
+    return ['es','en','pt','fr','it','de','nl','ru','zh','ja','ko','ar','hi','tr','pl'].indexOf(out) >= 0 ? out : 'es';
   } catch (e) { return 'es'; }
 }
 async function enviarWhatsapp(instancia, numero, texto, messageId) {

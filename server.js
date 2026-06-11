@@ -7,8 +7,17 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  // Lista blanca de origenes permitidos (solo la app de Raices CRM)
+  const ORIGENES_PERMITIDOS = [
+    'https://raices-crm.vercel.app',
+    'http://localhost:3000'
+  ];
+  const origin = req.headers.origin;
+  // Peticiones sin origin (server-to-server, ej webhook de Evolution) pasan sin restriccion CORS
+  if (origin && ORIGENES_PERMITIDOS.indexOf(origin) !== -1) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  res.header('Access-Control-Allow-Headers', 'Content-Type, apikey, Authorization');
   res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();

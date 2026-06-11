@@ -23,6 +23,26 @@ app.use((req, res, next) => {
   next();
 });
 
+// === SEGURIDAD: rate limiting casero en memoria (sin dependencias) ===
+// Limite generoso: protege de abuso/ataques sin molestar el uso normal.
+// El webhook de Evolution queda EXENTO (puede mandar muchos mensajes legitimos).
+const _rlHits = new Map();
+const _RL_VENTANA_MS = 60 * 1000;
+const _RL_MAX = 200;
+setInterval(() => { _rlHits.clear(); }, _RL_VENTANA_MS);
+app.use((req, res, next) => {
+  try {
+    // el webhook de WhatsApp no se limita
+    if (req.path === '/api/webhook/whatsapp') return next();
+    if (req.path === '/health') return next();
+    const ip = (req.headers['x-forwarded-for'] || req.ip || 'sin-ip').split(',')[0].trim();
+    const n = (_rlHits.get(ip) || 0) + 1;
+    _rlHits.set(ip, n);
+    if (n > _RL_MAX) return res.status(429).json({ error: 'Demasiadas peticiones, intenta en un momento' });
+    next();
+  } catch (e) { next(); }
+});
+
 const PORT = process.env.PORT || 3001;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '' });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');

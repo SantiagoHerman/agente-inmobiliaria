@@ -432,11 +432,10 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
       const base = Math.min(6000, Math.max(1200, parte.length * aleatorio(40, 70)));
       const tipeo = base + aleatorio(0, 800);
       await mostrarEscribiendo(instancia, numero, tipeo);
-      await esperar(tipeo);
       const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-        body: JSON.stringify({ number: numero, text: parte })
+        body: JSON.stringify({ number: numero, text: parte, delay: tipeo, presence: 'composing' })
       });
       if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); algunoFallo = true; }
       // pequena pausa entre mensajes (no en el ultimo)

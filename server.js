@@ -552,6 +552,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     }
 
     // 5) Si la IA esta activa, responder por WhatsApp
+    // PAUSA GLOBAL: si el CRM esta pausado, la IA no responde a nadie (los mensajes igual se guardan).
+    // No modifica el ai_enabled de cada conversacion; es una capa global aparte.
+    const { data: _bsPausa } = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle();
+    if (_bsPausa && _bsPausa.crm_pausado === true) return;
     if (conv.ai_enabled === false) return;
     const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
     if (resultado && resultado.reply) { await enviarWhatsapp(instanciaNombre, telefono, resultado.reply); }

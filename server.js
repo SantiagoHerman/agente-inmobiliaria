@@ -623,7 +623,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
     await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg });
-    await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente
+    const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
+    if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
+    await supabase.from('conversations').update(_updConv).eq('id', conv.id);
 
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos

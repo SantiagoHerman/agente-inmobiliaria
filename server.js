@@ -420,6 +420,10 @@ app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'onli
 app.post('/api/agent/respond', async (req, res) => {
   try {
     const { user_id, conversation_id, message } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!user_id || !message) return res.status(400).json({ error: 'Faltan user_id o message' });
     // Guardar el mensaje del contacto (cuando se prueba desde el CRM)
     if (conversation_id) {
@@ -565,6 +569,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 app.post('/api/whatsapp/send', async (req, res) => {
   try {
     const { user_id, conversation_id, texto, enviado_por } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!user_id || !conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
 
     // 1) Buscar la conversacion para obtener el contacto
@@ -651,6 +659,10 @@ async function configurarWebhookInstancia(instancia) {
 app.post('/api/whatsapp/conectar', async (req, res) => {
   try {
     const { user_id } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
 
@@ -702,6 +714,10 @@ app.post('/api/whatsapp/conectar', async (req, res) => {
 app.post('/api/whatsapp/desconectar', async (req, res) => {
   try {
     const { user_id } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
     const instancia = await instanciaActiva(user_id);
@@ -724,6 +740,10 @@ app.post('/api/whatsapp/desconectar', async (req, res) => {
 app.get('/api/whatsapp/estado', async (req, res) => {
   try {
     const user_id = req.query.user_id;
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     const instancia = await instanciaActiva(user_id);
     const r = await fetch(EVOLUTION_URL + '/instance/connectionState/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } });
@@ -939,6 +959,10 @@ setTimeout(hacerBackup, 90 * 1000);
 app.post('/api/asesores/crear', async (req, res) => {
   try {
     const { admin_id, nombre, usuario, clave, cargo } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!admin_id || !nombre || !usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
     // Limite de 5 asesores por admin
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
@@ -964,6 +988,10 @@ app.post('/api/asesores/crear', async (req, res) => {
 app.post('/api/asesores/activar', async (req, res) => {
   try {
     const { admin_id, asesor_id } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
     // 1. Poner el asesor activo
     await supabase.from('asesores').update({ activo: true, estado: 'activo' }).eq('id', asesor_id);
@@ -998,6 +1026,10 @@ app.post('/api/asesores/activar', async (req, res) => {
 app.post('/api/asesores/cambiar-clave', async (req, res) => {
   try {
     const { admin_id, asesor_id, clave_nueva } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!admin_id || !asesor_id || !clave_nueva) return res.status(400).json({ error: 'Faltan datos' });
     if (String(clave_nueva).length < 6) return res.status(400).json({ error: 'La clave debe tener al menos 6 caracteres' });
     // verificar que el asesor pertenezca a este admin
@@ -1013,6 +1045,10 @@ app.post('/api/asesores/cambiar-clave', async (req, res) => {
 app.post('/api/asesores/eliminar', async (req, res) => {
   try {
     const { admin_id, asesor_id } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
     const { data: ases } = await supabase.from('asesores').select('*').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
     if (!ases) return res.status(404).json({ error: 'Asesor no encontrado' });
@@ -1118,6 +1154,10 @@ async function clasificarTemperatura(textoUsuario) {
 app.get('/api/whatsapp/listar-chats', async function(req, res) {
   try {
     const user_id = req.query.user_id;
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     const instancia = await instanciaActiva(user_id);
     if (!instancia) return res.status(400).json({ error: 'No hay instancia para este usuario' });
@@ -1214,6 +1254,10 @@ async function recuperarHistorialLead(instancia, telefono, chatsCache) {
 app.post('/api/whatsapp/importar-leads', async function(req, res) {
   try {
     const user_id = req.body && req.body.user_id;
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     const leads = (req.body && req.body.leads) || [];
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     if (!Array.isArray(leads) || leads.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });

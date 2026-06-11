@@ -275,8 +275,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   const reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
 
   if (conversation_id) {
+    // Traducir la respuesta de la IA al idioma base del sistema para que el asesor la lea (traductor bidireccional)
+    let contentOriginalAi = null;
+    let idiomaAi = null;
+    try {
+      const traduccionAsesor = await traducir(reply, idiomaBase);
+      if (traduccionAsesor && traduccionAsesor.trim() !== reply.trim()) {
+        contentOriginalAi = traduccionAsesor; // version en el idioma base (lo que ve el asesor)
+        idiomaAi = idiomaBase;
+      }
+    } catch (e) { /* si falla la traduccion, se guarda solo el original */ }
     await supabase.from('messages').insert([
-      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply, enviado_por: 'Agente IA' }
+      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply, content_original: contentOriginalAi, idioma: idiomaAi, enviado_por: 'Agente IA' }
     ]);
     await supabase.from('conversations').update({ last_message: reply, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }

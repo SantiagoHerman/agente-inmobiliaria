@@ -477,11 +477,13 @@ async function enviarReportesProgramados() {
     const diaSemana = ahora.getDay(); // 0=domingo, 1=lunes
     const diaMes = ahora.getDate();
     const hora = ahora.getHours();
-    // Solo enviar reportes programados en una franja de la manana (8 a 10) para no spamear
-    if (hora < 8 || hora > 10) return;
+    // La hora de envio la define cada cuenta (cfg.hora). Se compara dentro del loop.
     for (const cta of cuentas) {
       const cfg = cta.reportes_config || {};
       if (!cfg.whatsapp) continue;
+      // Respetar la hora de envio configurada por la cuenta (formato HH:MM). Solo comparamos la hora.
+      const horaCfg = (cfg.hora && /^[0-9]{1,2}:/.test(cfg.hora)) ? parseInt(cfg.hora.split(':')[0], 10) : 9;
+      if (hora !== horaCfg) continue;
       const envios = cfg.ultimo_envio || {};
       let toca = null;
       if (cfg.diario && envios.diario !== hoyStr) toca = 'diario';

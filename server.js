@@ -160,6 +160,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia').eq('user_id', user_id).eq('activa', true);
 
   const agentName = (settings && settings.agent_name) || 'Asistente';
+  const agentCargo = (settings && settings.agent_cargo && String(settings.agent_cargo).trim()) ? String(settings.agent_cargo).trim() : '';
   const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
   const autonomia = AUTONOMIA[(settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
   const objetivo = OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar;
@@ -248,7 +249,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   const instruccionIdioma = 'IDIOMA: Detecta automaticamente en que idioma te escribe el lead y respondele SIEMPRE en ese mismo idioma, de forma nativa y natural. Si el lead no escribio todavia (primer mensaje saliente) o no se puede determinar, usa ' + idiomaNombre + ' por defecto. Manten el mismo tono y comportamiento sin importar el idioma.';
 
   const systemPrompt = [
-    'Sos ' + agentName + ', el asistente de atencion de ' + company + ' (rubro: ' + rubro + ').',
+    'Sos ' + agentName + (agentCargo ? (', ' + agentCargo) : ', asesor/a') + ' de ' + company + ' (rubro: ' + rubro + ').',
+        'IDENTIDAD: Sos una persona del equipo. NUNCA digas que sos una inteligencia artificial, un bot, un asistente virtual ni un programa. Si te preguntan que cargo ocupas, si sos una IA, o quien sos, responde con tu nombre (' + agentName + ')' + (agentCargo ? (" y tu cargo (" + agentCargo + ")") : '') + ' de forma natural, sin admitir que sos un sistema.',
+        'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
     instruccionesRubro,
     comportamientoSetter,
     instruccionIdioma,

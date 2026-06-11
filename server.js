@@ -504,6 +504,41 @@ async function enviarReportesProgramados() {
   } catch (e) { /* silencioso */ }
 }
 
+async function guardarSnapshotDiario() {
+  try {
+    const hoyStr = new Date().toISOString().substring(0, 10);
+    // traer todas las conversaciones agrupando por user_id
+    const { data: convs } = await supabase.from('conversations').select('user_id, status');
+    if (!convs || !convs.length) return;
+    // agrupar por user_id
+    const porUser = {};
+    for (const cv of convs) {
+      if (!cv.user_id) continue;
+      if (!porUser[cv.user_id]) porUser[cv.user_id] = { conversaciones:0, interesados:0, listo_humano:0, cierres:0, recontactos:0 };
+      const u = porUser[cv.user_id];
+      u.conversaciones++;
+      if (cv.status === 'interesado') u.interesados++;
+      else if (cv.status === 'listo_humano') u.listo_humano++;
+      else if (cv.status === 'cerrado') u.cierres++;
+      else if (cv.status === 'recontacto') u.recontactos++;
+    }
+    // contar mensajes por user (una query por user para no traer todo)
+    for (const uid of Object.keys(porUser)) {
+      let totalMsgs = 0;
+      try {
+        const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', uid);
+        totalMsgs = count || 0;
+      } catch (e) { totalMsgs = 0; }
+      const m = porUser[uid];
+      await supabase.from('reportes_snapshots').upsert({
+        user_id: uid, fecha: hoyStr,
+        conversaciones: m.conversaciones, interesados: m.interesados, listo_humano: m.listo_humano,
+        cierres: m.cierres, recontactos: m.recontactos, mensajes: totalMsgs
+      }, { onConflict: 'user_id,fecha' });
+    }
+  } catch (e) { /* silencioso */ }
+}
+
 async function generarReporteAdmin(user_id, cfg) {
   // cfg = reportes_config (info: que incluir). Devuelve texto ASCII del reporte.
   const info = (cfg && cfg.info) || {};
@@ -1068,6 +1103,8 @@ async function reintentarFallidos() {
 setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
 setInterval(enviarReportesProgramados, 60 * 60 * 1000); // reportes programados: chequear cada hora
+setInterval(guardarSnapshotDiario, 60 * 60 * 1000); // snapshot de metricas: actualizar cada hora
+setTimeout(guardarSnapshotDiario, 50 * 1000); // primer snapshot al arrancar
 setTimeout(enviarReportesProgramados, 45 * 1000); // primer chequeo al arrancar
 setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)

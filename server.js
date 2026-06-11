@@ -467,6 +467,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     const data = body.data || {};
     const instanciaNombre = body.instance || data.instanceName || '';
+    // SEGURIDAD: validar que la instancia tenga el formato esperado de Raices CRM
+    if (!instanciaNombre || instanciaNombre.indexOf('cliente_') !== 0) return;
     if (!instanciaNombre) return;
 
     const key = data.key || {};

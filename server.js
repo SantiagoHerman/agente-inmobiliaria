@@ -26,6 +26,23 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3001;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '' });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');
+
+// === SEGURIDAD: verificacion de identidad por token JWT de Supabase ===
+// Lee el token del header Authorization, lo valida contra Supabase y
+// devuelve el user_id REAL del token (o null si no hay token valido).
+// Capa 1: definido pero todavia NO aplicado a los endpoints.
+async function verificarUsuario(req) {
+  try {
+    const auth = req.headers.authorization || req.headers.Authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    if (!token) return null;
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data || !data.user) return null;
+    return data.user.id;
+  } catch (e) {
+    return null;
+  }
+}
 const EVOLUTION_URL = process.env.EVOLUTION_URL || '';
 const EVOLUTION_KEY = process.env.EVOLUTION_KEY || '';
 

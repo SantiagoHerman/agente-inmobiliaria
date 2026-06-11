@@ -458,6 +458,34 @@ app.post('/api/agent/respond', async (req, res) => {
 });
 
 // ============ WEBHOOK ENTRANTE DE WHATSAPP (Evolution API) ============
+async function generarReporteAdmin(user_id, cfg) {
+  // cfg = reportes_config (info: que incluir). Devuelve texto ASCII del reporte.
+  const info = (cfg && cfg.info) || {};
+  const lineas = [];
+  lineas.push('*Reporte Raices CRM*');
+  lineas.push('');
+  try {
+    // traer conversaciones del user con su status
+    const { data: convs } = await supabase.from('conversations').select('status').eq('user_id', user_id);
+    const lista = convs || [];
+    const cuenta = function(st){ return lista.filter(function(x){ return x.status === st; }).length; };
+    if (info.conversaciones_nuevas) lineas.push('Conversaciones totales: ' + lista.length);
+    if (info.interesados) lineas.push('Interesados: ' + cuenta('interesado'));
+    if (info.listo_humano) lineas.push('Listos para humano: ' + cuenta('listo_humano'));
+    if (info.cierres) lineas.push('Cierres: ' + cuenta('cerrado'));
+    if (info.recontactos) lineas.push('En recontacto: ' + cuenta('recontacto'));
+    if (info.mensajes) {
+      const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
+      lineas.push('Mensajes totales: ' + (count || 0));
+    }
+  } catch (e) {
+    lineas.push('(No se pudieron cargar todos los datos)');
+  }
+  lineas.push('');
+  lineas.push('Generado: ' + new Date().toLocaleString('es-AR'));
+  return lineas.join(String.fromCharCode(10));
+}
+
 app.post('/api/webhook/whatsapp', async (req, res) => {
   res.json({ received: true });
   try {
@@ -495,6 +523,24 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: inst } = await supabase.from('whatsapp_instancias').select('user_id').eq('instancia_nombre', instanciaNombre).maybeSingle();
     if (!inst) { console.error('Instancia sin user_id:', instanciaNombre); return; }
     const user_id = inst.user_id;
+
+    // === REPORTE AL ADMIN: si quien escribe es el numero de reportes del dueno y pide reporte ===
+    try {
+      const { data: bsRep } = await supabase.from('business_settings').select('reportes_config').eq('user_id', user_id).maybeSingle();
+      const repCfg = bsRep && bsRep.reportes_config ? bsRep.reportes_config : null;
+      if (repCfg && repCfg.whatsapp) {
+        const soloNumRep = String(repCfg.whatsapp).replace(/[^0-9]/g, '');
+        const soloNumTel = String(telefono).replace(/[^0-9]/g, '');
+        // comparar por los ultimos 8 digitos (evita lios de prefijos/0/15)
+        const coincide = soloNumRep.length >= 8 && soloNumTel.length >= 8 && soloNumRep.slice(-8) === soloNumTel.slice(-8);
+        const pideReporte = /\breporte\b/i.test(String(texto || ''));
+        if (coincide && pideReporte) {
+          const textoReporte = await generarReporteAdmin(user_id, repCfg);
+          await enviarWhatsapp(instanciaNombre, telefono, textoReporte);
+          return; // no procesar como lead
+        }
+      }
+    } catch (e) { /* si falla el reporte, seguir con el flujo normal */ }
 
     // 2) Buscar contacto por telefono dentro del user_id (persistencia: no duplicar)
     let contacto;

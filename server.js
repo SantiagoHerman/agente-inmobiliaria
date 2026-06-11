@@ -458,6 +458,40 @@ app.post('/api/agent/respond', async (req, res) => {
 });
 
 // ============ WEBHOOK ENTRANTE DE WHATSAPP (Evolution API) ============
+async function enviarReportesProgramados() {
+  try {
+    const { data: cuentas } = await supabase.from('business_settings').select('user_id, reportes_config').not('reportes_config', 'is', null);
+    if (!cuentas || !cuentas.length) return;
+    const ahora = new Date();
+    const hoyStr = ahora.toISOString().substring(0, 10); // YYYY-MM-DD
+    const diaSemana = ahora.getDay(); // 0=domingo, 1=lunes
+    const diaMes = ahora.getDate();
+    const hora = ahora.getHours();
+    // Solo enviar reportes programados en una franja de la manana (8 a 10) para no spamear
+    if (hora < 8 || hora > 10) return;
+    for (const cta of cuentas) {
+      const cfg = cta.reportes_config || {};
+      if (!cfg.whatsapp) continue;
+      const envios = cfg.ultimo_envio || {};
+      let toca = null;
+      if (cfg.diario && envios.diario !== hoyStr) toca = 'diario';
+      else if (cfg.semanal && diaSemana === 1 && envios.semanal !== hoyStr) toca = 'semanal';
+      else if (cfg.mensual && diaMes === 1 && envios.mensual !== hoyStr) toca = 'mensual';
+      if (!toca) continue;
+      try {
+        const textoReporte = await generarReporteAdmin(cta.user_id, cfg);
+        const encabezado = (toca === 'diario' ? 'Reporte diario' : toca === 'semanal' ? 'Reporte semanal' : 'Reporte mensual');
+        await enviarWhatsapp(nombreInstancia(cta.user_id), cfg.whatsapp, encabezado + String.fromCharCode(10) + String.fromCharCode(10) + textoReporte);
+        // marcar como enviado
+        const nuevosEnvios = Object.assign({}, envios);
+        nuevosEnvios[toca] = hoyStr;
+        const nuevaCfg = Object.assign({}, cfg, { ultimo_envio: nuevosEnvios });
+        await supabase.from('business_settings').update({ reportes_config: nuevaCfg }).eq('user_id', cta.user_id);
+      } catch (e) { /* seguir con la siguiente cuenta */ }
+    }
+  } catch (e) { /* silencioso */ }
+}
+
 async function generarReporteAdmin(user_id, cfg) {
   // cfg = reportes_config (info: que incluir). Devuelve texto ASCII del reporte.
   const info = (cfg && cfg.info) || {};
@@ -1018,6 +1052,8 @@ async function reintentarFallidos() {
 // Revisar fallidos cada 60 segundos (reenvia apenas WhatsApp vuelve a estar conectado)
 setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
+setInterval(enviarReportesProgramados, 60 * 60 * 1000); // reportes programados: chequear cada hora
+setTimeout(enviarReportesProgramados, 45 * 1000); // primer chequeo al arrancar
 setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)
 setInterval(enviarRecontactosPendientes, 15 * 60 * 1000);

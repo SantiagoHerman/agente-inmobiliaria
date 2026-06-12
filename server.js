@@ -1774,4 +1774,99 @@ app.post('/api/scraping-config', async function(req, res) {
 });
 
 
+// ===== MOTOR DE SCRAPING AUTOMATICO (revisa cada hora que cuentas deben actualizar inventario) =====
+async function correrScrapingDeUsuario(cfg) {
+  // trae propiedades de la fuente y las guarda en modo directo (upsert por numero)
+  try {
+    var sitio = (cfg.fuente_url || '').trim();
+    if (!sitio) return { ok: false, motivo: 'sin url' };
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    var lista = await traerListaPropiedades(sitio, null);
+    if (!lista.length) return { ok: false, motivo: 'sin propiedades' };
+    var creados = 0, actualizados = 0, errores = 0;
+    for (var i = 0; i < lista.length; i++) {
+      try {
+        var p = await procesarPropiedad(lista[i]);
+        if (!p.numero) { errores++; continue; }
+        var fila = {
+          user_id: cfg.user_id, numero: String(p.numero), title: p.titulo || 'Sin titulo',
+          type: p.tipo || null, zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null,
+          price: p.precio || null, description: p.descripcion || null,
+          caracteristicas: p.caracteristicas || null, link: p.link || null, activa: true
+        };
+        var ex = await supabase.from('properties').select('id').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        if (ex.data && ex.data.id) {
+          var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
+          if (up.error) errores++; else actualizados++;
+        } else {
+          var ins = await supabase.from('properties').insert(fila);
+          if (ins.error) errores++; else creados++;
+        }
+      } catch (e) { errores++; }
+    }
+    return { ok: true, creados: creados, actualizados: actualizados, errores: errores, total: lista.length };
+  } catch (e) { return { ok: false, motivo: e && e.message }; }
+}
+
+// Endpoint para correr el scraping automatico de una cuenta a pedido (sirve para probar el motor)
+app.post('/api/scraping-config/correr-ahora', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var q = await supabase.from('scraping_config').select('*').eq('user_id', user_id).maybeSingle();
+    if (!q.data) return res.json({ ok: false, mensaje: 'No hay configuracion guardada' });
+    var r = await correrScrapingDeUsuario(q.data);
+    await supabase.from('scraping_config').update({ ultimo_scraping: new Date().toISOString() }).eq('user_id', user_id);
+    return res.json({ ok: true, resultado: r });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+async function revisarScrapingsAutomaticos() {
+  try {
+    var q = await supabase.from('scraping_config').select('*').eq('automatico', true);
+    var cuentas = q.data || [];
+    if (!cuentas.length) return;
+    var ahora = new Date();
+    var hoyStr = ahora.toISOString().substring(0, 10);
+    var diaSemana = ahora.getDay();
+    var diaMes = ahora.getDate();
+    var horaActual = ahora.getHours();
+    var nombresDias = ['dom','lun','mar','mie','jue','vie','sab'];
+    var diaHoy = nombresDias[diaSemana];
+    for (var i = 0; i < cuentas.length; i++) {
+      var cfg = cuentas[i];
+      var horarios = Array.isArray(cfg.horarios) ? cfg.horarios : [];
+      var dias = Array.isArray(cfg.dias_semana) ? cfg.dias_semana : [];
+      // determinar la hora objetivo segun frecuencia
+      var horasObjetivo = horarios.map(function(h){ return parseInt(String(h).split(':')[0], 10); }).filter(function(n){ return !isNaN(n); });
+      if (!horasObjetivo.length) horasObjetivo = [9];
+      var leToca = false;
+      // marca anti-repeticion: para dos_por_dia usamos fecha+hora; para el resto, fecha
+      var marca = hoyStr;
+      if (cfg.frecuencia === 'dos_por_dia') {
+        if (horasObjetivo.indexOf(horaActual) >= 0) { leToca = true; marca = hoyStr + '-' + horaActual; }
+      } else if (cfg.frecuencia === 'dias_semana') {
+        if (dias.indexOf(diaHoy) >= 0 && horaActual === horasObjetivo[0]) leToca = true;
+      } else if (cfg.frecuencia === 'semanal') {
+        if (diaSemana === 1 && horaActual === horasObjetivo[0]) leToca = true;
+      } else if (cfg.frecuencia === 'mensual') {
+        if (diaMes === 1 && horaActual === horasObjetivo[0]) leToca = true;
+      }
+      if (!leToca) continue;
+      // anti-repeticion: si ya corrio con esta marca, saltar
+      if (cfg.ultimo_scraping && String(cfg.ultimo_scraping).indexOf(marca) >= 0) continue;
+      // correr el scraping (modo directo en esta version)
+      if (cfg.modo === 'directo') {
+        await correrScrapingDeUsuario(cfg);
+      }
+      // registrar que corrio (guarda la marca para no repetir)
+      await supabase.from('scraping_config').update({ ultimo_scraping: ahora.toISOString().substring(0,13) + ':00:00 marca=' + marca }).eq('user_id', cfg.user_id);
+    }
+  } catch (e) {}
+}
+// revisar cada hora, con un arranque inicial a los 90 segundos del deploy
+setInterval(revisarScrapingsAutomaticos, 60 * 60 * 1000);
+setTimeout(revisarScrapingsAutomaticos, 90 * 1000);
+
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

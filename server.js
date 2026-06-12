@@ -1283,11 +1283,16 @@ app.post('/api/scrape/detalle', async function(req, res) {
         }
         // titulo y descripcion desde meta og (flexible al orden de atributos)
         const tituloM = html.match(/og:title["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:title/i);
+        // descripcion completa: primero el bloque property-description (Houzez/WP), fallback og:description
+        var descCompleta = null;
+        var mDescBloque = html.match(/<div[^>]*class="[^"]*property-description[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
+        if (mDescBloque) { var dl = mDescBloque[1].replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').replace(/^\s*Descripci[^\s]*\s*/i, '').trim(); if (dl.length > 100) descCompleta = dl; }
+        if (!descCompleta) { var mDescClase = html.match(/class="[^"]*description[^"]*"[^>]*>([\s\S]{200,4000}?)<\/div>/i); if (mDescClase) { var dl2 = mDescClase[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); if (dl2.length > 100) descCompleta = dl2; } }
         const descM = html.match(/og:description["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:description/i);
         resultados.push({
           url: u,
           titulo: tituloM ? tituloM[1].trim() : '',
-          descripcion: descM ? descM[1].trim().substring(0, 500) : '',
+          descripcion: descCompleta ? descCompleta : (descM ? descM[1].trim() : ''),
           campos: campos
         });
       } catch (e) { resultados.push({ url: u, error: e && e.message }); }

@@ -1743,4 +1743,35 @@ app.post('/api/scrape/v2', async function(req, res) {
 });
 
 
+// ===== CONFIG DE SCRAPING/IMPORTACION AUTOMATICA =====
+app.get('/api/scraping-config', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var q = await supabase.from('scraping_config').select('*').eq('user_id', user_id).maybeSingle();
+    return res.json({ ok: true, config: q.data || null });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/scraping-config', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    var fila = {
+      user_id: user_id,
+      fuente_tipo: (b.fuente_tipo === 'archivo') ? 'archivo' : 'web',
+      fuente_url: (b.fuente_url || '').trim(),
+      automatico: !!b.automatico,
+      frecuencia: ['dos_por_dia','dias_semana','semanal','mensual'].indexOf(b.frecuencia) >= 0 ? b.frecuencia : 'semanal',
+      horarios: Array.isArray(b.horarios) ? b.horarios : [],
+      dias_semana: Array.isArray(b.dias_semana) ? b.dias_semana : [],
+      modo: (b.modo === 'directo') ? 'directo' : 'pendiente'
+    };
+    var up = await supabase.from('scraping_config').upsert(fila, { onConflict: 'user_id' }).select().maybeSingle();
+    if (up.error) return res.status(500).json({ error: up.error.message });
+    return res.json({ ok: true, config: up.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

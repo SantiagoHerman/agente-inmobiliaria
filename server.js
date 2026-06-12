@@ -1815,12 +1815,51 @@ app.post('/api/scraping-config/correr-ahora', async function(req, res) {
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     var q = await supabase.from('scraping_config').select('*').eq('user_id', user_id).maybeSingle();
     if (!q.data) return res.json({ ok: false, mensaje: 'No hay configuracion guardada' });
-    var r = await correrScrapingDeUsuario(q.data);
+    var r = (q.data.modo === 'directo') ? await correrScrapingDeUsuario(q.data) : await correrScrapingPendiente(q.data);
     await supabase.from('scraping_config').update({ ultimo_scraping: new Date().toISOString() }).eq('user_id', user_id);
     return res.json({ ok: true, resultado: r });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+async function correrScrapingPendiente(cfg) {
+  // compara lo scrapeado con la base y guarda diferencias en scraping_pendientes (no aplica)
+  try {
+    var sitio = (cfg.fuente_url || '').trim();
+    if (!sitio) return { ok: false, motivo: 'sin url' };
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    var lista = await traerListaPropiedades(sitio, null);
+    if (!lista.length) return { ok: false, motivo: 'sin propiedades' };
+    // limpiar pendientes anteriores de este usuario (se reemplazan por el scraping nuevo)
+    await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id);
+    var nuevas = 0, modificadas = 0;
+    for (var i = 0; i < lista.length; i++) {
+      try {
+        var p = await procesarPropiedad(lista[i]);
+        if (!p.numero) continue;
+        var nuevo = {
+          numero: String(p.numero), title: p.titulo || 'Sin titulo', type: p.tipo || null,
+          zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null, price: p.precio || null,
+          description: p.descripcion || null, caracteristicas: p.caracteristicas || null, link: p.link || null
+        };
+        var ex = await supabase.from('properties').select('id,title,price,zone,description').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        if (ex.data && ex.data.id) {
+          // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion)
+          var v = ex.data;
+          var cambio = (String(v.price||'') !== String(nuevo.price||'')) || (String(v.title||'') !== String(nuevo.title||'')) || (String(v.zone||'') !== String(nuevo.zone||'')) || (String(v.description||'') !== String(nuevo.description||''));
+          if (cambio) {
+            await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'modificada', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: { title: v.title, price: v.price, zone: v.zone }, property_id: v.id });
+            modificadas++;
+          }
+        } else {
+          // no existe: es nueva
+          await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'nueva', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: null, property_id: null });
+          nuevas++;
+        }
+      } catch (e) {}
+    }
+    return { ok: true, nuevas: nuevas, modificadas: modificadas, total: lista.length };
+  } catch (e) { return { ok: false, motivo: e && e.message }; }
+}
 async function revisarScrapingsAutomaticos() {
   try {
     var q = await supabase.from('scraping_config').select('*').eq('automatico', true);
@@ -1858,6 +1897,8 @@ async function revisarScrapingsAutomaticos() {
       // correr el scraping (modo directo en esta version)
       if (cfg.modo === 'directo') {
         await correrScrapingDeUsuario(cfg);
+      } else {
+        await correrScrapingPendiente(cfg);
       }
       // registrar que corrio (guarda la marca para no repetir)
       await supabase.from('scraping_config').update({ ultimo_scraping: ahora.toISOString().substring(0,13) + ':00:00 marca=' + marca }).eq('user_id', cfg.user_id);
@@ -1867,6 +1908,54 @@ async function revisarScrapingsAutomaticos() {
 // revisar cada hora, con un arranque inicial a los 90 segundos del deploy
 setInterval(revisarScrapingsAutomaticos, 60 * 60 * 1000);
 setTimeout(revisarScrapingsAutomaticos, 90 * 1000);
+
+
+// ===== BANDEJA DE CAMBIOS PENDIENTES (modo 'deja pendientes') =====
+app.get('/api/scraping-pendientes', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var q = await supabase.from('scraping_pendientes').select('*').eq('user_id', user_id).order('created_at', { ascending: true });
+    return res.json({ ok: true, pendientes: q.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var soloId = (req.body && req.body.id) ? req.body.id : null;
+    var query = supabase.from('scraping_pendientes').select('*').eq('user_id', user_id);
+    if (soloId) query = query.eq('id', soloId);
+    var q = await query;
+    var items = q.data || [];
+    var aplicados = 0;
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var d = it.datos_nuevos || {};
+      var fila = { user_id: user_id, numero: String(it.numero), title: d.title || 'Sin titulo', type: d.type || null, zone: d.zone || null, price: d.price || null, description: d.description || null, caracteristicas: d.caracteristicas || null, link: d.link || null, activa: true };
+      if (it.tipo_cambio === 'modificada' && it.property_id) {
+        await supabase.from('properties').update(fila).eq('id', it.property_id);
+      } else {
+        var ex = await supabase.from('properties').select('id').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
+        if (ex.data && ex.data.id) { await supabase.from('properties').update(fila).eq('id', ex.data.id); }
+        else { await supabase.from('properties').insert(fila); }
+      }
+      await supabase.from('scraping_pendientes').delete().eq('id', it.id);
+      aplicados++;
+    }
+    return res.json({ ok: true, aplicados: aplicados });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/scraping-pendientes/rechazar', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var soloId = (req.body && req.body.id) ? req.body.id : null;
+    if (soloId) { await supabase.from('scraping_pendientes').delete().eq('user_id', user_id).eq('id', soloId); }
+    else { await supabase.from('scraping_pendientes').delete().eq('user_id', user_id); }
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

@@ -1477,4 +1477,141 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== SCRAPER UNIVERSAL DE INVENTARIO (multiples vias, cualquier inmobiliaria) =====
+function limpiarHTML(html) {
+  if (!html) return '';
+  return String(html).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8211;/g, '-').replace(/&#8217;/g, "'").replace(/&quot;/g, '"').replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function extraerPrecioDe(html) {
+  if (!html) return null;
+  // metodo 1: clase item-price (Houzez), capturando contenido anidado
+  var m = html.match(/<(span|div|p|h\d)[^>]*class="[^"]*item-price[^"]*"[^>]*>([\s\S]*?)<\/\1>/i);
+  if (m) { var l = limpiarHTML(m[2]); if (l && /\d{3,}/.test(l)) return l; }
+  // metodo 2: cualquier clase con 'price' que tenga numeros
+  m = html.match(/class="[^"]*price[^"]*"[^>]*>([\s\S]{0,80}?\d[\d.,]{2,}[\s\S]{0,10}?)<\//i);
+  if (m) { var l2 = limpiarHTML(m[1]); if (/\d{3,}/.test(l2)) return l2; }
+  // metodo 3: JSON-LD con price
+  var lds = html.match(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (var i = 0; i < lds.length; i++) {
+    try { var obj = JSON.parse(lds[i].replace(/<script[^>]*>/i,'').replace(/<\/script>/i,''));
+      var stack = [obj];
+      while (stack.length) { var o = stack.pop(); if (o && typeof o === 'object') { if (o.price) return String(o.price); if (o.offers) stack.push(o.offers); for (var k in o) { if (o[k] && typeof o[k] === 'object') stack.push(o[k]); } } }
+    } catch (e) {}
+  }
+  // metodo 4: patron de precio en texto plano
+  m = html.match(/(USD|U\$S)\s?[\d.,]{3,}/i) || html.match(/\$\s?[\d.,]{4,}/);
+  if (m) return m[0].trim();
+  return null;
+}
+
+// Trae propiedades probando varias vias. Devuelve array de objetos normalizados.
+async function obtenerPropiedadesUniversal(sitio, limite) {
+  var baseUrl = sitio.replace(/\/+$/, '');
+  var props = [];
+  // --- VIA 1: WordPress REST API con _embed (la mas completa) ---
+  try {
+    var pagina = 1; var seguir = true;
+    while (seguir && props.length < (limite || 9999)) {
+      var url = baseUrl + '/wp-json/wp/v2/properties?per_page=50&page=' + pagina + '&_embed=1';
+      var r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+      if (!r.ok) break;
+      var data = await r.json();
+      if (!Array.isArray(data) || data.length === 0) break;
+      for (var i = 0; i < data.length; i++) {
+        var p = data[i];
+        var emb = p._embedded || {};
+        var terms = emb['wp:term'] || [];
+        function taxOf(tax) { for (var a = 0; a < terms.length; a++) { var g = terms[a] || []; for (var b = 0; b < g.length; b++) { if (g[b].taxonomy === tax) return g[b].name; } } return null; }
+        var feats = []; for (var a = 0; a < terms.length; a++) { var g = terms[a] || []; for (var b = 0; b < g.length; b++) { if (g[b].taxonomy === 'property_feature') feats.push(g[b].name); } }
+        var media = emb['wp:featuredmedia'] || [];
+        var foto = (media[0] && media[0].source_url) ? media[0].source_url : null;
+        props.push({
+          titulo: limpiarHTML(p.title && p.title.rendered),
+          descripcion: limpiarHTML(p.content && p.content.rendered),
+          link: p.link || (baseUrl + '/?p=' + p.id),
+          tipo: taxOf('property_type'),
+          operacion: taxOf('property_status'),
+          ciudad: taxOf('property_city'),
+          zona: taxOf('property_area'),
+          provincia: taxOf('property_state'),
+          caracteristicas: feats.join(', '),
+          foto: foto,
+          precio: null,
+          fuente: 'wp-rest'
+        });
+      }
+      if (data.length < 50) seguir = false;
+      pagina++;
+    }
+  } catch (e) {}
+  return props;
+}
+
+// Endpoint del scraper universal. Params: url (sitio), modo ('update'|'reset'), limite (opcional)
+app.post('/api/scrape/universal', async function(req, res) {
+  try {
+    var token = (req.headers.authorization || '').replace('Bearer ', '');
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var sitio = (req.body.url || '').trim();
+    var modo = (req.body.modo === 'reset') ? 'reset' : 'update';
+    var limite = req.body.limite ? parseInt(req.body.limite, 10) : null;
+    if (!sitio) return res.status(400).json({ error: 'Falta la url del sitio' });
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+
+    var props = await obtenerPropiedadesUniversal(sitio, limite);
+    if (!props.length) return res.json({ ok: false, mensaje: 'No se encontraron propiedades por ninguna via', total: 0 });
+
+    // sacar el precio de cada propiedad entrando a su pagina (en tandas para no saturar)
+    for (var i = 0; i < props.length; i++) {
+      if (!props[i].link) continue;
+      try {
+        var h = await fetch(props[i].link, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        if (h.ok) { var html = await h.text(); props[i].precio = extraerPrecioDe(html); }
+      } catch (e) {}
+    }
+
+    // modo reset: borrar el inventario actual del usuario antes de cargar
+    if (modo === 'reset') {
+      await supabase.from('properties').delete().eq('user_id', user_id);
+    }
+
+    // guardar cada propiedad (upsert por link para no duplicar en modo update)
+    var creados = 0, actualizados = 0, errores = 0;
+    for (var j = 0; j < props.length; j++) {
+      var p = props[j];
+      var fila = {
+        user_id: user_id,
+        title: p.titulo || 'Sin titulo',
+        type: p.tipo || null,
+        operation: p.operacion || null,
+        zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null,
+        price: p.precio || null,
+        description: p.descripcion || null,
+        caracteristicas: p.caracteristicas || null,
+        link: p.link || null,
+        activa: true
+      };
+      try {
+        if (modo === 'reset') {
+          var insR = await supabase.from('properties').insert(fila);
+          if (insR.error) errores++; else creados++;
+        } else {
+          // update: buscar por link; si existe actualiza, si no inserta
+          var ex = await supabase.from('properties').select('id').eq('user_id', user_id).eq('link', p.link).maybeSingle();
+          if (ex.data && ex.data.id) {
+            var upR = await supabase.from('properties').update(fila).eq('id', ex.data.id);
+            if (upR.error) errores++; else actualizados++;
+          } else {
+            var inR = await supabase.from('properties').insert(fila);
+            if (inR.error) errores++; else creados++;
+          }
+        }
+      } catch (e) { errores++; }
+    }
+    return res.json({ ok: true, modo: modo, total: props.length, creados: creados, actualizados: actualizados, errores: errores });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

@@ -638,7 +638,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     // 3) Buscar o crear conversacion
     let conv;
-    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
+    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo, idioma_lead').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
       const asesorAsignado = await elegirAsesorActivo(user_id);
@@ -653,7 +653,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
     try {
-      const idiomaDetectado = await detectarIdioma(texto);
+      const idiomaDetectado = (conv && conv.idioma_lead && conv.idioma_lead !== 'es') ? conv.idioma_lead : await detectarIdioma(texto);
       if (idiomaDetectado && idiomaDetectado !== 'es') {
         const trad = await traducir(texto, 'es');
         if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }

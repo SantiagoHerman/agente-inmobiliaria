@@ -1614,4 +1614,128 @@ app.post('/api/scrape/universal', async function(req, res) {
 });
 
 
+// ===== SCRAPER CORREGIDO: extraccion completa por propiedad =====
+function limpiarHTML2(html) {
+  if (!html) return '';
+  return String(html).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8211;/g, '-').replace(/&#8217;/g, "'").replace(/&#8220;|&#8221;/g, '"').replace(/&quot;/g, '"').replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ').trim();
+}
+// Extrae los pares Etiqueta:Valor de la tabla de detalles (Houzez y similares)
+function extraerTablaDetalles(html) {
+  var pares = {};
+  var re = /<strong>([^<:]{1,40}):?<\/strong>\s*([^<]{1,60})</gi;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    var k = m[1].trim(); var v = m[2].trim();
+    if (k && v && !/^\s*$/.test(v)) pares[k] = v;
+  }
+  return pares;
+}
+// Detecta el numero identificador de forma adaptativa (cada inmobiliaria lo nombra distinto)
+function detectarNumeroProp(pares, titulo, plataformaId) {
+  var patrones = [/propiedad\s*id/i, /property\s*id/i, /listing\s*id/i, /\bmls\b/i, /c[oa]d(igo)?\.?\s*(de\s*)?prop/i, /\bref(erencia)?\.?\b/i, /\bn[uu]mero\b/i, /\bnro\.?\b/i, /c[oa]d(igo)?\.?/i, /\bid\b/i];
+  var excluir = /postal|barrio|zona|telefono|tel\.|whatsapp|a[nu]o|construc|metro|ambient|ba[nu]o|cuarto|habitacion/i;
+  for (var pi = 0; pi < patrones.length; pi++) {
+    for (var k in pares) {
+      if (excluir.test(k)) continue;
+      if (patrones[pi].test(k)) {
+        var val = String(pares[k]).match(/[A-Za-z0-9][A-Za-z0-9\-\/]*/);
+        if (val) return val[0];
+      }
+    }
+  }
+  if (titulo) { var mt = titulo.match(/(?:id|c[oa]d(?:igo)?|ref(?:erencia)?|#)[\s\-:.]*([A-Za-z0-9][A-Za-z0-9\-]*)/i); if (mt) return mt[1]; }
+  if (plataformaId) return String(plataformaId);
+  return null;
+}
+// Detecta operacion y devuelve flags
+function detectarOperacion(estado, textoExtra) {
+  var t = ((estado || '') + ' ' + (textoExtra || '')).toLowerCase();
+  if (/tempora|por noche|por dia|por d.a|alquiler temporal|temporario|veraneo|diaria/.test(t)) return 'temporal';
+  if (/anual|alquiler anual|alquiler permanente|todo el a.o/.test(t)) return 'anual';
+  if (/alquiler|renta|rent/.test(t)) return 'anual';
+  if (/venta|vende|compra|sale/.test(t)) return 'venta';
+  return 'venta';
+}
+
+function extraerPrecio2(html) {
+  if (!html) return null;
+  var m = html.match(/<(span|div|p|h\d)[^>]*class="[^"]*item-price[^"]*"[^>]*>([\s\S]*?)<\/\1>/i);
+  if (m) { var l = limpiarHTML2(m[2]); if (l && /\d{3,}/.test(l)) return l; }
+  m = html.match(/class="[^"]*price[^"]*"[^>]*>([\s\S]{0,80}?\d[\d.,]{2,}[\s\S]{0,10}?)<\//i);
+  if (m) { var l2 = limpiarHTML2(m[1]); if (/\d{3,}/.test(l2)) return l2; }
+  var lds = html.match(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (var i = 0; i < lds.length; i++) { try { var obj = JSON.parse(lds[i].replace(/<script[^>]*>/i,'').replace(/<\/script>/i,'')); var st=[obj]; while(st.length){ var o=st.pop(); if(o&&typeof o==='object'){ if(o.price) return String(o.price); if(o.offers) st.push(o.offers); for(var k in o){ if(o[k]&&typeof o[k]==='object') st.push(o[k]); } } } } catch(e){} }
+  m = html.match(/(USD|U\$S)\s?[\d.,]{3,}/i) || html.match(/\$\s?[\d.,]{4,}/);
+  if (m) return m[0].trim();
+  return null;
+}
+// Procesa una propiedad de la API + su ficha. Devuelve objeto con todos los campos para revision.
+async function procesarPropiedad(p) {
+  var emb = p._embedded || {};
+  var terms = emb['wp:term'] || [];
+  var feats = [];
+  for (var a = 0; a < terms.length; a++) { var g = terms[a] || []; for (var b = 0; b < g.length; b++) { if (g[b].taxonomy === 'property_feature') feats.push(g[b].name); } }
+  var media = emb['wp:featuredmedia'] || [];
+  var foto = (media[0] && media[0].source_url) ? media[0].source_url : null;
+  var titulo = limpiarHTML2(p.title && p.title.rendered);
+  var descripcion = limpiarHTML2(p.content && p.content.rendered);
+  var link = p.link || '';
+  var pares = {}; var precio = null;
+  try { var resp = await fetch(link, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } }); if (resp.ok) { var html = await resp.text(); pares = extraerTablaDetalles(html); precio = extraerPrecio2(html); } } catch (e) {}
+  var numero = detectarNumeroProp(pares, titulo, p.id);
+  var operacion = detectarOperacion(pares['Estado'] || pares['Estado de la propiedad'], titulo + ' ' + descripcion.substring(0, 200));
+  var ambientes = pares['Ambientes'] || pares['Habitaciones / Cuartos'] || pares['Habitaciones'] || null;
+  var banos = pares['Banos'] || pares['Ba' + String.fromCharCode(241) + 'os'] || null;
+  var parking = pares['Parking'] || pares['Cochera'] || pares['Garage'] || null;
+  var ciudad = (pares['Ciudad/ Localidad'] || pares['Ciudad'] || pares['Localidad'] || '').split(',')[0].trim() || null;
+  var zona = pares['Barrio/ Zona'] || pares['Zona'] || pares['Barrio'] || null;
+  var caract = [].concat(feats);
+  if (banos) caract.push('Banos: ' + banos);
+  if (parking && !/no|aplica/i.test(parking)) caract.push('Cochera: ' + parking);
+  return {
+    numero: numero, titulo: titulo, tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
+    operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
+    ciudad: ciudad, zona: zona, caracteristicas: caract.join(', '), descripcion: descripcion,
+    link: link, foto: foto
+  };
+}
+
+async function traerListaPropiedades(sitio, limite) {
+  var baseUrl = sitio.replace(/\/+$/, '');
+  var props = []; var pagina = 1; var seguir = true;
+  try {
+    while (seguir && props.length < (limite || 9999)) {
+      var url = baseUrl + '/wp-json/wp/v2/properties?per_page=50&page=' + pagina + '&_embed=1';
+      var r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+      if (!r.ok) break;
+      var data = await r.json();
+      if (!Array.isArray(data) || data.length === 0) break;
+      for (var i = 0; i < data.length; i++) props.push(data[i]);
+      if (data.length < 50) seguir = false;
+      pagina++;
+    }
+  } catch (e) {}
+  if (limite) props = props.slice(0, limite);
+  return props;
+}
+// Endpoint: devuelve las propiedades procesadas (para que el frontend muestre y el humano apruebe)
+app.post('/api/scrape/v2', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var sitio = (req.body.url || '').trim();
+    var limite = req.body.limite ? parseInt(req.body.limite, 10) : null;
+    if (!sitio) return res.status(400).json({ error: 'Falta la url del sitio' });
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    var lista = await traerListaPropiedades(sitio, limite);
+    if (!lista.length) return res.json({ ok: false, mensaje: 'No se encontraron propiedades', propiedades: [] });
+    var procesadas = [];
+    for (var i = 0; i < lista.length; i++) {
+      try { var pr = await procesarPropiedad(lista[i]); procesadas.push(pr); } catch (e) {}
+    }
+    return res.json({ ok: true, total: procesadas.length, propiedades: procesadas });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

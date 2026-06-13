@@ -207,6 +207,26 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
   } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); global._ultimoErrorMedia = { excepcion: (e && e.message) || String(e), stack: (e && e.stack ? String(e.stack).substring(0,300) : '') }; return false; }
 }
 
+app.get('/api/debug-variantes', async (req, res) => {
+  const numero = '5492235624061';
+  const media = 'https://euvgrvtnjzuqnuvuskee.supabase.co/storage/v1/object/public/media/test/prueba.png';
+  const inst = nombreInstancia('190b9a5c-9a3e-4053-80a2-21fb47cac10d');
+  const variantes = [
+    { nombre: 'A_plano', body: { number: numero, mediatype: 'image', media: media } },
+    { nombre: 'B_fileName', body: { number: numero, mediatype: 'image', mimetype: 'image/png', media: media, fileName: 'foto.png' } },
+    { nombre: 'C_options', body: { number: numero, mediaMessage: { mediatype: 'image', media: media } } },
+    { nombre: 'D_anidado', body: { number: numero, options: {}, mediaMessage: { mediatype: 'image', media: media, fileName: 'foto.png' } } }
+  ];
+  const resultados = [];
+  for (const v of variantes) {
+    try {
+      const r = await fetch(EVOLUTION_URL + '/message/sendMedia/' + inst, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify(v.body) });
+      const t = await r.text();
+      resultados.push({ variante: v.nombre, status: r.status, resp: t.substring(0, 200) });
+    } catch (e) { resultados.push({ variante: v.nombre, error: (e && e.message) || String(e) }); }
+  }
+  res.json({ instancia: inst, resultados: resultados });
+});
 app.get('/api/debug-media', async (req, res) => { res.json(global._ultimoErrorMedia || { sinError: true }); });
 
 app.post('/api/enviar-media', async (req, res) => {

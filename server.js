@@ -208,24 +208,23 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
 }
 
 app.get('/api/debug-variantes', async (req, res) => {
+  const out = {};
+  // 1) listar instancias en Evolution y su estado
+  try {
+    const ri = await fetch(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY } });
+    const ti = await ri.json();
+    out.instancias = Array.isArray(ti) ? ti.map(function(x){ return { name: (x.instance && x.instance.instanceName) || x.name || x.instanceName, estado: (x.instance && x.instance.state) || x.connectionStatus || x.state }; }) : ti;
+  } catch (e) { out.errorInstancias = (e && e.message) || String(e); }
+  // 2) probar envio contra la instancia del amigo (conectada)
+  const inst = 'cliente_b4b470eb56ac42db';
   const numero = '5492235624061';
   const media = 'https://euvgrvtnjzuqnuvuskee.supabase.co/storage/v1/object/public/media/test/prueba.png';
-  const inst = nombreInstancia('190b9a5c-9a3e-4053-80a2-21fb47cac10d');
-  const variantes = [
-    { nombre: 'A_plano', body: { number: numero, mediatype: 'image', media: media } },
-    { nombre: 'B_fileName', body: { number: numero, mediatype: 'image', mimetype: 'image/png', media: media, fileName: 'foto.png' } },
-    { nombre: 'C_options', body: { number: numero, mediaMessage: { mediatype: 'image', media: media } } },
-    { nombre: 'D_anidado', body: { number: numero, options: {}, mediaMessage: { mediatype: 'image', media: media, fileName: 'foto.png' } } }
-  ];
-  const resultados = [];
-  for (const v of variantes) {
-    try {
-      const r = await fetch(EVOLUTION_URL + '/message/sendMedia/' + inst, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify(v.body) });
-      const t = await r.text();
-      resultados.push({ variante: v.nombre, status: r.status, resp: t.substring(0, 200) });
-    } catch (e) { resultados.push({ variante: v.nombre, error: (e && e.message) || String(e) }); }
-  }
-  res.json({ instancia: inst, resultados: resultados });
+  try {
+    const r = await fetch(EVOLUTION_URL + '/message/sendMedia/' + inst, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ number: numero, mediatype: 'image', media: media, fileName: 'foto.png' }) });
+    const t = await r.text();
+    out.envioAmigo = { status: r.status, resp: t.substring(0, 250) };
+  } catch (e) { out.envioAmigo = { error: (e && e.message) || String(e) }; }
+  res.json(out);
 });
 app.get('/api/debug-media', async (req, res) => { res.json(global._ultimoErrorMedia || { sinError: true }); });
 

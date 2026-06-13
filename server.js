@@ -408,7 +408,7 @@ async function detectarIdioma(texto) {
     const comp = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 10,
-      system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Ignora palabras sueltas o expresiones que esten en otro idioma (ej. un saludo o una palabra prestada): lo que importa es el idioma dominante del mensaje. Responde SOLO con el codigo de dos letras del idioma (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl, u otro codigo ISO 639-1 si corresponde). Nada mas.',
+      system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Mira la ORACION completa, no palabras aisladas. Si el mensaje entero es un saludo o frase corta (ej. hi, hello, bonjour, hallo), ESE es el idioma. Solo si dentro de una oracion larga hay una palabra prestada de otro idioma, ignora esa palabra y usa el idioma dominante de la oracion. Responde SOLO con el codigo de dos letras del idioma (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl, u otro codigo ISO 639-1 si corresponde). Nada mas.',
       messages: [ { role: 'user', content: texto } ]
     });
     const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : 'es';
@@ -654,12 +654,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
     try {
-      const idiomaDetectado = (conv && conv.idioma_lead && conv.idioma_lead !== 'es') ? conv.idioma_lead : await detectarIdioma(texto);
+      const idiomaDetectado = await detectarIdioma(texto);
       if (idiomaDetectado && idiomaDetectado !== 'es') {
         const trad = await traducir(texto, 'es');
         if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
         // recordar el idioma del lead en la conversacion para el traductor saliente
         await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
+        if (conv) conv.idioma_lead = idiomaDetectado;
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
     await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg });

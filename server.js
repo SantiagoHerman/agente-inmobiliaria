@@ -186,6 +186,45 @@ async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia) {
     return url ? { url: url, tipo: tipoMedia } : null;
   } catch (e) { console.error('subirMediaAStorage error:', e && e.message); return null; }
 }
+// ===== ENVIAR MULTIMEDIA por WhatsApp (Evolution sendMedia) =====
+async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
+  try {
+    let mediatype = 'document';
+    if (tipo === 'imagen') mediatype = 'image';
+    else if (tipo === 'video') mediatype = 'video';
+    else if (tipo === 'audio') mediatype = 'audio';
+    const endpoint = (mediatype === 'audio') ? '/message/sendWhatsAppAudio/' : '/message/sendMedia/';
+    let bodyFinal;
+    if (mediatype === 'audio') { bodyFinal = { number: numero, audio: mediaUrl }; }
+    else { bodyFinal = { number: numero, mediatype: mediatype, media: mediaUrl }; if (caption) bodyFinal.caption = caption; }
+    const resp = await fetch(EVOLUTION_URL + endpoint + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify(bodyFinal)
+    });
+    return resp.ok;
+  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
+}
+
+app.post('/api/enviar-media', async (req, res) => {
+  try {
+    const _uid = await verificarUsuario(req);
+    if (!_uid) return res.status(401).json({ error: 'No autorizado' });
+    const { conversation_id, media_url, media_tipo, caption, enviado_por } = req.body || {};
+    if (!conversation_id || !media_url || !media_tipo) return res.status(400).json({ error: 'Faltan datos' });
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', conversation_id).maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+    if (!contacto) return res.status(404).json({ error: 'Contacto no encontrado' });
+    const instanciaNombre = nombreInstancia(conv.user_id);
+    const contenidoCartelito = caption || ('[' + media_tipo + ']');
+    const { data: msgIns } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: contenidoCartelito, enviado_por: enviado_por || 'Asesor', media_url: media_url, media_tipo: media_tipo }).select('id').maybeSingle();
+    const ok = await enviarWhatsappMedia(instanciaNombre, contacto.phone, media_url, media_tipo, caption);
+    if (msgIns && msgIns.id) { try { await supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', msgIns.id); } catch (e) {} }
+    await supabase.from('conversations').update({ last_message: contenidoCartelito, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    return res.json({ ok: ok });
+  } catch (e) { console.error('enviar-media error:', e && e.message); return res.status(500).json({ error: e && e.message }); }
+});
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;
   const historialManual = (opciones && opciones.historialManual) || null;

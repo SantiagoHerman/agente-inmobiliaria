@@ -202,9 +202,12 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify(bodyFinal)
     });
+    if (!resp.ok) { const errTxt = await resp.text(); console.error('sendMedia fallo', resp.status, errTxt); global._ultimoErrorMedia = { status: resp.status, body: errTxt.substring(0,500), endpoint: endpoint, bodyEnviado: JSON.stringify(bodyFinal).substring(0,300) }; }
     return resp.ok;
   } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
 }
+
+app.get('/api/debug-media', async (req, res) => { res.json(global._ultimoErrorMedia || { sinError: true }); });
 
 app.post('/api/enviar-media', async (req, res) => {
   try {

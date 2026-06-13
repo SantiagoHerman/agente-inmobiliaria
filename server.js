@@ -154,7 +154,9 @@ async function elegirAsesorActivo(admin_id) {
   } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
 }
 
-async function generarRespuestaAgente(user_id, conversation_id, message) {
+async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
+  const modoPrueba = opciones && opciones.modoPrueba;
+  const historialManual = (opciones && opciones.historialManual) || null;
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia').eq('user_id', user_id).eq('activa', true);
@@ -213,7 +215,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
   }
 
   let historial = [];
-  if (conversation_id) {
+  if (modoPrueba && historialManual) {
+    historial = historialManual.map(function(m){ return { role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }; });
+  } else if (conversation_id) {
     const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
     if (prev && prev.length > 0) {
       historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: (m.content_original || m.content) }; });
@@ -289,10 +293,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message) {
         idiomaAi = idiomaBase;
       }
     } catch (e) { /* si falla la traduccion, se guarda solo el original */ }
+    if (!modoPrueba) {
     await supabase.from('messages').insert([
       { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply, content_original: contentOriginalAi, idioma: idiomaAi, enviado_por: 'Agente IA' }
     ]);
     await supabase.from('conversations').update({ last_message: reply, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    }
   }
 
   return { reply: reply, usage: completion.usage };
@@ -1968,5 +1974,18 @@ app.post('/api/scraping-pendientes/rechazar', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+
+// ===== CHAT DE PRUEBA DEL AGENTE (no guarda nada, no manda WhatsApp) =====
+app.post('/api/probar-agente', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var message = (req.body && req.body.message) ? String(req.body.message) : '';
+    var historial = (req.body && Array.isArray(req.body.historial)) ? req.body.historial : [];
+    if (!message.trim()) return res.status(400).json({ error: 'Mensaje vacio' });
+    var r = await generarRespuestaAgente(user_id, null, message, { modoPrueba: true, historialManual: historial });
+    return res.json({ ok: true, reply: r.reply });
+  } catch (e) { console.error('Error probar-agente:', e); return res.status(500).json({ error: e && e.message }); }
+});
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

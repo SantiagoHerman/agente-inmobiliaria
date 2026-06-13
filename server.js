@@ -218,12 +218,15 @@ app.post('/api/enviar-media', async (req, res) => {
     if (!contacto) return res.status(404).json({ error: 'Contacto no encontrado' });
     const instanciaNombre = nombreInstancia(conv.user_id);
     const contenidoCartelito = caption || ('[' + media_tipo + ']');
-    const { data: msgIns } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: contenidoCartelito, enviado_por: enviado_por || 'Asesor', media_url: media_url, media_tipo: media_tipo }).select('id').maybeSingle();
-    const ok = await enviarWhatsappMedia(instanciaNombre, contacto.phone, media_url, media_tipo, caption);
-    if (msgIns && msgIns.id) { try { await supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', msgIns.id); } catch (e) {} }
+    const { data: msgIns } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: contenidoCartelito, enviado_por: enviado_por || 'Asesor', media_url: media_url, media_tipo: media_tipo, estado_envio: 'enviando' }).select('id').maybeSingle();
     await supabase.from('conversations').update({ last_message: contenidoCartelito, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
-    return res.json({ ok: ok });
-  } catch (e) { console.error('enviar-media error:', e && e.message); return res.status(500).json({ error: e && e.message }); }
+    // Responder YA: el mensaje quedo guardado. El envio a WhatsApp sigue en segundo plano.
+    res.json({ ok: true });
+    // Envio a Evolution en segundo plano (no bloquea la respuesta)
+    enviarWhatsappMedia(instanciaNombre, contacto.phone, media_url, media_tipo, caption).then(function(ok){
+      if (msgIns && msgIns.id) { supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', msgIns.id).then(function(){}, function(){}); }
+    }, function(err){ console.error('envio media bg:', err && err.message); if (msgIns && msgIns.id) { supabase.from('messages').update({ estado_envio: 'fallido' }).eq('id', msgIns.id).then(function(){}, function(){}); } });
+  } catch (e) { console.error('enviar-media error:', e && e.message); if (!res.headersSent) return res.status(500).json({ error: e && e.message }); }
 });
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;

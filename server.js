@@ -154,6 +154,38 @@ async function elegirAsesorActivo(admin_id) {
   } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
 }
 
+// ===== MULTIMEDIA: baja un archivo de Evolution y lo sube a Supabase Storage =====
+async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia) {
+  try {
+    // 1) Pedir el base64 del archivo a Evolution
+    const resp = await fetch(EVOLUTION_URL + '/chat/getBase64FromMediaMessage/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({ message: mensajeCrudo, convertToMp4: false })
+    });
+    if (!resp.ok) { console.error('getBase64 fallo:', resp.status); return null; }
+    const j = await resp.json();
+    const base64 = j && (j.base64 || j.media || (j.data && j.data.base64));
+    if (!base64) { console.error('getBase64 sin base64'); return null; }
+    // 2) Determinar extension y content-type segun el tipo
+    const mime = (j && j.mimetype) ? j.mimetype : '';
+    let ext = 'bin';
+    if (tipoMedia === 'imagen') ext = (mime.indexOf('png') >= 0) ? 'png' : 'jpg';
+    else if (tipoMedia === 'audio') ext = (mime.indexOf('mp3') >= 0) ? 'mp3' : 'ogg';
+    else if (tipoMedia === 'video') ext = 'mp4';
+    else if (tipoMedia === 'documento') { if (mime.indexOf('pdf') >= 0) ext = 'pdf'; else if (mime.indexOf('word') >= 0) ext = 'docx'; else ext = 'bin'; }
+    const contentType = mime || 'application/octet-stream';
+    // 3) Subir a Supabase Storage (bucket 'media')
+    const buffer = Buffer.from(base64, 'base64');
+    const nombre = 'wa/' + Date.now() + '_' + Math.random().toString(36).substring(2, 8) + '.' + ext;
+    const up = await supabase.storage.from('media').upload(nombre, buffer, { contentType: contentType, upsert: false });
+    if (up.error) { console.error('upload Storage fallo:', up.error.message); return null; }
+    // 4) Obtener URL publica
+    const pub = supabase.storage.from('media').getPublicUrl(nombre);
+    const url = pub && pub.data ? pub.data.publicUrl : null;
+    return url ? { url: url, tipo: tipoMedia } : null;
+  } catch (e) { console.error('subirMediaAStorage error:', e && e.message); return null; }
+}
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;
   const historialManual = (opciones && opciones.historialManual) || null;

@@ -721,6 +721,16 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           }
         }
       }
+      // RED DE SEGURIDAD: si la conversacion esta en listo_humano sin asesor (quedo huerfana), derivar ahora
+      try {
+        const { data: cvSeg } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, user_id').eq('id', conv.id).single();
+        if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
+          const asesorSeg = await elegirAsesorActivo(cvSeg.user_id);
+          if (asesorSeg) {
+            await supabase.from('conversations').update({ asesor_id: asesorSeg, ultimo_asesor_id: asesorSeg }).eq('id', conv.id);
+          }
+        }
+      } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
     }
   } catch (e) { console.error('Error en webhook whatsapp:', e && e.message); }
 });

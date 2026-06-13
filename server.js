@@ -216,7 +216,7 @@ app.get('/api/debug-variantes', async (req, res) => {
     out.instancias = Array.isArray(ti) ? ti.map(function(x){ return { name: (x.instance && x.instance.instanceName) || x.name || x.instanceName, estado: (x.instance && x.instance.state) || x.connectionStatus || x.state }; }) : ti;
   } catch (e) { out.errorInstancias = (e && e.message) || String(e); }
   // 2) probar envio contra la instancia del amigo (conectada)
-  const inst = 'cliente_b4b470eb56ac42db';
+  const inst = 'cliente_190b9a5c9a3e4053';
   const numero = '5492235624061';
   const media = 'https://euvgrvtnjzuqnuvuskee.supabase.co/storage/v1/object/public/media/test/prueba.png';
   try {

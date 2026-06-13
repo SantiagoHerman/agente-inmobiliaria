@@ -629,8 +629,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const telefono = remoteJid.split('@')[0];
 
     const msg = data.message || {};
-    const texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
-    if (!texto) return;
+    let texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
+    // Detectar multimedia entrante
+    let tipoMediaEntrante = null;
+    if (msg.imageMessage) { tipoMediaEntrante = 'imagen'; if (!texto) texto = msg.imageMessage.caption || '[imagen]'; }
+    else if (msg.audioMessage) { tipoMediaEntrante = 'audio'; if (!texto) texto = '[audio]'; }
+    else if (msg.videoMessage) { tipoMediaEntrante = 'video'; if (!texto) texto = msg.videoMessage.caption || '[video]'; }
+    else if (msg.documentMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = (msg.documentMessage && msg.documentMessage.fileName) ? ('[documento] ' + msg.documentMessage.fileName) : '[documento]'; }
+    else if (msg.documentWithCaptionMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = '[documento]'; }
+    if (!texto && !tipoMediaEntrante) return;
 
     // Mensaje saliente escrito por un humano desde su WhatsApp: guardarlo con marca y cortar.
     if (esFromMe) {
@@ -701,7 +708,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         if (conv) conv.idioma_lead = idiomaDetectado;
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
-    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg });
+    let mediaUrlLead = null; let mediaTipoLead = null;
+    if (tipoMediaEntrante) {
+      try { const subido = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante); if (subido) { mediaUrlLead = subido.url; mediaTipoLead = subido.tipo; } } catch (eMedia) { console.error('subir media lead:', eMedia && eMedia.message); }
+    }
+    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead });
     // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
     if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }

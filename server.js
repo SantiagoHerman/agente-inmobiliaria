@@ -196,37 +196,15 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
     const endpoint = (mediatype === 'audio') ? '/message/sendWhatsAppAudio/' : '/message/sendMedia/';
     let bodyFinal;
     if (mediatype === 'audio') { bodyFinal = { number: numero, audio: mediaUrl }; }
-    else { bodyFinal = { number: numero, mediatype: mediatype, media: mediaUrl }; if (caption) bodyFinal.caption = caption; }
+    else { let extDef = 'bin'; if (mediatype === 'image') extDef = 'jpg'; else if (mediatype === 'video') extDef = 'mp4'; const nombreArch = 'archivo_' + Date.now() + '.' + extDef; bodyFinal = { number: numero, mediatype: mediatype, media: mediaUrl, fileName: nombreArch }; if (caption) bodyFinal.caption = caption; }
     const resp = await fetch(EVOLUTION_URL + endpoint + instancia, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify(bodyFinal)
     });
-    if (!resp.ok) { const errTxt = await resp.text(); console.error('sendMedia fallo', resp.status, errTxt); global._ultimoErrorMedia = { status: resp.status, body: errTxt.substring(0,500), endpoint: endpoint, bodyEnviado: JSON.stringify(bodyFinal).substring(0,300) }; }
     return resp.ok;
-  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); global._ultimoErrorMedia = { excepcion: (e && e.message) || String(e), stack: (e && e.stack ? String(e.stack).substring(0,300) : '') }; return false; }
+  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
 }
-
-app.get('/api/debug-variantes', async (req, res) => {
-  const out = {};
-  // 1) listar instancias en Evolution y su estado
-  try {
-    const ri = await fetch(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY } });
-    const ti = await ri.json();
-    out.instancias = Array.isArray(ti) ? ti.map(function(x){ return { name: (x.instance && x.instance.instanceName) || x.name || x.instanceName, estado: (x.instance && x.instance.state) || x.connectionStatus || x.state }; }) : ti;
-  } catch (e) { out.errorInstancias = (e && e.message) || String(e); }
-  // 2) probar envio contra la instancia del amigo (conectada)
-  const inst = 'cliente_190b9a5c9a3e4053';
-  const numero = '5492235624061';
-  const media = 'https://euvgrvtnjzuqnuvuskee.supabase.co/storage/v1/object/public/media/test/prueba_1781365999341.png';
-  try {
-    const r = await fetch(EVOLUTION_URL + '/message/sendMedia/' + inst, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ number: numero, mediatype: 'image', media: media, fileName: 'foto.png' }) });
-    const t = await r.text();
-    out.envioAmigo = { status: r.status, resp: t.substring(0, 250) };
-  } catch (e) { out.envioAmigo = { error: (e && e.message) || String(e) }; }
-  res.json(out);
-});
-app.get('/api/debug-media', async (req, res) => { res.json(global._ultimoErrorMedia || { sinError: true }); });
 
 app.post('/api/enviar-media', async (req, res) => {
   try {

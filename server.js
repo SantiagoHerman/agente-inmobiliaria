@@ -218,7 +218,7 @@ app.get('/api/debug-variantes', async (req, res) => {
   // 2) probar envio contra la instancia del amigo (conectada)
   const inst = 'cliente_190b9a5c9a3e4053';
   const numero = '5492235624061';
-  const media = 'https://euvgrvtnjzuqnuvuskee.supabase.co/storage/v1/object/public/media/test/prueba.png';
+  const media = 'https://euvgrvtnjzuqnuvuskee.supabase.co/storage/v1/object/public/media/test/prueba_1781365999341.png';
   try {
     const r = await fetch(EVOLUTION_URL + '/message/sendMedia/' + inst, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ number: numero, mediatype: 'image', media: media, fileName: 'foto.png' }) });
     const t = await r.text();

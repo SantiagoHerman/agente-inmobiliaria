@@ -204,7 +204,7 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
     });
     if (!resp.ok) { const errTxt = await resp.text(); console.error('sendMedia fallo', resp.status, errTxt); global._ultimoErrorMedia = { status: resp.status, body: errTxt.substring(0,500), endpoint: endpoint, bodyEnviado: JSON.stringify(bodyFinal).substring(0,300) }; }
     return resp.ok;
-  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
+  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); global._ultimoErrorMedia = { excepcion: (e && e.message) || String(e), stack: (e && e.stack ? String(e.stack).substring(0,300) : '') }; return false; }
 }
 
 app.get('/api/debug-media', async (req, res) => { res.json(global._ultimoErrorMedia || { sinError: true }); });

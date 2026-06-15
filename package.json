@@ -12,8 +12,9 @@
   "type": "commonjs",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",
+    "@supabase/supabase-js": "^2.49.4",
     "express": "^5.2.1",
-    "twilio": "^6.0.0",
-    "@supabase/supabase-js": "^2.49.4"
+    "firebase-admin": "^13.10.0",
+    "twilio": "^6.0.0"
   }
 }

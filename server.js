@@ -47,6 +47,51 @@ const PORT = process.env.PORT || 3001;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '' });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');
 
+// === Notificaciones push (FCM) via firebase-admin ===
+// Se inicializa SOLO si hay credenciales (env FIREBASE_SERVICE_ACCOUNT = JSON del service account).
+// Si no esta configurado, enviarPushAsesor no hace nada (no rompe el flujo de mensajes).
+let _fcmReady = false;
+let _fcmAdmin = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    _fcmAdmin = require('firebase-admin');
+    if (!_fcmAdmin.apps.length) {
+      _fcmAdmin.initializeApp({ credential: _fcmAdmin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
+    }
+    _fcmReady = true;
+    console.log('FCM listo (firebase-admin inicializado)');
+  } else {
+    console.log('FCM no configurado (sin FIREBASE_SERVICE_ACCOUNT)');
+  }
+} catch (e) { console.error('Error init firebase-admin:', e && e.message); }
+
+// Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
+async function enviarPushAsesor(authUserId, leadNombre, texto) {
+  try {
+    if (!_fcmReady || !authUserId) return;
+    const { data: toks } = await supabase.from('device_tokens').select('token').eq('user_id', authUserId);
+    if (!toks || !toks.length) return;
+    const tokens = toks.map(function (t) { return t.token; }).filter(Boolean);
+    if (!tokens.length) return;
+    const palabras = String(texto || '').trim().split(/\s+/).slice(0, 3).join(' ');
+    const resp = await _fcmAdmin.messaging().sendEachForMulticast({
+      tokens: tokens,
+      notification: { title: leadNombre || 'Nuevo lead', body: 'Nuevo mensaje · ' + palabras },
+      android: { priority: 'high', notification: { channelId: 'mensajes', sound: 'default', priority: 'high' } }
+    });
+    // Limpiar tokens invalidos (desinstalados / expirados)
+    if (resp && resp.responses) {
+      for (let i = 0; i < resp.responses.length; i++) {
+        const r = resp.responses[i];
+        const code = (r && r.error && r.error.code) || '';
+        if (!r.success && /not-registered|invalid-registration-token|invalid-argument/.test(code)) {
+          try { await supabase.from('device_tokens').delete().eq('token', tokens[i]); } catch (eDel) {}
+        }
+      }
+    }
+  } catch (e) { console.error('Error enviarPushAsesor:', e && e.message); }
+}
+
 // === SEGURIDAD: verificacion de identidad por token JWT de Supabase ===
 // Lee el token del header Authorization, lo valida contra Supabase y
 // devuelve el user_id REAL del token (o null si no hay token valido).
@@ -726,11 +771,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     // 3) Buscar o crear conversacion
     let conv;
-    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo, idioma_lead').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
+    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo, idioma_lead, asesor_id').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
       const asesorAsignado = await elegirAsesorActivo(user_id);
-      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true, asesor_id: asesorAsignado, ultimo_asesor_id: asesorAsignado }).select('id, ai_enabled').single();
+      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true, asesor_id: asesorAsignado, ultimo_asesor_id: asesorAsignado }).select('id, ai_enabled, asesor_id').single();
       conv = convNueva;
     }
     if (!conv) return;
@@ -759,6 +804,17 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
     if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
     await supabase.from('conversations').update(_updConv).eq('id', conv.id);
+
+    // === Notificacion push al asesor asignado (por cada mensaje entrante) ===
+    try {
+      const _asesorRowId = conv.asesor_id || (convExistente && convExistente.asesor_id) || null;
+      if (_asesorRowId) {
+        const { data: _ase } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesorRowId).maybeSingle();
+        if (_ase && _ase.auth_user_id) {
+          await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
+        }
+      }
+    } catch (ePush) { console.error('push asesor:', ePush && ePush.message); }
 
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos

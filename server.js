@@ -786,7 +786,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
     // Traducir SOLO texto/audio/imagen; NO traducir videos ni documentos.
-    const _noTraducir = (tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
+    const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
     try {
       if (!_noTraducir) {
         const idiomaDetectado = await detectarIdioma(texto);

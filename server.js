@@ -785,14 +785,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentLead = texto;
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
+    // Traducir SOLO texto/audio/imagen; NO traducir videos ni documentos.
+    const _noTraducir = (tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
     try {
-      const idiomaDetectado = await detectarIdioma(texto);
-      if (idiomaDetectado && idiomaDetectado !== 'es') {
-        const trad = await traducir(texto, 'es');
-        if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
-        // recordar el idioma del lead en la conversacion para el traductor saliente
-        await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
-        if (conv) conv.idioma_lead = idiomaDetectado;
+      if (!_noTraducir) {
+        const idiomaDetectado = await detectarIdioma(texto);
+        if (idiomaDetectado && idiomaDetectado !== 'es') {
+          const trad = await traducir(texto, 'es');
+          if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
+          // recordar el idioma del lead en la conversacion para el traductor saliente
+          await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
+          if (conv) conv.idioma_lead = idiomaDetectado;
+        }
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
     let mediaUrlLead = null; let mediaTipoLead = null;

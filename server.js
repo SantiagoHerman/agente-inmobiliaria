@@ -695,6 +695,40 @@ async function generarReporteAdmin(user_id, cfg) {
   return lineas.join(String.fromCharCode(10));
 }
 
+// El admin pregunta por WhatsApp lo que necesite; la IA responde con los datos reales del tenant.
+async function responderConsultaAdmin(user_id, pregunta) {
+  try {
+    const resConv = await supabase.from('conversations').select('id, status, asesor_id').eq('user_id', user_id);
+    const resAse = await supabase.from('asesores').select('id, nombre, usuario, activo').eq('admin_id', user_id);
+    const resCont = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
+    const lista = resConv.data || [];
+    const ases = resAse.data || [];
+    const convAsesor = {}; lista.forEach(function (c) { convAsesor[c.id] = c.asesor_id; });
+    const porEstado = {}; lista.forEach(function (c) { porEstado[c.status] = (porEstado[c.status] || 0) + 1; });
+    const asignados = {}; lista.forEach(function (c) { if (c.asesor_id) asignados[c.asesor_id] = (asignados[c.asesor_id] || 0) + 1; });
+    // Tiempos de respuesta (contact -> human) y ultima actividad, ultimos 30 dias
+    const hace30 = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+    const resMsg = await supabase.from('messages').select('conversation_id, role, created_at').eq('user_id', user_id).gte('created_at', hace30).order('created_at', { ascending: true }).limit(4000);
+    const lastContact = {}, respSum = {}, respCnt = {}, lastHuman = {};
+    (resMsg.data || []).forEach(function (m) {
+      const cv = m.conversation_id, t = new Date(m.created_at).getTime(), asid = convAsesor[cv];
+      if (m.role === 'contact') { if (lastContact[cv] == null) lastContact[cv] = t; }
+      else if (m.role === 'human') {
+        if (lastContact[cv] != null && asid) { const gap = t - lastContact[cv]; if (gap > 0 && gap < 7 * 24 * 3600 * 1000) { respSum[asid] = (respSum[asid] || 0) + gap; respCnt[asid] = (respCnt[asid] || 0) + 1; } }
+        lastContact[cv] = null; if (asid) lastHuman[asid] = Math.max(lastHuman[asid] || 0, t);
+      }
+    });
+    function fmtDur(ms) { const min = Math.round(ms / 60000); if (min < 60) return min + ' min'; return Math.floor(min / 60) + 'h ' + (min % 60) + 'm'; }
+    const resumenAses = ases.map(function (a) {
+      return { nombre: a.nombre || a.usuario, activo: a.activo, leads_asignados: asignados[a.id] || 0, tiempo_respuesta_promedio: respCnt[a.id] ? fmtDur(respSum[a.id] / respCnt[a.id]) : 'sin datos', ultima_actividad: lastHuman[a.id] ? new Date(lastHuman[a.id]).toLocaleString('es-AR') : 'sin actividad reciente' };
+    });
+    const datos = { contactos_totales: resCont.count || 0, conversaciones_totales: lista.length, conversaciones_por_estado: porEstado, asesores: resumenAses };
+    const sys = 'Sos el asistente de reportes de un CRM inmobiliario. El ADMINISTRADOR te hace una consulta por WhatsApp. Responde SOLO con los datos provistos (el JSON de abajo), en espanol rioplatense, claro y conciso, en formato WhatsApp (texto plano, podes usar *negrita* y saltos de linea, sin tablas). Si te piden un dato que no esta en los datos, deci que no lo tenes disponible. Nunca inventes numeros.';
+    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: [{ role: 'user', content: 'Datos actuales del CRM:\n' + JSON.stringify(datos, null, 1) + '\n\nConsulta del administrador: ' + pregunta }] });
+    return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : 'No pude generar el reporte.';
+  } catch (e) { console.error('responderConsultaAdmin:', e && e.message); return 'No pude generar el reporte en este momento.'; }
+}
+
 app.post('/api/webhook/whatsapp', async (req, res) => {
   res.json({ received: true });
   try {
@@ -749,11 +783,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const soloNumTel = String(telefono).replace(/[^0-9]/g, '');
         // comparar por los ultimos 8 digitos (evita lios de prefijos/0/15)
         const coincide = soloNumRep.length >= 8 && soloNumTel.length >= 8 && soloNumRep.slice(-8) === soloNumTel.slice(-8);
-        const pideReporte = /\breporte\b/i.test(String(texto || ''));
-        if (coincide && pideReporte) {
-          const textoReporte = await generarReporteAdmin(user_id, repCfg);
-          await enviarWhatsapp(instanciaNombre, telefono, textoReporte);
-          return; // no procesar como lead
+        if (coincide && texto && !tipoMediaEntrante) {
+          const respuestaAdmin = await responderConsultaAdmin(user_id, texto);
+          await enviarWhatsapp(instanciaNombre, telefono, respuestaAdmin);
+          return; // el numero del admin es canal de reportes; no se procesa como lead
         }
       }
     } catch (e) { /* si falla el reporte, seguir con el flujo normal */ }

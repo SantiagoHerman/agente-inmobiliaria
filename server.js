@@ -2640,6 +2640,19 @@ app.post('/api/maestro/saldo', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// Cancelar la suscripcion del cliente: revoca el preapproval en MercadoPago + marca cancelled localmente
+app.post('/api/suscripcion/cancelar', async function(req, res){
+  try{
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var sub = await getSubscription(user_id);
+    if (!sub) return res.status(400).json({ error: 'No tenes una suscripcion para cancelar' });
+    if (MP_TOKEN && sub.mp_preapproval_id) { try { await mpFetch('/preapproval/' + sub.mp_preapproval_id, 'PUT', { status: 'cancelled' }); } catch(eM){ console.error('cancelar MP:', eM && eM.message); } }
+    await supabase.from('subscriptions').update({ status: 'cancelled' }).eq('user_id', user_id);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // CRON suscripciones: dunning (past_due con +3 dias de gracia -> suspended) + reset mensual del contador de mensajes IA. Inerte si SUBSCRIPTIONS_ENABLED=false.
 async function revisarSuscripciones() {
   try {

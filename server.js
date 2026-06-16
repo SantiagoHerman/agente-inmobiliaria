@@ -34,6 +34,7 @@ app.use((req, res, next) => {
   try {
     // el webhook de WhatsApp no se limita
     if (req.path === '/api/webhook/whatsapp') return next();
+    if (req.path === '/api/webhook/mercadopago') return next();
     if (req.path === '/health') return next();
     const ip = (req.headers['x-forwarded-for'] || req.ip || 'sin-ip').split(',')[0].trim();
     const n = (_rlHits.get(ip) || 0) + 1;
@@ -134,6 +135,116 @@ const LARGO = {
   normal: 'Responde con un largo equilibrado, ni muy corto ni muy extenso.',
   detallado: 'Podes dar respuestas mas completas y detalladas cuando ayude.'
 };
+
+// ============ SUSCRIPCIONES Y PLANES (MercadoPago) — FASE 1 ============
+// Definido pero INERTE (patron "Capa 1"): el gating real se activa con
+// SUBSCRIPTIONS_ENABLED=true y requiere la tabla public.subscriptions.
+// Mientras este apagado, TODO se permite => no afecta a los tenants actuales.
+const SUBSCRIPTIONS_ENABLED = String(process.env.SUBSCRIPTIONS_ENABLED || '').toLowerCase() === 'true';
+const MP_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
+const MP_BASE = 'https://api.mercadopago.com';
+
+// Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
+const PLAN_LIMITS = {
+  trial:   { ai_messages: 200,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  basico:  { ai_messages: 1000,  asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
+  pro:     { ai_messages: 4000,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  premium: { ai_messages: 12000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+};
+// Plan por defecto cuando la funcion esta apagada o el tenant no tiene fila: acceso total.
+const PLAN_DEFECTO = 'premium';
+
+// Lee la suscripcion del tenant. Si la tabla no existe o no hay fila, devuelve null (no rompe).
+async function getSubscription(user_id) {
+  try {
+    if (!user_id) return null;
+    const { data, error } = await supabase.from('subscriptions').select('*').eq('user_id', user_id).maybeSingle();
+    if (error) return null;
+    return data || null;
+  } catch (e) { return null; }
+}
+
+// Plan vigente del tenant (considera estado y vencimiento). DEFAULT-OPEN si la funcion esta apagada.
+async function planActual(user_id) {
+  if (!SUBSCRIPTIONS_ENABLED) return PLAN_DEFECTO;
+  const sub = await getSubscription(user_id);
+  if (!sub) return PLAN_DEFECTO; // sin fila todavia: no bloquear
+  const activo = (sub.status === 'active' || sub.status === 'trial');
+  const vigente = !sub.current_period_end || new Date(sub.current_period_end).getTime() >= Date.now();
+  if (!activo || !vigente) return 'basico'; // suscripcion caida: cae al minimo, no corta del todo
+  return PLAN_LIMITS[sub.plan] ? sub.plan : PLAN_DEFECTO;
+}
+
+// True si el plan del tenant habilita una feature (reportes_ia, audio_traduccion, backup_drive, multi_whatsapp).
+async function planPermite(user_id, feature) {
+  if (!SUBSCRIPTIONS_ENABLED) return true;
+  const plan = await planActual(user_id);
+  const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+  return !!lim[feature];
+}
+
+// Mensajes IA consumidos en el periodo actual (0 si no hay fila).
+async function usoMensajesIA(user_id) {
+  const sub = await getSubscription(user_id);
+  return (sub && typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
+}
+
+// True si el tenant sigue dentro del tope de mensajes IA de su plan.
+async function dentroDelTopeIA(user_id) {
+  if (!SUBSCRIPTIONS_ENABLED) return true;
+  const plan = await planActual(user_id);
+  const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+  if (lim.ai_messages === Infinity) return true;
+  const usado = await usoMensajesIA(user_id);
+  return usado < lim.ai_messages;
+}
+
+// Suma 1 al contador de mensajes IA del periodo (best-effort, no rompe si falla).
+async function registrarUsoIA(user_id) {
+  try {
+    if (!SUBSCRIPTIONS_ENABLED || !user_id) return;
+    const sub = await getSubscription(user_id);
+    if (!sub) return;
+    const nuevo = ((typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0) + 1;
+    await supabase.from('subscriptions').update({ ai_messages_this_period: nuevo }).eq('user_id', user_id);
+  } catch (e) {}
+}
+
+// ---- MercadoPago via REST (sin SDK, sin dependencias nuevas; fetch es global en Node 18+) ----
+async function mpFetch(path, metodo, cuerpo) {
+  if (!MP_TOKEN) throw new Error('MercadoPago no configurado (falta MERCADOPAGO_ACCESS_TOKEN)');
+  const r = await fetch(MP_BASE + path, {
+    method: metodo || 'GET',
+    headers: { 'Authorization': 'Bearer ' + MP_TOKEN, 'Content-Type': 'application/json' },
+    body: cuerpo ? JSON.stringify(cuerpo) : undefined
+  });
+  const txt = await r.text();
+  let json = null; try { json = txt ? JSON.parse(txt) : null; } catch (e) {}
+  if (!r.ok) throw new Error('MP ' + r.status + ': ' + String((json && json.message) ? json.message : txt).slice(0, 200));
+  return json;
+}
+
+// Crea un plan de suscripcion en MP (uno por nivel). Devuelve el preapproval_plan (con .id).
+async function mpCrearPlan(nombre, montoARS, backUrl) {
+  const body = {
+    reason: nombre,
+    auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: montoARS, currency_id: 'ARS', free_trial: { frequency: 4, frequency_type: 'days' } },
+    back_url: backUrl,
+    payment_methods_allowed: { payment_types: [{ id: 'credit_card' }, { id: 'debit_card' }] }
+  };
+  return await mpFetch('/preapproval_plan', 'POST', body);
+}
+
+// Crea una suscripcion (preapproval) asociada a un plan. Devuelve el objeto con init_point (checkout de MP).
+async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl) {
+  const body = { preapproval_plan_id: planId, payer_email: payerEmail, external_reference: externalRef, back_url: backUrl };
+  return await mpFetch('/preapproval', 'POST', body);
+}
+
+// Consulta el estado de una suscripcion por id.
+async function mpConsultarSuscripcion(preapprovalId) {
+  return await mpFetch('/preapproval/' + preapprovalId, 'GET', null);
+}
 
 // ============ FUNCION REUTILIZABLE: genera la respuesta del agente ============
 async function guardarMensajeSaliente(remoteJid, texto) {
@@ -2164,6 +2275,79 @@ app.post('/api/probar-agente', async function(req, res) {
     var r = await generarRespuestaAgente(user_id, null, message, { modoPrueba: true, historialManual: historial });
     return res.json({ ok: true, reply: r.reply });
   } catch (e) { console.error('Error probar-agente:', e); return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SUSCRIPCIONES: estado, checkout y webhook de MercadoPago (FASE 1) =====
+// Inerte mientras no haya MERCADOPAGO_ACCESS_TOKEN / tabla subscriptions: responden 503 o vacio sin romper.
+
+// Estado del plan del tenant (para la pantalla "Mi plan" del frontend).
+app.get('/api/suscripcion', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var sub = await getSubscription(user_id);
+    var plan = await planActual(user_id);
+    var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+    var usado = await usoMensajesIA(user_id);
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Inicia el checkout de una suscripcion: devuelve init_point (URL de MP) para redirigir al cliente.
+app.post('/api/suscripcion/checkout', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
+    var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
+    var email = (req.body && req.body.email) ? String(req.body.email) : '';
+    if (['basico','pro','premium'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
+    if (!email) return res.status(400).json({ error: 'Falta email del pagador' });
+    // El id del plan en MP se guarda en business_settings.planes_mp[nivel] (se crea en Fase 2).
+    var bs = await supabase.from('business_settings').select('planes_mp').eq('user_id', user_id).maybeSingle();
+    var planId = (bs && bs.data && bs.data.planes_mp) ? bs.data.planes_mp[nivel] : null;
+    if (!planId) return res.status(503).json({ error: 'Planes de MercadoPago no creados todavia' });
+    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl);
+    return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Webhook de MercadoPago: avisa cambios de suscripcion/pago. Inerte si no hay token o la funcion esta apagada.
+app.post('/api/webhook/mercadopago', async function(req, res) {
+  res.sendStatus(200); // responder rapido siempre (MP reintenta si no)
+  try {
+    if (!MP_TOKEN || !SUBSCRIPTIONS_ENABLED) return;
+    var tipo = String((req.body && (req.body.type || req.body.topic)) || '');
+    var dataId = (req.body && req.body.data && req.body.data.id) || (req.query && req.query['data.id']) || null;
+    if (tipo.indexOf('subscription') < 0 && tipo.indexOf('preapproval') < 0) return;
+    if (!dataId) return;
+    var sus = await mpConsultarSuscripcion(dataId);
+    if (!sus) return;
+    var user_id = sus.external_reference || null; // lo seteamos al crear la suscripcion
+    if (!user_id) return;
+    var estado = (sus.status === 'authorized') ? 'active' : (sus.status === 'paused' ? 'past_due' : (sus.status === 'cancelled' ? 'cancelled' : 'trial'));
+    // (En Fase 2 resolvemos el nivel exacto desde sus.preapproval_plan_id via business_settings.planes_mp)
+    var fila = { user_id: user_id, status: estado, mp_preapproval_id: sus.id, current_period_end: sus.next_payment_date || null };
+    await supabase.from('subscriptions').upsert(fila, { onConflict: 'user_id' });
+  } catch (e) { console.error('webhook mercadopago:', e && e.message); }
+});
+
+// ===== TEMPORAL: prueba de conexion con MercadoPago (BORRAR despues de testear) =====
+app.get('/api/mp-test', async function(req, res) {
+  try {
+    if ((req.query.k || '') !== 'rztest2026') return res.status(403).json({ error: 'no autorizado' });
+    if (!MP_TOKEN) return res.json({ ok: false, error: 'falta MERCADOPAGO_ACCESS_TOKEN en el entorno' });
+    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raicescrm.com') + '/suscripcion/listo';
+    var plan = await mpCrearPlan('Raices CRM - Plan de prueba', 5000, backUrl);
+    return res.json({
+      ok: true,
+      plan_id: (plan && plan.id) || null,
+      status: (plan && plan.status) || null,
+      init_point: (plan && plan.init_point) || null,
+      modo: String(MP_TOKEN).indexOf('TEST-') === 0 ? 'TEST' : 'PRODUCCION'
+    });
+  } catch (e) { return res.json({ ok: false, error: e && e.message }); }
 });
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

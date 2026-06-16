@@ -2463,7 +2463,9 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var asesoresActivos = (ases.data || []).filter(function(a){ return a.activo === true; }).length;
     var sub = await supabase.from('subscriptions').select('*').eq('user_id', uid).maybeSingle();
     var S = sub.data || null;
-    var ultimoLogin = null; try { var u = await supabase.auth.admin.getUserById(uid); ultimoLogin = (u && u.data && u.data.user) ? u.data.user.last_sign_in_at : null; } catch(eL){}
+    var ultimoLogin = null; var altaFecha = null; try { var u = await supabase.auth.admin.getUserById(uid); if (u && u.data && u.data.user) { ultimoLogin = u.data.user.last_sign_in_at; altaFecha = u.data.user.created_at; } } catch(eL){}
+    var ultimoBackup = null; var backupsCount = 0; try { var bk = await supabase.from('backups').select('created_at', { count: 'exact' }).eq('user_id', uid).order('created_at', { ascending: false }).limit(1); ultimoBackup = (bk.data && bk.data[0]) ? bk.data[0].created_at : null; backupsCount = bk.count || 0; } catch(eB){}
+    var nota = ''; try { var nt = await supabase.from('admin_notas').select('nota').eq('user_id', uid).maybeSingle(); nota = (nt && nt.data && nt.data.nota) ? nt.data.nota : ''; } catch(eN){}
     var wa = 'desconocido'; try { wa = (await instanciaConectada(nombreInstancia(uid))) ? 'conectado' : 'desconectado'; } catch(eWa){}
     var planCli = (S && S.cortesia === true) ? 'premium' : ((S && PLAN_LIMITS[S.plan]) ? S.plan : 'premium');
     var ov = (S && S.limits_override) || {};
@@ -2473,7 +2475,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var nConv = stats.conversaciones || 0;
     var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
     var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
-    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, suscripcion: S });
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -2531,6 +2533,44 @@ app.post('/api/maestro/cliente/:id/impersonar', async function(req, res){
     }
     try { await supabase.from('admin_audit').insert({ accion: 'impersonar', target_user_id: uid, detalle: email }); } catch(eA){}
     return res.json({ ok: true, token_hash: link.data.properties.hashed_token, email: email });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Guardar nota interna del dev sobre un cliente
+app.post('/api/maestro/cliente/:id/nota', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var nota = (req.body && typeof req.body.nota === 'string') ? req.body.nota : '';
+    await supabase.from('admin_notas').upsert({ user_id: req.params.id, nota: nota, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Reconectar WhatsApp del cliente: pide el QR a Evolution para re-escanear
+app.post('/api/maestro/cliente/:id/reconectar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var instancia = nombreInstancia(req.params.id);
+    var r = await fetch(EVOLUTION_URL + '/instance/connect/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } });
+    var j = await r.json();
+    var qr = (j && j.base64) ? j.base64 : ((j && j.qrcode && j.qrcode.base64) ? j.qrcode.base64 : null);
+    var estado = (j && j.instance && j.instance.state) || (j && j.state) || null;
+    return res.json({ ok: true, qr: qr, estado: estado });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Ver conversaciones recientes del cliente (solo lectura)
+app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.params.id;
+    var cv = await supabase.from('conversations').select('id, contact_id, status, last_message, last_role, updated_at').eq('user_id', uid).order('updated_at', { ascending: false }).limit(20);
+    var convs = cv.data || [];
+    var ids = convs.map(function(c){ return c.contact_id; }).filter(Boolean);
+    var nombres = {};
+    if (ids.length) { try { var ct = await supabase.from('contacts').select('id, name').in('id', ids); (ct.data || []).forEach(function(x){ nombres[x.id] = x.name; }); } catch(eC){} }
+    var out = convs.map(function(c){ return { id: c.id, contacto: nombres[c.contact_id] || 'Contacto', status: c.status, ultimo: c.last_message || '', rol: c.last_role || '', fecha: c.updated_at }; });
+    return res.json({ ok: true, conversaciones: out });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

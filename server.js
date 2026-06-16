@@ -653,7 +653,7 @@ function quitarEmojis(t) {
     .replace(/\p{Extended_Pictographic}/gu, '')
     .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]/gu, '')
     .replace(/[ \t]{2,}/g, ' ')
-    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/[ \t]+([,.;:!?])/g, '$1')
     .trim();
 }
 // Traduce un texto a un idioma destino usando el modelo. Devuelve el texto traducido (o el original si falla).
@@ -1390,7 +1390,7 @@ async function enviarRecontactosPendientes() {
     // Conversaciones en recontacto
     const { data: enRecontacto } = await supabase
       .from('conversations')
-      .select('id, user_id, contact_id, recontacto_count, recontacto_max')
+      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead')
       .eq('status', 'recontacto');
     if (!enRecontacto || enRecontacto.length === 0) return;
     for (const conv of enRecontacto) {
@@ -1429,12 +1429,17 @@ async function enviarRecontactosPendientes() {
       const { data: bsRec } = await supabase.from('business_settings').select('company_name').eq('user_id', conv.user_id).maybeSingle();
       const empresaRec = bsRec && bsRec.company_name ? bsRec.company_name : '';
       const texto = mensajeRecontacto(contacto.name, esPrimerContacto, empresaRec);
-      // Registrar primero en messages (con id) para poder marcar estado de envio
-      const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: texto, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
+      // Si el lead habla otro idioma y el traductor esta activo, traducir el recontacto antes de enviar (igual que el camino reactivo/manual)
+      let textoEnviar = texto, idiomaRec = null;
+      if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es') {
+        try { const tr = await traducir(texto, conv.idioma_lead); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto:', eTr && eTr.message); }
+      }
+      // Registrar primero en messages (con id) para marcar estado de envio. content = lo que recibe el cliente; content_original = castellano para el asesor.
+      const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
       // Enviar y registrar estado (enviado/fallido) en ese mensaje
-      await enviarWhatsapp(inst.instancia_nombre, contacto.phone, texto, msgRec ? msgRec.id : null);
-      await supabase.from('conversations').update({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
-      await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: texto, enviado_at: new Date().toISOString() });
+      await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
+      await supabase.from('conversations').update({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
       console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
     }

@@ -143,6 +143,8 @@ const LARGO = {
 const SUBSCRIPTIONS_ENABLED = String(process.env.SUBSCRIPTIONS_ENABLED || '').toLowerCase() === 'true';
 const MP_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
 const MP_BASE = 'https://api.mercadopago.com';
+// IDs globales de los planes en MercadoPago (creados 2026-06-16). Son del SaaS, compartidos por todos los tenants.
+const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7' };
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
@@ -986,8 +988,26 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: _bsPausa } = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle();
     if (_bsPausa && _bsPausa.crm_pausado === true) return;
     if (conv.ai_enabled === false) return;
+    // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)
+    if (SUBSCRIPTIONS_ENABLED) {
+      try {
+        const _sub = await getSubscription(user_id);
+        const _est = _sub ? _sub.status : null;
+        if (_est === 'cancelled' || _est === 'suspended') {
+          await enviarWhatsapp(instanciaNombre, telefono, 'El servicio esta momentaneamente pausado. El administrador debe regularizar la suscripcion para continuar.');
+          return;
+        }
+        if (!(await dentroDelTopeIA(user_id))) {
+          await enviarWhatsapp(instanciaNombre, telefono, 'Se alcanzo el limite de mensajes del plan. El administrador puede actualizar el plan para seguir.');
+          return;
+        }
+      } catch (e) { console.error('enforcement suscripcion:', e && e.message); }
+    }
     const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
-    if (resultado && resultado.reply) { await enviarWhatsapp(instanciaNombre, telefono, resultado.reply); }
+    if (resultado && resultado.reply) {
+      await enviarWhatsapp(instanciaNombre, telefono, resultado.reply);
+      if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
+    }
 
     // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
     // Leer el estado actual ANTES de clasificar
@@ -2303,10 +2323,9 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     var email = (req.body && req.body.email) ? String(req.body.email) : '';
     if (['basico','pro','premium'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
     if (!email) return res.status(400).json({ error: 'Falta email del pagador' });
-    // El id del plan en MP se guarda en business_settings.planes_mp[nivel] (se crea en Fase 2).
-    var bs = await supabase.from('business_settings').select('planes_mp').eq('user_id', user_id).maybeSingle();
-    var planId = (bs && bs.data && bs.data.planes_mp) ? bs.data.planes_mp[nivel] : null;
-    if (!planId) return res.status(503).json({ error: 'Planes de MercadoPago no creados todavia' });
+    // Los planes son GLOBALES (del SaaS), no per-tenant.
+    var planId = PLANES_MP[nivel] || null;
+    if (!planId) return res.status(503).json({ error: 'Plan de MercadoPago no encontrado' });
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
     var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl);
     return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
@@ -2327,30 +2346,16 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
     var user_id = sus.external_reference || null; // lo seteamos al crear la suscripcion
     if (!user_id) return;
     var estado = (sus.status === 'authorized') ? 'active' : (sus.status === 'paused' ? 'past_due' : (sus.status === 'cancelled' ? 'cancelled' : 'trial'));
-    // (En Fase 2 resolvemos el nivel exacto desde sus.preapproval_plan_id via business_settings.planes_mp)
+    // Resolver el nivel del plan desde el preapproval_plan_id (planes globales)
+    var planNivel = null;
+    var ppId = sus.preapproval_plan_id || null;
+    if (ppId) { Object.keys(PLANES_MP).forEach(function(k){ if (PLANES_MP[k] === ppId) planNivel = k; }); }
     var fila = { user_id: user_id, status: estado, mp_preapproval_id: sus.id, current_period_end: sus.next_payment_date || null };
+    if (planNivel) fila.plan = planNivel;
     await supabase.from('subscriptions').upsert(fila, { onConflict: 'user_id' });
   } catch (e) { console.error('webhook mercadopago:', e && e.message); }
 });
 
-// ===== TEMPORAL: crea los 3 planes reales en MercadoPago (BORRAR despues de usar una vez) =====
-app.get('/api/mp-setup-planes', async function(req, res) {
-  try {
-    if ((req.query.k || '') !== 'rztest2026') return res.status(403).json({ error: 'no autorizado' });
-    if (!MP_TOKEN) return res.json({ ok: false, error: 'falta MERCADOPAGO_ACCESS_TOKEN' });
-    var back = (process.env.BACKEND_PUBLIC_URL || 'https://raicescrm.com') + '/suscripcion/listo';
-    var defs = [
-      { key: 'basico',  nombre: 'Raices CRM - Plan Basico',  monto: 50000 },
-      { key: 'pro',     nombre: 'Raices CRM - Plan Pro',     monto: 120000 },
-      { key: 'premium', nombre: 'Raices CRM - Plan Premium', monto: 310000 }
-    ];
-    var out = {};
-    for (var i = 0; i < defs.length; i++) {
-      var p = await mpCrearPlan(defs[i].nombre, defs[i].monto, back);
-      out[defs[i].key] = { id: (p && p.id) || null, init_point: (p && p.init_point) || null };
-    }
-    return res.json({ ok: true, modo: String(MP_TOKEN).indexOf('TEST-') === 0 ? 'TEST' : 'PRODUCCION', planes: out });
-  } catch (e) { return res.json({ ok: false, error: e && e.message }); }
-});
+// (endpoint temporal /api/mp-setup-planes eliminado: los 3 planes ya estan creados y sus IDs viven en PLANES_MP)
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

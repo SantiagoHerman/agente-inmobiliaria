@@ -217,6 +217,21 @@ async function registrarUsoIA(user_id) {
   } catch (e) {}
 }
 
+// Precio de Sonnet 4.6 en USD por 1M de tokens (input / output / cache read / cache write).
+const PRECIO_IA = { in: 3, out: 15, cache_read: 0.30, cache_write: 3.75 };
+// Registra el uso real de tokens de una respuesta de la IA y su costo en USD (best-effort, no rompe).
+async function registrarUsoTokens(user_id, usage) {
+  try {
+    if (!user_id || !usage) return;
+    const i = usage.input_tokens || 0;
+    const o = usage.output_tokens || 0;
+    const cr = usage.cache_read_input_tokens || 0;
+    const cw = usage.cache_creation_input_tokens || 0;
+    const costo = (i * PRECIO_IA.in + o * PRECIO_IA.out + cr * PRECIO_IA.cache_read + cw * PRECIO_IA.cache_write) / 1000000;
+    await supabase.from('ia_uso').insert({ user_id: user_id, input_tokens: i, output_tokens: o, cache_read: cr, cache_creation: cw, cost_usd: costo });
+  } catch (e) {}
+}
+
 // ---- MercadoPago via REST (sin SDK, sin dependencias nuevas; fetch es global en Node 18+) ----
 async function mpFetch(path, metodo, cuerpo) {
   if (!MP_TOKEN) throw new Error('MercadoPago no configurado (falta MERCADOPAGO_ACCESS_TOKEN)');
@@ -1012,6 +1027,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
     if (resultado && resultado.reply) {
       await enviarWhatsapp(instanciaNombre, telefono, resultado.reply);
+      try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
       if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
     }
 
@@ -2571,6 +2587,45 @@ app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
     if (ids.length) { try { var ct = await supabase.from('contacts').select('id, name').in('id', ids); (ct.data || []).forEach(function(x){ nombres[x.id] = x.name; }); } catch(eC){} }
     var out = convs.map(function(c){ return { id: c.id, contacto: nombres[c.contact_id] || 'Contacto', status: c.status, ultimo: c.last_message || '', rol: c.last_role || '', fecha: c.updated_at }; });
     return res.json({ ok: true, conversaciones: out });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Consumo de IA en USD por periodo (rolling): hoy=24h, 7d, 30d, 365d. Global + por cliente + saldo estimado.
+app.get('/api/maestro/consumo', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var periodo = String((req.query && req.query.periodo) || '30d');
+    var dias = periodo === 'hoy' ? 1 : (periodo === '7d' ? 7 : (periodo === '365d' ? 365 : 30));
+    var desde = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
+    var u = await supabase.from('ia_uso').select('user_id, cost_usd, input_tokens, output_tokens').gte('created_at', desde).limit(100000);
+    var rows = u.data || [];
+    var totalCost = 0, totalIn = 0, totalOut = 0; var porCliente = {};
+    rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; totalCost += c; totalIn += r.input_tokens || 0; totalOut += r.output_tokens || 0; var pc = porCliente[r.user_id] || { cost: 0, msgs: 0 }; pc.cost += c; pc.msgs++; porCliente[r.user_id] = pc; });
+    var nombres = {};
+    var keys = Object.keys(porCliente);
+    if (keys.length) { try { var bs = await supabase.from('business_settings').select('user_id, company_name').in('user_id', keys); (bs.data || []).forEach(function(b){ nombres[b.user_id] = b.company_name; }); } catch(eN){} }
+    var ranking = keys.map(function(k){ return { user_id: k, empresa: nombres[k] || '(sin nombre)', cost: Math.round(porCliente[k].cost * 100) / 100, msgs: porCliente[k].msgs }; }).sort(function(a, b){ return b.cost - a.cost; });
+    // saldo estimado
+    var cfg = await supabase.from('superadmin_config').select('saldo_cargado, saldo_fecha').eq('id', 1).maybeSingle();
+    var saldoCargado = (cfg.data && cfg.data.saldo_cargado != null) ? Number(cfg.data.saldo_cargado) : null;
+    var saldoRestante = null;
+    if (saldoCargado != null && cfg.data.saldo_fecha) {
+      var ud = await supabase.from('ia_uso').select('cost_usd').gte('created_at', cfg.data.saldo_fecha).limit(100000);
+      var gastado = (ud.data || []).reduce(function(a, r){ return a + (Number(r.cost_usd) || 0); }, 0);
+      saldoRestante = Math.round((saldoCargado - gastado) * 100) / 100;
+    }
+    return res.json({ ok: true, periodo: periodo, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, ranking: ranking.slice(0, 50), saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Cargar saldo manual de Anthropic (la API no expone el saldo; el dueno lo ingresa al recargar)
+app.post('/api/maestro/saldo', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var monto = parseFloat(req.body && req.body.monto);
+    if (isNaN(monto)) return res.status(400).json({ error: 'Monto invalido' });
+    await supabase.from('superadmin_config').update({ saldo_cargado: monto, saldo_fecha: new Date().toISOString() }).eq('id', 1);
+    return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

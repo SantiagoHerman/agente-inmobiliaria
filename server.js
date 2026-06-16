@@ -536,26 +536,27 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const block = completion.content[0];
   const reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
 
-  if (conversation_id) {
-    // Traducir la respuesta de la IA al idioma base del sistema para que el asesor la lea (traductor bidireccional)
-    let contentOriginalAi = null;
-    let idiomaAi = null;
+  // 'reply' esta en el idioma base de la empresa (la IA SIEMPRE responde en ese idioma, ver instruccionIdioma).
+  // Si el traductor esta activo y el lead habla otro idioma, traducimos la respuesta al idioma del lead para ENVIARSELA,
+  // y guardamos la version en idioma base como content_original para que el asesor la lea (mismo criterio que el envio manual).
+  let replyCliente = reply; // lo que efectivamente se le envia al cliente por WhatsApp
+  let idiomaAi = null;
+  if (conversation_id && !modoPrueba) {
     try {
-      const traduccionAsesor = await traducir(reply, idiomaBase);
-      if (traduccionAsesor && traduccionAsesor.trim() !== reply.trim()) {
-        contentOriginalAi = traduccionAsesor; // version en el idioma base (lo que ve el asesor)
-        idiomaAi = idiomaBase;
+      const { data: convTrad } = await supabase.from('conversations').select('traductor_activo, idioma_lead').eq('id', conversation_id).maybeSingle();
+      if (convTrad && convTrad.traductor_activo && convTrad.idioma_lead && convTrad.idioma_lead !== idiomaBase) {
+        const trad = await traducir(reply, convTrad.idioma_lead);
+        if (trad && trad.trim() && trad.trim() !== reply.trim()) { replyCliente = trad; idiomaAi = convTrad.idioma_lead; }
       }
-    } catch (e) { /* si falla la traduccion, se guarda solo el original */ }
-    if (!modoPrueba) {
+    } catch (e) { console.error('trad saliente IA:', e && e.message); /* si falla, se envia el original en idioma base */ }
+    // content = lo que recibe el cliente (idioma del lead); content_original = version en idioma base para el asesor
     await supabase.from('messages').insert([
-      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: reply, content_original: contentOriginalAi, idioma: idiomaAi, enviado_por: 'Agente IA' }
+      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: 'Agente IA' }
     ]);
-    await supabase.from('conversations').update({ last_message: reply, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
-    }
+    await supabase.from('conversations').update({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }
 
-  return { reply: reply, usage: completion.usage };
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage };
 }
 
 // Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
@@ -1037,7 +1038,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     }
     const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
     if (resultado && resultado.reply) {
-      await enviarWhatsapp(instanciaNombre, telefono, resultado.reply);
+      await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
       try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
       if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
     }

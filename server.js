@@ -534,7 +534,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   });
 
   const block = completion.content[0];
-  const reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
+  let reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
+  if (!usaEmojis) { const _limpio = quitarEmojis(reply); if (_limpio) reply = _limpio; } // emojis desactivados en config: los sacamos si o si
 
   // 'reply' esta en el idioma base de la empresa (la IA SIEMPRE responde en ese idioma, ver instruccionIdioma).
   // Si el traductor esta activo y el lead habla otro idioma, traducimos la respuesta al idioma del lead para ENVIARSELA,
@@ -644,6 +645,16 @@ function partirMensaje(texto) {
   // si quedaron frases sueltas, agregarlas al ultimo grupo
   if (idx < frases.length) grupos[grupos.length - 1] += ' ' + frases.slice(idx).join(' ');
   return grupos.filter(Boolean);
+}
+// Quita emojis/emoticonos del texto. Se usa cuando el tenant los tiene DESACTIVADOS: no alcanza con pedirselo a la IA en el prompt, a veces igual los mete.
+function quitarEmojis(t) {
+  return String(t || '')
+    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '')
+    .replace(/\p{Extended_Pictographic}/gu, '')
+    .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]/gu, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .trim();
 }
 // Traduce un texto a un idioma destino usando el modelo. Devuelve el texto traducido (o el original si falla).
 async function traducir(texto, idiomaDestino) {

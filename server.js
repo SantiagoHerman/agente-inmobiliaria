@@ -2333,20 +2333,23 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
   } catch (e) { console.error('webhook mercadopago:', e && e.message); }
 });
 
-// ===== TEMPORAL: prueba de conexion con MercadoPago (BORRAR despues de testear) =====
-app.get('/api/mp-test', async function(req, res) {
+// ===== TEMPORAL: crea los 3 planes reales en MercadoPago (BORRAR despues de usar una vez) =====
+app.get('/api/mp-setup-planes', async function(req, res) {
   try {
     if ((req.query.k || '') !== 'rztest2026') return res.status(403).json({ error: 'no autorizado' });
-    if (!MP_TOKEN) return res.json({ ok: false, error: 'falta MERCADOPAGO_ACCESS_TOKEN en el entorno' });
-    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raicescrm.com') + '/suscripcion/listo';
-    var plan = await mpCrearPlan('Raices CRM - Plan de prueba', 5000, backUrl);
-    return res.json({
-      ok: true,
-      plan_id: (plan && plan.id) || null,
-      status: (plan && plan.status) || null,
-      init_point: (plan && plan.init_point) || null,
-      modo: String(MP_TOKEN).indexOf('TEST-') === 0 ? 'TEST' : 'PRODUCCION'
-    });
+    if (!MP_TOKEN) return res.json({ ok: false, error: 'falta MERCADOPAGO_ACCESS_TOKEN' });
+    var back = (process.env.BACKEND_PUBLIC_URL || 'https://raicescrm.com') + '/suscripcion/listo';
+    var defs = [
+      { key: 'basico',  nombre: 'Raices CRM - Plan Basico',  monto: 50000 },
+      { key: 'pro',     nombre: 'Raices CRM - Plan Pro',     monto: 120000 },
+      { key: 'premium', nombre: 'Raices CRM - Plan Premium', monto: 310000 }
+    ];
+    var out = {};
+    for (var i = 0; i < defs.length; i++) {
+      var p = await mpCrearPlan(defs[i].nombre, defs[i].monto, back);
+      out[defs[i].key] = { id: (p && p.id) || null, init_point: (p && p.init_point) || null };
+    }
+    return res.json({ ok: true, modo: String(MP_TOKEN).indexOf('TEST-') === 0 ? 'TEST' : 'PRODUCCION', planes: out });
   } catch (e) { return res.json({ ok: false, error: e && e.message }); }
 });
 

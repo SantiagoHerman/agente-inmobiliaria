@@ -2484,4 +2484,21 @@ app.post('/api/maestro/soporte/:id/responder', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// Impersonar: genera un acceso de un solo uso al dashboard del cliente (sin su clave)
+app.post('/api/maestro/cliente/:id/impersonar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.params.id;
+    var u = await supabase.auth.admin.getUserById(uid);
+    var email = u && u.data && u.data.user && u.data.user.email;
+    if (!email) return res.status(404).json({ error: 'El cliente no tiene email asociado' });
+    var link = await supabase.auth.admin.generateLink({ type: 'magiclink', email: email });
+    if ((link && link.error) || !link || !link.data || !link.data.properties || !link.data.properties.hashed_token) {
+      return res.status(500).json({ error: (link && link.error && link.error.message) || 'No se pudo generar el acceso' });
+    }
+    try { await supabase.from('admin_audit').insert({ accion: 'impersonar', target_user_id: uid, detalle: email }); } catch(eA){}
+    return res.json({ ok: true, token_hash: link.data.properties.hashed_token, email: email });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

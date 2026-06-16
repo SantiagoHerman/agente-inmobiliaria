@@ -2653,6 +2653,42 @@ app.post('/api/suscripcion/cancelar', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// Genera un resumen breve de la conversacion con IA (para que el asesor se ponga al dia sin leer todo el chat)
+async function generarResumenConversacion(conversation_id, user_id) {
+  try {
+    const r = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
+    const msgs = r.data || [];
+    if (msgs.length === 0) return null;
+    const transcripcion = msgs.map(function(m){ const quien = m.role === 'contact' ? 'Cliente' : (m.role === 'ai' ? 'Asistente' : 'Asesor'); return quien + ': ' + (m.content_original || m.content || ''); }).join('\n').slice(0, 12000);
+    const comp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 400,
+      system: 'Sos un asistente de un CRM inmobiliario. Resumi esta conversacion entre un cliente y el negocio para que un asesor humano se ponga al dia en 10 segundos. Devolve un resumen breve (4 a 6 lineas) que incluya: que busca el cliente (tipo de propiedad, zona, presupuesto si lo menciono), su nivel de interes, que se le respondio, y cual es el proximo paso pendiente. Escribi en espanol rioplatense, directo, sin saludos ni titulos, solo el resumen.',
+      messages: [ { role: 'user', content: 'Conversacion:\n' + transcripcion } ]
+    });
+    try { if (typeof registrarUsoTokens === 'function' && comp && comp.usage) await registrarUsoTokens(user_id, comp.usage); } catch(eU){}
+    const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim() : '';
+    return out || null;
+  } catch (e) { console.error('Error generando resumen:', e && e.message); return null; }
+}
+
+// Generar/actualizar el resumen IA de una conversacion (read-only para el asesor)
+app.post('/api/conversations/resumen', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var conversation_id = req.body && req.body.conversation_id;
+    if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
+    var c = await supabase.from('conversations').select('user_id').eq('id', conversation_id).maybeSingle();
+    if (!c.data) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    if (c.data.user_id !== uid) return res.status(403).json({ error: 'No autorizado' });
+    var resumen = await generarResumenConversacion(conversation_id, uid);
+    if (!resumen) return res.status(422).json({ error: 'No se pudo generar el resumen (sin mensajes o error de IA)' });
+    await supabase.from('conversations').update({ summary: resumen, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    return res.json({ ok: true, summary: resumen });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // CRON suscripciones: dunning (past_due con +3 dias de gracia -> suspended) + reset mensual del contador de mensajes IA. Inerte si SUBSCRIPTIONS_ENABLED=false.
 async function revisarSuscripciones() {
   try {

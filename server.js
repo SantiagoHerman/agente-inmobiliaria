@@ -171,6 +171,7 @@ async function planActual(user_id) {
   if (!SUBSCRIPTIONS_ENABLED) return PLAN_DEFECTO;
   const sub = await getSubscription(user_id);
   if (!sub) return PLAN_DEFECTO; // sin fila todavia: no bloquear
+  if (sub.cortesia === true) return PLAN_DEFECTO; // cortesia: acceso libre con features plenas
   const activo = (sub.status === 'active' || sub.status === 'trial');
   const vigente = !sub.current_period_end || new Date(sub.current_period_end).getTime() >= Date.now();
   if (!activo || !vigente) return 'basico'; // suscripcion caida: cae al minimo, no corta del todo
@@ -198,7 +199,8 @@ async function dentroDelTopeIA(user_id) {
   const plan = await planActual(user_id);
   const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
   let tope = lim.ai_messages;
-  if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // override del panel maestro
+  if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages; // override por cliente (panel maestro)
+  else if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // compat override viejo
   if (tope === Infinity) return true;
   const usado = (sub && typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
   return usado < tope;
@@ -996,7 +998,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       try {
         const _sub = await getSubscription(user_id);
         const _est = _sub ? _sub.status : null;
-        if (_est === 'cancelled' || _est === 'suspended') {
+        const _cortesia = _sub && _sub.cortesia === true;
+        if (!_cortesia && (_est === 'cancelled' || _est === 'suspended')) {
           await enviarWhatsapp(instanciaNombre, telefono, 'El servicio esta momentaneamente pausado. El administrador debe regularizar la suscripcion para continuar.');
           return;
         }
@@ -2397,6 +2400,8 @@ app.post('/api/maestro/setup', async function(req, res){
     if (!MAESTRO_ENABLED) return res.status(404).json({ error: 'no disponible' });
     var boot = (req.body && req.body.bootstrap) ? String(req.body.bootstrap) : '';
     if (!MAESTRO_BOOTSTRAP || boot !== MAESTRO_BOOTSTRAP) return res.status(403).json({ error: 'bootstrap invalido' });
+    var yaConfig = await supabase.from('superadmin_config').select('id').eq('id', 1).maybeSingle();
+    if (yaConfig && yaConfig.data) return res.status(409).json({ error: 'El panel ya esta configurado. Para reconfigurarlo hay que borrar la fila de superadmin_config en Supabase (a proposito, por seguridad).' });
     var pass = (req.body && req.body.password) ? String(req.body.password) : '';
     if (pass.length < 8) return res.status(400).json({ error: 'La contrasena debe tener al menos 8 caracteres' });
     var salt = _cripto.randomBytes(16).toString('hex');
@@ -2426,9 +2431,13 @@ app.get('/api/maestro/clientes', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado');
-    var subs = await supabase.from('subscriptions').select('user_id, plan, status, ai_messages_this_period, current_period_end');
+    var subs = await supabase.from('subscriptions').select('user_id, plan, status, ai_messages_this_period, current_period_end, cortesia, limits_override');
     var byUser = {}; (subs.data || []).forEach(function(s){ byUser[s.user_id] = s; });
-    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', pausado: b.crm_pausado === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, vence: s.current_period_end || null }; });
+    var act = {}; try { var cv = await supabase.from('conversations').select('user_id, updated_at').order('updated_at', { ascending: false }).limit(3000); (cv.data || []).forEach(function(r){ if (!act[r.user_id]) act[r.user_id] = r.updated_at; }); } catch(eAct){}
+    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; var topeOv = (s.limits_override && typeof s.limits_override.ai_messages === 'number') ? s.limits_override.ai_messages : null; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', pausado: b.crm_pausado === true, cortesia: s.cortesia === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, tope: topeOv, vence: s.current_period_end || null, ultima_actividad: act[b.user_id] || null }; });
+    try { var est = await Promise.all(clientes.map(function(c){ return Promise.race([ instanciaConectada(nombreInstancia(c.user_id)).catch(function(){ return null; }), new Promise(function(rz){ setTimeout(function(){ rz(null); }, 4000); }) ]); })); clientes.forEach(function(c, i){ c.whatsapp = (est[i] === true) ? 'conectado' : (est[i] === false ? 'desconectado' : 'desconocido'); }); } catch(eW){ clientes.forEach(function(c){ c.whatsapp = 'desconocido'; }); }
+    var ahora = Date.now();
+    clientes.forEach(function(c){ var sal = 'ok'; if (c.pausado) sal = 'pausada'; else if (c.whatsapp === 'desconectado') sal = 'whatsapp'; else if (c.tope && c.ai_mes >= c.tope) sal = 'tope'; else if (c.ultima_actividad && (ahora - new Date(c.ultima_actividad).getTime()) > 7 * 24 * 3600 * 1000) sal = 'inactivo'; c.salud = sal; });
     var totalIA = clientes.reduce(function(a, c){ return a + (c.ai_mes || 0); }, 0);
     return res.json({ ok: true, total_clientes: clientes.length, total_ai_mes: totalIA, costo_estimado_usd: Math.round(totalIA * 0.01 * 100) / 100, clientes: clientes });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -2440,13 +2449,31 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var uid = req.params.id;
     var bs = await supabase.from('business_settings').select('*').eq('user_id', uid).maybeSingle();
-    var convs = await supabase.from('conversations').select('status').eq('user_id', uid);
+    var B = bs.data || {};
+    var convs = await supabase.from('conversations').select('status, updated_at').eq('user_id', uid).order('updated_at', { ascending: false });
     var stats = { conversaciones: 0, interesado: 0, listo_humano: 0, cerrado: 0, recontacto: 0 };
     (convs.data || []).forEach(function(c){ stats.conversaciones++; if (stats[c.status] !== undefined) stats[c.status]++; });
+    var ultimaActividad = (convs.data && convs.data[0]) ? convs.data[0].updated_at : null;
     var cont = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('user_id', uid);
     var msgs = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', uid).eq('role', 'ai');
+    var props = await supabase.from('properties').select('id', { count: 'exact', head: true }).eq('user_id', uid);
+    var kb = await supabase.from('knowledge_base').select('question', { count: 'exact', head: true }).eq('user_id', uid);
+    var ases = await supabase.from('asesores').select('activo').eq('admin_id', uid);
+    var asesoresTotal = (ases.data || []).length;
+    var asesoresActivos = (ases.data || []).filter(function(a){ return a.activo === true; }).length;
     var sub = await supabase.from('subscriptions').select('*').eq('user_id', uid).maybeSingle();
-    return res.json({ ok: true, empresa: (bs.data && bs.data.company_name) || null, rubro: (bs.data && bs.data.rubro) || null, pausado: !!(bs.data && bs.data.crm_pausado), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), suscripcion: sub.data || null });
+    var S = sub.data || null;
+    var ultimoLogin = null; try { var u = await supabase.auth.admin.getUserById(uid); ultimoLogin = (u && u.data && u.data.user) ? u.data.user.last_sign_in_at : null; } catch(eL){}
+    var wa = 'desconocido'; try { wa = (await instanciaConectada(nombreInstancia(uid))) ? 'conectado' : 'desconectado'; } catch(eWa){}
+    var planCli = (S && S.cortesia === true) ? 'premium' : ((S && PLAN_LIMITS[S.plan]) ? S.plan : 'premium');
+    var ov = (S && S.limits_override) || {};
+    function lef(k){ return (typeof ov[k] !== 'undefined' && ov[k] !== null) ? ov[k] : (PLAN_LIMITS[planCli] ? PLAN_LIMITS[planCli][k] : null); }
+    var limites = { ai_messages: lef('ai_messages'), asesores: lef('asesores'), contactos: lef('contactos'), propiedades: (typeof ov.propiedades !== 'undefined' && ov.propiedades !== null) ? ov.propiedades : null };
+    var config = { agente: B.agent_name || 'Asistente', cargo: B.agent_cargo || '', tono: B.agent_tone || 'cercano', autonomia: B.autonomy || 'equilibrado', objetivo: B.agent_objetivo || 'informar', largo: B.response_length || 'corto', emojis: B.use_emojis === true, idioma: B.idioma || 'es', instrucciones: B.instructions || '' };
+    var nConv = stats.conversaciones || 0;
+    var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
+    var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -2461,6 +2488,12 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
     } else if (accion === 'limite') {
       var lim = parseInt(req.body && req.body.ai_messages, 10);
       if (!isNaN(lim)) await supabase.from('subscriptions').upsert({ user_id: uid, ai_messages_limit_override: lim }, { onConflict: 'user_id' });
+    } else if (accion === 'limites') {
+      var ov = {};
+      ['ai_messages', 'asesores', 'contactos', 'propiedades'].forEach(function(k){ var v = req.body && req.body[k]; if (v === '' || v === null || typeof v === 'undefined') return; var n = parseInt(v, 10); if (!isNaN(n)) ov[k] = n; });
+      await supabase.from('subscriptions').upsert({ user_id: uid, limits_override: ov }, { onConflict: 'user_id' });
+    } else if (accion === 'cortesia') {
+      await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: (req.body && req.body.activo === true) }, { onConflict: 'user_id' });
     } else { return res.status(400).json({ error: 'Accion invalida' }); }
     try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify(req.body || {}) }); } catch(eA){}
     return res.json({ ok: true });

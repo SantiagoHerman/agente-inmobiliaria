@@ -141,6 +141,8 @@ const LARGO = {
 // SUBSCRIPTIONS_ENABLED=true y requiere la tabla public.subscriptions.
 // Mientras este apagado, TODO se permite => no afecta a los tenants actuales.
 const SUBSCRIPTIONS_ENABLED = String(process.env.SUBSCRIPTIONS_ENABLED || '').toLowerCase() === 'true';
+// Fecha ISO de corte: los clientes creados DESDE aca deben suscribirse; los anteriores quedan grandfathered (gratis). Vacio = nadie obligado.
+const TRIAL_DESDE = process.env.TRIAL_DESDE || '';
 const MP_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
 const MP_BASE = 'https://api.mercadopago.com';
 // IDs globales de los planes en MercadoPago (creados 2026-06-16). Son del SaaS, compartidos por todos los tenants.
@@ -1014,6 +1016,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const _sub = await getSubscription(user_id);
         const _est = _sub ? _sub.status : null;
         const _cortesia = _sub && _sub.cortesia === true;
+        // Cliente NUEVO (creado desde TRIAL_DESDE) sin suscripcion: debe suscribirse para activar la IA. Los anteriores quedan grandfathered.
+        if (!_sub && TRIAL_DESDE) {
+          var _esNuevo = false;
+          try { var _u = await supabase.auth.admin.getUserById(user_id); var _ca = _u && _u.data && _u.data.user && _u.data.user.created_at; if (_ca && new Date(_ca).getTime() >= new Date(TRIAL_DESDE).getTime()) _esNuevo = true; } catch (eC) {}
+          if (_esNuevo) {
+            await enviarWhatsapp(instanciaNombre, telefono, 'Para activar el asistente, el administrador debe iniciar la suscripcion (incluye 4 dias de prueba gratis).');
+            return;
+          }
+        }
         if (!_cortesia && (_est === 'cancelled' || _est === 'suspended')) {
           await enviarWhatsapp(instanciaNombre, telefono, 'El servicio esta momentaneamente pausado. El administrador debe regularizar la suscripcion para continuar.');
           return;

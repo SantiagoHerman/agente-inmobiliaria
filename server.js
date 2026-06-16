@@ -194,11 +194,14 @@ async function usoMensajesIA(user_id) {
 // True si el tenant sigue dentro del tope de mensajes IA de su plan.
 async function dentroDelTopeIA(user_id) {
   if (!SUBSCRIPTIONS_ENABLED) return true;
+  const sub = await getSubscription(user_id);
   const plan = await planActual(user_id);
   const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
-  if (lim.ai_messages === Infinity) return true;
-  const usado = await usoMensajesIA(user_id);
-  return usado < lim.ai_messages;
+  let tope = lim.ai_messages;
+  if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // override del panel maestro
+  if (tope === Infinity) return true;
+  const usado = (sub && typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
+  return usado < tope;
 }
 
 // Suma 1 al contador de mensajes IA del periodo (best-effort, no rompe si falla).
@@ -2357,5 +2360,128 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
 });
 
 // (endpoint temporal /api/mp-setup-planes eliminado: los 3 planes ya estan creados y sus IDs viven en PLANES_MP)
+
+// ===== SOPORTE: el cliente envia un mensaje (error/sugerencia/modificacion) que llega al panel maestro =====
+app.post('/api/soporte', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var categoria = (req.body && req.body.categoria) ? String(req.body.categoria).slice(0, 40) : 'consulta';
+    var mensaje = (req.body && req.body.mensaje) ? String(req.body.mensaje).slice(0, 4000) : '';
+    if (!mensaje.trim()) return res.status(400).json({ error: 'El mensaje esta vacio' });
+    var ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto' });
+    if (ins.error) { console.error('soporte insert:', ins.error.message); return res.status(503).json({ error: 'El soporte se esta habilitando, intenta mas tarde' }); }
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== PANEL MAESTRO (superadmin/creador) — DOBLE GATEADO: MAESTRO_ENABLED + credenciales (dormido si no se activa) =====
+const _cripto = require('crypto');
+const MAESTRO_ENABLED = String(process.env.MAESTRO_ENABLED || '').toLowerCase() === 'true';
+const MAESTRO_SECRET = process.env.MAESTRO_SECRET || ('rz-maestro-' + String(process.env.SUPABASE_SERVICE_KEY || 'x').slice(0, 16));
+const MAESTRO_BOOTSTRAP = process.env.MAESTRO_BOOTSTRAP || '';
+
+// TOTP (RFC 6238, SHA1, 6 digitos, ventana +-30s) sin dependencias
+function _b32dec(s){ var a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; var bits=''; s=String(s).replace(/=+$/,'').toUpperCase(); for(var i=0;i<s.length;i++){ var idx=a.indexOf(s[i]); if(idx<0) continue; bits+=idx.toString(2).padStart(5,'0'); } var bytes=[]; for(var j=0;j+8<=bits.length;j+=8){ bytes.push(parseInt(bits.slice(j,j+8),2)); } return Buffer.from(bytes); }
+function _totpAt(secret, counter){ var key=_b32dec(secret); var buf=Buffer.alloc(8); buf.writeUInt32BE(Math.floor(counter/4294967296),0); buf.writeUInt32BE(counter>>>0,4); var h=_cripto.createHmac('sha1',key).update(buf).digest(); var o=h[h.length-1]&0xf; var n=((h[o]&0x7f)<<24)|((h[o+1]&0xff)<<16)|((h[o+2]&0xff)<<8)|(h[o+3]&0xff); return String(n%1000000).padStart(6,'0'); }
+function _totpOk(secret, code){ if(!secret||!code) return false; var c=Math.floor(Date.now()/1000/30); for(var w=-1;w<=1;w++){ if(_totpAt(secret,c+w)===String(code).trim()) return true; } return false; }
+function _totpNuevo(){ var a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; var b=_cripto.randomBytes(32); var s=''; for(var i=0;i<32;i++) s+=a[b[i]%32]; return s; }
+function _hashPass(p, salt){ return _cripto.scryptSync(String(p), String(salt), 32).toString('hex'); }
+function _maestroToken(){ var payload=Buffer.from(JSON.stringify({ exp: Math.floor(Date.now()/1000)+3600 })).toString('base64'); var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(payload).digest('hex'); return payload+'.'+sig; }
+function _maestroTokenOk(tok){ try{ if(!tok) return false; var parts=String(tok).split('.'); if(parts.length!==2) return false; var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(parts[0]).digest('hex'); if(sig!==parts[1]) return false; var p=JSON.parse(Buffer.from(parts[0],'base64').toString()); return p.exp > Math.floor(Date.now()/1000); }catch(e){ return false; } }
+function maestroAuth(req){ var auth=req.headers.authorization||req.headers.Authorization||''; var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null; return _maestroTokenOk(tok); }
+
+// Setup inicial (una vez): requiere el bootstrap (env MAESTRO_BOOTSTRAP). Devuelve el secreto TOTP para cargar en la app autenticadora.
+app.post('/api/maestro/setup', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED) return res.status(404).json({ error: 'no disponible' });
+    var boot = (req.body && req.body.bootstrap) ? String(req.body.bootstrap) : '';
+    if (!MAESTRO_BOOTSTRAP || boot !== MAESTRO_BOOTSTRAP) return res.status(403).json({ error: 'bootstrap invalido' });
+    var pass = (req.body && req.body.password) ? String(req.body.password) : '';
+    if (pass.length < 8) return res.status(400).json({ error: 'La contrasena debe tener al menos 8 caracteres' });
+    var salt = _cripto.randomBytes(16).toString('hex');
+    var totp = _totpNuevo();
+    var up = await supabase.from('superadmin_config').upsert({ id: 1, password_hash: _hashPass(pass, salt), password_salt: salt, totp_secret: totp }, { onConflict: 'id' });
+    if (up.error) return res.status(503).json({ error: 'Falta la tabla superadmin_config: ' + up.error.message });
+    return res.json({ ok: true, totp_secret: totp, otpauth: 'otpauth://totp/RaicesCRM-Maestro?secret=' + totp + '&issuer=RaicesCRM' });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Login: contrasena + codigo TOTP -> token de sesion maestro (1h)
+app.post('/api/maestro/login', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED) return res.status(404).json({ error: 'no disponible' });
+    var pass = (req.body && req.body.password) ? String(req.body.password) : '';
+    var code = (req.body && req.body.code) ? String(req.body.code) : '';
+    var cfg = await supabase.from('superadmin_config').select('*').eq('id', 1).maybeSingle();
+    if (!cfg.data) return res.status(403).json({ error: 'Panel no configurado' });
+    if (_hashPass(pass, cfg.data.password_salt) !== cfg.data.password_hash) return res.status(403).json({ error: 'Credenciales invalidas' });
+    if (!_totpOk(cfg.data.totp_secret, code)) return res.status(403).json({ error: 'Codigo invalido' });
+    return res.json({ ok: true, token: _maestroToken() });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Lista de clientes + stats globales
+app.get('/api/maestro/clientes', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado');
+    var subs = await supabase.from('subscriptions').select('user_id, plan, status, ai_messages_this_period, current_period_end');
+    var byUser = {}; (subs.data || []).forEach(function(s){ byUser[s.user_id] = s; });
+    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', pausado: b.crm_pausado === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, vence: s.current_period_end || null }; });
+    var totalIA = clientes.reduce(function(a, c){ return a + (c.ai_mes || 0); }, 0);
+    return res.json({ ok: true, total_clientes: clientes.length, total_ai_mes: totalIA, costo_estimado_usd: Math.round(totalIA * 0.01 * 100) / 100, clientes: clientes });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Detalle de un cliente
+app.get('/api/maestro/cliente/:id', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.params.id;
+    var bs = await supabase.from('business_settings').select('*').eq('user_id', uid).maybeSingle();
+    var convs = await supabase.from('conversations').select('status').eq('user_id', uid);
+    var stats = { conversaciones: 0, interesado: 0, listo_humano: 0, cerrado: 0, recontacto: 0 };
+    (convs.data || []).forEach(function(c){ stats.conversaciones++; if (stats[c.status] !== undefined) stats[c.status]++; });
+    var cont = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('user_id', uid);
+    var msgs = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', uid).eq('role', 'ai');
+    var sub = await supabase.from('subscriptions').select('*').eq('user_id', uid).maybeSingle();
+    return res.json({ ok: true, empresa: (bs.data && bs.data.company_name) || null, rubro: (bs.data && bs.data.rubro) || null, pausado: !!(bs.data && bs.data.crm_pausado), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), suscripcion: sub.data || null });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Accion sobre un cliente: pausar/reactivar IA o cambiar limite particular
+app.post('/api/maestro/cliente/:id/accion', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.params.id;
+    var accion = (req.body && req.body.accion) ? String(req.body.accion) : '';
+    if (accion === 'pausar' || accion === 'reactivar') {
+      await supabase.from('business_settings').update({ crm_pausado: (accion === 'pausar') }).eq('user_id', uid);
+    } else if (accion === 'limite') {
+      var lim = parseInt(req.body && req.body.ai_messages, 10);
+      if (!isNaN(lim)) await supabase.from('subscriptions').upsert({ user_id: uid, ai_messages_limit_override: lim }, { onConflict: 'user_id' });
+    } else { return res.status(400).json({ error: 'Accion invalida' }); }
+    try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify(req.body || {}) }); } catch(eA){}
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Bandeja de soporte (mensajes de los clientes)
+app.get('/api/maestro/soporte', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var m = await supabase.from('support_messages').select('*').order('created_at', { ascending: false }).limit(200);
+    return res.json({ ok: true, mensajes: m.data || [] });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/maestro/soporte/:id/responder', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var resp = (req.body && req.body.respuesta) ? String(req.body.respuesta) : '';
+    await supabase.from('support_messages').update({ respuesta: resp, estado: 'resuelto' }).eq('id', req.params.id);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

@@ -2640,4 +2640,24 @@ app.post('/api/maestro/saldo', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// CRON suscripciones: dunning (past_due con +3 dias de gracia -> suspended) + reset mensual del contador de mensajes IA. Inerte si SUBSCRIPTIONS_ENABLED=false.
+async function revisarSuscripciones() {
+  try {
+    if (!SUBSCRIPTIONS_ENABLED) return;
+    var ahora = Date.now();
+    var subs = await supabase.from('subscriptions').select('*');
+    for (var k = 0; k < (subs.data || []).length; k++) {
+      var s = subs.data[k];
+      var updates = {};
+      if (s.status === 'past_due' && s.current_period_end && (ahora - new Date(s.current_period_end).getTime()) > 3 * 24 * 3600 * 1000) updates.status = 'suspended';
+      var ini = s.period_start ? new Date(s.period_start).getTime() : null;
+      if (!ini) updates.period_start = new Date(ahora).toISOString();
+      else if (ahora - ini > 30 * 24 * 3600 * 1000) { updates.ai_messages_this_period = 0; updates.period_start = new Date(ahora).toISOString(); }
+      if (Object.keys(updates).length) { try { await supabase.from('subscriptions').update(updates).eq('user_id', s.user_id); } catch (eU) {} }
+    }
+  } catch (e) { console.error('revisarSuscripciones:', e && e.message); }
+}
+setInterval(revisarSuscripciones, 6 * 60 * 60 * 1000);
+setTimeout(revisarSuscripciones, 120 * 1000);
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

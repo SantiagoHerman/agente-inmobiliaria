@@ -1865,6 +1865,126 @@ async function clasificarTemperatura(textoUsuario) {
     return null;
   } catch (e) { console.log('clasificarTemperatura error:', e && e.message); return null; }
 }
+// ===== FASE 3: AUTO-CATALOGO DE FOTOS POR VISION =====
+// Clasifica fotos de propiedades en una categoria (dormitorio, baño, etc) usando vision de Claude.
+// Endpoint nuevo y aislado: NO toca el flujo del agente, webhook, debounce ni memoria.
+const CATEGORIAS_FOTO = ['dormitorio', 'baño', 'cocina', 'comedor', 'living', 'parque', 'frente', 'pileta', 'cochera', 'exterior', 'otra'];
+// Normaliza acentos y mayusculas para comparar contra la lista de categorias.
+function normalizarTexto(s) {
+  return (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+}
+// Devuelve una categoria valida (sin acentos) a partir del texto crudo de Claude; si no matchea -> 'otra'.
+function matchearCategoriaFoto(textoCrudo) {
+  const norm = normalizarTexto(textoCrudo);
+  if (!norm) return 'otra';
+  // Mapa normalizado -> categoria canonica (con acento donde corresponde)
+  for (let i = 0; i < CATEGORIAS_FOTO.length; i++) {
+    const cat = CATEGORIAS_FOTO[i];
+    if (normalizarTexto(cat) === norm) return cat;
+  }
+  // Match por inclusion (la respuesta puede traer palabras de mas, ej "es un dormitorio")
+  for (let i = 0; i < CATEGORIAS_FOTO.length; i++) {
+    const cat = CATEGORIAS_FOTO[i];
+    if (norm.indexOf(normalizarTexto(cat)) >= 0) return cat;
+  }
+  return 'otra';
+}
+const PROMPT_CLASIFICAR_FOTO = 'Clasifica esta foto de una propiedad inmobiliaria en UNA sola palabra de esta lista exacta: dormitorio, baño, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Responde SOLO la palabra.';
+// Fallback: descarga la imagen y la manda como base64 (cuando source.type:'url' falla o hay duda).
+async function clasificarFotoBase64(url) {
+  const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  let mediaType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  // La API de vision solo acepta estos tipos; default a jpeg si viene algo raro.
+  if (['image/jpeg', 'image/png', 'image/gif', 'image/webp'].indexOf(mediaType) < 0) mediaType = 'image/jpeg';
+  const buf = Buffer.from(await resp.arrayBuffer());
+  const r = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 10,
+    messages: [{ role: 'user', content: [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: buf.toString('base64') } },
+      { type: 'text', text: PROMPT_CLASIFICAR_FOTO }
+    ] }]
+  });
+  return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+}
+// Clasifica una sola foto: primero intenta source.type:'url' (soportado por el SDK 0.91), y si falla cae a base64.
+async function clasificarFotoUna(url) {
+  try {
+    const r = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'url', url: url } },
+        { type: 'text', text: PROMPT_CLASIFICAR_FOTO }
+      ] }]
+    });
+    const t = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+    return matchearCategoriaFoto(t);
+  } catch (eUrl) {
+    console.log('clasificar-fotos url fallo, probando base64:', eUrl && eUrl.message);
+    try {
+      const t2 = await clasificarFotoBase64(url);
+      return matchearCategoriaFoto(t2);
+    } catch (eB64) {
+      console.log('clasificar-fotos base64 tambien fallo:', eB64 && eB64.message);
+      return 'otra';
+    }
+  }
+}
+app.post('/api/clasificar-fotos', async (req, res) => {
+  try {
+    const _uid = await verificarUsuario(req);
+    if (!_uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const body = req.body || {};
+    const urls = Array.isArray(body.urls) ? body.urls.filter(function(u){ return typeof u === 'string' && u.trim(); }) : [];
+    const property_id = body.property_id;
+    if (!urls.length) return res.status(400).json({ error: 'Falta urls (array de strings)' });
+    // Concurrencia limitada: procesar de a 4 en paralelo para no saturar la API.
+    const LOTE = 4;
+    const resultados = [];
+    for (let i = 0; i < urls.length; i += LOTE) {
+      const lote = urls.slice(i, i + LOTE);
+      const parciales = await Promise.all(lote.map(async function(u) {
+        try {
+          const categoria = await clasificarFotoUna(u);
+          return { url: u, categoria: categoria };
+        } catch (e) {
+          console.log('clasificar-fotos error foto:', e && e.message);
+          return { url: u, categoria: 'otra' };
+        }
+      }));
+      for (let j = 0; j < parciales.length; j++) resultados.push(parciales[j]);
+    }
+    // Opcional: si viene property_id, persistir el catalogo en properties.images (no rompe si falla).
+    if (property_id) {
+      try {
+        const mapa = {};
+        for (let k = 0; k < resultados.length; k++) mapa[resultados[k].url] = resultados[k].categoria;
+        const { data: prop } = await supabase.from('properties').select('images, user_id').eq('id', property_id).maybeSingle();
+        if (prop && prop.user_id === _uid) {
+          let imgs = prop.images;
+          if (Array.isArray(imgs)) {
+            imgs = imgs.map(function(it) {
+              if (typeof it === 'string') {
+                return mapa[it] ? { url: it, categoria: mapa[it] } : { url: it };
+              }
+              if (it && typeof it === 'object' && it.url && mapa[it.url]) {
+                return Object.assign({}, it, { categoria: mapa[it.url] });
+              }
+              return it;
+            });
+            await supabase.from('properties').update({ images: imgs }).eq('id', property_id);
+          }
+        }
+      } catch (ePersist) { console.log('clasificar-fotos persistir images fallo (no critico):', ePersist && ePersist.message); }
+    }
+    return res.json({ ok: true, resultados: resultados });
+  } catch (e) {
+    console.error('clasificar-fotos error:', e && e.message);
+    if (!res.headersSent) return res.status(500).json({ error: e && e.message });
+  }
+});
 // ===== FASE 2: IMPORTAR LEADS AL CONECTAR =====
 // Paso 1: listar los chats existentes en el WhatsApp (sin guardar)
 app.get('/api/whatsapp/listar-chats', async function(req, res) {

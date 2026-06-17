@@ -2707,10 +2707,80 @@ app.post('/api/soporte', async function(req, res) {
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     var categoria = (req.body && req.body.categoria) ? String(req.body.categoria).slice(0, 40) : 'consulta';
     var mensaje = (req.body && req.body.mensaje) ? String(req.body.mensaje).slice(0, 4000) : '';
+    var telefono = (req.body && req.body.telefono) ? String(req.body.telefono).replace(/[^0-9+ ]/g, '').slice(0, 30) : '';
     if (!mensaje.trim()) return res.status(400).json({ error: 'El mensaje esta vacio' });
-    var ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto' });
+    // DEFENSIVO: intentar con telefono; si la columna aun no existe (migracion pendiente), reintentar sin el. Soporte nunca se rompe.
+    var ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto', telefono: telefono });
+    if (ins.error && /telefono|column|does not exist|schema cache/i.test(String(ins.error.message || ''))) {
+      ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto' });
+    }
     if (ins.error) { console.error('soporte insert:', ins.error.message); return res.status(503).json({ error: 'El soporte se esta habilitando, intenta mas tarde' }); }
     return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== AGENTE DE IA DE SOPORTE: responde dudas del cliente sobre como funciona el CRM, y escala a humano si hace falta =====
+// Conocimiento del producto CONDENSADO a partir de las 9 secciones de la pagina de Ayuda (texto embebido, sin imports cross-repo).
+var CONOCIMIENTO_SOPORTE = [
+  'CRM Raices: CRM inmobiliario con un agente de IA (Sofia) que responde a tus leads por WhatsApp. Secciones del producto:',
+  '',
+  '1) PANEL PRINCIPAL (Dashboard): pantalla de inicio. Muestra de un vistazo cuantas conversaciones tenes, cuantas necesitan atencion de un humano, cuantas estan en recontacto y cuantas se cerraron. Los numeros se actualizan solos. Las tarjetas de arriba son un resumen (mira sobre todo "Necesitan atencion"); mas abajo ves las conversaciones recientes con su estado. Usa el menu para entrar a cada seccion.',
+  '',
+  '2) CONVERSACIONES: es el corazon del CRM. Aca ves todos los chats con tus leads de WhatsApp, Instagram y Messenger en un solo lugar y podes responder vos cuando haga falta. A la izquierda la lista de chats; a la derecha la conversacion abierta. Cada chat tiene un estado (en conversacion, interesado, listo para humano, recontacto, cerrado). La IA responde sola salvo que la pauses o el chat pase a "Listo para humano" (ahi la IA se apaga sola en ese chat). Usa "Tomar conversacion" para responder vos y "Devolver a IA" para reactivarla. Escribi abajo para mandar un mensaje manual.',
+  '',
+  '3) INTEGRACIONES (conectar WhatsApp): aca conectas tu numero de WhatsApp para que Sofia empiece a responder. Al conectar se genera un codigo QR que escaneas con tu telefono (como WhatsApp Web). Una vez conectado, los mensajes entran solos a Conversaciones. El boton "IA ACTIVA / IA PAUSADA" frena o reactiva las respuestas automaticas de toda la cuenta (los mensajes igual llegan). Tambien podes importar tus contactos anteriores desde aca.',
+  '',
+  '4) INVENTARIO (propiedades): es el listado de propiedades o unidades que ofreces. Sofia usa este inventario para responder con datos reales (precios, zonas, caracteristicas). Cada propiedad tiene tipo, operacion (venta/alquiler), zona, precio y detalles. Podes importar tu inventario para cargarlo de una. Cuanto mejor cargado este, mas precisas son las respuestas del agente.',
+  '',
+  '5) RECONTACTOS: sirve para no perder leads que se enfriaron. La IA vuelve a escribirles sola a los que dejaron de responder, hasta cierta cantidad de intentos y dentro del horario que configures. Revisa los leads en cola de recontacto; el sistema los contacta solo segun la configuracion. El horario y la cantidad de intentos se configuran en Configuracion.',
+  '',
+  '6) ASESORES: te permite dar acceso a tu equipo de ventas. Cada asesor entra con su propio usuario y ve las conversaciones que le corresponden. Vos (administrador) creas los asesores con usuario y clave; ellos entran a una version del CRM enfocada en atender los chats asignados. Podes activarlos, desactivarlos o cambiarles la clave. Para crear uno: "Crear nuevo asesor" y carga nombre, usuario y clave.',
+  '',
+  '7) CONFIGURACION DEL AGENTE: aca defines como se comporta Sofia: el rubro del negocio, el tono, hasta donde avanza con el lead, el idioma base y el horario de oficina. El rubro ajusta el vocabulario, el tono define si es mas formal o cercano, y el objetivo define hasta donde lleva al lead antes de derivarlo a un humano. Elegi rubro, tono y nivel de autonomia, defini idioma y horario, y apreta "Guardar configuracion". Si cambias el idioma, la pantalla se actualiza sola.',
+  '',
+  '8) BASE DE CONOCIMIENTO: es la memoria del agente. Cargas preguntas frecuentes y datos del negocio (horarios, formas de pago, ubicacion, politicas) para que Sofia responda con info correcta. Se organiza por categorias; cada entrada es una pregunta y su respuesta. Elegi una categoria, carga la pregunta y la respuesta con "+ Agregar a la base". Cuanto mas completes, mejor responde Sofia.',
+  '',
+  '9) IMPORTAR LEADS: sirve para subir una lista de contactos que ya tenes (archivo CSV) y cargarlos como leads para hacerles recontacto. Tambien podes traer los contactos que ya te escribieron a tu WhatsApp. Prepara el CSV, arrastralo o hace clic para elegirlo, y el CRM los carga como leads listos para recontactar.'
+].join('\n');
+
+app.post('/api/soporte/agente', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var pregunta = (req.body && req.body.pregunta) ? String(req.body.pregunta).slice(0, 2000) : '';
+    var telefono = (req.body && req.body.telefono) ? String(req.body.telefono).replace(/[^0-9+ ]/g, '').slice(0, 30) : '';
+    if (!pregunta.trim()) return res.status(400).json({ error: 'La consulta esta vacia' });
+
+    var sys = 'Sos el asistente de soporte del CRM Raices. Respondé SOLO con la info provista sobre cómo funciona el producto, en español rioplatense, claro y breve. Si la consulta requiere una ACCIÓN que cambia la cuenta (cancelar suscripción, cambiar límites, pausar, borrar datos) NO la ejecutes: explicá y ofrecé derivar a una persona. Si no sabés la respuesta o el usuario pide hablar con alguien, indicá que derivás al equipo.\n\nCONOCIMIENTO DEL PRODUCTO:\n' + CONOCIMIENTO_SOPORTE + '\n\nAl final de tu respuesta, en una linea aparte, escribi exactamente "ESCALAR: SI" si no podes resolver la consulta con la info de arriba, si el usuario pide hablar con una persona, o si pide una accion que cambia la cuenta; en cualquier otro caso escribi "ESCALAR: NO". Esa linea es interna, el usuario igual la vera.';
+
+    var respuesta = '';
+    var escalado = false;
+    try {
+      var r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: [{ role: 'user', content: 'Consulta del cliente: ' + pregunta }] });
+      try { if (r && r.usage) await registrarUsoTokens(user_id, r.usage); } catch (eU) {}
+      var texto = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+      // Detectar la marca de escalamiento y removerla de la respuesta visible.
+      var m = /ESCALAR:\s*(SI|SÍ|NO)/i.exec(texto);
+      if (m) { escalado = /S/i.test(m[1]); texto = texto.replace(/\s*ESCALAR:\s*(SI|SÍ|NO)\s*/gi, ' ').trim(); }
+      respuesta = texto || 'No pude generar una respuesta. Te derivo con el equipo.';
+      if (!texto) escalado = true;
+    } catch (eIA) {
+      console.error('soporte/agente IA:', eIA && eIA.message);
+      respuesta = 'No pude procesar tu consulta en este momento. Te derivo con el equipo.';
+      escalado = true;
+    }
+
+    if (escalado) {
+      // DEFENSIVO: insertar la fila escalada con telefono; si la columna no existe aun, reintentar sin el. Nunca rompe.
+      var fila = { user_id: user_id, categoria: 'consulta', mensaje: pregunta, estado: 'escalado' };
+      var ins = await supabase.from('support_messages').insert(Object.assign({}, fila, { telefono: telefono }));
+      if (ins.error && /telefono|column|does not exist|schema cache/i.test(String(ins.error.message || ''))) {
+        ins = await supabase.from('support_messages').insert(fila);
+      }
+      if (ins.error) console.error('soporte/agente escalar insert:', ins.error.message);
+    }
+
+    return res.json({ ok: true, respuesta: respuesta, escalado: escalado });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -2895,6 +2965,8 @@ app.post('/api/maestro/soporte/:id/responder', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var resp = (req.body && req.body.respuesta) ? String(req.body.respuesta) : '';
+    // Leer la fila primero (para tener user_id/telefono disponibles); no rompe el flujo si falla.
+    var fila = null; try { var fr = await supabase.from('support_messages').select('*').eq('id', req.params.id).maybeSingle(); fila = fr && fr.data ? fr.data : null; } catch (eF) {}
     await supabase.from('support_messages').update({ respuesta: resp, estado: 'resuelto' }).eq('id', req.params.id);
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }

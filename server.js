@@ -1073,11 +1073,16 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           if (nuevoEstado === 'listo_humano') {
             const { data: cv } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', conv.id).single();
             if (cv && !cv.asesor_id && !cv.admin_tomo) {
-              const asesorAuto = await elegirAsesorActivo(conv.user_id);
+              const asesorAuto = await elegirAsesorActivo(user_id);
               if (asesorAuto) {
                 await supabase.from('conversations').update({ asesor_id: asesorAuto, ultimo_asesor_id: asesorAuto }).eq('id', conv.id);
               }
             }
+            // Al TRANSICIONAR a listo_humano, generar el RESUMEN IA y guardarlo (no bloquea ni rompe la respuesta)
+            try {
+              var _res = await generarResumenConversacion(conv.id, user_id);
+              if (_res) await supabase.from('conversations').update({ summary: _res, updated_at: new Date().toISOString() }).eq('id', conv.id);
+            } catch (eResumen) { console.error('Error resumen auto listo_humano:', eResumen && eResumen.message); }
           }
         }
       }

@@ -2762,19 +2762,6 @@ app.post('/api/maestro/cliente/:id/nota', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
-// Reconectar WhatsApp del cliente: pide el QR a Evolution para re-escanear
-app.post('/api/maestro/cliente/:id/reconectar', async function(req, res){
-  try{
-    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
-    var instancia = nombreInstancia(req.params.id);
-    var r = await fetch(EVOLUTION_URL + '/instance/connect/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } });
-    var j = await r.json();
-    var qr = (j && j.base64) ? j.base64 : ((j && j.qrcode && j.qrcode.base64) ? j.qrcode.base64 : null);
-    var estado = (j && j.instance && j.instance.state) || (j && j.state) || null;
-    return res.json({ ok: true, qr: qr, estado: estado });
-  }catch(e){ return res.status(500).json({ error: e && e.message }); }
-});
-
 // Ver conversaciones recientes del cliente (solo lectura)
 app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
   try{

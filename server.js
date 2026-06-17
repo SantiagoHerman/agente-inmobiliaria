@@ -474,7 +474,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   } else if (conversation_id) {
     const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
     if (prev && prev.length > 0) {
-      historial = prev.map(function(m){ return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: (m.content_original || m.content) }; });
+      historial = prev.map(function(m){ var textoBase = (m.role === 'ai') ? (m.content_original || m.content) : m.content; return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: textoBase }; });
     }
   }
 

@@ -2838,6 +2838,51 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// Alta de un cliente nuevo desde el Panel Maestro (incluye modo cortesia: exento, sin tarjeta).
+// NO crea instancia de Evolution ni toca whatsapp_instancias (eso es lazy). Endpoint admin aislado.
+app.post('/api/maestro/cliente/crear', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    var email = (b.email ? String(b.email) : '').trim().toLowerCase();
+    var company = (b.company ? String(b.company) : '').trim();
+    var rubro = (b.rubro ? String(b.rubro) : '').trim() || 'inmobiliaria';
+    var nombre = (b.nombre ? String(b.nombre) : '').trim();
+    var whatsapp = (b.whatsapp ? String(b.whatsapp) : '').trim();
+    var cortesia = (b.cortesia === true);
+    if (!email || !company) return res.status(400).json({ error: 'Faltan datos: email y company son obligatorios' });
+    // Password: usa la provista o genera una fuerte con crypto
+    var password = (b.password ? String(b.password) : '').trim();
+    if (!password) password = _cripto.randomBytes(12).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 14) + 'A9!';
+    // 1) Crear el usuario en Auth
+    var created, errAuth;
+    try {
+      var r = await supabase.auth.admin.createUser({ email: email, password: password, email_confirm: true, user_metadata: { name: nombre, company: company, rubro: rubro } });
+      created = r.data; errAuth = r.error;
+    } catch(eC){ errAuth = eC; }
+    if (errAuth) {
+      var msg = String((errAuth && errAuth.message) || errAuth || '');
+      if (/already|registered|exists|duplicate/i.test(msg)) return res.status(400).json({ error: 'Ese email ya esta registrado' });
+      return res.status(400).json({ error: msg || 'No se pudo crear el usuario' });
+    }
+    var uid = (created && created.user) ? created.user.id : null;
+    if (!uid) return res.status(400).json({ error: 'No se pudo crear el usuario (sin id)' });
+    // 2) business_settings (rollback del auth user si falla)
+    var ins = await supabase.from('business_settings').insert({ user_id: uid, company_name: company, rubro: rubro, whatsapp_contacto: whatsapp });
+    if (ins.error) {
+      try { await supabase.auth.admin.deleteUser(uid); } catch(eD){}
+      return res.status(400).json({ error: ins.error.message });
+    }
+    // 3) Cortesia (exento, sin tarjeta)
+    if (cortesia === true) {
+      try { await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' }); } catch(eS){}
+    }
+    // 4) Auditoria (no critico)
+    try { await supabase.from('admin_audit').insert({ accion: 'crear_cliente', target_user_id: uid, detalle: JSON.stringify({ email: email, company: company, cortesia: cortesia }) }); } catch(eA){}
+    return res.json({ ok: true, user_id: uid, email: email, password: password });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // Bandeja de soporte (mensajes de los clientes)
 app.get('/api/maestro/soporte', async function(req, res){
   try{

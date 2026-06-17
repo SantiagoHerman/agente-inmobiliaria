@@ -29,6 +29,17 @@ app.use((req, res, next) => {
 const _rlHits = new Map();
 const _RL_VENTANA_MS = 60 * 1000;
 const _RL_MAX = 200;
+
+// === DEBOUNCE POR CONVERSACION (FIX bug doble-presentacion) ===
+// Cuando un lead manda 2+ mensajes seguidos rapidos, llegan webhooks concurrentes y la IA
+// respondia/se presentaba 2 veces. Solucion (sin migracion, instancia unica): por cada conv.id
+// agrupamos la rafaga. Cada mensaje entrante SE GUARDA igual (no se pierde nada); solo la
+// GENERACION de respuesta se debouncea: el ultimo mensaje reinicia un timer, y al vencer
+// DEBOUNCE_MS se genera UNA sola respuesta que re-lee TODO el historial (contempla la rafaga).
+// _genEnCurso evita que dos disparos solapados generen dos respuestas para la misma conv.
+const _debounceConv = new Map(); // conv.id -> timeout handle
+const _genEnCurso = new Set();   // conv.id en generacion ahora mismo
+const DEBOUNCE_MS = 6000;
 setInterval(() => { _rlHits.clear(); }, _RL_VENTANA_MS);
 app.use((req, res, next) => {
   try {
@@ -415,6 +426,19 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia').eq('user_id', user_id).eq('activa', true);
 
+  // MEMORIA DEL LEAD: traer datos ya conocidos del contacto (name/interest/budget/notes) para inyectarlos al prompt
+  // y evitar re-preguntar o re-presentarse. No bloquea ni rompe si falla (campos opcionales).
+  let datosLead = null;
+  if (conversation_id && !modoPrueba) {
+    try {
+      const { data: convC } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).maybeSingle();
+      if (convC && convC.contact_id) {
+        const { data: cont } = await supabase.from('contacts').select('name, interest, budget, notes').eq('id', convC.contact_id).maybeSingle();
+        if (cont) datosLead = cont;
+      }
+    } catch (eDL) { console.error('lectura datos lead:', eDL && eDL.message); }
+  }
+
   const agentName = (settings && settings.agent_name) || 'Asistente';
   const agentCargo = (settings && settings.agent_cargo && String(settings.agent_cargo).trim()) ? String(settings.agent_cargo).trim() : '';
   const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
@@ -506,8 +530,22 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const idiomaNombre = NOMBRE_IDIOMA[idiomaBase] || 'espanol';
   const instruccionIdioma = 'IDIOMA (OBLIGATORIO, NO NEGOCIABLE): Respondé SIEMPRE y EXCLUSIVAMENTE en ' + idiomaNombre + '. Es el idioma configurado por la empresa. AUNQUE el lead te escriba en otro idioma (castellano, ingles, lo que sea), vos SIEMPRE respondes en ' + idiomaNombre + ', de forma nativa y natural. Nunca cambies de idioma para acompanar al lead: la configuracion manda.';
 
+  // MEMORIA DEL LEAD: armar el bloque con lo que YA sabemos del contacto, para no re-preguntar ni re-presentarse.
+  let bloqueDatosLead = '';
+  if (datosLead) {
+    const _partes = [];
+    if (datosLead.name && String(datosLead.name).trim()) _partes.push('nombre=' + String(datosLead.name).trim());
+    if (datosLead.interest && String(datosLead.interest).trim()) _partes.push('interes=' + String(datosLead.interest).trim());
+    if (datosLead.budget && String(datosLead.budget).trim()) _partes.push('presupuesto=' + String(datosLead.budget).trim());
+    if (datosLead.notes && String(datosLead.notes).trim()) _partes.push('notas=' + String(datosLead.notes).trim());
+    if (_partes.length > 0) {
+      bloqueDatosLead = 'DATOS YA CONOCIDOS DEL LEAD (no los vuelvas a preguntar ni te re-presentes si ya sabes el nombre): ' + _partes.join('; ') + '.';
+    }
+  }
+
   const systemPrompt = [
     'Sos ' + agentName + (agentCargo ? (', ' + agentCargo) : ', asesor/a') + ' de ' + company + ' (rubro: ' + rubro + ').',
+    bloqueDatosLead,
         'IDENTIDAD: Sos una persona del equipo. NUNCA digas que sos una inteligencia artificial, un bot, un asistente virtual ni un programa. Si te preguntan que cargo ocupas, si sos una IA, o quien sos, responde con tu nombre (' + agentName + ')' + (agentCargo ? (" y tu cargo (" + agentCargo + ")") : '') + ' de forma natural, sin admitir que sos un sistema.',
         'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
     'LINKS DE PROPIEDADES: Cuando menciones o recomiendes una propiedad que en el inventario tenga un campo link, inclui ese link en tu respuesta para que el lead pueda ver mas informacion y fotos. Compartilo de forma natural, por ejemplo: Te paso el link para que veas las fotos y los detalles. Si la propiedad no tiene link en el inventario, no inventes ninguno ni menciones que falta.',
@@ -581,6 +619,44 @@ async function clasificarEstado(mensajeCliente) {
     if (out.includes('interesado')) return 'interesado';
     return null;
   } catch (e) { console.error('Error clasificando estado:', e && e.message); return null; }
+}
+
+// Extrae datos que el LEAD menciona (nombre, origen, interes, presupuesto) para tener MEMORIA y no re-preguntar.
+// Mismo patron barato que clasificarEstado/clasificarTemperatura: una llamada chica a Anthropic que devuelve JSON.
+// Solo extrae lo que el lead DICE explicitamente; no inventa (campo vacio si no lo menciona).
+// datosPrevios se pasan como contexto para no duplicar lo ya sabido. Robusta a errores (try/catch).
+async function extraerDatosLead(texto, datosPrevios) {
+  try {
+    if (!texto || !texto.trim()) return { nombre: '', origen: '', interes: '', presupuesto: '' };
+    const prev = datosPrevios || {};
+    const prompt = [
+      'Sos un extractor de datos de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
+      'A partir del MENSAJE del cliente, devolve SOLO un JSON con estos campos (string):',
+      '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "" }',
+      '- nombre: el nombre de pila/nombre propio SOLO si el cliente lo dice (ej: "soy Juan", "me llamo Ana"). Si no lo dice, "".',
+      '- origen: de donde viene o como llego (ej: "Instagram", "Facebook", "un anuncio", "me recomendo un amigo", una ciudad/pais). Si no lo dice, "".',
+      '- interes: que busca o le interesa (ej: "departamento 2 ambientes en Palermo", "casa para alquilar", "cabana para 4 personas el finde"). Si no lo dice, "".',
+      '- presupuesto: cuanto puede/quiere gastar si lo menciona (ej: "USD 80000", "hasta 200 mil pesos por mes"). Si no lo dice, "".',
+      'REGLAS: extrae SOLO lo que el cliente menciona EXPLICITAMENTE en este mensaje. NO inventes ni asumas. Si un dato no aparece, dejalo "".',
+      'Responde UNICAMENTE el JSON, sin texto adicional, sin markdown.',
+      (prev.nombre || prev.interes || prev.presupuesto) ? ('Datos ya conocidos (no hace falta repetirlos, solo agrega lo nuevo): ' + JSON.stringify({ nombre: prev.nombre || '', interes: prev.interes || '', presupuesto: prev.presupuesto || '' })) : '',
+      'Mensaje del cliente: ' + JSON.stringify(texto)
+    ].filter(Boolean).join('\n');
+    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 150, messages: [{ role: 'user', content: prompt }] });
+    let out = (r && r.content && r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
+    // por si la IA envuelve en ```json ... ```
+    const m = out.match(/\{[\s\S]*\}/);
+    if (m) out = m[0];
+    let parsed = {};
+    try { parsed = JSON.parse(out); } catch (eP) { return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
+    const limpiar = function(v){ return (typeof v === 'string') ? v.trim() : ''; };
+    return {
+      nombre: limpiar(parsed.nombre),
+      origen: limpiar(parsed.origen),
+      interes: limpiar(parsed.interes),
+      presupuesto: limpiar(parsed.presupuesto)
+    };
+  } catch (e) { console.error('Error extrayendo datos del lead:', e && e.message); return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
 }
 
 // Enviar mensaje de WhatsApp via Evolution
@@ -939,15 +1015,30 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     } catch (e) { /* si falla el reporte, seguir con el flujo normal */ }
 
     // 2) Buscar contacto por telefono dentro del user_id (persistencia: no duplicar)
+    // FLUJO PRINCIPAL: el lookup/insert que da el id del contacto usa la PROYECCION MINIMA SEGURA
+    // (solo 'id'). Asi, aunque faltara alguna columna de enriquecimiento (name/interest/budget/notes),
+    // el agente sigue respondiendo: el flujo NUNCA depende de esas columnas.
     let contacto;
+    const _pushName = data.pushName || telefono;
     const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
     if (existente) { contacto = existente; }
     else {
-      const pushName = data.pushName || telefono;
-      const { data: nuevo } = await supabase.from('contacts').insert({ user_id: user_id, name: pushName, phone: telefono, channel: 'whatsapp' }).select('id').single();
+      const { data: nuevo } = await supabase.from('contacts').insert({ user_id: user_id, name: _pushName, phone: telefono, channel: 'whatsapp' }).select('id').single();
       contacto = nuevo;
     }
     if (!contacto) return;
+    // ENRIQUECIMIENTO best-effort: leer name/interest/budget/notes para la memoria del lead.
+    // Si este select falla (p.ej. faltara una columna), NO aborta el webhook: solo se pierde el
+    // enriquecimiento opcional y el contacto queda con esos campos en null/undefined.
+    try {
+      const { data: _enr } = await supabase.from('contacts').select('name, interest, budget, notes').eq('id', contacto.id).maybeSingle();
+      if (_enr) {
+        contacto.name = _enr.name;
+        contacto.interest = _enr.interest;
+        contacto.budget = _enr.budget;
+        contacto.notes = _enr.notes;
+      }
+    } catch (eEnr) { console.error('enriquecimiento contacto (best-effort):', eEnr && eEnr.message); }
 
     // 3) Buscar o crear conversacion
     let conv;
@@ -988,6 +1079,42 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
     if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
     await supabase.from('conversations').update(_updConv).eq('id', conv.id);
+
+    // === MEMORIA DEL LEAD: extraer datos (nombre/origen/interes/presupuesto) y guardarlos en contacts ===
+    // NO bloquea el flujo (mismo criterio que clasificarEstado/clasificarTemperatura): fire-and-forget.
+    // Solo para mensajes de texto (no media). Usa contentLead (ya traducido a espanol) para extraer bien.
+    if (!tipoMediaEntrante && contentLead && contentLead.trim()) {
+      (async function(){
+        try {
+          const datosPrevios = { nombre: contacto.name, interes: contacto.interest, presupuesto: contacto.budget };
+          const ext = await extraerDatosLead(contentLead, datosPrevios);
+          if (!ext) return;
+          const updContacto = {};
+          // nombre: solo si el lead dio un nombre real Y el actual parece el pushName de WhatsApp
+          // (el pushName es el que vino de Evolution; si el name guardado coincide con el pushName, todavia no tenemos el nombre real que dio el lead)
+          if (ext.nombre && (!contacto.name || contacto.name === _pushName)) {
+            updContacto.name = ext.nombre;
+          }
+          // interest / budget: completar/actualizar si el lead aporto algo
+          if (ext.interes) updContacto.interest = ext.interes;
+          if (ext.presupuesto) updContacto.budget = ext.presupuesto;
+          // origen (y nombre, si no fue a la columna name) van a notes: append corto sin pisar lo que haya
+          const notasNuevas = [];
+          if (ext.origen) notasNuevas.push('origen: ' + ext.origen);
+          if (ext.nombre && !updContacto.name) notasNuevas.push('dice llamarse: ' + ext.nombre);
+          if (notasNuevas.length > 0) {
+            const notasPrev = (contacto.notes && String(contacto.notes).trim()) ? String(contacto.notes).trim() : '';
+            const aAgregar = notasNuevas.filter(function(n){ return notasPrev.indexOf(n) === -1; });
+            if (aAgregar.length > 0) {
+              updContacto.notes = (notasPrev ? (notasPrev + ' | ') : '') + aAgregar.join(' | ');
+            }
+          }
+          if (Object.keys(updContacto).length > 0) {
+            await supabase.from('contacts').update(updContacto).eq('id', contacto.id);
+          }
+        } catch (eMem) { console.error('memoria lead:', eMem && eMem.message); }
+      })();
+    }
 
     // === Notificacion push al asesor asignado (por cada mensaje entrante) ===
     try {
@@ -1047,56 +1174,96 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         }
       } catch (e) { console.error('enforcement suscripcion:', e && e.message); }
     }
-    const resultado = await generarRespuestaAgente(user_id, conv.id, texto);
-    if (resultado && resultado.reply) {
-      await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
-      try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
-      if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
-    }
+    // === DEBOUNCE POR CONVERSACION ===
+    // En vez de generar la respuesta YA (lo que con 2 webhooks concurrentes hacia que la IA se presente 2 veces),
+    // agrupamos la rafaga: cada mensaje reinicia el reloj; al vencer DEBOUNCE_MS se genera UNA sola respuesta.
+    // El mensaje entrante YA quedo guardado arriba (paso 4), asi que generarRespuestaAgente re-lee TODO el
+    // historial de la DB y contesta contemplando toda la rafaga. No se pierde ningun mensaje.
+    if (_debounceConv.has(conv.id)) { clearTimeout(_debounceConv.get(conv.id)); }
+    const _convId = conv.id;
+    // procesar(): se ejecuta al vencer el debounce. Si hay una generacion en curso para esta
+    // conv, NO descarta el disparo: REPROGRAMA un nuevo timer (reintenta tras DEBOUNCE_MS) para
+    // que cuando la generacion en curso libere _genEnCurso, este reintento dispare y conteste
+    // UNA sola respuesta contemplando el/los mensaje(s) nuevo(s) (generarRespuestaAgente re-lee
+    // todo el historial). Asi ningun mensaje del lead queda sin respuesta.
+    const procesar = async function(){
+      // guard: si ya se esta generando para esta conv, reprogramar (no descartar) y salir.
+      if (_genEnCurso.has(_convId)) {
+        const _reintento = setTimeout(procesar, DEBOUNCE_MS);
+        _debounceConv.set(_convId, _reintento);
+        return;
+      }
+      _genEnCurso.add(_convId);
+      // Este timer ya disparo y vamos a generar: liberar su entrada del mapa AHORA (es JS de un
+      // solo hilo, ningun mensaje pudo interleavear entre el guard y aqui). Asi, si durante la
+      // generacion (que puede tardar >DEBOUNCE_MS por el tipeo simulado) llega un mensaje nuevo,
+      // ese mensaje agenda su PROPIO timer en el mapa sin pisar nada, y disparara un reintento
+      // que tras liberarse _genEnCurso generara UNA respuesta con los mensajes nuevos.
+      _debounceConv.delete(_convId);
+      try {
+        {
+          const resultado = await generarRespuestaAgente(user_id, _convId, texto);
+          if (resultado && resultado.reply) {
+            await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
+            try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
+            if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
+          }
 
-    // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
-    // Leer el estado actual ANTES de clasificar
-    const { data: convActual } = await supabase.from('conversations').select('status').eq('id', conv.id).maybeSingle();
-    const estadoActual = (convActual && convActual.status) || 'en_conversacion';
-    // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
-    if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
-      const nuevoEstado = await clasificarEstado(texto);
-      if (nuevoEstado) {
-        // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
-        const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
-        if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
-          const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
-          // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
-          if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
-          await supabase.from('conversations').update(update).eq('id', conv.id);
-          // Si paso a listo_humano y no tiene asesor ni fue tomado por el admin, asignar automaticamente
-          if (nuevoEstado === 'listo_humano') {
-            const { data: cv } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', conv.id).single();
-            if (cv && !cv.asesor_id && !cv.admin_tomo) {
-              const asesorAuto = await elegirAsesorActivo(user_id);
-              if (asesorAuto) {
-                await supabase.from('conversations').update({ asesor_id: asesorAuto, ultimo_asesor_id: asesorAuto }).eq('id', conv.id);
+          // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
+          // Leer el estado actual ANTES de clasificar
+          const { data: convActual } = await supabase.from('conversations').select('status').eq('id', _convId).maybeSingle();
+          const estadoActual = (convActual && convActual.status) || 'en_conversacion';
+          // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
+          if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
+            const nuevoEstado = await clasificarEstado(texto);
+            if (nuevoEstado) {
+              // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
+              const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
+              if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
+                const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
+                // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
+                if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
+                await supabase.from('conversations').update(update).eq('id', _convId);
+                // Si paso a listo_humano y no tiene asesor ni fue tomado por el admin, asignar automaticamente
+                if (nuevoEstado === 'listo_humano') {
+                  const { data: cv } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', _convId).single();
+                  if (cv && !cv.asesor_id && !cv.admin_tomo) {
+                    const asesorAuto = await elegirAsesorActivo(user_id);
+                    if (asesorAuto) {
+                      await supabase.from('conversations').update({ asesor_id: asesorAuto, ultimo_asesor_id: asesorAuto }).eq('id', _convId);
+                    }
+                  }
+                  // Al TRANSICIONAR a listo_humano, generar el RESUMEN IA y guardarlo (no bloquea ni rompe la respuesta)
+                  try {
+                    var _res = await generarResumenConversacion(_convId, user_id);
+                    if (_res) await supabase.from('conversations').update({ summary: _res, updated_at: new Date().toISOString() }).eq('id', _convId);
+                  } catch (eResumen) { console.error('Error resumen auto listo_humano:', eResumen && eResumen.message); }
+                }
               }
             }
-            // Al TRANSICIONAR a listo_humano, generar el RESUMEN IA y guardarlo (no bloquea ni rompe la respuesta)
+            // RED DE SEGURIDAD: si la conversacion esta en listo_humano sin asesor (quedo huerfana), derivar ahora
             try {
-              var _res = await generarResumenConversacion(conv.id, user_id);
-              if (_res) await supabase.from('conversations').update({ summary: _res, updated_at: new Date().toISOString() }).eq('id', conv.id);
-            } catch (eResumen) { console.error('Error resumen auto listo_humano:', eResumen && eResumen.message); }
+              const { data: cvSeg } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, user_id').eq('id', _convId).single();
+              if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
+                const asesorSeg = await elegirAsesorActivo(cvSeg.user_id);
+                if (asesorSeg) {
+                  await supabase.from('conversations').update({ asesor_id: asesorSeg, ultimo_asesor_id: asesorSeg }).eq('id', _convId);
+                }
+              }
+            } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
           }
         }
+      } catch (eGen) { console.error('Error generando respuesta (debounce):', eGen && eGen.message); }
+      finally {
+        // Siempre liberar _genEnCurso: la conv nunca queda trabada y un eventual reintento ya
+        // agendado por un mensaje nuevo podra disparar y responder.
+        // NO se toca _debounceConv aqui: su entrada (si la hay) pertenece a un mensaje que llego
+        // durante la generacion y debe sobrevivir para reintentar (no clobberear timer nuevo).
+        _genEnCurso.delete(_convId);
       }
-      // RED DE SEGURIDAD: si la conversacion esta en listo_humano sin asesor (quedo huerfana), derivar ahora
-      try {
-        const { data: cvSeg } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, user_id').eq('id', conv.id).single();
-        if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
-          const asesorSeg = await elegirAsesorActivo(cvSeg.user_id);
-          if (asesorSeg) {
-            await supabase.from('conversations').update({ asesor_id: asesorSeg, ultimo_asesor_id: asesorSeg }).eq('id', conv.id);
-          }
-        }
-      } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
-    }
+    };
+    const _timer = setTimeout(procesar, DEBOUNCE_MS);
+    _debounceConv.set(conv.id, _timer);
   } catch (e) { console.error('Error en webhook whatsapp:', e && e.message); }
 });
 

@@ -424,7 +424,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const historialManual = (opciones && opciones.historialManual) || null;
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
-  const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia').eq('user_id', user_id).eq('activa', true);
+  const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, images').eq('user_id', user_id).eq('activa', true);
 
   // MEMORIA DEL LEAD: traer datos ya conocidos del contacto (name/interest/budget/notes) para inyectarlos al prompt
   // y evitar re-preguntar o re-presentarse. No bloquea ni rompe si falla (campos opcionales).
@@ -488,7 +488,19 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     if (ops.length === 0 && p.operation) ops.push(p.operation + (p.price ? ': ' + p.price : ''));
     var enc = (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title||'');
     var carac = [p.zone, p.caracteristicas].filter(Boolean).join(', ');
-    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '');
+    // Resumen de fotos disponibles por categoria (ADITIVO, solo si la propiedad tiene images cargadas).
+    // Asi la IA sabe que categorias puede mandar con la tool enviar_foto_propiedad.
+    var fotosTxt = '';
+    try {
+      var _imgs = Array.isArray(p.images) ? p.images : [];
+      if (_imgs.length > 0) {
+        var _cats = [];
+        _imgs.forEach(function(im){ var c = im && im.categoria; if (c && _cats.indexOf(c) === -1) _cats.push(c); });
+        if (_cats.length > 0) fotosTxt = ' | fotos disponibles: ' + _cats.join(', ');
+        else fotosTxt = ' | fotos disponibles: si (sin categorizar)';
+      }
+    } catch (eImg) { fotosTxt = ''; }
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
   }).join(String.fromCharCode(10));
   }
 
@@ -549,6 +561,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         'IDENTIDAD: Sos una persona del equipo. NUNCA digas que sos una inteligencia artificial, un bot, un asistente virtual ni un programa. Si te preguntan que cargo ocupas, si sos una IA, o quien sos, responde con tu nombre (' + agentName + ')' + (agentCargo ? (" y tu cargo (" + agentCargo + ")") : '') + ' de forma natural, sin admitir que sos un sistema.',
         'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
     'LINKS DE PROPIEDADES: Cuando menciones o recomiendes una propiedad que en el inventario tenga un campo link, inclui ese link en tu respuesta para que el lead pueda ver mas informacion y fotos. Compartilo de forma natural, por ejemplo: Te paso el link para que veas las fotos y los detalles. Si la propiedad no tiene link en el inventario, no inventes ninguno ni menciones que falta.',
+    'FOTOS DE PROPIEDADES: Cuando el lead te PIDA ver una foto de una propiedad (por ejemplo: mandame una del dormitorio, mostrame la pileta, tenes fotos de la cocina), usa la herramienta enviar_foto_propiedad indicando el numero de la propiedad (campo numero del inventario, ej: 12) y la categoria pedida. Solo podes mandar fotos de propiedades que en el inventario digan fotos disponibles. Las categorias validas son: dormitorio, bano, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Si no tenes claro de que propiedad habla, primero preguntale cual antes de usar la herramienta. No inventes fotos que no existan.',
     instruccionesRubro,
     comportamientoSetter,
     instruccionIdioma,
@@ -564,15 +577,116 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
 
   const mensajesParaIA = historial.concat([{ role: 'user', content: message }]);
 
+  // Tool para que la IA pueda enviar una foto de una propiedad cuando el lead la pide.
+  // ADITIVO: si la IA no la usa, el flujo es exactamente el mismo de antes (respuesta de texto).
+  const CATEGORIAS_FOTO = ['dormitorio', 'bano', 'cocina', 'comedor', 'living', 'parque', 'frente', 'pileta', 'cochera', 'exterior', 'otra'];
+  const toolsAgente = [{
+    name: 'enviar_foto_propiedad',
+    description: 'Envia al lead una foto de una propiedad por WhatsApp. Usala SOLO cuando el lead pide ver una foto concreta (ej: mandame una del dormitorio, mostrame la pileta). Indica el numero de la propiedad (campo numero del inventario) y la categoria de foto pedida.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        numero: { type: 'string', description: 'El numero de la propiedad tal como figura en el inventario (ej: 12).' },
+        categoria: { type: 'string', enum: CATEGORIAS_FOTO, description: 'La categoria de foto pedida por el lead.' }
+      },
+      required: ['numero', 'categoria']
+    }
+  }];
+
   const completion = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 500,
     system: systemPrompt,
+    tools: toolsAgente,
     messages: mensajesParaIA
   });
 
-  const block = completion.content[0];
-  let reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
+  // mediaAEnviar: fotos que el webhook debera mandar DESPUES del texto. Vacio si la IA no pidio foto.
+  let mediaAEnviar = [];
+  let reply;
+  // ¿La IA pidio usar la tool de foto?
+  if (completion && completion.stop_reason === 'tool_use') {
+    try {
+      const toolUse = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'enviar_foto_propiedad'; });
+      const textoPrevio = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let fotoUrl = null;
+      let fotoCategoria = null;
+      let toolResultTexto = '';
+      if (toolUse && toolUse.input) {
+        const numPedido = String(toolUse.input.numero == null ? '' : toolUse.input.numero).trim();
+        fotoCategoria = String(toolUse.input.categoria == null ? '' : toolUse.input.categoria).trim();
+        // Buscar la propiedad por numero entre las YA cargadas (no re-consultamos la DB).
+        const propFoto = (properties || []).find(function(p){ return p.numero != null && String(p.numero).trim() === numPedido; });
+        if (propFoto) {
+          const imgs = Array.isArray(propFoto.images) ? propFoto.images : [];
+          if (imgs.length > 0) {
+            // 1) intentar por categoria exacta
+            let cand = imgs.filter(function(im){ return im && im.categoria === fotoCategoria && im.url; });
+            // 2) fallback: portada / primera foto con url
+            if (cand.length === 0) cand = imgs.filter(function(im){ return im && im.url; });
+            if (cand.length > 0) {
+              fotoUrl = cand[0].url;
+              const huboCategoria = cand[0].categoria === fotoCategoria;
+              toolResultTexto = huboCategoria
+                ? ('OK: foto enviada de la propiedad N' + numPedido + ', categoria ' + fotoCategoria + '. Acompanala con un comentario breve y natural.')
+                : ('No habia foto especifica de la categoria ' + fotoCategoria + ' para la propiedad N' + numPedido + '. Se envio otra foto disponible de la propiedad. Aclara con naturalidad que le mandas una foto de la propiedad aunque no sea exactamente de ' + fotoCategoria + '.');
+            } else {
+              toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
+            }
+          } else {
+            toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
+          }
+        } else {
+          toolResultTexto = 'No se encontro ninguna propiedad con el numero ' + numPedido + ' en el inventario. Pedile al lead que aclare de que propiedad quiere la foto.';
+        }
+      } else {
+        toolResultTexto = 'No se pudo procesar el pedido de foto. Segui la conversacion con normalidad.';
+      }
+
+      // SEGUNDO TURNO: devolvemos el tool_result para que la IA cierre con texto natural (en idioma base).
+      let textoFinal = '';
+      try {
+        const mensajesTurno2 = mensajesParaIA.concat([
+          { role: 'assistant', content: completion.content },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse ? toolUse.id : 'sin_id', content: toolResultTexto }] }
+        ]);
+        const completion2 = await anthropic.messages.create({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 500,
+          system: systemPrompt,
+          tools: toolsAgente,
+          messages: mensajesTurno2
+        });
+        const b2 = (completion2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
+        if (b2 && b2.text) textoFinal = b2.text;
+        // acumular uso del segundo turno (no rompe registrarUsoTokens si falta algun campo)
+        if (completion2 && completion2.usage && completion && completion.usage) {
+          completion.usage = {
+            input_tokens: (completion.usage.input_tokens || 0) + (completion2.usage.input_tokens || 0),
+            output_tokens: (completion.usage.output_tokens || 0) + (completion2.usage.output_tokens || 0)
+          };
+        }
+      } catch (eTurno2) {
+        console.error('segundo turno tool foto:', eTurno2 && eTurno2.message);
+        // Fallback: caption corto fijo (en idioma base). La traduccion de salida se aplica igual mas abajo.
+        textoFinal = textoPrevio || (fotoUrl ? 'Te mando una foto de la propiedad.' : 'Por ahora no tengo esa foto para mandarte.');
+      }
+      if (!textoFinal || !textoFinal.trim()) {
+        textoFinal = textoPrevio || (fotoUrl ? 'Te mando una foto de la propiedad.' : 'Por ahora no tengo esa foto para mandarte.');
+      }
+      reply = textoFinal;
+      if (fotoUrl) mediaAEnviar.push({ url: fotoUrl, caption: '' });
+    } catch (eFoto) {
+      // Si algo de las fotos falla, NO rompemos la respuesta de texto: usamos el texto que haya o un fallback.
+      console.error('flujo tool foto:', eFoto && eFoto.message);
+      mediaAEnviar = [];
+      const _txt = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      reply = _txt || 'Disculpa, ahora mismo no puedo mandarte la foto, pero seguimos por aca.';
+    }
+  } else {
+    const block = (completion && completion.content) ? completion.content[0] : null;
+    reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
+  }
   if (!usaEmojis) { const _limpio = quitarEmojis(reply); if (_limpio) reply = _limpio; } // emojis desactivados en config: los sacamos si o si
 
   // 'reply' esta en el idioma base de la empresa (la IA SIEMPRE responde en ese idioma, ver instruccionIdioma).
@@ -595,7 +709,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     await supabase.from('conversations').update({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }
 
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage };
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar };
 }
 
 // Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
@@ -1207,6 +1321,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
             try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
             if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
+            // FOTOS: si la IA pidio mandar foto(s), enviarlas DESPUES del texto. Aislado en try/catch:
+            // si una foto falla, NO afecta el flujo de texto ya enviado.
+            try {
+              const _media = (resultado && Array.isArray(resultado.mediaAEnviar)) ? resultado.mediaAEnviar : [];
+              for (let _i = 0; _i < _media.length; _i++) {
+                const _m = _media[_i];
+                if (_m && _m.url) {
+                  try { await enviarWhatsappMedia(instanciaNombre, telefono, _m.url, 'imagen', _m.caption || ''); }
+                  catch (eM1) { console.error('envio foto propiedad:', eM1 && eM1.message); }
+                }
+              }
+            } catch (eMedia) { console.error('loop fotos propiedad:', eMedia && eMedia.message); }
           }
 
           // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)

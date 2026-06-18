@@ -221,6 +221,40 @@ async function dentroDelTopeIA(user_id) {
   return usado < tope;
 }
 
+// Senal AUTORITATIVA de corte por falta de pago. Replica EXACTAMENTE el gate del
+// webhook (~1271-1294) + planActual + cortesia + grandfathered, SIN alterarlo: solo
+// computa lo mismo de forma reusable. FAIL-OPEN: ante cualquier error o duda -> false.
+// TRUE solo cuando: SUBSCRIPTIONS_ENABLED esta activo Y el tenant NO es cortesia Y NO es
+// grandfathered Y debe pagar y no lo hizo (status en {cancelled, suspended}
+// O no tiene fila de suscripcion y su cuenta es posterior a TRIAL_DESDE).
+// En CUALQUIER otro caso (flag apagado, cortesia, grandfathered, trial, active, sin certeza) -> false.
+async function debeBloquearAcceso(user_id) {
+  try {
+    if (!SUBSCRIPTIONS_ENABLED) return false; // funcion apagada: no se corta a nadie
+    const sub = await getSubscription(user_id);
+    const est = sub ? sub.status : null;
+    const cortesia = sub && sub.cortesia === true;
+    if (cortesia) return false; // cortesia: acceso libre, nunca se bloquea
+    // Sin fila de suscripcion: solo se bloquea si la cuenta es NUEVA (creada DESDE TRIAL_DESDE).
+    // Los anteriores quedan grandfathered (gratis) -> NO se bloquean. (mismo criterio que el webhook ~1277-1284)
+    if (!sub) {
+      if (!TRIAL_DESDE) return false; // nadie obligado a suscribirse
+      try {
+        const u = await supabase.auth.admin.getUserById(user_id);
+        const ca = u && u.data && u.data.user && u.data.user.created_at;
+        // grandfathered (created_at < TRIAL_DESDE) o sin certeza de la fecha -> NO bloquear (fail-open)
+        if (ca && new Date(ca).getTime() >= new Date(TRIAL_DESDE).getTime()) return true;
+        return false;
+      } catch (eC) { return false; } // sin certeza -> no bloquear
+    }
+    // Con fila de suscripcion: bloquear SOLO si esta cancelled/suspended (EXACTO como el gate del agente,
+    // webhook ~1285). NO se bloquea past_due: el agente sigue atendiendo durante la gracia de 3 dias, y el
+    // cron revisarSuscripciones pasa past_due -> suspended tras esa gracia (recien ahi se bloquea aca).
+    if (est === 'cancelled' || est === 'suspended') return true;
+    return false; // trial, active, past_due (en gracia), o estado desconocido -> no bloquear
+  } catch (e) { return false; } // ante cualquier error -> fail-open (no cortar el servicio)
+}
+
 // Suma 1 al contador de mensajes IA del periodo (best-effort, no rompe si falla).
 async function registrarUsoIA(user_id) {
   try {
@@ -3400,7 +3434,10 @@ app.get('/api/suscripcion', async function(req, res) {
     var plan = await planActual(user_id);
     var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
     var usado = await usoMensajesIA(user_id);
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null });
+    // Senal AUTORITATIVA para el frontend: congelar el acceso si el tenant debe pagar y no lo hizo.
+    // Misma logica EXACTA con la que el agente corta el servicio (debeBloquearAcceso). FAIL-OPEN.
+    var bloqueado = await debeBloquearAcceso(user_id);
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

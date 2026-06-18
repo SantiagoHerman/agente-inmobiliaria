@@ -231,6 +231,13 @@ async function dentroDelTopeIA(user_id) {
 // En CUALQUIER otro caso (flag apagado, cortesia, grandfathered, trial, active, sin certeza) -> false.
 async function debeBloquearAcceso(user_id) {
   try {
+    // PAPELERA (aditivo, independiente de las suscripciones): si el cliente fue eliminado
+    // (business_settings.eliminado_at NOT NULL) no puede usar la app, este la funcion de
+    // suscripciones encendida o no. Degrada bien si la columna aun no existe (select falla -> no bloquea por esto).
+    try {
+      const elim = await supabase.from('business_settings').select('eliminado_at').eq('user_id', user_id).maybeSingle();
+      if (elim && !elim.error && elim.data && elim.data.eliminado_at) return true;
+    } catch (eElim) {}
     if (!SUBSCRIPTIONS_ENABLED) return false; // funcion apagada: no se corta a nadie
     const sub = await getSubscription(user_id);
     const est = sub ? sub.status : null;
@@ -1359,7 +1366,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // 5) Si la IA esta activa, responder por WhatsApp
     // PAUSA GLOBAL: si el CRM esta pausado, la IA no responde a nadie (los mensajes igual se guardan).
     // No modifica el ai_enabled de cada conversacion; es una capa global aparte.
-    const { data: _bsPausa } = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle();
+    // Pedimos crm_pausado + eliminado_at en una sola query. Si la columna eliminado_at aun no existe el select falla
+    // -> reintentamos solo con crm_pausado (degradar bien, sin romper el webhook).
+    let _bsPausa = null;
+    { const _bsq = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
+      if (_bsq && _bsq.error) { const _bsq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsPausa = _bsq2 && _bsq2.data; }
+      else { _bsPausa = _bsq && _bsq.data; } }
+    // PAPELERA: cliente eliminado (soft-delete) -> la IA no responde (aditivo, no toca la logica de suscripcion).
+    if (_bsPausa && _bsPausa.eliminado_at) return;
     if (_bsPausa && _bsPausa.crm_pausado === true) return;
     if (conv.ai_enabled === false) return;
     // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)
@@ -4294,6 +4308,116 @@ function _maestroToken(){ var payload=Buffer.from(JSON.stringify({ exp: Math.flo
 function _maestroTokenOk(tok){ try{ if(!tok) return false; var parts=String(tok).split('.'); if(parts.length!==2) return false; var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(parts[0]).digest('hex'); if(sig!==parts[1]) return false; var p=JSON.parse(Buffer.from(parts[0],'base64').toString()); return p.exp > Math.floor(Date.now()/1000); }catch(e){ return false; } }
 function maestroAuth(req){ var auth=req.headers.authorization||req.headers.Authorization||''; var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null; return _maestroTokenOk(tok); }
 
+// ===== 2FA GATES ('ingreso' / 'eliminar') + PAPELERA — almacen en tabla maestro_config (service key) =====
+// Genera un secreto base32 de 20 bytes aleatorios (estandar Google Authenticator; reusa _b32enc).
+function _b32enc(buf){ var a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; var bits=''; for(var i=0;i<buf.length;i++){ bits+=buf[i].toString(2).padStart(8,'0'); } var out=''; for(var j=0;j<bits.length;j+=5){ var chunk=bits.slice(j,j+5); if(chunk.length<5) chunk=chunk.padEnd(5,'0'); out+=a[parseInt(chunk,2)]; } return out; }
+function _secret2fa(){ return _b32enc(_cripto.randomBytes(20)); }
+// Arma el otpauth para mostrar el QR/manual una sola vez.
+function _otpauth2fa(cual, secret){ var label = (cual === 'eliminar') ? 'Eliminar' : 'Ingreso'; return 'otpauth://totp/RaicesCRM%20Maestro%20(' + label + ')?secret=' + secret + '&issuer=RaicesCRM&period=30&digits=6'; }
+// Normaliza el parametro 'cual' a uno de los dos gates validos (o null).
+function _gate2fa(v){ var s=String(v||'').trim().toLowerCase(); return (s==='ingreso'||s==='eliminar') ? s : null; }
+// Lee el secreto guardado de un gate. Degrada bien si la tabla maestro_config aun no existe -> null (no-configurado).
+async function _getSecret2fa(cual){ try{ var clave='2fa_'+cual; var r=await supabase.from('maestro_config').select('valor').eq('clave',clave).maybeSingle(); if(r && r.error) return null; return (r && r.data && r.data.valor) ? String(r.data.valor) : null; }catch(e){ return null; } }
+// Guarda/regenera el secreto de un gate (service key). Devuelve {ok, error?}.
+async function _setSecret2fa(cual, secret){ try{ var clave='2fa_'+cual; var r=await supabase.from('maestro_config').upsert({ clave: clave, valor: secret, updated_at: new Date().toISOString() }, { onConflict: 'clave' }); if(r && r.error) return { ok:false, error: r.error.message }; return { ok:true }; }catch(e){ return { ok:false, error: (e && e.message) || 'error' }; } }
+// Verifica un codigo TOTP contra el secreto guardado de un gate (server-side, RFC6238 +-1 ventana via _totpOk).
+async function _verificar2fa(cual, codigo){ var sec=await _getSecret2fa(cual); if(!sec) return false; return _totpOk(sec, codigo); }
+
+// Estado de los dos gates 2FA (configurado = hay secreto guardado). No expone los secretos.
+app.get('/api/maestro/2fa/estado', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var ing = await _getSecret2fa('ingreso');
+    var eli = await _getSecret2fa('eliminar');
+    return res.json({ ok: true, ingresoConfigurado: !!ing, eliminarConfigurado: !!eli });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Genera/regenera el secreto de un gate, lo guarda server-side y devuelve secret+otpauth (para QR/manual UNA vez).
+app.post('/api/maestro/2fa/setup', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var cual = _gate2fa(req.body && req.body.cual);
+    if (!cual) return res.status(400).json({ error: "cual debe ser 'ingreso' o 'eliminar'" });
+    var secret = _secret2fa();
+    var g = await _setSecret2fa(cual, secret);
+    if (!g.ok) return res.status(503).json({ error: 'Falta la tabla maestro_config: ' + g.error });
+    return res.json({ ok: true, secret: secret, otpauth: _otpauth2fa(cual, secret) });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Verifica un codigo de un gate (server-side). Devuelve { ok:bool }.
+app.post('/api/maestro/2fa/verificar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var cual = _gate2fa(req.body && req.body.cual);
+    if (!cual) return res.status(400).json({ error: "cual debe ser 'ingreso' o 'eliminar'" });
+    var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
+    var ok = await _verificar2fa(cual, codigo);
+    return res.json({ ok: !!ok });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// SOFT-DELETE (papelera): exige codigo del gate 'eliminar' valido (server-side). NO borra datos, solo marca eliminado_at.
+app.post('/api/maestro/cliente/eliminar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = (req.body && req.body.user_id) ? String(req.body.user_id) : '';
+    var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
+    if (!uid) return res.status(400).json({ error: 'Falta user_id' });
+    if (!(await _verificar2fa('eliminar', codigo))) return res.status(403).json({ ok: false, error: 'codigo' });
+    var up = await supabase.from('business_settings').update({ eliminado_at: new Date().toISOString() }).eq('user_id', uid);
+    if (up.error) return res.status(500).json({ ok: false, error: up.error.message });
+    try { await supabase.from('admin_audit').insert({ accion: 'eliminar_cliente_papelera', target_user_id: uid, detalle: '{}' }); } catch(eA){}
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// RESTAURAR: saca al cliente de la papelera (eliminado_at = null). Gateado por auth Maestro; codigo 'eliminar' opcional (si viene, se valida).
+app.post('/api/maestro/cliente/restaurar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = (req.body && req.body.user_id) ? String(req.body.user_id) : '';
+    if (!uid) return res.status(400).json({ error: 'Falta user_id' });
+    var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
+    if (codigo) { if (!(await _verificar2fa('eliminar', codigo))) return res.status(403).json({ ok: false, error: 'codigo' }); }
+    var up = await supabase.from('business_settings').update({ eliminado_at: null }).eq('user_id', uid);
+    if (up.error) return res.status(500).json({ ok: false, error: up.error.message });
+    try { await supabase.from('admin_audit').insert({ accion: 'restaurar_cliente', target_user_id: uid, detalle: '{}' }); } catch(eA){}
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// BORRADO DEFINITIVO: exige codigo 'eliminar' valido -> exporta backup recuperable -> borra TODO en cascada + el auth user.
+app.post('/api/maestro/cliente/borrar-definitivo', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = (req.body && req.body.user_id) ? String(req.body.user_id) : '';
+    var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
+    if (!uid) return res.status(400).json({ error: 'Falta user_id' });
+    if (!(await _verificar2fa('eliminar', codigo))) return res.status(403).json({ ok: false, error: 'codigo' });
+    // 1) EXPORTAR backup recuperable (snapshot completo del tenant) ANTES de borrar nada.
+    var contenido = {};
+    var tablasUser = ['business_settings','subscriptions','conversations','messages','contacts','properties','knowledge_base','recontactos','whatsapp_instancias','scraping_config','scraping_pendientes','reportes_snapshots','ia_uso','admin_notas','support_messages','device_tokens'];
+    for (var ti = 0; ti < tablasUser.length; ti++) {
+      var t = tablasUser[ti];
+      try { var d = await supabase.from(t).select('*').eq('user_id', uid); contenido[t] = (d && d.data) ? d.data : []; } catch(eT){ contenido[t] = []; }
+    }
+    try { var dAse = await supabase.from('asesores').select('*').eq('admin_id', uid); contenido.asesores = (dAse && dAse.data) ? dAse.data : []; } catch(eAse){ contenido.asesores = []; }
+    var resumen = 'BORRADO DEFINITIVO conv:' + (contenido.conversations || []).length + ' msg:' + (contenido.messages || []).length + ' cont:' + (contenido.contacts || []).length + ' prop:' + (contenido.properties || []).length;
+    var backupGuardado = false;
+    try { var bkr = await supabase.from('backups').insert({ user_id: uid, contenido: contenido, resumen: resumen }); backupGuardado = !(bkr && bkr.error); } catch(eBk){ backupGuardado = false; }
+    if (!backupGuardado) return res.status(503).json({ ok: false, error: 'No se pudo guardar el backup recuperable; se aborta el borrado por seguridad' });
+    // 2) Borrar en cascada (best-effort; el backup ya esta a salvo).
+    for (var di = 0; di < tablasUser.length; di++) { try { await supabase.from(tablasUser[di]).delete().eq('user_id', uid); } catch(eD){} }
+    try { await supabase.from('asesores').delete().eq('admin_id', uid); } catch(eDA){}
+    // 3) Borrar el usuario de Auth (ultimo paso).
+    try { await supabase.auth.admin.deleteUser(uid); } catch(eAu){ console.error('deleteUser borrar-definitivo:', eAu && eAu.message); }
+    try { await supabase.from('admin_audit').insert({ accion: 'borrar_definitivo', target_user_id: uid, detalle: JSON.stringify({ resumen: resumen }) }); } catch(eA){}
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // Setup inicial (una vez): requiere el bootstrap (env MAESTRO_BOOTSTRAP). Devuelve el secreto TOTP para cargar en la app autenticadora.
 app.post('/api/maestro/setup', async function(req, res){
   try{
@@ -4330,16 +4454,21 @@ app.post('/api/maestro/login', async function(req, res){
 app.get('/api/maestro/clientes', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
-    var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado');
+    // Pedimos eliminado_at para distinguir ACTIVOS (null) de ELIMINADOS (papelera). Si la columna aun no existe,
+    // el select falla -> reintentamos sin ella (degradar bien: todos quedan como activos, eliminado_at=null).
+    var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado, eliminado_at');
+    if (bs && bs.error) { bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado'); }
     var subs = await supabase.from('subscriptions').select('user_id, plan, status, ai_messages_this_period, current_period_end, cortesia, limits_override');
     var byUser = {}; (subs.data || []).forEach(function(s){ byUser[s.user_id] = s; });
     var act = {}; try { var cv = await supabase.from('conversations').select('user_id, updated_at').order('updated_at', { ascending: false }).limit(3000); (cv.data || []).forEach(function(r){ if (!act[r.user_id]) act[r.user_id] = r.updated_at; }); } catch(eAct){}
-    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; var topeOv = (s.limits_override && typeof s.limits_override.ai_messages === 'number') ? s.limits_override.ai_messages : null; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', pausado: b.crm_pausado === true, cortesia: s.cortesia === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, tope: topeOv, vence: s.current_period_end || null, ultima_actividad: act[b.user_id] || null }; });
+    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; var topeOv = (s.limits_override && typeof s.limits_override.ai_messages === 'number') ? s.limits_override.ai_messages : null; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', pausado: b.crm_pausado === true, eliminado: !!b.eliminado_at, eliminado_at: b.eliminado_at || null, cortesia: s.cortesia === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, tope: topeOv, vence: s.current_period_end || null, ultima_actividad: act[b.user_id] || null }; });
     try { var est = await Promise.all(clientes.map(function(c){ return Promise.race([ instanciaConectada(nombreInstancia(c.user_id)).catch(function(){ return null; }), new Promise(function(rz){ setTimeout(function(){ rz(null); }, 4000); }) ]); })); clientes.forEach(function(c, i){ c.whatsapp = (est[i] === true) ? 'conectado' : (est[i] === false ? 'desconectado' : 'desconocido'); }); } catch(eW){ clientes.forEach(function(c){ c.whatsapp = 'desconocido'; }); }
     var ahora = Date.now();
     clientes.forEach(function(c){ var sal = 'ok'; if (c.pausado) sal = 'pausada'; else if (c.whatsapp === 'desconectado') sal = 'whatsapp'; else if (c.tope && c.ai_mes >= c.tope) sal = 'tope'; else if (c.ultima_actividad && (ahora - new Date(c.ultima_actividad).getTime()) > 7 * 24 * 3600 * 1000) sal = 'inactivo'; c.salud = sal; });
     var totalIA = clientes.reduce(function(a, c){ return a + (c.ai_mes || 0); }, 0);
-    return res.json({ ok: true, total_clientes: clientes.length, total_ai_mes: totalIA, costo_estimado_usd: Math.round(totalIA * 0.01 * 100) / 100, clientes: clientes });
+    var activos = clientes.filter(function(c){ return !c.eliminado; });
+    var eliminados = clientes.filter(function(c){ return c.eliminado; });
+    return res.json({ ok: true, total_clientes: activos.length, total_eliminados: eliminados.length, total_ai_mes: totalIA, costo_estimado_usd: Math.round(totalIA * 0.01 * 100) / 100, clientes: activos, eliminados: eliminados });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

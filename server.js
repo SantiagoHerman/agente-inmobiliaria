@@ -1947,6 +1947,9 @@ app.post('/api/asesores/eliminar', async (req, res) => {
 function _limpiarHtmlScrape(html) {
   if (!html) return '';
   return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
@@ -3441,7 +3444,7 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
 // ===== SCRAPER UNIVERSAL DE INVENTARIO (multiples vias, cualquier inmobiliaria) =====
 function limpiarHTML(html) {
   if (!html) return '';
-  return String(html).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8211;/g, '-').replace(/&#8217;/g, "'").replace(/&quot;/g, '"').replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ').trim();
+  return String(html).replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<!--[\s\S]*?-->/g, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8211;/g, '-').replace(/&#8217;/g, "'").replace(/&quot;/g, '"').replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ').trim();
 }
 function extraerPrecioDe(html) {
   if (!html) return null;
@@ -3578,7 +3581,7 @@ app.post('/api/scrape/universal', async function(req, res) {
 // ===== SCRAPER CORREGIDO: extraccion completa por propiedad =====
 function limpiarHTML2(html) {
   if (!html) return '';
-  return String(html).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8211;/g, '-').replace(/&#8217;/g, "'").replace(/&#8220;|&#8221;/g, '"').replace(/&quot;/g, '"').replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ').trim();
+  return String(html).replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<!--[\s\S]*?-->/g, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8211;/g, '-').replace(/&#8217;/g, "'").replace(/&#8220;|&#8221;/g, '"').replace(/&quot;/g, '"').replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ').trim();
 }
 // Extrae los pares Etiqueta:Valor de la tabla de detalles (Houzez y similares)
 function extraerTablaDetalles(html) {

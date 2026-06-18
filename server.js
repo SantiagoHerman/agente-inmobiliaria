@@ -3679,6 +3679,28 @@ app.post('/api/scrape/v2', async function(req, res) {
 });
 
 
+// ===== BANCO DE PROPIEDADES (para el chat / conversaciones) =====
+// Devuelve las propiedades de la CUENTA del usuario logueado, resuelto server-side
+// con la service key (que bypasea RLS). Esto arregla el bug donde un ASESOR veia
+// "No hay propiedades" porque el frontend consultaba properties directo y la RLS
+// lo bloqueaba (su auth.uid() != user_id del dueno de la cuenta).
+// SEGURIDAD: el ownerId SIEMPRE se deriva del JWT del usuario (nunca de un
+// parametro del request), asi un asesor solo ve las propiedades de SU cuenta.
+app.get('/api/propiedades', async function(req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // Resolver el OWNER de la cuenta: si el usuario es un asesor, el dueno es su admin_id;
+    // si no hay fila de asesor, el usuario ES el dueno de la cuenta.
+    var ownerId = userId;
+    var ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data && ase.data.admin_id) ownerId = ase.data.admin_id;
+    var q = await supabase.from('properties').select('*').eq('user_id', ownerId).order('numero');
+    if (q.error) return res.status(500).json({ error: q.error.message });
+    return res.json({ ok: true, propiedades: q.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // ===== CONFIG DE SCRAPING/IMPORTACION AUTOMATICA =====
 app.get('/api/scraping-config', async function(req, res) {
   try {

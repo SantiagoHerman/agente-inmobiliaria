@@ -2066,11 +2066,31 @@ function parsearDetalleTokko(html, url) {
     : /alquiler|renta/i.test(tipoub) ? 'Alquiler anual' : 'Venta';
   campos['Estado'] = estado;
 
+  // FOTOS: la galeria de Tokko viene en la MISMA ficha (ya descargada) como
+  //   static.tokkobroker.com/pictures/<prop-id>_<hash>.jpg   (full-size)
+  // mientras que /thumbs/ y /sm_pics/ son miniaturas (las ignoramos). Cada foto aparece
+  // ~3 veces (slider + data-thumb + lightbox), por eso deduplicamos. Anclamos al prop-id
+  // de la URL (/p/NNN) para NO mezclar fotos de propiedades relacionadas que figuren en la
+  // misma pagina. Deterministico: sin IA y sin descargas extra. Tope 15 (igual que WordPress).
+  var fotos = [];
+  var pidM = (url || '').match(/\/p\/(\d+)/);
+  var pid = pidM ? pidM[1] : null;
+  var reFoto = pid
+    ? new RegExp('https?://static\\.tokkobroker\\.com/pictures/' + pid + '_[0-9]+\\.(?:jpe?g|png|webp)', 'gi')
+    : /https?:\/\/static\.tokkobroker\.com\/pictures\/\d+_[0-9]+\.(?:jpe?g|png|webp)/gi;
+  var fm, vistosFoto = {};
+  while ((fm = reFoto.exec(html)) !== null && fotos.length < 15) {
+    var fu = fm[0];
+    if (!vistosFoto[fu]) { vistosFoto[fu] = 1; fotos.push(fu); }
+  }
+
   return {
     url: url,
     titulo: tituloM ? _limpiarHtmlScrape(tituloM[1]) : (tipoub || ''),
     descripcion: descM ? _limpiarHtmlScrape(descM[1]) : '',
-    campos: campos
+    campos: campos,
+    foto: fotos[0] || '',
+    fotos: fotos
   };
 }
 

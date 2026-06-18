@@ -10,6 +10,8 @@ app.use((req, res, next) => {
   // Lista blanca de origenes permitidos (solo la app de Raices CRM)
   const ORIGENES_PERMITIDOS = [
     'https://raices-crm.vercel.app',
+    'https://www.raicescrm.com',
+    'https://raicescrm.com',
     'http://localhost:3000'
   ];
   const origin = req.headers.origin;

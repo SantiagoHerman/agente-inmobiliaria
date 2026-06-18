@@ -124,6 +124,7 @@ async function verificarUsuario(req) {
 }
 const EVOLUTION_URL = process.env.EVOLUTION_URL || '';
 const EVOLUTION_KEY = process.env.EVOLUTION_KEY || '';
+const GROQ_KEY = process.env.GROQ_API_KEY || '';
 
 const TONO = {
   formal: 'Usa un tono formal y profesional, tratando de usted.',
@@ -306,11 +307,32 @@ async function mpCrearPlan(nombre, montoARS, backUrl) {
   return await mpFetch('/preapproval_plan', 'POST', body);
 }
 
-// Crea una suscripcion (preapproval) asociada a un plan. Devuelve el objeto con init_point (checkout de MP).
+// Crea una suscripcion (preapproval). Devuelve el objeto con init_point (checkout de MP).
+// IMPORTANTE: el flujo "con preapproval_plan_id + payer_email" via API exige card_token_id (MP400).
+// Para obtener el init_point (checkout donde el cliente carga la tarjeta en MP) SIN exigir tarjeta,
+// creamos la preapproval SIN plan, con status:'pending', copiando precio/frecuencia/prueba del plan
+// (que leemos de MP, donde viven los precios). Conserva external_reference para mapear al usuario.
 async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl) {
-  // status:'pending' -> MP devuelve init_point (checkout donde el cliente carga la tarjeta) sin exigir
-  // card_token_id. Sin status, al mandar payer_email MP intenta autorizar directo y pide la tarjeta (MP400).
-  const body = { preapproval_plan_id: planId, payer_email: payerEmail, external_reference: externalRef, back_url: backUrl, status: 'pending' };
+  var ar = {};
+  try {
+    var plan = await mpFetch('/preapproval_plan/' + planId, 'GET', null);
+    ar = (plan && plan.auto_recurring) ? plan.auto_recurring : {};
+  } catch (e) { ar = {}; }
+  var autoRecurring = {
+    frequency: ar.frequency || 1,
+    frequency_type: ar.frequency_type || 'months',
+    transaction_amount: ar.transaction_amount,
+    currency_id: ar.currency_id || 'ARS'
+  };
+  if (ar.free_trial) autoRecurring.free_trial = ar.free_trial;
+  var body = {
+    reason: (typeof plan !== 'undefined' && plan && plan.reason) ? plan.reason : 'Suscripcion Raices CRM',
+    external_reference: externalRef,
+    payer_email: payerEmail,
+    back_url: backUrl,
+    status: 'pending',
+    auto_recurring: autoRecurring
+  };
   return await mpFetch('/preapproval', 'POST', body);
 }
 
@@ -385,6 +407,28 @@ async function elegirAsesorActivo(admin_id) {
   } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
 }
 
+// ===== TRANSCRIPCION DE AUDIO con Groq Whisper (multilenguaje, autodetect) =====
+async function transcribirAudioGroq(base64, mime) {
+  try {
+    if (!GROQ_KEY || !base64) return null; // fallback: sin key o sin audio
+    const buffer = Buffer.from(base64, 'base64');
+    const m = mime || 'audio/ogg';
+    const nombreArchivo = (m.indexOf('mp3') >= 0 || m.indexOf('mpeg') >= 0) ? 'audio.mp3' : 'audio.ogg';
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: m }), nombreArchivo);
+    form.append('model', 'whisper-large-v3');
+    // NO se manda 'language': dejamos que Whisper autodetecte el idioma (clave multilenguaje).
+    const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + GROQ_KEY }, // sin Content-Type: el FormData setea el boundary
+      body: form
+    });
+    if (!resp.ok) { console.error('transcribirAudioGroq fallo:', resp.status); return null; }
+    const j = await resp.json();
+    return ((j && j.text) || '').trim() || null;
+  } catch (e) { console.error('transcribirAudioGroq error:', e && e.message); return null; }
+}
+
 // ===== MULTIMEDIA: baja un archivo de Evolution y lo sube a Supabase Storage =====
 async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia) {
   try {
@@ -414,7 +458,12 @@ async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia) {
     // 4) Obtener URL publica
     const pub = supabase.storage.from('media').getPublicUrl(nombre);
     const url = pub && pub.data ? pub.data.publicUrl : null;
-    return url ? { url: url, tipo: tipoMedia } : null;
+    // 5) Si es audio y hay Groq: transcribir REUSANDO el base64 ya bajado (sin segunda descarga)
+    let transcripcion = null;
+    if (tipoMedia === 'audio' && GROQ_KEY) {
+      transcripcion = await transcribirAudioGroq(base64, mime);
+    }
+    return url ? { url: url, tipo: tipoMedia, transcripcion: transcripcion } : null;
   } catch (e) { console.error('subirMediaAStorage error:', e && e.message); return null; }
 }
 // ===== ENVIAR MULTIMEDIA por WhatsApp (Evolution sendMedia) =====
@@ -1206,6 +1255,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (!conv) return;
 
     // 4) Guardar SIEMPRE el mensaje entrante (no se pierde nada)
+    // MEDIA ENTRANTE: subir a Storage ANTES de traducir/IA. Si es audio y hay Groq, subirMediaAStorage
+    // ademas transcribe (reusando el base64 ya bajado, sin segunda descarga). Si vino transcripcion,
+    // reemplazamos el '[audio]' por el texto real ANTES de armar contentLead -> asi la IA y el traductor
+    // procesan el audio como si fuera un mensaje escrito. Fallback total: si falta GROQ_KEY o falla la
+    // transcripcion, 'texto' sigue siendo '[audio]' (comportamiento exacto de hoy).
+    let mediaSubido = null;
+    if (tipoMediaEntrante) {
+      try { mediaSubido = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante); } catch (eMedia) { console.error('subir media lead:', eMedia && eMedia.message); }
+      if (tipoMediaEntrante === 'audio' && mediaSubido && mediaSubido.transcripcion) {
+        texto = mediaSubido.transcripcion;
+      }
+    }
     // Traduccion entrante: detectar idioma del lead y traducir al espanol para el asesor
     let contentLead = texto;
     let contentOrigLead = null;
@@ -1225,9 +1286,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
     let mediaUrlLead = null; let mediaTipoLead = null;
-    if (tipoMediaEntrante) {
-      try { const subido = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante); if (subido) { mediaUrlLead = subido.url; mediaTipoLead = subido.tipo; } } catch (eMedia) { console.error('subir media lead:', eMedia && eMedia.message); }
-    }
+    if (mediaSubido) { mediaUrlLead = mediaSubido.url; mediaTipoLead = mediaSubido.tipo; }
     await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead });
     // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };

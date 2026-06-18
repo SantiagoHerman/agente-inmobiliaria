@@ -308,7 +308,9 @@ async function mpCrearPlan(nombre, montoARS, backUrl) {
 
 // Crea una suscripcion (preapproval) asociada a un plan. Devuelve el objeto con init_point (checkout de MP).
 async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl) {
-  const body = { preapproval_plan_id: planId, payer_email: payerEmail, external_reference: externalRef, back_url: backUrl };
+  // status:'pending' -> MP devuelve init_point (checkout donde el cliente carga la tarjeta) sin exigir
+  // card_token_id. Sin status, al mandar payer_email MP intenta autorizar directo y pide la tarjeta (MP400).
+  const body = { preapproval_plan_id: planId, payer_email: payerEmail, external_reference: externalRef, back_url: backUrl, status: 'pending' };
   return await mpFetch('/preapproval', 'POST', body);
 }
 
@@ -2402,6 +2404,103 @@ function listarUrlsHeuristica(html, base) {
   return out;
 }
 
+// GALERIA DESDE HTML — para sitios WordPress cuyas fichas NO estan expuestas en wp-json
+// (ej. remaxbosque: las propiedades viven en /propiedades/<id>/ como paginas server-rendered,
+// no como post type REST). El camino wp-json (_mapearPropWpJsonADetalle) ya resuelve la galeria
+// via fave_property_images/parent-media; esta funcion es SOLO el fallback del camino HTML.
+//
+// Estrategia:
+//  - junta imagenes wp-content/uploads cuyo NOMBRE DE ARCHIVO sea un UUID
+//    ([0-9a-f]{8}-...-[0-9a-f]{12}). Eso distingue las fotos de la propiedad del logo/portada/
+//    banners (que tienen nombres descriptivos: Logo-REMAX..., Portada-...).
+//  - dedup por foto base: normaliza quitando el sufijo de tamano -WxH y el sufijo -scaled antes
+//    de comparar; prefiere la version full (sin -WxH/-scaled). Mantiene el ORDEN del documento.
+//  - excluye logo/portada/icon/avatar/placeholder por nombre.
+//  - cap 15 (igual que los otros caminos).
+//  - fallback: si el patron UUID no matchea nada (otros sitios), toma imagenes uploads del
+//    PRIMER contenedor de gallery/slider/swiper/carousel del HTML, mismo dedup/cap.
+function _extraerGaleriaHtml(html, baseUrl) {
+  if (!html) return [];
+  var RX_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  var RX_EXCLUIR = /(logo|portada|cover|banner|icon|avatar|placeholder|sprite|favicon|watermark|marca-?agua)/i;
+  // saca el sufijo de tamano -WxH (justo antes de la extension) y luego -scaled.
+  // OJO: NO tocar un sufijo numerico tipo -1 (re-subida de WP) — eso es parte del nombre base.
+  function _normalizarBase(u) {
+    var sinQuery = u.split('?')[0].split('#')[0];
+    var b = sinQuery.replace(/-\d{1,5}x\d{1,5}(?=\.[a-z0-9]+$)/i, '');
+    b = b.replace(/-scaled(?=\.[a-z0-9]+$)/i, '');
+    return b.toLowerCase();
+  }
+  // "calidad" de una variante para elegir la MEJOR de una misma foto base.
+  // full (sin sufijo) gana; luego -scaled; luego -WxH por area (mas grande mejor).
+  function _calidad(u) {
+    var archivo = u.split('?')[0].split('#')[0];
+    var mWH = archivo.match(/-(\d{1,5})x(\d{1,5})\.[a-z0-9]+$/i);
+    if (mWH) return parseInt(mWH[1], 10) * parseInt(mWH[2], 10);   // area (siempre > 0, < scaled)
+    if (/-scaled\.[a-z0-9]+$/i.test(archivo)) return 1e9;           // scaled: muy buena, debajo de full
+    return 2e9;                                                     // full (sin -WxH ni -scaled): la mejor
+  }
+  function _mejorQue(nueva, vieja) {
+    var cn = _calidad(nueva), cv = _calidad(vieja);
+    if (cn !== cv) return cn > cv;
+    return nueva.length < vieja.length;   // empate: la mas corta
+  }
+  function _abs(u) { try { return new URL(u, (baseUrl || '') + '/').toString(); } catch (e) { return u; } }
+
+  // recolecta URLs de uploads en ORDEN del documento desde CUALQUIER atributo (src, data-*, href,
+  // data-rsBigImg de RoyalSlider, etc.) y desde srcset. Esto asegura juntar todas las variantes
+  // de cada foto (incluida la mas grande, ej. -scaled) para luego quedarnos con la mejor.
+  function _recolectar(fragmento) {
+    var urls = [];
+    var rx = /(?:[a-zA-Z_:-]+)\s*=\s*["']([^"']*\/wp-content\/uploads\/[^"']+?\.(?:jpe?g|png|webp))(?:["'?])/gi;
+    var m;
+    while ((m = rx.exec(fragmento)) !== null) urls.push(m[1]);
+    // srcset: tomar TODAS las URLs de cada srcset (incluye la de mayor resolucion).
+    var rxSet = /srcset\s*=\s*["']([^"']*\/wp-content\/uploads\/[^"']+)["']/gi;
+    var ms;
+    while ((ms = rxSet.exec(fragmento)) !== null) {
+      var partes = ms[1].split(',');
+      for (var s = 0; s < partes.length; s++) {
+        var cand = partes[s].trim().split(/\s+/)[0];
+        if (cand && /\.(?:jpe?g|png|webp)$/i.test(cand.split('?')[0])) urls.push(cand);
+      }
+    }
+    return urls;
+  }
+
+  // dedup por base + cap, preservando orden de aparicion y eligiendo la mejor variante.
+  function _consolidar(urls, exigirUuid) {
+    var porBase = {};   // base -> { url, idx }
+    var orden = [];     // bases en orden de primera aparicion
+    for (var i = 0; i < urls.length; i++) {
+      var raw = urls[i];
+      var archivo = raw.split('?')[0].split('#')[0].split('/').pop() || '';
+      if (RX_EXCLUIR.test(archivo)) continue;
+      if (exigirUuid && !RX_UUID.test(archivo)) continue;
+      var abs = _abs(raw);
+      var base = _normalizarBase(abs);
+      if (!porBase[base]) { porBase[base] = { url: abs }; orden.push(base); }
+      else if (_mejorQue(abs, porBase[base].url)) { porBase[base].url = abs; }
+    }
+    var out = [];
+    for (var k = 0; k < orden.length && out.length < 15; k++) out.push(porBase[orden[k]].url);
+    return out;
+  }
+
+  // 1) intento principal: TODO el HTML, exigiendo UUID en el nombre (filtra logo/portada/banners).
+  var todas = _recolectar(html);
+  var galeria = _consolidar(todas, true);
+  if (galeria.length) return galeria;
+
+  // 2) fallback: primer contenedor de gallery/slider/swiper/carousel, sin exigir UUID.
+  var mCont = html.match(/<[^>]+class=["'][^"']*(?:galler|slider|swiper|carousel|woocommerce-product-gallery|product-image-gallery)[^"']*["'][^>]*>([\s\S]{0,40000}?)<\/(?:div|ul|section)>/i);
+  if (mCont) {
+    var fb = _consolidar(_recolectar(mCont[0]), false);
+    if (fb.length) return fb;
+  }
+  return [];
+}
+
 // (5) EXTRACCION CON IA — ultimo recurso. Manda el HTML limpio del LISTADO a Anthropic y
 // pide TODAS las propiedades como JSON array. Solo se invoca si 1-4 fallaron. Cap de HTML
 // y registro de uso de tokens (control de costo). Si no hay key, devuelve [] sin romper.
@@ -3080,8 +3179,28 @@ app.post('/api/scrape/detalle', async function(req, res) {
           descripcion: descCompleta ? descCompleta : (descM ? descM[1].trim() : ''),
           campos: campos
         };
+        // GALERIA (camino HTML): SOLO aplica a fichas que NO vinieron por wp-json
+        // (este `procesarUnaUrlHtml` corre justamente para las pendientes que no resolvio wp-json).
+        // og:image como portada de respaldo; galeria UUID/contenedor como `fotos`. No pisa nada si
+        // ya hay fotos en el objeto detalle. Lo computamos una vez y lo adjuntamos antes de cada return.
+        var ogImg = '';
+        var ogM = html.match(/og:image["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:image/i);
+        if (ogM && ogM[1]) ogImg = ogM[1].trim();
+        var galeriaHtml = [];
+        try { galeriaHtml = _extraerGaleriaHtml(html, u); } catch (eG) { galeriaHtml = []; }
+        function _adjuntarFotos(det) {
+          if (!det || typeof det !== 'object') return det;
+          // si ya trae fotos (p.ej. de un camino que las provea), no tocar.
+          if (Array.isArray(det.fotos) && det.fotos.length) { if (!det.foto) det.foto = det.fotos[0]; return det; }
+          var fotos = galeriaHtml.slice(0, 15);
+          if (!fotos.length && ogImg) fotos = [ogImg];   // fallback final: la portada de siempre
+          var portada = det.foto || (fotos.length ? fotos[0] : (ogImg || ''));
+          if (portada) det.foto = portada;
+          det.fotos = fotos;
+          return det;
+        }
         // si el parseo WordPress/Houzez ya saco campos tecnicos utiles, listo (camino de siempre).
-        if (Object.keys(campos).length > 0) { return detWp; }
+        if (Object.keys(campos).length > 0) { return _adjuntarFotos(detWp); }
 
         // (3) FALLBACK datos estructurados: JSON-LD / OpenGraph / microdata
         const detEst = parsearDetalleEstructurado(html, u);
@@ -3089,14 +3208,14 @@ app.post('/api/scrape/detalle', async function(req, res) {
           // combinar: titulo/desc del que tenga mejor info
           if (!detEst.titulo && detWp.titulo) detEst.titulo = detWp.titulo;
           if (!detEst.descripcion && detWp.descripcion) detEst.descripcion = detWp.descripcion;
-          return detEst;
+          return _adjuntarFotos(detEst);
         }
 
         // (5) FALLBACK IA para la ficha (ultimo recurso; solo si lo determinista no saco campos)
         const detIa = await parsearDetalleIA(html, u, user_id);
         if (detIa && (Object.keys(detIa.campos).length > 0 || detIa.descripcion)) {
           if (!detIa.titulo && detWp.titulo) detIa.titulo = detWp.titulo;
-          return detIa;
+          return _adjuntarFotos(detIa);
         }
 
         // si nada saco campos pero la lista IA ya traia datos pre-extraidos, usarlos como base.
@@ -3113,12 +3232,12 @@ app.post('/api/scrape/detalle', async function(req, res) {
           if (p.ubicacion) camposPrev['Ciudad/ Localidad'] = p.ubicacion;
           if (p.operacion) camposPrev['Estado'] = /alquiler\s*tempora|temporari/i.test(p.operacion) ? 'Alquiler temporario' : (/alquiler|renta/i.test(p.operacion) ? 'Alquiler anual' : 'Venta');
           if (Object.keys(camposPrev).length > 0) {
-            return { url: u, titulo: detWp.titulo || '', descripcion: detWp.descripcion || '', campos: camposPrev, ia: true };
+            return _adjuntarFotos({ url: u, titulo: detWp.titulo || '', descripcion: detWp.descripcion || '', campos: camposPrev, ia: true });
           }
         }
 
         // ultimo: devolver lo que haya (titulo/desc de OG) aunque no haya campos tecnicos.
-        return detWp;
+        return _adjuntarFotos(detWp);
       } catch (e) { return { url: u, error: e && e.message }; }
     }
 

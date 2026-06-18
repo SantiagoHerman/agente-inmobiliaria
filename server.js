@@ -332,9 +332,11 @@ async function hacerBackup() {
 }
 
 // Elige el asesor ACTIVO con menos leads asignados (reparto equitativo). Devuelve su id o null.
+// Los usuarios con rol 'administrador' quedan EXCLUIDOS de la auto-asignacion/rotacion
+// (un admin no recibe leads automaticamente). El filtro deja pasar rol='asesor' y rol NULL (legacy).
 async function elegirAsesorActivo(admin_id) {
   try {
-    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true);
+    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
     if (!activos || activos.length === 0) return null;
     // contar leads asignados a cada asesor activo
     let mejor = null; let menos = Infinity;
@@ -1797,12 +1799,16 @@ setTimeout(hacerBackup, 90 * 1000);
 // Crear un asesor: crea el usuario en Auth (con la service key) y la fila en asesores.
 app.post('/api/asesores/crear', async (req, res) => {
   try {
-    const { admin_id, nombre, usuario, clave, cargo } = req.body || {};
+    const { admin_id, nombre, usuario, clave, cargo, rol } = req.body || {};
     // SEGURIDAD: validar identidad por token
     const _uidToken = await verificarUsuario(req);
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!admin_id || !nombre || !usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
+    // Rol del usuario: 'asesor' (default) o 'administrador'. Los administradores quedan excluidos
+    // de la auto-asignacion/rotacion de leads y de las notificaciones push automaticas de la IA.
+    const rolFinal = (rol === 'administrador') ? 'administrador' : 'asesor';
+    if (rol && rol !== 'asesor' && rol !== 'administrador') return res.status(400).json({ error: 'Rol invalido (debe ser asesor o administrador)' });
     // Limite de 5 asesores por admin
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
     if (existentes && existentes.length >= 5) return res.status(400).json({ error: 'Maximo 5 asesores' });
@@ -1814,10 +1820,10 @@ app.post('/api/asesores/crear', async (req, res) => {
     const aliasLimpio = usuario.toLowerCase().replace(/[^a-z0-9]/g, '');
     const partes = adminEmail.split('@');
     const email = partes[0] + '+' + aliasLimpio + '@' + partes[1];
-    const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: 'asesor', admin_id: admin_id, nombre: nombre } });
+    const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: rolFinal, admin_id: admin_id, nombre: nombre } });
     if (errAuth) return res.status(400).json({ error: errAuth.message });
     const authId = created && created.user ? created.user.id : null;
-    const { error: errIns } = await supabase.from('asesores').insert({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : 'Asesor', estado: 'activo', activo: true });
+    const { error: errIns } = await supabase.from('asesores').insert({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : 'Asesor', rol: rolFinal, estado: 'activo', activo: true });
     if (errIns) { if (authId) { try { await supabase.auth.admin.deleteUser(authId); } catch (e) {} } return res.status(400).json({ error: errIns.message }); }
     return res.json({ ok: true, email: email });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
@@ -1834,8 +1840,8 @@ app.post('/api/asesores/activar', async (req, res) => {
     if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
     // 1. Poner el asesor activo
     await supabase.from('asesores').update({ activo: true, estado: 'activo' }).eq('id', asesor_id);
-    // 2. Buscar asesores activos de la inmobiliaria
-    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true);
+    // 2. Buscar asesores activos de la inmobiliaria (excluyendo administradores: no reciben leads)
+    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
     if (!activos || activos.length === 0) return res.json({ ok: true, asignados: 0 });
     // 3. Buscar leads en espera, sin asignar y no tomados por el admin
     const { data: enEspera } = await supabase.from('conversations').select('id').eq('user_id', admin_id).is('asesor_id', null).eq('admin_tomo', false);

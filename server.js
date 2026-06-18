@@ -2504,6 +2504,21 @@ function _metaVal(meta, clave) {
   v = String(v).trim();
   return v === '' ? null : v;
 }
+// Devuelve un meta como array de strings (para campos multivaluados ej. fave_property_images).
+// Acepta tanto el formato wp ["76714","76715"] como un valor suelto. Filtra vacios.
+function _metaArr(meta, clave) {
+  if (!meta) return [];
+  var v = meta[clave];
+  if (v === undefined || v === null) return [];
+  var arr = Array.isArray(v) ? v : [v];
+  var out = [];
+  for (var i = 0; i < arr.length; i++) {
+    if (arr[i] === undefined || arr[i] === null) continue;
+    var s = String(arr[i]).trim();
+    if (s !== '') out.push(s);
+  }
+  return out;
+}
 // Devuelve el nombre del primer termino de una taxonomia dada dentro de _embedded.wp:term.
 function _taxNombre(emb, tax) {
   var terms = (emb && emb['wp:term']) || [];
@@ -2522,7 +2537,7 @@ function _taxLista(emb, tax) {
 
 // Mapea UN objeto propiedad de wp-json al MISMO shape {url, titulo, descripcion, campos} que
 // espera normalizarPropiedadScrape (mismas claves KNOWN del camino HTML/Houzez). NUNCA usa IA.
-function _mapearPropWpJsonADetalle(p, urlOriginal) {
+function _mapearPropWpJsonADetalle(p, urlOriginal, mediaMap) {
   var emb = p._embedded || {};
   var meta = p.property_meta || {};
   var titulo = limpiarHTML2(p.title && p.title.rendered) || '';
@@ -2585,15 +2600,77 @@ function _mapearPropWpJsonADetalle(p, urlOriginal) {
 
   // --- Foto destacada (para el front) ---
   var media = emb['wp:featuredmedia'] || [];
-  var foto = (media[0] && media[0].source_url) ? media[0].source_url : null;
+  var featuredId = (media[0] && media[0].id) ? String(media[0].id) : null;
+  var featuredUrl = (media[0] && media[0].source_url) ? media[0].source_url : null;
 
-  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, foto: foto, wpjson: true };
+  // --- Galeria: IDs de adjuntos de property_meta (NO trae URLs directas) ---
+  // Orden: portada (slider) primero, luego la galeria completa, luego el featured.
+  // Las URLs se resuelven aparte (endpoint /media) y llegan en `mediaMap` (id -> source_url).
+  var idsGaleria = []
+    .concat(_metaArr(meta, 'fave_prop_slider_image'))
+    .concat(_metaArr(meta, 'fave_property_images'));
+  if (featuredId) idsGaleria.push(featuredId);
+
+  var foto = featuredUrl; // portada: featured si lo tenemos
+  var fotos = [];
+  var vistas = {};
+  // Si tenemos el mapa id->url, construimos la galeria en orden, dedup, cap 15.
+  if (mediaMap) {
+    for (var gi = 0; gi < idsGaleria.length && fotos.length < 15; gi++) {
+      var sourceUrl = mediaMap[idsGaleria[gi]];
+      if (!sourceUrl || vistas[sourceUrl]) continue;
+      vistas[sourceUrl] = 1;
+      fotos.push(sourceUrl);
+    }
+    // si no resolvimos featured por _embedded, usar la primera de la galeria como portada
+    if (!foto && fotos.length) foto = fotos[0];
+  }
+  // si por algun motivo no hay galeria pero si portada, dejar al menos la portada en fotos
+  if (fotos.length === 0 && foto) fotos.push(foto);
+
+  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, foto: foto, fotos: fotos, _idsGaleria: idsGaleria, wpjson: true };
+}
+
+// Resuelve EN BLOQUE un set de IDs de adjuntos WordPress a sus source_url.
+// El meta de Houzez (fave_property_images) trae solo IDs, NO URLs -> hay que pedirlas al endpoint /media.
+// Pide GET /wp-json/wp/v2/media?include=<ids>&per_page=100&_fields=id,source_url, loteando de a 100 IDs.
+// Usa fetchScrape (TLS-tolerante para oilher). Devuelve un mapa { id(string) -> source_url }.
+async function _resolverMediaWpJson(base, ids) {
+  var mapa = {};
+  if (!base || !ids || !ids.length) return mapa;
+  // dedup preservando como strings
+  var unicos = [];
+  var visto = {};
+  for (var i = 0; i < ids.length; i++) {
+    var id = String(ids[i] || '').trim();
+    if (!id || visto[id]) continue;
+    visto[id] = 1;
+    unicos.push(id);
+  }
+  // lotear de a 100 (limite per_page de WP)
+  for (var off = 0; off < unicos.length; off += 100) {
+    var lote = unicos.slice(off, off + 100);
+    var url = base + '/wp-json/wp/v2/media?include=' + lote.join(',') + '&per_page=100&_fields=id,source_url';
+    try {
+      var r = await fetchScrape(url);
+      if (r && r.ok) {
+        var data = JSON.parse(await r.text());
+        if (Array.isArray(data)) {
+          for (var j = 0; j < data.length; j++) {
+            var m = data[j];
+            if (m && m.id != null && m.source_url) mapa[String(m.id)] = m.source_url;
+          }
+        }
+      }
+    } catch (e) { /* lo que no resuelva queda sin url; la prop se queda con su portada */ }
+  }
+  return mapa;
 }
 
 // Trae EN LOTE los detalles de un conjunto de URLs/items WordPress via wp-json (1 sola llamada por lote).
 // Estrategia: extraer el slug (ultimo segmento del path) de cada URL y pedir ?slug=a,b,c&_embed=1.
 // Fallback: si la URL trae un id numerico de post (?p=NN o item.postId), usar ?include=...
-// Devuelve un array de detalles {url, titulo, descripcion, campos, foto} alineado por slug; las URLs
+// Devuelve un array de detalles {url, titulo, descripcion, campos, foto, fotos} alineado por slug; las URLs
 // que no matchearon vuelven como null (para que el caller decida el fallback HTML/IA).
 async function _traerDetallesWpJson(base, items) {
   // items: array de strings (url) u objetos {url,...}
@@ -2617,12 +2694,40 @@ async function _traerDetallesWpJson(base, items) {
       if (r && r.ok) {
         var data = JSON.parse(await r.text());
         if (Array.isArray(data)) {
+          // --- PASO 1: mapear cada prop SIN galeria (recolecta los IDs de imagen en _idsGaleria) ---
+          var dets = [];
+          var idsTodos = [];
           for (var i = 0; i < data.length; i++) {
             var p = data[i];
             // matchear el item original por slug para conservar SU url exacta
             var orig = metas.find(function(m) { return m.slug === p.slug; });
-            var det = _mapearPropWpJsonADetalle(p, orig ? orig.url : (p.link || ''));
-            if (orig) resultadoPorUrl[orig.url] = det; else resultadoPorUrl[p.link] = det;
+            var det = _mapearPropWpJsonADetalle(p, orig ? orig.url : (p.link || ''), null);
+            dets.push(det);
+            if (det._idsGaleria && det._idsGaleria.length) idsTodos = idsTodos.concat(det._idsGaleria);
+          }
+          // --- PASO 2: resolver TODOS los IDs del lote a URLs en bloque (endpoint /media) ---
+          var mediaMap = await _resolverMediaWpJson(base, idsTodos);
+          // --- PASO 3: asignar la galeria (orden, dedup, cap 15) a cada prop ---
+          for (var k = 0; k < dets.length; k++) {
+            var d = dets[k];
+            var fotos = [];
+            var vistas = {};
+            var idsg = d._idsGaleria || [];
+            for (var gi = 0; gi < idsg.length && fotos.length < 15; gi++) {
+              var sUrl = mediaMap[idsg[gi]];
+              if (!sUrl || vistas[sUrl]) continue;
+              vistas[sUrl] = 1;
+              fotos.push(sUrl);
+            }
+            if (fotos.length) {
+              d.fotos = fotos;
+              if (!d.foto) d.foto = fotos[0];
+            } else if (d.foto) {
+              d.fotos = [d.foto];
+            }
+            // limpiar campos internos antes de devolver
+            delete d._idsGaleria;
+            resultadoPorUrl[d.url] = d;
           }
         }
       }

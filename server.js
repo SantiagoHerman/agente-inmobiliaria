@@ -4410,8 +4410,13 @@ app.post('/api/conversations/resumen', async function(req, res){
     if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
     var c = await supabase.from('conversations').select('user_id').eq('id', conversation_id).maybeSingle();
     if (!c.data) return res.status(404).json({ error: 'Conversacion no encontrada' });
-    if (c.data.user_id !== uid) return res.status(403).json({ error: 'No autorizado' });
-    var resumen = await generarResumenConversacion(conversation_id, uid);
+    // Permitir al DUEÑO o a un ASESOR de la misma cuenta (asesor.admin_id === dueño de la conversacion).
+    if (c.data.user_id !== uid) {
+      var aRes = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (!aRes.data || aRes.data.admin_id !== c.data.user_id) return res.status(403).json({ error: 'No autorizado' });
+    }
+    // El consumo de tokens se atribuye al DUEÑO de la cuenta, no al asesor.
+    var resumen = await generarResumenConversacion(conversation_id, c.data.user_id);
     if (!resumen) return res.status(422).json({ error: 'No se pudo generar el resumen (sin mensajes o error de IA)' });
     await supabase.from('conversations').update({ summary: resumen, updated_at: new Date().toISOString() }).eq('id', conversation_id);
     return res.json({ ok: true, summary: resumen });

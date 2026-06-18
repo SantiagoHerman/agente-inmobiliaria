@@ -249,7 +249,7 @@ async function debeBloquearAcceso(user_id) {
       } catch (eC) { return false; } // sin certeza -> no bloquear
     }
     // Con fila de suscripcion: bloquear SOLO si esta cancelled/suspended (EXACTO como el gate del agente,
-    // webhook ~1285). NO se bloquea past_due: el agente sigue atendiendo durante la gracia de 3 dias, y el
+    // webhook ~1285). NO se bloquea past_due: el agente sigue atendiendo durante la gracia de 1 dia, y el
     // cron revisarSuscripciones pasa past_due -> suspended tras esa gracia (recien ahi se bloquea aca).
     if (est === 'cancelled' || est === 'suspended') return true;
     return false; // trial, active, past_due (en gracia), o estado desconocido -> no bloquear
@@ -4601,7 +4601,7 @@ app.post('/api/conversations/resumen', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
-// CRON suscripciones: dunning (past_due con +3 dias de gracia -> suspended) + reset mensual del contador de mensajes IA. Inerte si SUBSCRIPTIONS_ENABLED=false.
+// CRON suscripciones: dunning (past_due con +1 dia de gracia -> suspended) + reset mensual del contador de mensajes IA. Inerte si SUBSCRIPTIONS_ENABLED=false.
 async function revisarSuscripciones() {
   try {
     if (!SUBSCRIPTIONS_ENABLED) return;
@@ -4610,7 +4610,7 @@ async function revisarSuscripciones() {
     for (var k = 0; k < (subs.data || []).length; k++) {
       var s = subs.data[k];
       var updates = {};
-      if (s.status === 'past_due' && s.current_period_end && (ahora - new Date(s.current_period_end).getTime()) > 3 * 24 * 3600 * 1000) updates.status = 'suspended';
+      if (s.status === 'past_due' && s.current_period_end && (ahora - new Date(s.current_period_end).getTime()) > 1 * 24 * 3600 * 1000) updates.status = 'suspended';
       var ini = s.period_start ? new Date(s.period_start).getTime() : null;
       if (!ini) updates.period_start = new Date(ahora).toISOString();
       else if (ahora - ini > 30 * 24 * 3600 * 1000) { updates.ai_messages_this_period = 0; updates.period_start = new Date(ahora).toISOString(); }

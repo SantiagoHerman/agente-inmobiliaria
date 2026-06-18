@@ -1903,7 +1903,144 @@ app.post('/api/asesores/eliminar', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
-// ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress) =====
+// ===== SCRAPER MULTIPLATAFORMA: HELPERS (aditivo, no rompe el camino WordPress) =====
+// Estrategia: el flujo de import sigue siendo lista -> detalle. Para WordPress/Houzez
+// se usa el sitemap (como siempre). Para Tokko Broker (sin sitemap ni wp-json) se
+// detecta la plataforma y se listan/parsean las propiedades desde el HTML renderizado.
+// Sin dependencias nuevas: solo fetch + regex (no hay cheerio en node_modules).
+
+// Quita tags HTML y entidades para texto limpio (variante local del scraper).
+function _limpiarHtmlScrape(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#8211;/g, '-')
+    .replace(/&#8217;/g, "'")
+    .replace(/&#?[a-z0-9]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Detecta si un HTML corresponde a un sitio Tokko Broker.
+function esSitioTokko(html) {
+  if (!html) return false;
+  return /tokkobroker\.com\/tfw\//i.test(html)
+    || /Software\s+Inmobiliario\s*-\s*Tokko/i.test(html)
+    || /<li\s+prop-id="\d+"/i.test(html);
+}
+
+// Lista las URLs de detalle de propiedades Tokko presentes en un HTML de listado.
+// Cada tarjeta es <li prop-id="NNN"> ... <a href="/p/NNN-slug">. Devuelve [{url, numero}].
+function listarPropsTokkoDeHTML(html, base) {
+  var out = [];
+  var re = /<li\s+prop-id="(\d+)"[\s\S]*?<a\s+href="(\/p\/[^"]+)"/gi;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    out.push({ numero: m[1], url: base + m[2] });
+  }
+  return out;
+}
+
+// Recorre las paginas de operacion/tipo de un sitio Tokko y junta todas las URLs de detalle.
+// Tokko renderiza ~20 props por pagina (server-side) y pagina con ?o=&1=1&page=N.
+// Como la paginacion por query es inestable mas alla de la pagina 2, ademas recorremos
+// las secciones de operacion y de tipo y deduplicamos por numero.
+async function listarUrlsTokko(base, limite) {
+  var SECCIONES = ['/Venta', '/Alquiler', '/Alquiler-temporario',
+    '/Casas', '/Departamentos', '/PHs', '/Terrenos', '/Locales',
+    '/Fondos-De-Comercio', '/Terrenos-comerciales', '/Oficinas', '/Cocheras'];
+  var vistos = {};
+  var items = [];
+  var tope = limite || 9999;
+  for (var s = 0; s < SECCIONES.length && items.length < tope; s++) {
+    var antes = items.length;
+    for (var pagina = 1; pagina <= 6 && items.length < tope; pagina++) {
+      var url = (pagina === 1)
+        ? base + SECCIONES[s]
+        : base + SECCIONES[s] + '?o=&1=1&page=' + pagina;
+      var html;
+      try {
+        var r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        if (!r.ok) break;
+        html = await r.text();
+      } catch (e) { break; }
+      var encontrados = listarPropsTokkoDeHTML(html, base);
+      if (encontrados.length === 0) break;
+      var nuevosEnPagina = 0;
+      for (var i = 0; i < encontrados.length; i++) {
+        var it = encontrados[i];
+        if (!vistos[it.numero]) {
+          vistos[it.numero] = 1;
+          items.push(it);
+          nuevosEnPagina++;
+          if (items.length >= tope) break;
+        }
+      }
+      // si una pagina no aporto nada nuevo, la paginacion ya no avanza -> pasar de seccion
+      if (nuevosEnPagina === 0) break;
+    }
+    // si la primera seccion ya devolvio props pero ninguna seccion nueva aporta, igual seguimos
+    void antes;
+  }
+  return items;
+}
+
+// Parsea la ficha de detalle de una propiedad Tokko a {titulo, descripcion, campos}
+// con las MISMAS claves que espera normalizarPropiedadScrape en el frontend
+// (Propiedad ID, Precio, Tipo de propiedad, Ambientes, Ciudad/ Localidad, Barrio/ Zona, Estado, Plazas).
+function parsearDetalleTokko(html, url) {
+  var raw = {};
+  // ficha_detalle_item: <b>Etiqueta</b><br/>Valor</div>
+  var re = /<div class="ficha_detalle_item">\s*<b>([^<]+)<\/b>\s*(?:<br\s*\/?>)?\s*([^<]*)</gi;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    var k = _limpiarHtmlScrape(m[1]).replace(/:$/, '').trim();
+    var v = _limpiarHtmlScrape(m[2]);
+    if (k && v) raw[k] = v;
+  }
+  // codigo de referencia: "(REF. RHO7897445)" o <div class='codref'>RHO...</div>
+  var cod = html.match(/\(REF\.?\s*([A-Za-z0-9\-]+)\)/i)
+    || html.match(/codref[^>]*>\s*([A-Za-z0-9\-]+)\s*</i)
+    || (url || '').match(/\/p\/(\d+)/);
+  // precio: USD115.000 / U$S / US$ / $300.000
+  var pr = html.match(/(USD|U\$S|US\$)\s?[\d.,]{3,}/i) || html.match(/\$\s?[\d.,]{4,}/);
+  // operacion: del bloque tipo-ub de la tarjeta o del og:title
+  var tipoub = (html.match(/prop-desc-tipo-ub">([^<]+)</)
+    || html.match(/<meta[^>]*og:title[^>]*content="([^"]+)"/i)
+    || [])[1] || '';
+  var tituloM = html.match(/<meta[^>]*og:title[^>]*content="([^"]+)"/i);
+  var descM = html.match(/<meta[^>]*og:description[^>]*content="([^"]+)"/i);
+
+  var campos = {};
+  if (cod) campos['Propiedad ID'] = cod[1];
+  if (pr) campos['Precio'] = pr[0].trim();
+  var tipo = raw['Tipo de Propiedad'] || raw['Tipo de propiedad'] || raw['Tipo'];
+  if (tipo) campos['Tipo de propiedad'] = tipo;
+  var amb = raw['Ambientes'] || raw['Dormitorios'] || raw['Habitaciones'];
+  if (amb) campos['Ambientes'] = amb;
+  var ubic = raw['Ubicaci' + String.fromCharCode(243) + 'n'] || raw['Ubicacion'] || raw['Localidad'] || raw['Ciudad'];
+  if (ubic) campos['Ciudad/ Localidad'] = ubic;
+  var dir = raw['Direcci' + String.fromCharCode(243) + 'n'] || raw['Direccion'] || raw['Barrio'] || raw['Zona'];
+  if (dir) campos['Barrio/ Zona'] = dir;
+  var plazas = raw['Plazas'] || raw['Capacidad'] || raw['Hu' + String.fromCharCode(233) + 'spedes'];
+  if (plazas) campos['Plazas'] = plazas;
+  // Estado/operacion: lo que entiende el normalizador (venta / alquiler anual / alquiler temporario)
+  var estado = /alquiler\s*tempora|temporari|por\s*(noche|d[ií]a)|veraneo/i.test(tipoub)
+    ? 'Alquiler temporario'
+    : /alquiler|renta/i.test(tipoub) ? 'Alquiler anual' : 'Venta';
+  campos['Estado'] = estado;
+
+  return {
+    url: url,
+    titulo: tituloM ? _limpiarHtmlScrape(tituloM[1]) : (tipoub || ''),
+    descripcion: descM ? _limpiarHtmlScrape(descM[1]) : '',
+    campos: campos
+  };
+}
+
+// ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress + Tokko Broker) =====
 app.get('/api/scrape/lista', async function(req, res) {
   try {
     let sitio = (req.query.url || '').trim();
@@ -1933,10 +2070,24 @@ app.get('/api/scrape/lista', async function(req, res) {
         }
       } catch(e) { /* probar siguiente */ }
     }
-    if (urls.length === 0) return res.json({ ok: true, total: 0, urls: [], nota: 'No se encontro sitemap de propiedades. La web puede no ser compatible.' });
+    // 2) FALLBACK MULTIPLATAFORMA: si no hubo sitemap WordPress, detectar la plataforma
+    //    cargando el HOME y, si es Tokko Broker, listar las propiedades del HTML renderizado.
+    if (urls.length === 0) {
+      try {
+        const rHome = await fetch(base + '/', { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        const homeHtml = rHome.ok ? await rHome.text() : '';
+        if (esSitioTokko(homeHtml)) {
+          const tokkoItems = await listarUrlsTokko(base, null);
+          if (tokkoItems.length > 0) {
+            return res.json({ ok: true, total: tokkoItems.length, urls: tokkoItems, plataforma: 'tokko' });
+          }
+        }
+      } catch (e) { /* si el fallback falla, devolvemos el "no compatible" de siempre */ }
+      return res.json({ ok: true, total: 0, urls: [], nota: 'No se encontro sitemap de propiedades. La web puede no ser compatible.' });
+    }
     // extraer id de cada url (patron -id-NUMERO o idNUMERO)
     const items = urls.map(function(u){ const m = u.match(/id-?(\d+)/i); return { url: u, numero: m ? m[1] : '' }; });
-    return res.json({ ok: true, total: items.length, urls: items });
+    return res.json({ ok: true, total: items.length, urls: items, plataforma: 'wordpress' });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/scrape/detalle', async function(req, res) {
@@ -1951,7 +2102,13 @@ app.post('/api/scrape/detalle', async function(req, res) {
         const r = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
         if (!r.ok) { resultados.push({ url: u, error: 'status ' + r.status }); continue; }
         const html = await r.text();
-        // extraer todos los pares <strong>Etiqueta:</strong> Valor
+        // MULTIPLATAFORMA: si la ficha es de Tokko Broker, parsearla con su estructura propia
+        // y devolver el MISMO shape {url, titulo, descripcion, campos} que espera el frontend.
+        if (esSitioTokko(html)) {
+          resultados.push(parsearDetalleTokko(html, u));
+          continue;
+        }
+        // extraer todos los pares <strong>Etiqueta:</strong> Valor (camino WordPress/Houzez de siempre)
         const campos = {};
         // lista blanca de campos tecnicos conocidos de Houzez (evita capturar la descripcion)
         const KNOWN = ['Propiedad ID','Precio','Metros totales','Metros cubiertos','Ambientes','Plazas','Parking','Año de construcción','Tipo de propiedad','Estado','Habitaciones / Cuartos','Habitaciones','Cuartos','Baños','Acepta Permuta?','Vende Amueblado','Cantidad de plantas','Disposición','Cantidad de Pisos','Orientación','Puntaje','Acepta Mascota?','Ciudad/ Localidad','Ciudad / Localidad','Provincia','Barrio/ Zona','Barrio / Zona','País'];

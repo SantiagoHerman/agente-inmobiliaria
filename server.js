@@ -2104,16 +2104,30 @@ function _esErrorCertificado(err) {
   const msg = (err && err.message ? err.message : '') + ' ' + ((err && err.cause && err.cause.message) ? err.cause.message : '');
   return /UNABLE_TO_VERIFY_LEAF_SIGNATURE|UNABLE_TO_GET_ISSUER_CERT|SELF_SIGNED_CERT|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT|ERR_TLS_CERT_ALTNAME|certificate/i.test(String(code) + ' ' + msg);
 }
+// (3) CACHE DE DECISION TLS POR DOMINIO. Cuando un host falla por certificado, lo recordamos
+// y para las SIGUIENTES descargas de ese host vamos DIRECTO al agente TLS-tolerante, salteando
+// el intento "seguro" que sabemos que va a fallar (cada reintento contra oilher costaba un RTT + error).
+// Para hosts normales (sin cert roto) NO se relaja nada: nunca entran a este Map.
+const _hostsCertRoto = new Map();
+function _hostDe(url) { try { return new URL(url).host; } catch (e) { return ''; } }
 // fetchScrape: usar SIEMPRE esta funcion para las descargas del scraper (no el fetch crudo).
-// Reintenta una sola vez con el agente TLS tolerante si el primer intento falla por certificado.
+// Reintenta una sola vez con el agente TLS tolerante si el primer intento falla por certificado,
+// y memoriza el host para no volver a pagar el intento seguro fallido.
 async function fetchScrape(url, opciones) {
   const opts = Object.assign({ headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RaicesCRM/1.0; +https://raicescrm.com)' } }, opciones || {});
+  const host = _hostDe(url);
+  // host con cert roto conocido -> directo al fallback TLS tolerante (sin intentar el fetch seguro).
+  if (host && _hostsCertRoto.get(host) && _getAgenteTlsInseguro()) {
+    return await _fetchHttpsInseguro(url, opts);
+  }
   try {
     return await fetch(url, opts);
   } catch (e) {
     if (_esErrorCertificado(e)) {
       const ag = _getAgenteTlsInseguro();
       if (ag) {
+        // recordar el host para saltear el intento seguro la proxima vez.
+        if (host) _hostsCertRoto.set(host, true);
         // Node 18+: el agente se pasa via dispatcher? No: usamos el cliente https nativo a traves de
         // la opcion `agent` que undici ignora, asi que descargamos por https.get como fallback real.
         return await _fetchHttpsInseguro(url, opts);
@@ -2150,7 +2164,10 @@ function _fetchHttpsInseguro(url, opts) {
         resp.on('data', function(c) { chunks.push(c); });
         resp.on('end', function() {
           var body = Buffer.concat(chunks).toString('utf8');
-          resolve({ ok: resp.statusCode >= 200 && resp.statusCode < 300, status: resp.statusCode, text: function() { return Promise.resolve(body); } });
+          // exponer headers con la misma interfaz minima que usamos de fetch (.get), en minuscula.
+          var hdrs = resp.headers || {};
+          var headersLike = { get: function(name) { var v = hdrs[String(name).toLowerCase()]; return (v === undefined) ? null : (Array.isArray(v) ? v.join(', ') : v); } };
+          resolve({ ok: resp.statusCode >= 200 && resp.statusCode < 300, status: resp.statusCode, headers: headersLike, text: function() { return Promise.resolve(body); }, json: function() { return Promise.resolve(JSON.parse(body)); } });
         });
       });
       req.on('error', reject);
@@ -2435,6 +2452,189 @@ async function parsearDetalleIA(html, url, user_id) {
   } catch (e) { console.error('[scraper IA] parsearDetalleIA:', e && e.message); return null; }
 }
 
+// ===== WORDPRESS via wp-json (RAPIDO, SIN IA, SIN HTML por ficha) =====
+// Muchos sitios WordPress (incluso con temas NO estandar/no-Houzez como oilherpropiedades.com)
+// exponen /wp-json/wp/v2/properties con TODOS los datos: title, content, taxonomias (_embedded.wp:term),
+// foto destacada (_embedded.wp:featuredmedia) y, sobre todo, `property_meta` (campos fave_* de Houzez:
+// precio, ambientes, dormitorios, banos, cochera, m2, ref, direccion). Esto evita bajar el HTML de cada
+// ficha y CAER A IA ficha-por-ficha (181 llamadas a Claude). Lo usamos como camino preferente para WP.
+
+// Helper de concurrencia ACOTADA: ejecuta fn(item) sobre items, como mucho `limite` en paralelo.
+async function _mapConcurrente(items, limite, fn) {
+  var out = new Array(items.length);
+  var idx = 0;
+  var n = Math.max(1, limite || 1);
+  async function worker() {
+    while (idx < items.length) {
+      var i = idx++;
+      try { out[i] = await fn(items[i], i); }
+      catch (e) { out[i] = { error: e && e.message }; }
+    }
+  }
+  var workers = [];
+  for (var w = 0; w < Math.min(n, items.length); w++) workers.push(worker());
+  await Promise.all(workers);
+  return out;
+}
+
+// Cache por host: ¿este sitio expone wp-json/wp/v2/properties? (evita re-chequear en cada lote).
+// undefined = no chequeado; true/false = resultado memorizado.
+const _hostsWpJson = new Map();
+async function _detectarWpJson(base) {
+  var host = _hostDe(base);
+  if (host && _hostsWpJson.has(host)) return _hostsWpJson.get(host);
+  var ok = false;
+  try {
+    var r = await fetchScrape(base + '/wp-json/wp/v2/properties?per_page=1&_fields=id');
+    if (r && r.ok) {
+      var txt = await r.text();
+      try { var d = JSON.parse(txt); ok = Array.isArray(d); } catch (e) { ok = false; }
+    }
+  } catch (e) { ok = false; }
+  if (host) _hostsWpJson.set(host, ok);
+  return ok;
+}
+
+// Toma el primer valor de un campo de property_meta (Houzez los guarda como array de 1 elemento).
+function _metaVal(meta, clave) {
+  if (!meta) return null;
+  var v = meta[clave];
+  if (Array.isArray(v)) v = v[0];
+  if (v === undefined || v === null) return null;
+  v = String(v).trim();
+  return v === '' ? null : v;
+}
+// Devuelve el nombre del primer termino de una taxonomia dada dentro de _embedded.wp:term.
+function _taxNombre(emb, tax) {
+  var terms = (emb && emb['wp:term']) || [];
+  for (var a = 0; a < terms.length; a++) {
+    var g = terms[a] || [];
+    for (var b = 0; b < g.length; b++) { if (g[b] && g[b].taxonomy === tax) return g[b].name; }
+  }
+  return null;
+}
+// Junta todos los nombres de una taxonomia (ej. property_feature -> caracteristicas).
+function _taxLista(emb, tax) {
+  var out = []; var terms = (emb && emb['wp:term']) || [];
+  for (var a = 0; a < terms.length; a++) { var g = terms[a] || []; for (var b = 0; b < g.length; b++) { if (g[b] && g[b].taxonomy === tax) out.push(g[b].name); } }
+  return out;
+}
+
+// Mapea UN objeto propiedad de wp-json al MISMO shape {url, titulo, descripcion, campos} que
+// espera normalizarPropiedadScrape (mismas claves KNOWN del camino HTML/Houzez). NUNCA usa IA.
+function _mapearPropWpJsonADetalle(p, urlOriginal) {
+  var emb = p._embedded || {};
+  var meta = p.property_meta || {};
+  var titulo = limpiarHTML2(p.title && p.title.rendered) || '';
+  var descripcion = limpiarHTML2(p.content && p.content.rendered) || '';
+  var url = urlOriginal || p.link || '';
+  var campos = {};
+
+  // --- ID / referencia: fave_property_id (ej OIL-220637), si no app_id / id del slug / id del post ---
+  var ref = _metaVal(meta, 'fave_property_id') || _metaVal(meta, 'app_id');
+  if (!ref && p.slug) { var ms = String(p.slug).match(/^(\d{3,})/); if (ms) ref = ms[1]; }
+  if (!ref && p.id) ref = String(p.id);
+  if (ref) campos['Propiedad ID'] = ref;
+
+  // --- Precio: fave_property_price + postfix/moneda ---
+  var precioNum = _metaVal(meta, 'fave_property_price');
+  if (precioNum) {
+    var moneda = _metaVal(meta, 'fave_property_price_postfix') || _metaVal(meta, 'fave_currency') || '';
+    // precio suele venir "250000.00" -> dejar limpio (sin .00) y prefijar moneda.
+    var precioLimpio = precioNum.replace(/\.00$/, '').replace(/\.0$/, '');
+    campos['Precio'] = (moneda ? (moneda + ' ') : '') + precioLimpio;
+  }
+
+  // --- Tipo / operacion (taxonomias) ---
+  var tipo = _taxNombre(emb, 'property_type');
+  if (tipo) campos['Tipo de propiedad'] = tipo;
+  var estadoTax = _taxNombre(emb, 'property_status') || '';
+  // normalizar a lo que entiende el front: Venta / Alquiler anual / Alquiler temporario
+  var op = detectarOperacion(estadoTax, titulo + ' ' + descripcion.substring(0, 200));
+  campos['Estado'] = (op === 'temporal') ? 'Alquiler temporario' : (op === 'anual') ? 'Alquiler anual' : 'Venta';
+
+  // --- Ambientes / habitaciones / banos / cochera ---
+  var ambientes = _metaVal(meta, 'fave_property_rooms');
+  if (ambientes) campos['Ambientes'] = ambientes;
+  var dorm = _metaVal(meta, 'fave_property_bedrooms');
+  if (dorm) campos['Habitaciones'] = dorm;
+  var banos = _metaVal(meta, 'fave_property_bathrooms');
+  if (banos) campos['Baños'] = banos;
+  var garage = _metaVal(meta, 'fave_property_garage');
+  if (garage && !/^0$/.test(garage)) campos['Parking'] = garage;
+
+  // --- Metros ---
+  var size = _metaVal(meta, 'fave_property_size');
+  if (size && !/^0(\.0+)?$/.test(size)) campos['Metros cubiertos'] = size;
+  var land = _metaVal(meta, 'fave_property_land_real') || _metaVal(meta, 'fave_property_land');
+  if (land && !/^0(\.0+)?$/.test(land)) campos['Metros totales'] = land;
+
+  // --- Anio / orientacion ---
+  var anio = _metaVal(meta, 'fave_property_year');
+  if (anio) campos['A' + String.fromCharCode(241) + 'o de construcci' + String.fromCharCode(243) + 'n'] = anio;
+  var orient = _metaVal(meta, 'fave_orientation');
+  if (orient) campos['Orientaci' + String.fromCharCode(243) + 'n'] = orient;
+
+  // --- Ubicacion (taxonomias city/area/state) + direccion ---
+  var ciudad = _taxNombre(emb, 'property_city');
+  if (ciudad) campos['Ciudad/ Localidad'] = ciudad;
+  var area = _taxNombre(emb, 'property_area') || _metaVal(meta, 'fave_property_address');
+  if (area) campos['Barrio/ Zona'] = area;
+  var prov = _taxNombre(emb, 'property_state');
+  if (prov) campos['Provincia'] = prov;
+
+  // --- Foto destacada (para el front) ---
+  var media = emb['wp:featuredmedia'] || [];
+  var foto = (media[0] && media[0].source_url) ? media[0].source_url : null;
+
+  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, foto: foto, wpjson: true };
+}
+
+// Trae EN LOTE los detalles de un conjunto de URLs/items WordPress via wp-json (1 sola llamada por lote).
+// Estrategia: extraer el slug (ultimo segmento del path) de cada URL y pedir ?slug=a,b,c&_embed=1.
+// Fallback: si la URL trae un id numerico de post (?p=NN o item.postId), usar ?include=...
+// Devuelve un array de detalles {url, titulo, descripcion, campos, foto} alineado por slug; las URLs
+// que no matchearon vuelven como null (para que el caller decida el fallback HTML/IA).
+async function _traerDetallesWpJson(base, items) {
+  // items: array de strings (url) u objetos {url,...}
+  var metas = items.map(function(it) {
+    var u = (typeof it === 'string') ? it : (it && it.url) || '';
+    var slug = '';
+    try {
+      var path = new URL(u).pathname.replace(/\/+$/, '');
+      slug = decodeURIComponent(path.split('/').pop() || '');
+    } catch (e) { slug = ''; }
+    return { url: u, slug: slug };
+  });
+  var resultadoPorUrl = {};
+  // pedir por slug en lotes (la query de slug acepta lista separada por coma)
+  var slugs = metas.filter(function(m) { return m.slug; }).map(function(m) { return m.slug; });
+  if (slugs.length) {
+    var qs = slugs.map(encodeURIComponent).join(',');
+    var url = base + '/wp-json/wp/v2/properties?slug=' + qs + '&_embed=1&per_page=' + Math.min(100, slugs.length);
+    try {
+      var r = await fetchScrape(url);
+      if (r && r.ok) {
+        var data = JSON.parse(await r.text());
+        if (Array.isArray(data)) {
+          for (var i = 0; i < data.length; i++) {
+            var p = data[i];
+            // matchear el item original por slug para conservar SU url exacta
+            var orig = metas.find(function(m) { return m.slug === p.slug; });
+            var det = _mapearPropWpJsonADetalle(p, orig ? orig.url : (p.link || ''));
+            if (orig) resultadoPorUrl[orig.url] = det; else resultadoPorUrl[p.link] = det;
+          }
+        }
+      }
+    } catch (e) { /* el caller cae a HTML/IA para los que falten */ }
+  }
+  // devolver alineado al input
+  return items.map(function(it) {
+    var u = (typeof it === 'string') ? it : (it && it.url) || '';
+    return resultadoPorUrl[u] || null;
+  });
+}
+
 // ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress + Tokko Broker) =====
 app.get('/api/scrape/lista', async function(req, res) {
   try {
@@ -2444,7 +2644,48 @@ app.get('/api/scrape/lista', async function(req, res) {
     // normalizar a dominio base
     let base;
     try { const u = new URL(sitio); base = u.protocol + '//' + u.host; } catch(e){ return res.status(400).json({ error: 'URL invalida' }); }
-    // 1) intentar el sitemap de propiedades de Houzez
+
+    // ===== (1) WORDPRESS via wp-json BULK (preferente) =====
+    // Si el sitio expone /wp-json/wp/v2/properties, paginamos per_page=50 siguiendo X-WP-TotalPages
+    // y devolvemos las URLs canonicas (cuyo slug matchea wp-json) + el numero ya pre-extraido.
+    // Esto hace que /api/scrape/detalle resuelva el lote por wp-json (sin IA, sin HTML por ficha).
+    try {
+      if (await _detectarWpJson(base)) {
+        var itemsWp = [];
+        var vistosWp = {};
+        var paginaWp = 1;
+        var totalPaginas = 1;
+        var LIMITE_PAGINAS = 50; // tope sano (50 paginas * 50 = 2500 props)
+        do {
+          var urlWp = base + '/wp-json/wp/v2/properties?per_page=50&page=' + paginaWp + '&_fields=id,slug,link,property_meta';
+          var rWp = await fetchScrape(urlWp);
+          if (!rWp || !rWp.ok) break;
+          // X-WP-TotalPages: en _fetchHttpsInseguro tenemos headers; con fetch global usar .headers.get
+          var tp = rWp.headers ? (rWp.headers.get ? rWp.headers.get('x-wp-totalpages') : rWp.headers['x-wp-totalpages']) : null;
+          if (tp) { var tpn = parseInt(tp, 10); if (tpn > 0) totalPaginas = tpn; }
+          var dataWp = JSON.parse(await rWp.text());
+          if (!Array.isArray(dataWp) || dataWp.length === 0) break;
+          for (var iWp = 0; iWp < dataWp.length; iWp++) {
+            var pWp = dataWp[iWp];
+            var linkWp = pWp.link || (base + '/?p=' + pWp.id);
+            if (vistosWp[linkWp]) continue;
+            vistosWp[linkWp] = 1;
+            var mw = pWp.property_meta || {};
+            var numWp = (Array.isArray(mw.fave_property_id) ? mw.fave_property_id[0] : null)
+              || (Array.isArray(mw.app_id) ? mw.app_id[0] : null)
+              || (pWp.slug ? (String(pWp.slug).match(/^(\d{3,})/) || [])[1] : null)
+              || String(pWp.id || '');
+            itemsWp.push({ url: linkWp, numero: numWp || '' });
+          }
+          paginaWp++;
+        } while (paginaWp <= totalPaginas && paginaWp <= LIMITE_PAGINAS);
+        if (itemsWp.length > 0) {
+          return res.json({ ok: true, total: itemsWp.length, urls: itemsWp, plataforma: 'wordpress', estrategia: 'wp-json-bulk' });
+        }
+      }
+    } catch (eWpL) { console.error('[scraper wp-json] lista bulk:', eWpL && eWpL.message); /* caer a sitemap */ }
+
+    // 1b) intentar el sitemap de propiedades de Houzez (fallback si wp-json no devolvio nada)
     const candidatos = [base + '/wp-sitemap-posts-property-1.xml', base + '/property-sitemap.xml', base + '/wp-sitemap.xml'];
     let urls = [];
     for (const sm of candidatos) {
@@ -2541,22 +2782,43 @@ app.post('/api/scrape/detalle', async function(req, res) {
   try {
     const urls = (req.body && req.body.urls) || [];
     if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: 'Falta el array urls' });
-    if (urls.length > 15) return res.status(400).json({ error: 'Maximo 15 por lote' });
+    // limite sano: con wp-json el lote viaja en 1 sola llamada, asi que toleramos lotes mas grandes.
+    if (urls.length > 60) return res.status(400).json({ error: 'Maximo 60 por lote' });
     const user_id = (req.body && req.body.user_id ? String(req.body.user_id).trim() : '');
-    const resultados = [];
-    for (const item of urls) {
+
+    // ===== (1) CAMINO RAPIDO WORDPRESS via wp-json (SIN IA, SIN HTML por ficha) =====
+    // Si el sitio expone /wp-json/wp/v2/properties, traemos TODO el lote en 1 llamada por slug
+    // y mapeamos property_meta/_embedded al shape {url,titulo,descripcion,campos}. Las URLs que
+    // wp-json no resuelva caen al camino HTML/IA de siempre (abajo).
+    var resueltasWp = {};
+    try {
+      var base0 = '';
+      try { var u0 = new URL(typeof urls[0] === 'string' ? urls[0] : urls[0].url); base0 = u0.protocol + '//' + u0.host; } catch (e0) {}
+      if (base0 && await _detectarWpJson(base0)) {
+        var detsWp = await _traerDetallesWpJson(base0, urls);
+        for (var iw = 0; iw < urls.length; iw++) {
+          if (detsWp[iw] && detsWp[iw].campos && Object.keys(detsWp[iw].campos).length > 0) {
+            var uw = typeof urls[iw] === 'string' ? urls[iw] : urls[iw].url;
+            resueltasWp[uw] = detsWp[iw];
+          }
+        }
+      }
+    } catch (eWp) { console.error('[scraper wp-json] detalle batch:', eWp && eWp.message); }
+
+    // ===== (4) RESTO via HTML/IA con CONCURRENCIA ACOTADA (6 en paralelo) =====
+    // Procesa UNA url por el camino HTML/Tokko/estructurado/IA de siempre (logica intacta).
+    async function procesarUnaUrlHtml(item) {
       const u = typeof item === 'string' ? item : item.url;
       // si la lista vino de la IA, ya trae datos pre-extraidos; los usamos como base/fallback.
       const datosIaPrevios = (item && typeof item === 'object' && item.datos) ? item.datos : null;
       try {
         const r = await fetchScrape(u);
-        if (!r.ok) { resultados.push({ url: u, error: 'status ' + r.status }); continue; }
+        if (!r.ok) { return { url: u, error: 'status ' + r.status }; }
         const html = await r.text();
         // MULTIPLATAFORMA: si la ficha es de Tokko Broker, parsearla con su estructura propia
         // y devolver el MISMO shape {url, titulo, descripcion, campos} que espera el frontend.
         if (esSitioTokko(html)) {
-          resultados.push(parsearDetalleTokko(html, u));
-          continue;
+          return parsearDetalleTokko(html, u);
         }
         // extraer todos los pares <strong>Etiqueta:</strong> Valor (camino WordPress/Houzez de siempre)
         const campos = {};
@@ -2585,7 +2847,7 @@ app.post('/api/scrape/detalle', async function(req, res) {
           campos: campos
         };
         // si el parseo WordPress/Houzez ya saco campos tecnicos utiles, listo (camino de siempre).
-        if (Object.keys(campos).length > 0) { resultados.push(detWp); continue; }
+        if (Object.keys(campos).length > 0) { return detWp; }
 
         // (3) FALLBACK datos estructurados: JSON-LD / OpenGraph / microdata
         const detEst = parsearDetalleEstructurado(html, u);
@@ -2593,16 +2855,14 @@ app.post('/api/scrape/detalle', async function(req, res) {
           // combinar: titulo/desc del que tenga mejor info
           if (!detEst.titulo && detWp.titulo) detEst.titulo = detWp.titulo;
           if (!detEst.descripcion && detWp.descripcion) detEst.descripcion = detWp.descripcion;
-          resultados.push(detEst);
-          continue;
+          return detEst;
         }
 
         // (5) FALLBACK IA para la ficha (ultimo recurso; solo si lo determinista no saco campos)
         const detIa = await parsearDetalleIA(html, u, user_id);
         if (detIa && (Object.keys(detIa.campos).length > 0 || detIa.descripcion)) {
           if (!detIa.titulo && detWp.titulo) detIa.titulo = detWp.titulo;
-          resultados.push(detIa);
-          continue;
+          return detIa;
         }
 
         // si nada saco campos pero la lista IA ya traia datos pre-extraidos, usarlos como base.
@@ -2619,16 +2879,30 @@ app.post('/api/scrape/detalle', async function(req, res) {
           if (p.ubicacion) camposPrev['Ciudad/ Localidad'] = p.ubicacion;
           if (p.operacion) camposPrev['Estado'] = /alquiler\s*tempora|temporari/i.test(p.operacion) ? 'Alquiler temporario' : (/alquiler|renta/i.test(p.operacion) ? 'Alquiler anual' : 'Venta');
           if (Object.keys(camposPrev).length > 0) {
-            resultados.push({ url: u, titulo: detWp.titulo || '', descripcion: detWp.descripcion || '', campos: camposPrev, ia: true });
-            continue;
+            return { url: u, titulo: detWp.titulo || '', descripcion: detWp.descripcion || '', campos: camposPrev, ia: true };
           }
         }
 
         // ultimo: devolver lo que haya (titulo/desc de OG) aunque no haya campos tecnicos.
-        resultados.push(detWp);
-      } catch (e) { resultados.push({ url: u, error: e && e.message }); }
+        return detWp;
+      } catch (e) { return { url: u, error: e && e.message }; }
     }
-    return res.json({ ok: true, resultados: resultados });
+
+    // Construir resultados: lo que resolvio wp-json va directo; el resto se procesa por HTML/IA
+    // con concurrencia ACOTADA (6 en paralelo) en vez de secuencial.
+    const pendientes = [];
+    const idxPendiente = [];
+    const resultados = new Array(urls.length);
+    for (var ir = 0; ir < urls.length; ir++) {
+      var uir = typeof urls[ir] === 'string' ? urls[ir] : urls[ir].url;
+      if (resueltasWp[uir]) { resultados[ir] = resueltasWp[uir]; }
+      else { pendientes.push(urls[ir]); idxPendiente.push(ir); }
+    }
+    if (pendientes.length) {
+      const procesados = await _mapConcurrente(pendientes, 6, procesarUnaUrlHtml);
+      for (var ip = 0; ip < procesados.length; ip++) resultados[idxPendiente[ip]] = procesados[ip];
+    }
+    return res.json({ ok: true, resultados: resultados, via_wpjson: Object.keys(resueltasWp).length, via_html: pendientes.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 // ===== TEMPERATURA DE LEADS =====
@@ -2969,7 +3243,7 @@ async function obtenerPropiedadesUniversal(sitio, limite) {
     var pagina = 1; var seguir = true;
     while (seguir && props.length < (limite || 9999)) {
       var url = baseUrl + '/wp-json/wp/v2/properties?per_page=50&page=' + pagina + '&_embed=1';
-      var r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+      var r = await fetchScrape(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
       if (!r.ok) break;
       var data = await r.json();
       if (!Array.isArray(data) || data.length === 0) break;
@@ -3022,7 +3296,7 @@ app.post('/api/scrape/universal', async function(req, res) {
     for (var i = 0; i < props.length; i++) {
       if (!props[i].link) continue;
       try {
-        var h = await fetch(props[i].link, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        var h = await fetchScrape(props[i].link, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
         if (h.ok) { var html = await h.text(); props[i].precio = extraerPrecioDe(html); }
       } catch (e) {}
     }
@@ -3137,7 +3411,7 @@ async function procesarPropiedad(p) {
   var descripcion = limpiarHTML2(p.content && p.content.rendered);
   var link = p.link || '';
   var pares = {}; var precio = null;
-  try { var resp = await fetch(link, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } }); if (resp.ok) { var html = await resp.text(); pares = extraerTablaDetalles(html); precio = extraerPrecio2(html); } } catch (e) {}
+  try { var resp = await fetchScrape(link, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } }); if (resp.ok) { var html = await resp.text(); pares = extraerTablaDetalles(html); precio = extraerPrecio2(html); } } catch (e) {}
   var numero = detectarNumeroProp(pares, titulo, p.id);
   var operacion = detectarOperacion(pares['Estado'] || pares['Estado de la propiedad'], titulo + ' ' + descripcion.substring(0, 200));
   var ambientes = pares['Ambientes'] || pares['Habitaciones / Cuartos'] || pares['Habitaciones'] || null;
@@ -3162,7 +3436,7 @@ async function traerListaPropiedades(sitio, limite) {
   try {
     while (seguir && props.length < (limite || 9999)) {
       var url = baseUrl + '/wp-json/wp/v2/properties?per_page=50&page=' + pagina + '&_embed=1';
-      var r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+      var r = await fetchScrape(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
       if (!r.ok) break;
       var data = await r.json();
       if (!Array.isArray(data) || data.length === 0) break;

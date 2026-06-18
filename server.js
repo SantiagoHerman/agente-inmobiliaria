@@ -1962,7 +1962,7 @@ async function listarUrlsTokko(base, limite) {
         : base + SECCIONES[s] + '?o=&1=1&page=' + pagina;
       var html;
       try {
-        var r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        var r = await fetchScrape(url);
         if (!r.ok) break;
         html = await r.text();
       } catch (e) { break; }
@@ -2040,6 +2040,367 @@ function parsearDetalleTokko(html, url) {
   };
 }
 
+// ===== SCRAPER UNIVERSAL: CASCADA DE ESTRATEGIAS (ADITIVO) =====
+// Objetivo: que el importador lea la MAYORIA de las inmobiliarias. El orden de la cascada es:
+//   1) Sitemap WordPress / wp-json (Houzez)        [ya existia]
+//   2) Tokko Broker (HTML server-rendered)          [ya existia]
+//   3) Datos estructurados: JSON-LD / OpenGraph / microdata
+//   4) Heuristica HTML generica (tarjetas: precio + m2 + link a ficha + ref)
+//   5) Extraccion con IA (ultimo recurso; solo si 1-4 no extrajeron nada util)
+//   6) Tolerancia TLS (https.Agent rejectUnauthorized:false) SOLO para descargas del scraper
+//   7) Paginacion robusta + dedup
+// Sin dependencias npm nuevas: fetch global + regex + https nativo + el SDK anthropic ya presente.
+
+// (6) TOLERANCIA TLS — fetch del scraper con fallback a cadena de certificado incompleta.
+// IMPORTANTE: NO altera la verificacion TLS global del backend (no se toca NODE_TLS_REJECT_UNAUTHORIZED
+// ni el agente global). El https.Agent inseguro se usa SOLO en este fetch y SOLO como fallback
+// cuando la descarga falla por un error de certificado (ej. oilherpropiedades.com con cadena incompleta).
+let _agenteTlsInseguro = null;
+function _getAgenteTlsInseguro() {
+  if (!_agenteTlsInseguro) {
+    try {
+      const https = require('https');
+      _agenteTlsInseguro = new https.Agent({ rejectUnauthorized: false });
+    } catch (e) { _agenteTlsInseguro = null; }
+  }
+  return _agenteTlsInseguro;
+}
+function _esErrorCertificado(err) {
+  const code = err && (err.code || (err.cause && err.cause.code)) || '';
+  const msg = (err && err.message ? err.message : '') + ' ' + ((err && err.cause && err.cause.message) ? err.cause.message : '');
+  return /UNABLE_TO_VERIFY_LEAF_SIGNATURE|UNABLE_TO_GET_ISSUER_CERT|SELF_SIGNED_CERT|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT|ERR_TLS_CERT_ALTNAME|certificate/i.test(String(code) + ' ' + msg);
+}
+// fetchScrape: usar SIEMPRE esta funcion para las descargas del scraper (no el fetch crudo).
+// Reintenta una sola vez con el agente TLS tolerante si el primer intento falla por certificado.
+async function fetchScrape(url, opciones) {
+  const opts = Object.assign({ headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RaicesCRM/1.0; +https://raicescrm.com)' } }, opciones || {});
+  try {
+    return await fetch(url, opts);
+  } catch (e) {
+    if (_esErrorCertificado(e)) {
+      const ag = _getAgenteTlsInseguro();
+      if (ag) {
+        // Node 18+: el agente se pasa via dispatcher? No: usamos el cliente https nativo a traves de
+        // la opcion `agent` que undici ignora, asi que descargamos por https.get como fallback real.
+        return await _fetchHttpsInseguro(url, opts);
+      }
+    }
+    throw e;
+  }
+}
+// Fallback real de descarga con https nativo + agente inseguro (cuando el fetch global rechaza el cert).
+// Devuelve un objeto con la misma forma minima que usamos de Response: { ok, status, text() }.
+function _fetchHttpsInseguro(url, opts) {
+  return new Promise(function(resolve, reject) {
+    try {
+      const https = require('https');
+      const u = new URL(url);
+      const req = https.request({
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: (opts && opts.method) || 'GET',
+        headers: (opts && opts.headers) || {},
+        agent: _getAgenteTlsInseguro(),
+        timeout: 20000
+      }, function(resp) {
+        // seguir redirects basicos (301/302/307/308)
+        if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+          var loc = resp.headers.location;
+          try { loc = new URL(loc, url).toString(); } catch (e) {}
+          resp.resume();
+          return resolve(_fetchHttpsInseguro(loc, opts));
+        }
+        var chunks = [];
+        resp.on('data', function(c) { chunks.push(c); });
+        resp.on('end', function() {
+          var body = Buffer.concat(chunks).toString('utf8');
+          resolve({ ok: resp.statusCode >= 200 && resp.statusCode < 300, status: resp.statusCode, text: function() { return Promise.resolve(body); } });
+        });
+      });
+      req.on('error', reject);
+      req.on('timeout', function() { req.destroy(new Error('timeout')); });
+      if (opts && opts.body) req.write(opts.body);
+      req.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+// Limpia HTML para mandar a la IA: saca scripts/estilos/nav/header/footer y comprime espacios.
+// Devuelve texto + algo de estructura (mantiene href y precios). Cap configurable de chars.
+function _htmlParaIA(html, capChars) {
+  if (!html) return '';
+  var s = String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+    .replace(/<nav[\s\S]*?<\/nav>/gi, ' ')
+    .replace(/<header[\s\S]*?<\/header>/gi, ' ')
+    .replace(/<footer[\s\S]*?<\/footer>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    // conservar los href para que la IA pueda devolver url_detalle
+    .replace(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>/gi, ' [LINK:$1] ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#?[a-z0-9]+;/gi, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+  var cap = capChars || 70000;
+  if (s.length > cap) s = s.slice(0, cap);
+  return s;
+}
+
+// Parsea defensivamente un array JSON que viene de una respuesta de la IA (puede traer texto alrededor).
+function _parseJsonArrayDefensivo(texto) {
+  if (!texto) return null;
+  var t = String(texto).trim();
+  // sacar fences ```json ... ```
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  // intento directo
+  try { var d = JSON.parse(t); if (Array.isArray(d)) return d; if (d && Array.isArray(d.propiedades)) return d.propiedades; } catch (e) {}
+  // buscar el primer [ ... ] balanceado
+  var ini = t.indexOf('[');
+  var fin = t.lastIndexOf(']');
+  if (ini >= 0 && fin > ini) {
+    var sub = t.slice(ini, fin + 1);
+    try { var d2 = JSON.parse(sub); if (Array.isArray(d2)) return d2; } catch (e) {}
+  }
+  return null;
+}
+function _parseJsonObjetoDefensivo(texto) {
+  if (!texto) return null;
+  var t = String(texto).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  try { var d = JSON.parse(t); if (d && typeof d === 'object') return d; } catch (e) {}
+  var ini = t.indexOf('{');
+  var fin = t.lastIndexOf('}');
+  if (ini >= 0 && fin > ini) { try { var d2 = JSON.parse(t.slice(ini, fin + 1)); if (d2 && typeof d2 === 'object') return d2; } catch (e) {} }
+  return null;
+}
+
+// (3) DATOS ESTRUCTURADOS — extrae bloques JSON-LD de un HTML y los devuelve como array de objetos.
+function _extraerJsonLd(html) {
+  var out = [];
+  if (!html) return out;
+  var re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    var raw = m[1].trim();
+    if (!raw) continue;
+    var parsed = null;
+    try { parsed = JSON.parse(raw); }
+    catch (e) {
+      // algunos sitios meten varios objetos o comas finales; intento defensivo
+      try { parsed = JSON.parse(raw.replace(/,\s*([}\]])/g, '$1')); } catch (e2) { parsed = null; }
+    }
+    if (!parsed) continue;
+    // aplanar @graph y arrays
+    var lista = Array.isArray(parsed) ? parsed : (parsed['@graph'] && Array.isArray(parsed['@graph']) ? parsed['@graph'] : [parsed]);
+    for (var i = 0; i < lista.length; i++) if (lista[i] && typeof lista[i] === 'object') out.push(lista[i]);
+  }
+  return out;
+}
+function _tipoJsonLd(o) {
+  if (!o) return '';
+  var t = o['@type'];
+  if (Array.isArray(t)) t = t.join(' ');
+  return String(t || '').toLowerCase();
+}
+// True si un nodo JSON-LD parece una propiedad inmobiliaria / producto vendible.
+function _esNodoPropiedad(o) {
+  var t = _tipoJsonLd(o);
+  return /realestatelisting|residence|house|apartment|singlefamilyresidence|product|offer|accommodation|place|property/i.test(t);
+}
+// Extrae la URL de detalle de un nodo JSON-LD.
+function _urlDeNodo(o, base) {
+  var u = o.url || o['@id'] || (o.mainEntityOfPage && (o.mainEntityOfPage['@id'] || o.mainEntityOfPage)) || '';
+  if (!u) return '';
+  try { return new URL(u, base + '/').toString(); } catch (e) { return (typeof u === 'string' ? u : ''); }
+}
+// (3) lista de URLs de propiedades desde JSON-LD del HTML de listado.
+function listarUrlsJsonLd(html, base) {
+  var nodos = _extraerJsonLd(html);
+  var out = [];
+  var vistos = {};
+  for (var i = 0; i < nodos.length; i++) {
+    var o = nodos[i];
+    // ItemList -> itemListElement[].url / .item.url
+    var t = _tipoJsonLd(o);
+    if (/itemlist/i.test(t) && Array.isArray(o.itemListElement)) {
+      for (var j = 0; j < o.itemListElement.length; j++) {
+        var el = o.itemListElement[j];
+        var it = el && (el.item || el);
+        var u = it ? _urlDeNodo(it, base) : (el && el.url ? el.url : '');
+        if (u && !vistos[u]) { vistos[u] = 1; out.push({ url: u, numero: (u.match(/(\d{3,})/) || [])[1] || '' }); }
+      }
+      continue;
+    }
+    if (_esNodoPropiedad(o)) {
+      var u2 = _urlDeNodo(o, base);
+      if (u2 && !vistos[u2]) { vistos[u2] = 1; out.push({ url: u2, numero: (u2.match(/(\d{3,})/) || [])[1] || '' }); }
+    }
+  }
+  return out;
+}
+// (3) parsea una ficha de detalle desde JSON-LD + OpenGraph al shape {url,titulo,descripcion,campos}.
+function parsearDetalleEstructurado(html, url) {
+  var nodos = _extraerJsonLd(html);
+  var prop = null;
+  for (var i = 0; i < nodos.length; i++) { if (_esNodoPropiedad(nodos[i])) { prop = nodos[i]; break; } }
+  var campos = {};
+  var titulo = '';
+  var descripcion = '';
+  if (prop) {
+    titulo = prop.name || prop.title || '';
+    descripcion = prop.description || '';
+    // precio: offers.price / offers[].price / price
+    var ofer = prop.offers || prop.priceSpecification || null;
+    if (Array.isArray(ofer)) ofer = ofer[0];
+    var precio = (ofer && (ofer.price || (ofer.priceSpecification && ofer.priceSpecification.price))) || prop.price || '';
+    var moneda = (ofer && (ofer.priceCurrency || (ofer.priceSpecification && ofer.priceSpecification.priceCurrency))) || '';
+    if (precio) campos['Precio'] = (moneda ? (moneda + ' ') : '') + precio;
+    if (prop.identifier || prop.sku || prop.productID) campos['Propiedad ID'] = String(prop.identifier || prop.sku || prop.productID);
+    if (prop.numberOfRooms) campos['Ambientes'] = String(prop.numberOfRooms.value || prop.numberOfRooms);
+    if (prop.numberOfBedrooms) campos['Habitaciones'] = String(prop.numberOfBedrooms);
+    if (prop.numberOfBathroomsTotal || prop.numberOfBathrooms) campos['Baños'] = String(prop.numberOfBathroomsTotal || prop.numberOfBathrooms);
+    var fa = prop.floorSize || prop.area;
+    if (fa) campos['Metros totales'] = String((fa.value || fa) + (fa.unitText ? (' ' + fa.unitText) : ''));
+    var addr = prop.address;
+    if (addr && typeof addr === 'object') {
+      if (addr.addressLocality) campos['Ciudad/ Localidad'] = addr.addressLocality;
+      if (addr.streetAddress) campos['Barrio/ Zona'] = addr.streetAddress;
+      if (addr.addressRegion && !campos['Ciudad/ Localidad']) campos['Ciudad/ Localidad'] = addr.addressRegion;
+    } else if (typeof addr === 'string') { campos['Barrio/ Zona'] = addr; }
+  }
+  // completar con OpenGraph si falto algo
+  if (!titulo) { var tM = html.match(/og:title["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:title/i); if (tM) titulo = tM[1]; }
+  if (!descripcion) { var dM = html.match(/og:description["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:description/i); if (dM) descripcion = dM[1]; }
+  if (!campos['Precio']) {
+    var pm = html.match(/(?:product:price:amount|og:price:amount)["'][^>]*content=["']([^"']+)/i);
+    var cm = html.match(/(?:product:price:currency|og:price:currency)["'][^>]*content=["']([^"']+)/i);
+    if (pm) campos['Precio'] = (cm ? cm[1] + ' ' : '') + pm[1];
+  }
+  // microdata simple: itemprop="price" / "priceCurrency"
+  if (!campos['Precio']) {
+    var ip = html.match(/itemprop=["']price["'][^>]*content=["']([^"']+)/i) || html.match(/itemprop=["']price["'][^>]*>\s*([\d.,]+)/i);
+    if (ip) campos['Precio'] = ip[1];
+  }
+  var hayCampos = Object.keys(campos).length > 0;
+  if (!titulo && !descripcion && !hayCampos) return null;
+  return { url: url, titulo: _limpiarHtmlScrape(titulo), descripcion: _limpiarHtmlScrape(descripcion), campos: campos };
+}
+
+// (4) HEURISTICA HTML GENERICA — busca links de ficha de propiedad por patrones de URL,
+// y se queda con los que conviven con precio (USD/$) o m2 en la pagina. Pensado para
+// listados de plataformas no soportadas (custom, Inmoup-embed, etc.).
+function listarUrlsHeuristica(html, base) {
+  if (!html) return [];
+  var vistos = {};
+  var out = [];
+  // patrones tipicos de URL de ficha de propiedad
+  var rxFicha = /href=["']([^"']*(?:\/propiedad|\/propiedades\/|\/property|\/inmueble|\/aviso|\/ficha|\/listing|\/venta\/|\/alquiler\/|\/emprendimiento|\/p\/\d|\/MLA-?\d)[^"']*)["']/gi;
+  var m;
+  var baseHost = '';
+  try { baseHost = new URL(base).host; } catch (e) {}
+  while ((m = rxFicha.exec(html)) !== null) {
+    var href = m[1];
+    if (/^(#|javascript:|mailto:|tel:)/i.test(href)) continue;
+    var abs;
+    try { abs = new URL(href, base + '/').toString(); } catch (e) { continue; }
+    // mantener solo links del mismo dominio (o ML/embed externos comunes)
+    var host = '';
+    try { host = new URL(abs).host; } catch (e) {}
+    var mismoSitio = host === baseHost;
+    var esML = /mercadolibre|mercadolibre\.com|tokkobroker\.com/i.test(host);
+    if (!mismoSitio && !esML) continue;
+    // descartar links de categoria obvia (sin id ni slug largo)
+    if (/(\/category\/|\/tag\/|\/page\/|\/author\/|\/buscar|\/search|#)/i.test(abs)) continue;
+    if (!vistos[abs]) { vistos[abs] = 1; out.push({ url: abs, numero: (abs.match(/(\d{4,})/) || [])[1] || '' }); }
+  }
+  // si hay un monton de links, exigir que la pagina tenga senales de precio/m2 (evita falsos positivos)
+  if (out.length > 0) {
+    var haySenal = /(USD|U\$S|US\$|\$\s?\d)[\s\S]{0,40}|\bm2\b|m²|metros\s*cuadrados|ambientes|dormitorios/i.test(html);
+    if (!haySenal && out.length < 3) return [];
+  }
+  return out;
+}
+
+// (5) EXTRACCION CON IA — ultimo recurso. Manda el HTML limpio del LISTADO a Anthropic y
+// pide TODAS las propiedades como JSON array. Solo se invoca si 1-4 fallaron. Cap de HTML
+// y registro de uso de tokens (control de costo). Si no hay key, devuelve [] sin romper.
+async function listarUrlsIA(html, base, user_id) {
+  try {
+    if (!process.env.ANTHROPIC_KEY) { console.log('[scraper IA] sin ANTHROPIC_KEY, se omite IA'); return []; }
+    var limpio = _htmlParaIA(html, 70000);
+    if (limpio.length < 200) return [];
+    var sys = 'Sos un extractor de listados inmobiliarios. Te paso el TEXTO de una pagina de listado de una inmobiliaria ' +
+      '(los links aparecen como [LINK:url]). Devolve EXCLUSIVAMENTE un JSON array (sin texto alrededor, sin markdown) ' +
+      'con TODAS las propiedades del listado. Cada item: {"url_detalle","ref","operacion","tipo","precio","moneda","ubicacion","m2","ambientes","dormitorios","banos"}. ' +
+      'url_detalle debe ser el link a la ficha (absoluto si podes, base del sitio: ' + base + '). ' +
+      'Si un dato no aparece, deja "". No inventes propiedades. Si no hay propiedades, devolve [].';
+    var r = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4000,
+      system: sys,
+      messages: [{ role: 'user', content: 'TEXTO DEL LISTADO:\n' + limpio }]
+    });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage); } catch (eU) {}
+    var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+    var arr = _parseJsonArrayDefensivo(txt);
+    if (!Array.isArray(arr)) return [];
+    var vistos = {};
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+      var p = arr[i] || {};
+      var u = (p.url_detalle || p.url || '').trim();
+      if (!u) continue;
+      try { u = new URL(u, base + '/').toString(); } catch (e) {}
+      if (vistos[u]) continue;
+      vistos[u] = 1;
+      out.push({ url: u, numero: (p.ref || (u.match(/(\d{3,})/) || [])[1] || ''), ia: true, datos: p });
+    }
+    return out;
+  } catch (e) { console.error('[scraper IA] listarUrlsIA:', e && e.message); return []; }
+}
+// (5) IA para FICHA de detalle — cuando el parseo determinista de una ficha no saca nada util.
+async function parsearDetalleIA(html, url, user_id) {
+  try {
+    if (!process.env.ANTHROPIC_KEY) return null;
+    var limpio = _htmlParaIA(html, 50000);
+    if (limpio.length < 100) return null;
+    var sys = 'Sos un extractor de fichas inmobiliarias. Te paso el TEXTO de la ficha de UNA propiedad. ' +
+      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor) con: ' +
+      '{"titulo","descripcion","ref","operacion","tipo","precio","moneda","ubicacion","barrio","m2","ambientes","dormitorios","banos"}. ' +
+      'Si un dato no aparece, deja "". No inventes.';
+    var r = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1500,
+      system: sys,
+      messages: [{ role: 'user', content: 'TEXTO DE LA FICHA:\n' + limpio }]
+    });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage); } catch (eU) {}
+    var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+    var o = _parseJsonObjetoDefensivo(txt);
+    if (!o) return null;
+    var campos = {};
+    if (o.precio) campos['Precio'] = (o.moneda ? (o.moneda + ' ') : '') + o.precio;
+    if (o.ref) campos['Propiedad ID'] = String(o.ref);
+    if (o.tipo) campos['Tipo de propiedad'] = o.tipo;
+    if (o.ambientes) campos['Ambientes'] = String(o.ambientes);
+    if (o.dormitorios) campos['Habitaciones'] = String(o.dormitorios);
+    if (o.banos) campos['Baños'] = String(o.banos);
+    if (o.m2) campos['Metros totales'] = String(o.m2);
+    if (o.ubicacion) campos['Ciudad/ Localidad'] = o.ubicacion;
+    if (o.barrio) campos['Barrio/ Zona'] = o.barrio;
+    if (o.operacion) campos['Estado'] = /alquiler\s*tempora|temporari/i.test(o.operacion) ? 'Alquiler temporario' : (/alquiler|renta/i.test(o.operacion) ? 'Alquiler anual' : (/venta/i.test(o.operacion) ? 'Venta' : o.operacion));
+    if (!o.titulo && !o.descripcion && Object.keys(campos).length === 0) return null;
+    return { url: url, titulo: _limpiarHtmlScrape(o.titulo || ''), descripcion: _limpiarHtmlScrape(o.descripcion || ''), campos: campos, ia: true };
+  } catch (e) { console.error('[scraper IA] parsearDetalleIA:', e && e.message); return null; }
+}
+
 // ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress + Tokko Broker) =====
 app.get('/api/scrape/lista', async function(req, res) {
   try {
@@ -2054,7 +2415,7 @@ app.get('/api/scrape/lista', async function(req, res) {
     let urls = [];
     for (const sm of candidatos) {
       try {
-        const r = await fetch(sm, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        const r = await fetchScrape(sm);
         if (!r.ok) continue;
         const xml = await r.text();
         const matches = xml.match(/<loc>([^<]+)<\/loc>/g) || [];
@@ -2065,29 +2426,81 @@ app.get('/api/scrape/lista', async function(req, res) {
         // si era el indice de sitemaps, buscar el de property y seguir
         const subProperty = locs.find(function(u){ return /property/i.test(u) && u.endsWith('.xml'); });
         if (subProperty) {
-          const r2 = await fetch(subProperty, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+          const r2 = await fetchScrape(subProperty);
           if (r2.ok) { const xml2 = await r2.text(); const m2 = xml2.match(/<loc>([^<]+)<\/loc>/g) || []; urls = m2.map(function(m){ return m.replace(/<\/?loc>/g, ''); }); break; }
         }
       } catch(e) { /* probar siguiente */ }
     }
-    // 2) FALLBACK MULTIPLATAFORMA: si no hubo sitemap WordPress, detectar la plataforma
-    //    cargando el HOME y, si es Tokko Broker, listar las propiedades del HTML renderizado.
-    if (urls.length === 0) {
-      try {
-        const rHome = await fetch(base + '/', { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
-        const homeHtml = rHome.ok ? await rHome.text() : '';
-        if (esSitioTokko(homeHtml)) {
-          const tokkoItems = await listarUrlsTokko(base, null);
-          if (tokkoItems.length > 0) {
-            return res.json({ ok: true, total: tokkoItems.length, urls: tokkoItems, plataforma: 'tokko' });
-          }
-        }
-      } catch (e) { /* si el fallback falla, devolvemos el "no compatible" de siempre */ }
-      return res.json({ ok: true, total: 0, urls: [], nota: 'No se encontro sitemap de propiedades. La web puede no ser compatible.' });
+    // si el sitemap WordPress dio resultados, ese es el camino (estrategia 1) — devolver ya.
+    if (urls.length > 0) {
+      // extraer id de cada url (patron -id-NUMERO o idNUMERO)
+      const items = urls.map(function(u){ const m = u.match(/id-?(\d+)/i); return { url: u, numero: m ? m[1] : '' }; });
+      return res.json({ ok: true, total: items.length, urls: items, plataforma: 'wordpress', estrategia: 'sitemap-wp' });
     }
-    // extraer id de cada url (patron -id-NUMERO o idNUMERO)
-    const items = urls.map(function(u){ const m = u.match(/id-?(\d+)/i); return { url: u, numero: m ? m[1] : '' }; });
-    return res.json({ ok: true, total: items.length, urls: items, plataforma: 'wordpress' });
+    // ===== CASCADA DE FALLBACKS (2->5) si no hubo sitemap WordPress =====
+    // Descargamos el HOME + un par de rutas de listado tipicas para tener material a analizar.
+    var user_id = (req.query.user_id || (req.body && req.body.user_id) || '').trim();
+    var rutasListado = ['/', '/propiedades', '/propiedades/', '/listado', '/buscar', '/emprendimientos', '/venta', '/alquiler'];
+    var homeHtml = '';
+    var htmlsListado = [];
+    for (var ri = 0; ri < rutasListado.length; ri++) {
+      try {
+        var rr = await fetchScrape(base + rutasListado[ri]);
+        if (rr && rr.ok) { var h = await rr.text(); if (ri === 0) homeHtml = h; if (h && h.length > 500) htmlsListado.push(h); }
+      } catch (e) { /* seguir */ }
+      if (ri === 0 && !homeHtml) { /* home fallo; igual probamos rutas */ }
+    }
+    if (htmlsListado.length === 0 && homeHtml) htmlsListado.push(homeHtml);
+
+    // (2) Tokko Broker
+    try {
+      if (esSitioTokko(homeHtml) || htmlsListado.some(esSitioTokko)) {
+        const tokkoItems = await listarUrlsTokko(base, null);
+        if (tokkoItems.length > 0) {
+          return res.json({ ok: true, total: tokkoItems.length, urls: tokkoItems, plataforma: 'tokko', estrategia: 'tokko' });
+        }
+      }
+    } catch (e) { /* seguir a la siguiente estrategia */ }
+
+    // (3) Datos estructurados: JSON-LD / OpenGraph
+    try {
+      var jsonld = [];
+      var vis3 = {};
+      for (var hi = 0; hi < htmlsListado.length; hi++) {
+        var got = listarUrlsJsonLd(htmlsListado[hi], base);
+        for (var gi = 0; gi < got.length; gi++) { if (!vis3[got[gi].url]) { vis3[got[gi].url] = 1; jsonld.push(got[gi]); } }
+      }
+      if (jsonld.length > 0) {
+        return res.json({ ok: true, total: jsonld.length, urls: jsonld, plataforma: 'estructurado', estrategia: 'json-ld' });
+      }
+    } catch (e) { /* seguir */ }
+
+    // (4) Heuristica HTML generica
+    try {
+      var heur = [];
+      var vis4 = {};
+      for (var hj = 0; hj < htmlsListado.length; hj++) {
+        var gotH = listarUrlsHeuristica(htmlsListado[hj], base);
+        for (var gk = 0; gk < gotH.length; gk++) { if (!vis4[gotH[gk].url]) { vis4[gotH[gk].url] = 1; heur.push(gotH[gk]); } }
+      }
+      if (heur.length >= 3) {
+        return res.json({ ok: true, total: heur.length, urls: heur, plataforma: 'heuristica', estrategia: 'heuristica-html' });
+      }
+    } catch (e) { /* seguir */ }
+
+    // (5) Extraccion con IA (ultimo recurso; solo si 2-4 no extrajeron nada util).
+    // Elegimos el HTML de listado MAS GRANDE (suele ser el que trae mas propiedades) para
+    // darle a la IA el mejor material posible dentro del cap de chars.
+    try {
+      var htmlIA = homeHtml;
+      for (var hk = 0; hk < htmlsListado.length; hk++) { if ((htmlsListado[hk] || '').length > (htmlIA || '').length) htmlIA = htmlsListado[hk]; }
+      var iaItems = await listarUrlsIA(htmlIA, base, user_id);
+      if (iaItems.length > 0) {
+        return res.json({ ok: true, total: iaItems.length, urls: iaItems, plataforma: 'ia', estrategia: 'ia' });
+      }
+    } catch (e) { /* nada mas que probar */ }
+
+    return res.json({ ok: true, total: 0, urls: [], nota: 'No se pudieron extraer propiedades con ninguna estrategia (sitemap/Tokko/JSON-LD/heuristica/IA). La web puede no ser compatible o requerir JavaScript.' });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/scrape/detalle', async function(req, res) {
@@ -2095,11 +2508,14 @@ app.post('/api/scrape/detalle', async function(req, res) {
     const urls = (req.body && req.body.urls) || [];
     if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: 'Falta el array urls' });
     if (urls.length > 15) return res.status(400).json({ error: 'Maximo 15 por lote' });
+    const user_id = (req.body && req.body.user_id ? String(req.body.user_id).trim() : '');
     const resultados = [];
     for (const item of urls) {
       const u = typeof item === 'string' ? item : item.url;
+      // si la lista vino de la IA, ya trae datos pre-extraidos; los usamos como base/fallback.
+      const datosIaPrevios = (item && typeof item === 'object' && item.datos) ? item.datos : null;
       try {
-        const r = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+        const r = await fetchScrape(u);
         if (!r.ok) { resultados.push({ url: u, error: 'status ' + r.status }); continue; }
         const html = await r.text();
         // MULTIPLATAFORMA: si la ficha es de Tokko Broker, parsearla con su estructura propia
@@ -2128,12 +2544,54 @@ app.post('/api/scrape/detalle', async function(req, res) {
         if (mDescBloque) { var dl = mDescBloque[1].replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').replace(/^\s*Descripci[^\s]*\s*/i, '').trim(); if (dl.length > 100) descCompleta = dl; }
         if (!descCompleta) { var mDescClase = html.match(/class="[^"]*description[^"]*"[^>]*>([\s\S]{200,4000}?)<\/div>/i); if (mDescClase) { var dl2 = mDescClase[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); if (dl2.length > 100) descCompleta = dl2; } }
         const descM = html.match(/og:description["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:description/i);
-        resultados.push({
+        const detWp = {
           url: u,
           titulo: tituloM ? tituloM[1].trim() : '',
           descripcion: descCompleta ? descCompleta : (descM ? descM[1].trim() : ''),
           campos: campos
-        });
+        };
+        // si el parseo WordPress/Houzez ya saco campos tecnicos utiles, listo (camino de siempre).
+        if (Object.keys(campos).length > 0) { resultados.push(detWp); continue; }
+
+        // (3) FALLBACK datos estructurados: JSON-LD / OpenGraph / microdata
+        const detEst = parsearDetalleEstructurado(html, u);
+        if (detEst && Object.keys(detEst.campos).length > 0) {
+          // combinar: titulo/desc del que tenga mejor info
+          if (!detEst.titulo && detWp.titulo) detEst.titulo = detWp.titulo;
+          if (!detEst.descripcion && detWp.descripcion) detEst.descripcion = detWp.descripcion;
+          resultados.push(detEst);
+          continue;
+        }
+
+        // (5) FALLBACK IA para la ficha (ultimo recurso; solo si lo determinista no saco campos)
+        const detIa = await parsearDetalleIA(html, u, user_id);
+        if (detIa && (Object.keys(detIa.campos).length > 0 || detIa.descripcion)) {
+          if (!detIa.titulo && detWp.titulo) detIa.titulo = detWp.titulo;
+          resultados.push(detIa);
+          continue;
+        }
+
+        // si nada saco campos pero la lista IA ya traia datos pre-extraidos, usarlos como base.
+        if (datosIaPrevios) {
+          var camposPrev = {};
+          var p = datosIaPrevios;
+          if (p.precio) camposPrev['Precio'] = (p.moneda ? (p.moneda + ' ') : '') + p.precio;
+          if (p.ref) camposPrev['Propiedad ID'] = String(p.ref);
+          if (p.tipo) camposPrev['Tipo de propiedad'] = p.tipo;
+          if (p.ambientes) camposPrev['Ambientes'] = String(p.ambientes);
+          if (p.dormitorios) camposPrev['Habitaciones'] = String(p.dormitorios);
+          if (p.banos) camposPrev['Baños'] = String(p.banos);
+          if (p.m2) camposPrev['Metros totales'] = String(p.m2);
+          if (p.ubicacion) camposPrev['Ciudad/ Localidad'] = p.ubicacion;
+          if (p.operacion) camposPrev['Estado'] = /alquiler\s*tempora|temporari/i.test(p.operacion) ? 'Alquiler temporario' : (/alquiler|renta/i.test(p.operacion) ? 'Alquiler anual' : 'Venta');
+          if (Object.keys(camposPrev).length > 0) {
+            resultados.push({ url: u, titulo: detWp.titulo || '', descripcion: detWp.descripcion || '', campos: camposPrev, ia: true });
+            continue;
+          }
+        }
+
+        // ultimo: devolver lo que haya (titulo/desc de OG) aunque no haya campos tecnicos.
+        resultados.push(detWp);
       } catch (e) { resultados.push({ url: u, error: e && e.message }); }
     }
     return res.json({ ok: true, resultados: resultados });

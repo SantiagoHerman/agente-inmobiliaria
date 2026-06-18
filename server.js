@@ -2667,6 +2667,78 @@ async function _resolverMediaWpJson(base, ids) {
   return mapa;
 }
 
+// FALLBACK UNIVERSAL (independiente del tema): resuelve la galeria de un set de posts via los ADJUNTOS
+// del post -> GET /wp-json/wp/v2/media?parent=<id1,id2,...>&per_page=100&_fields=id,source_url,post.
+// Sirve para temas que NO exponen fave_property_images (ej. antonbienesraices). El param `parent`
+// acepta MULTIPLES ids separados por coma (confirmado en vivo) -> batcheamos y agrupamos por `post`.
+// Si por algun host el batch fallara/quedara vacio, caemos a per-property con concurrencia acotada (6).
+// Usa fetchScrape (TLS-tolerante). Devuelve un mapa { postId(string) -> [source_url, ...] } (orden tal cual lo da WP).
+async function _resolverMediaPorParent(base, postIds) {
+  var mapa = {};
+  if (!base || !postIds || !postIds.length) return mapa;
+  // dedup como strings
+  var unicos = [];
+  var visto = {};
+  for (var i = 0; i < postIds.length; i++) {
+    var id = String(postIds[i] || '').trim();
+    if (!id || visto[id]) continue;
+    visto[id] = 1;
+    unicos.push(id);
+  }
+  if (!unicos.length) return mapa;
+
+  // acumula una media (id/source_url/post) en el mapa, dedup por source_url dentro del mismo post, cap 15.
+  function _acumular(m) {
+    if (!m || !m.source_url || m.post == null) return;
+    var pid = String(m.post);
+    var arr = mapa[pid] || (mapa[pid] = []);
+    if (arr.length >= 15) return;
+    if (arr.indexOf(m.source_url) === -1) arr.push(m.source_url);
+  }
+
+  // 1) intento BATCH: parent=id1,id2,... El param `parent` acepta multiples ids (confirmado en vivo).
+  // Loteamos de a 5 posts: cada propiedad inmobiliaria suele tener 15-25 adjuntos y per_page tope=100,
+  // asi que 5 posts entran completos en una sola respuesta (mas posts -> WP corta en 100 y el resto
+  // queda para el per-property de abajo, perdiendo el ahorro del batch).
+  for (var off = 0; off < unicos.length; off += 5) {
+    var lote = unicos.slice(off, off + 5);
+    var url = base + '/wp-json/wp/v2/media?parent=' + lote.join(',') + '&per_page=100&_fields=id,source_url,post';
+    try {
+      var r = await fetchScrape(url);
+      if (r && r.ok) {
+        var data = JSON.parse(await r.text());
+        if (Array.isArray(data)) {
+          for (var j = 0; j < data.length; j++) _acumular(data[j]);
+        }
+      }
+    } catch (e) { /* lote fallido -> lo cubre el per-property de abajo si quedo sin fotos */ }
+  }
+
+  // 2) per-property (concurrencia 6) SOLO para los posts que el batch no resolvio.
+  var faltantes = unicos.filter(function(pid) { return !mapa[pid] || mapa[pid].length === 0; });
+  if (faltantes.length) {
+    await _mapConcurrente(faltantes, 6, async function(pid) {
+      var u = base + '/wp-json/wp/v2/media?parent=' + pid + '&per_page=100&_fields=id,source_url,post';
+      try {
+        var rr = await fetchScrape(u);
+        if (rr && rr.ok) {
+          var d = JSON.parse(await rr.text());
+          if (Array.isArray(d)) {
+            for (var k = 0; k < d.length; k++) {
+              var m = d[k];
+              // si la media no trae `post` (algun host) la imputamos al pid pedido
+              if (m && m.source_url && m.post == null) m.post = pid;
+              _acumular(m);
+            }
+          }
+        }
+      } catch (e) { /* sin fotos para este post */ }
+      return null;
+    });
+  }
+  return mapa;
+}
+
 // Trae EN LOTE los detalles de un conjunto de URLs/items WordPress via wp-json (1 sola llamada por lote).
 // Estrategia: extraer el slug (ultimo segmento del path) de cada URL y pedir ?slug=a,b,c&_embed=1.
 // Fallback: si la URL trae un id numerico de post (?p=NN o item.postId), usar ?include=...
@@ -2695,6 +2767,7 @@ async function _traerDetallesWpJson(base, items) {
         var data = JSON.parse(await r.text());
         if (Array.isArray(data)) {
           // --- PASO 1: mapear cada prop SIN galeria (recolecta los IDs de imagen en _idsGaleria) ---
+          // Ademas guardamos el id del POST (p.id) en cada det para el fallback universal por `parent`.
           var dets = [];
           var idsTodos = [];
           for (var i = 0; i < data.length; i++) {
@@ -2702,12 +2775,14 @@ async function _traerDetallesWpJson(base, items) {
             // matchear el item original por slug para conservar SU url exacta
             var orig = metas.find(function(m) { return m.slug === p.slug; });
             var det = _mapearPropWpJsonADetalle(p, orig ? orig.url : (p.link || ''), null);
+            det._postId = (p.id != null) ? String(p.id) : null;
             dets.push(det);
             if (det._idsGaleria && det._idsGaleria.length) idsTodos = idsTodos.concat(det._idsGaleria);
           }
           // --- PASO 2: resolver TODOS los IDs del lote a URLs en bloque (endpoint /media) ---
+          // Camino PREFERENTE Houzez: fave_property_images/slider -> URLs en orden curado.
           var mediaMap = await _resolverMediaWpJson(base, idsTodos);
-          // --- PASO 3: asignar la galeria (orden, dedup, cap 15) a cada prop ---
+          // --- PASO 3: asignar la galeria curada (Houzez): orden, dedup, cap 15 ---
           for (var k = 0; k < dets.length; k++) {
             var d = dets[k];
             var fotos = [];
@@ -2719,15 +2794,46 @@ async function _traerDetallesWpJson(base, items) {
               vistas[sUrl] = 1;
               fotos.push(sUrl);
             }
-            if (fotos.length) {
-              d.fotos = fotos;
-              if (!d.foto) d.foto = fotos[0];
-            } else if (d.foto) {
-              d.fotos = [d.foto];
+            d.fotos = fotos;          // puede quedar vacia (temas sin fave_property_images)
+            d._vistas = vistas;       // dedup acumulado (para combinar luego con parent-media)
+          }
+          // --- PASO 4 (UNIVERSAL): para las props con galeria VACIA o POBRE (<2 fotos), traer los
+          // adjuntos del post via ?parent=<id>. Combina featured + fave_property_images + parent-media,
+          // dedup por source_url, cap 15, portada primero. Independiente del tema (cubre antonbienesraices).
+          var postsPobres = [];
+          for (var pp = 0; pp < dets.length; pp++) {
+            var dpp = dets[pp];
+            if (dpp._postId && (!dpp.fotos || dpp.fotos.length < 2)) postsPobres.push(dpp._postId);
+          }
+          var parentMap = postsPobres.length ? await _resolverMediaPorParent(base, postsPobres) : {};
+          // --- PASO 5: combinar Houzez (preferente) + parent-media + featured, y cerrar cada det ---
+          for (var k2 = 0; k2 < dets.length; k2++) {
+            var d2 = dets[k2];
+            var fotos2 = d2.fotos || [];
+            var vistas2 = d2._vistas || {};
+            for (var fi = 0; fi < fotos2.length; fi++) vistas2[fotos2[fi]] = 1;
+            // agregar parent-media (universal) al final, sin pisar el orden curado de Houzez
+            var pm = (d2._postId && parentMap[d2._postId]) ? parentMap[d2._postId] : [];
+            for (var pj = 0; pj < pm.length && fotos2.length < 15; pj++) {
+              if (!pm[pj] || vistas2[pm[pj]]) continue;
+              vistas2[pm[pj]] = 1;
+              fotos2.push(pm[pj]);
+            }
+            // featured como ultimo recurso de portada/galeria
+            if (d2.foto && !vistas2[d2.foto] && fotos2.length < 15) { vistas2[d2.foto] = 1; fotos2.push(d2.foto); }
+            if (fotos2.length) {
+              d2.fotos = fotos2;
+              if (!d2.foto) d2.foto = fotos2[0];   // portada primero
+            } else if (d2.foto) {
+              d2.fotos = [d2.foto];
+            } else {
+              d2.fotos = [];
             }
             // limpiar campos internos antes de devolver
-            delete d._idsGaleria;
-            resultadoPorUrl[d.url] = d;
+            delete d2._idsGaleria;
+            delete d2._postId;
+            delete d2._vistas;
+            resultadoPorUrl[d2.url] = d2;
           }
         }
       }

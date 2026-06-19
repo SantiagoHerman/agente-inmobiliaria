@@ -3082,6 +3082,25 @@ async function _traerDetallesWpJson(base, items) {
   });
 }
 
+function _dominioDe(u) { try { return new URL((String(u||'').startsWith('http') ? u : 'https://' + u)).hostname.replace(/^www\./,'').toLowerCase(); } catch (e) { return ''; } }
+// Restringe el scraping al dominio del sitio configurado del tenant (scraping_config.fuente_url). Si aun NO
+// configuro fuente_url, se permite y se FIJA ese dominio (queda 'el suyo'). Para cambiarlo, el tenant edita la
+// URL en /api/scraping-config (o el Maestro). FAIL-OPEN: ante cualquier error de DB, NO bloquea el scraping.
+async function scrapeUrlPermitida(user_id, urlPedida) {
+  const domPedido = _dominioDe(urlPedida);
+  if (!domPedido) return { ok: false, error: 'URL invalida' };
+  try {
+    const cfg = await supabase.from('scraping_config').select('fuente_url').eq('user_id', user_id).maybeSingle();
+    const domConfig = (cfg && cfg.data && cfg.data.fuente_url) ? _dominioDe(cfg.data.fuente_url) : '';
+    if (!domConfig) {
+      try { await supabase.from('scraping_config').upsert({ user_id: user_id, fuente_url: urlPedida }, { onConflict: 'user_id' }); } catch (eU) {}
+      return { ok: true };
+    }
+    if (domPedido !== domConfig) return { ok: false, error: 'Solo podes importar desde tu propio sitio (' + domConfig + '). Para cambiarlo, actualiza la URL en la configuracion de importacion.' };
+    return { ok: true };
+  } catch (e) { return { ok: true }; }
+}
+
 // ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress + Tokko Broker) =====
 app.get('/api/scrape/lista', async function(req, res) {
   try {
@@ -3091,6 +3110,11 @@ app.get('/api/scrape/lista', async function(req, res) {
     // normalizar a dominio base
     let base;
     try { const u = new URL(sitio); base = u.protocol + '//' + u.host; } catch(e){ return res.status(400).json({ error: 'URL invalida' }); }
+
+    // restringir al dominio propio del tenant (anti-scrape de competencia / explosion de costo IA)
+    var user_id = (req.query.user_id || (req.body && req.body.user_id) || '').trim();
+    const _perm = await scrapeUrlPermitida(user_id, sitio);
+    if (!_perm.ok) return res.status(400).json({ error: _perm.error });
 
     // ===== (1) WORDPRESS via wp-json BULK (preferente) =====
     // Si el sitio expone /wp-json/wp/v2/properties, paginamos per_page=50 siguiendo X-WP-TotalPages
@@ -3161,7 +3185,7 @@ app.get('/api/scrape/lista', async function(req, res) {
     }
     // ===== CASCADA DE FALLBACKS (2->5) si no hubo sitemap WordPress =====
     // Descargamos el HOME + un par de rutas de listado tipicas para tener material a analizar.
-    var user_id = (req.query.user_id || (req.body && req.body.user_id) || '').trim();
+    // (user_id ya se obtuvo arriba para el chequeo de dominio propio)
     var rutasListado = ['/', '/propiedades', '/propiedades/', '/listado', '/buscar', '/emprendimientos', '/venta', '/alquiler'];
     var homeHtml = '';
     var htmlsListado = [];
@@ -3232,6 +3256,12 @@ app.post('/api/scrape/detalle', async function(req, res) {
     // limite sano: con wp-json el lote viaja en 1 sola llamada, asi que toleramos lotes mas grandes.
     if (urls.length > 60) return res.status(400).json({ error: 'Maximo 60 por lote' });
     const user_id = (req.body && req.body.user_id ? String(req.body.user_id).trim() : '');
+
+    // restringir al dominio propio del tenant: el lote viene de /api/scrape/lista (mismo sitio),
+    // asi que validamos el dominio de la primera url del array.
+    var _urlDetalle = (typeof urls[0] === 'string') ? urls[0] : (urls[0] && urls[0].url) || '';
+    const _perm = await scrapeUrlPermitida(user_id, _urlDetalle);
+    if (!_perm.ok) return res.status(400).json({ error: _perm.error });
 
     // ===== (1) CAMINO RAPIDO WORDPRESS via wp-json (SIN IA, SIN HTML por ficha) =====
     // Si el sitio expone /wp-json/wp/v2/properties, traemos TODO el lote en 1 llamada por slug
@@ -3774,6 +3804,10 @@ app.post('/api/scrape/universal', async function(req, res) {
     if (!sitio) return res.status(400).json({ error: 'Falta la url del sitio' });
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
 
+    // restringir al dominio propio del tenant (anti-scrape de competencia / explosion de costo IA)
+    const _perm = await scrapeUrlPermitida(user_id, sitio);
+    if (!_perm.ok) return res.status(400).json({ error: _perm.error });
+
     var props = await obtenerPropiedadesUniversal(sitio, limite);
     if (!props.length) return res.json({ ok: false, mensaje: 'No se encontraron propiedades por ninguna via', total: 0 });
 
@@ -3942,6 +3976,9 @@ app.post('/api/scrape/v2', async function(req, res) {
     var limite = req.body.limite ? parseInt(req.body.limite, 10) : null;
     if (!sitio) return res.status(400).json({ error: 'Falta la url del sitio' });
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    // restringir al dominio propio del tenant (anti-scrape de competencia / explosion de costo IA)
+    const _perm = await scrapeUrlPermitida(user_id, sitio);
+    if (!_perm.ok) return res.status(400).json({ error: _perm.error });
     var lista = await traerListaPropiedades(sitio, limite);
     if (!lista.length) return res.json({ ok: false, mensaje: 'No se encontraron propiedades', propiedades: [] });
     var procesadas = [];

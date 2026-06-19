@@ -614,9 +614,14 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (modoPrueba && historialManual) {
     historial = historialManual.map(function(m){ return { role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }; });
   } else if (conversation_id) {
-    const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: true });
+    // MEMORIA / costo: traemos solo los ULTIMOS N mensajes (no TODA la conversacion). Los datos clave del lead
+    // (nombre/interes/presupuesto) ya viajan en bloqueDatosLead, asi que charlas muy largas no encarecen cada
+    // respuesta ni el agente pierde el hilo reciente. (El historial NO se cachea -> capearlo baja el costo de
+    // las charlas largas.) Traemos los N mas recientes (desc + limit) y los reordenamos cronologicamente.
+    const MAX_HISTORIAL = 30;
+    const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: false }).limit(MAX_HISTORIAL);
     if (prev && prev.length > 0) {
-      historial = prev.map(function(m){ var textoBase = (m.role === 'ai') ? (m.content_original || m.content) : m.content; return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: textoBase }; });
+      historial = prev.slice().reverse().map(function(m){ var textoBase = (m.role === 'ai') ? (m.content_original || m.content) : m.content; return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: textoBase }; });
     }
   }
 

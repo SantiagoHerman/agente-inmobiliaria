@@ -3452,11 +3452,26 @@ app.post('/api/clasificar-fotos', async (req, res) => {
     const urls = Array.isArray(body.urls) ? body.urls.filter(function(u){ return typeof u === 'string' && u.trim(); }) : [];
     const property_id = body.property_id;
     if (!urls.length) return res.status(400).json({ error: 'Falta urls (array de strings)' });
+    // CACHE DE VISION: si la propiedad YA tiene categoria guardada para una URL, no la re-clasificamos (no se
+    // re-paga la vision). Solo se clasifican las URLs nuevas/sin categoria -> re-importar cuesta casi $0 en fotos ya hechas.
+    const yaClasif = {};
+    if (property_id) {
+      try {
+        const { data: propPrev } = await supabase.from('properties').select('images').eq('id', property_id).eq('user_id', _uid).maybeSingle();
+        if (propPrev && Array.isArray(propPrev.images)) {
+          propPrev.images.forEach(function(it){ if (it && typeof it === 'object' && it.url && it.categoria) yaClasif[it.url] = it.categoria; });
+        }
+      } catch (eCache) {}
+    }
+    const urlsNuevas = urls.filter(function(u){ return !yaClasif[u]; });
     // Concurrencia limitada: procesar de a 4 en paralelo para no saturar la API.
     const LOTE = 4;
     const resultados = [];
-    for (let i = 0; i < urls.length; i += LOTE) {
-      const lote = urls.slice(i, i + LOTE);
+    // Las ya cacheadas se devuelven sin costo (no llaman a la vision).
+    for (let k = 0; k < urls.length; k++) { if (yaClasif[urls[k]]) resultados.push({ url: urls[k], categoria: yaClasif[urls[k]], cacheada: true }); }
+    // Solo se clasifican (pagan vision) las URLs nuevas.
+    for (let i = 0; i < urlsNuevas.length; i += LOTE) {
+      const lote = urlsNuevas.slice(i, i + LOTE);
       const parciales = await Promise.all(lote.map(async function(u) {
         try {
           const categoria = await clasificarFotoUna(u, _uid);

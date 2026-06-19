@@ -661,9 +661,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   }
 
-  const systemPrompt = [
+  // Parte ESTATICA del system: identica para el tenant entre mensajes y leads -> se CACHEA con cache_control
+  // (prompt caching de Anthropic, ~-90% en relecturas). Los datos del lead (dinamicos) van en un bloque aparte.
+  const systemStatic = [
     'Sos ' + agentName + (agentCargo ? (', ' + agentCargo) : ', asesor/a') + ' de ' + company + ' (rubro: ' + rubro + ').',
-    bloqueDatosLead,
         'IDENTIDAD: Sos una persona del equipo. NUNCA digas que sos una inteligencia artificial, un bot, un asistente virtual ni un programa. Si te preguntan que cargo ocupas, si sos una IA, o quien sos, responde con tu nombre (' + agentName + ')' + (agentCargo ? (" y tu cargo (" + agentCargo + ")") : '') + ' de forma natural, sin admitir que sos un sistema.',
         'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
     'LINKS DE PROPIEDADES: Cuando menciones o recomiendes una propiedad que en el inventario tenga un campo link, inclui ese link en tu respuesta para que el lead pueda ver mas informacion y fotos. Compartilo de forma natural, por ejemplo: Te paso el link para que veas las fotos y los detalles. Si la propiedad no tiene link en el inventario, no inventes ninguno ni menciones que falta.',
@@ -699,10 +700,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   }];
 
+  // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
+  // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
+  // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
+  const systemBlocks = [{ type: 'text', text: systemStatic, cache_control: { type: 'ephemeral' } }];
+  if (bloqueDatosLead) systemBlocks.push({ type: 'text', text: bloqueDatosLead });
+
   const completion = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 500,
-    system: systemPrompt,
+    system: systemBlocks,
     tools: toolsAgente,
     messages: mensajesParaIA
   });
@@ -759,17 +766,19 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const completion2 = await anthropic.messages.create({
           model: 'claude-sonnet-4-6',
           max_tokens: 500,
-          system: systemPrompt,
+          system: systemBlocks,
           tools: toolsAgente,
           messages: mensajesTurno2
         });
         const b2 = (completion2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
         if (b2 && b2.text) textoFinal = b2.text;
-        // acumular uso del segundo turno (no rompe registrarUsoTokens si falta algun campo)
+        // acumular uso del segundo turno (incluye tokens de cache para que el costo logueado sea exacto)
         if (completion2 && completion2.usage && completion && completion.usage) {
           completion.usage = {
             input_tokens: (completion.usage.input_tokens || 0) + (completion2.usage.input_tokens || 0),
-            output_tokens: (completion.usage.output_tokens || 0) + (completion2.usage.output_tokens || 0)
+            output_tokens: (completion.usage.output_tokens || 0) + (completion2.usage.output_tokens || 0),
+            cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (completion2.usage.cache_read_input_tokens || 0),
+            cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (completion2.usage.cache_creation_input_tokens || 0)
           };
         }
       } catch (eTurno2) {

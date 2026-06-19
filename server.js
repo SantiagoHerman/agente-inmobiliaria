@@ -1264,7 +1264,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     // === REPORTE AL ADMIN: si quien escribe es el numero de reportes del dueno y pide reporte ===
     try {
-      const { data: bsRep } = await supabase.from('business_settings').select('reportes_config').eq('user_id', user_id).maybeSingle();
+      const { data: bsRep } = await supabase.from('business_settings').select('reportes_config, crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
       const repCfg = bsRep && bsRep.reportes_config ? bsRep.reportes_config : null;
       if (repCfg && repCfg.whatsapp) {
         const soloNumRep = String(repCfg.whatsapp).replace(/[^0-9]/g, '');
@@ -1272,6 +1272,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         // comparar por los ultimos 8 digitos (evita lios de prefijos/0/15)
         const coincide = soloNumRep.length >= 8 && soloNumTel.length >= 8 && soloNumRep.slice(-8) === soloNumTel.slice(-8);
         if (coincide && texto && !tipoMediaEntrante) {
+          // Pausa total del Maestro o cliente en papelera: NO gastar tokens ni siquiera en el canal de reportes.
+          if (bsRep && (bsRep.crm_pausado === true || bsRep.eliminado_at)) return;
           const respuestaAdmin = await responderConsultaAdmin(user_id, texto);
           await enviarWhatsapp(instanciaNombre, telefono, respuestaAdmin);
           return; // el numero del admin es canal de reportes; no se procesa como lead
@@ -1324,16 +1326,29 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
       if (_gq && _gq.error) { const _gq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsGate = _gq2 && _gq2.data; }
       else { _bsGate = _gq && _gq.data; } }
-    if (_bsGate && _bsGate.eliminado_at) return; // cliente en papelera: no se procesa nada
-    if (_bsGate && _bsGate.crm_pausado === true) {
-      // PAUSA TOTAL: guardamos el mensaje CRUDO (sin transcribir ni traducir) para que el chat siga visible,
-      // subimos el archivo si lo hay (Storage no gasta tokens) y cortamos. Cero IA, cero costo de tokens.
+    // Papelera (eliminado_at) o pausa TOTAL del Maestro (crm_pausado): NO se gasta ningun token de IA.
+    // Guardamos el mensaje CRUDO (sin transcribir ni traducir) para que el chat siga visible al reactivar/restaurar,
+    // subimos el archivo si lo hay (Storage no gasta tokens) y cortamos. Diferencia: en pausa total avisamos al
+    // asesor por push (un humano debe atender; el push es FCM, NO gasta tokens); en papelera no (cliente removido).
+    const _enPapelera = !!(_bsGate && _bsGate.eliminado_at);
+    const _enPausaTotal = !!(_bsGate && _bsGate.crm_pausado === true);
+    if (_enPapelera || _enPausaTotal) {
       let _mU = null, _mT = null;
       if (tipoMediaEntrante) { try { const _ms = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, true); if (_ms) { _mU = _ms.url; _mT = _ms.tipo; } } catch (e) {} }
       try {
         await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto, media_url: _mU, media_tipo: _mT });
         await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
-      } catch (e) { console.error('guardar msg en pausa total:', e && e.message); }
+      } catch (e) { console.error('guardar msg (pausa total/papelera):', e && e.message); }
+      if (_enPausaTotal) {
+        // Pausa total: avisar al asesor humano (FCM, sin tokens) para que atienda en lugar de la IA.
+        try {
+          const _asesorRowId = conv.asesor_id || (convExistente && convExistente.asesor_id) || null;
+          if (_asesorRowId) {
+            const { data: _ase } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesorRowId).maybeSingle();
+            if (_ase && _ase.auth_user_id) { await enviarPushAsesor(_ase.auth_user_id, _pushName, texto); }
+          }
+        } catch (ePush) { console.error('push asesor (pausa total):', ePush && ePush.message); }
+      }
       return;
     }
 
@@ -4839,10 +4854,10 @@ app.get('/api/maestro/consumo', async function(req, res){
     var saldoRestante = null;
     if (saldoCargado != null && cfg.data.saldo_fecha) {
       var ud = await supabase.from('ia_uso').select('cost_usd').gte('created_at', cfg.data.saldo_fecha).limit(100000);
-      var gastado = (ud.data || []).reduce(function(a, r){ return a + (Number(r.cost_usd) || 0); }, 0);
+      var gastado = (ud.data || []).reduce(function(a, r){ var c = Number(r.cost_usd) || 0; return (c > MAX_COSTO_FILA || c < 0) ? a : a + c; }, 0); // misma salvaguarda anti-dato-corrupto que el total
       saldoRestante = Math.round((saldoCargado - gastado) * 100) / 100;
     }
-    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, filas_anomalas_ignoradas: corruptas, costo_anomalo_ignorado: Math.round(costoCorrupto * 100) / 100, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
+    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, mensajes_validos: rows.length - corruptas, filas_anomalas_ignoradas: corruptas, costo_anomalo_ignorado: Math.round(costoCorrupto * 100) / 100, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

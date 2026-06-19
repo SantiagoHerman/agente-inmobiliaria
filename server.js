@@ -160,14 +160,16 @@ const TRIAL_DESDE = process.env.TRIAL_DESDE || '';
 const MP_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
 const MP_BASE = 'https://api.mercadopago.com';
 // IDs globales de los planes en MercadoPago (creados 2026-06-16). Son del SaaS, compartidos por todos los tenants.
-const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7' };
+// enterprise: su id se carga en la env MP_PLAN_ENTERPRISE de Railway (mismo patron; se crea una vez via /api/maestro/mp-crear-plan-enterprise).
+const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7', enterprise: process.env.MP_PLAN_ENTERPRISE || '' };
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
-  trial:   { ai_messages: 200,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  basico:  { ai_messages: 1000,  asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
-  pro:     { ai_messages: 4000,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  premium: { ai_messages: 12000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+  trial:      { ai_messages: 200,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  basico:     { ai_messages: 1000,  asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
+  pro:        { ai_messages: 4000,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  premium:    { ai_messages: 12000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
+  enterprise: { ai_messages: 20000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
 };
 // Plan por defecto cuando la funcion esta apagada o el tenant no tiene fila: acceso total.
 const PLAN_DEFECTO = 'premium';
@@ -4181,13 +4183,23 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
     var email = (req.body && req.body.email) ? String(req.body.email) : '';
-    if (['basico','pro','premium'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
+    if (['basico','pro','premium','enterprise'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
     if (!email) return res.status(400).json({ error: 'Falta email del pagador' });
     // Los planes son GLOBALES (del SaaS), no per-tenant.
     var planId = PLANES_MP[nivel] || null;
-    if (!planId) return res.status(503).json({ error: 'Plan de MercadoPago no encontrado' });
+    if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
     var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl);
+    // Guardar el plan ELEGIDO en la fila para que se apliquen sus limites al activarse (el webhook NO incluye
+    // 'plan' en su upsert -> se preserva). Asi un Enterprise queda con 20.000 y no cae al default. Si el tenant
+    // NO esta active/cortesia, lo dejamos en 'trial' (bloqueado por el candado) hasta que MP confirme el pago;
+    // si YA esta active (upgrade de plan), NO tocamos el status para no cortarle el acceso durante el cambio.
+    try {
+      var subPrev = await getSubscription(user_id);
+      var filaPlan = { user_id: user_id, plan: nivel };
+      if (!(subPrev && (subPrev.status === 'active' || subPrev.cortesia === true))) filaPlan.status = 'trial';
+      await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
+    } catch (eP) { console.error('checkout guardar plan:', eP && eP.message); }
     return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -4216,7 +4228,21 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
   } catch (e) { console.error('webhook mercadopago:', e && e.message); }
 });
 
-// (endpoint temporal /api/mp-setup-planes eliminado: los 3 planes ya estan creados y sus IDs viven en PLANES_MP)
+// (endpoint temporal /api/mp-setup-planes eliminado: los 3 planes base ya estan creados y sus IDs viven en PLANES_MP)
+
+// Crea el plan ENTERPRISE en MercadoPago (una vez). Gateado por auth Maestro. Misma config que los otros
+// (mensual, 4 dias de prueba, ARS, credito+debito) via mpCrearPlan. Devuelve el id para cargarlo en la env
+// MP_PLAN_ENTERPRISE de Railway (mismo patron que los 3 planes base). Si ya esta seteado, no crea otro.
+app.post('/api/maestro/mp-crear-plan-enterprise', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado' });
+    if (PLANES_MP.enterprise) return res.json({ ok: true, yaConfigurado: true, id: PLANES_MP.enterprise, aviso: 'Ya hay un plan Enterprise configurado (env MP_PLAN_ENTERPRISE). Para recrearlo, borra esa variable primero.' });
+    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var plan = await mpCrearPlan('Raices CRM - Plan Enterprise', 500000, backUrl);
+    return res.json({ ok: true, id: plan && plan.id, aviso: 'Plan Enterprise creado en MP. Copia este id a la variable MP_PLAN_ENTERPRISE en Railway y redeploya para activarlo.' });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
 
 // ===== SOPORTE: el cliente envia un mensaje (error/sugerencia/modificacion) que llega al panel maestro =====
 app.post('/api/soporte', async function(req, res) {

@@ -447,7 +447,7 @@ async function transcribirAudioGroq(base64, mime) {
 }
 
 // ===== MULTIMEDIA: baja un archivo de Evolution y lo sube a Supabase Storage =====
-async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia) {
+async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia, skipTranscribe) {
   try {
     // 1) Pedir el base64 del archivo a Evolution
     const resp = await fetch(EVOLUTION_URL + '/chat/getBase64FromMediaMessage/' + instancia, {
@@ -477,7 +477,7 @@ async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia) {
     const url = pub && pub.data ? pub.data.publicUrl : null;
     // 5) Si es audio y hay Groq: transcribir REUSANDO el base64 ya bajado (sin segunda descarga)
     let transcripcion = null;
-    if (tipoMedia === 'audio' && GROQ_KEY) {
+    if (tipoMedia === 'audio' && GROQ_KEY && !skipTranscribe) {
       transcripcion = await transcribirAudioGroq(base64, mime);
     }
     return url ? { url: url, tipo: tipoMedia, transcripcion: transcripcion } : null;
@@ -1316,6 +1316,27 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     }
     if (!conv) return;
 
+    // ===== GATE TEMPRANO (antes de gastar 1 solo token de IA) =====
+    // La pausa TOTAL del Maestro (crm_pausado) y la papelera (eliminado_at) cortan ACA, ANTES de transcribir
+    // (Groq) y de traducir/clasificar/responder (Claude) -> CERO gasto de tokens. La pausa POR-CONVERSACION
+    // (ai_enabled) NO entra aca: esa deja transcribir+traducir para el humano y solo frena al agente (mas abajo).
+    let _bsGate = null;
+    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
+      if (_gq && _gq.error) { const _gq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsGate = _gq2 && _gq2.data; }
+      else { _bsGate = _gq && _gq.data; } }
+    if (_bsGate && _bsGate.eliminado_at) return; // cliente en papelera: no se procesa nada
+    if (_bsGate && _bsGate.crm_pausado === true) {
+      // PAUSA TOTAL: guardamos el mensaje CRUDO (sin transcribir ni traducir) para que el chat siga visible,
+      // subimos el archivo si lo hay (Storage no gasta tokens) y cortamos. Cero IA, cero costo de tokens.
+      let _mU = null, _mT = null;
+      if (tipoMediaEntrante) { try { const _ms = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, true); if (_ms) { _mU = _ms.url; _mT = _ms.tipo; } } catch (e) {} }
+      try {
+        await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto, media_url: _mU, media_tipo: _mT });
+        await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      } catch (e) { console.error('guardar msg en pausa total:', e && e.message); }
+      return;
+    }
+
     // 4) Guardar SIEMPRE el mensaje entrante (no se pierde nada)
     // MEDIA ENTRANTE: subir a Storage ANTES de traducir/IA. Si es audio y hay Groq, subirMediaAStorage
     // ademas transcribe (reusando el base64 ya bajado, sin segunda descarga). Si vino transcripcion,
@@ -1418,18 +1439,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       }).eq('id', conv.id);
     }
 
-    // 5) Si la IA esta activa, responder por WhatsApp
-    // PAUSA GLOBAL: si el CRM esta pausado, la IA no responde a nadie (los mensajes igual se guardan).
-    // No modifica el ai_enabled de cada conversacion; es una capa global aparte.
-    // Pedimos crm_pausado + eliminado_at en una sola query. Si la columna eliminado_at aun no existe el select falla
-    // -> reintentamos solo con crm_pausado (degradar bien, sin romper el webhook).
-    let _bsPausa = null;
-    { const _bsq = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
-      if (_bsq && _bsq.error) { const _bsq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsPausa = _bsq2 && _bsq2.data; }
-      else { _bsPausa = _bsq && _bsq.data; } }
-    // PAPELERA: cliente eliminado (soft-delete) -> la IA no responde (aditivo, no toca la logica de suscripcion).
-    if (_bsPausa && _bsPausa.eliminado_at) return;
-    if (_bsPausa && _bsPausa.crm_pausado === true) return;
+    // 5) Si la IA esta activa, responder por WhatsApp.
+    // (La pausa TOTAL del Maestro -crm_pausado- y la papelera -eliminado_at- ya cortaron mas arriba, ANTES de
+    //  gastar un solo token. Aca queda solo la pausa POR-CONVERSACION: el agente no responde, pero el mensaje
+    //  ya se transcribio/tradujo para que lo tome un humano. Esta es tu distincion: app vs Maestro.)
     if (conv.ai_enabled === false) return;
     // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)
     if (SUBSCRIPTIONS_ENABLED) {

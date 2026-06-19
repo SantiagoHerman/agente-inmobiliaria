@@ -4786,17 +4786,36 @@ app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
 app.get('/api/maestro/consumo', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var TOPE_ALERTA_USD = 15;
     var periodo = String((req.query && req.query.periodo) || '30d');
+    // 'mes' = ultimos 30 dias (igual que 30d, por simplicidad).
     var dias = periodo === 'hoy' ? 1 : (periodo === '7d' ? 7 : (periodo === '365d' ? 365 : 30));
+    // RANGO CUSTOM: si vienen AMBOS query params 'desde' y 'hasta' (ISO date), se filtra por ese rango en vez del periodo.
+    var qDesde = req.query && req.query.desde ? String(req.query.desde) : null;
+    var qHasta = req.query && req.query.hasta ? String(req.query.hasta) : null;
+    var rangoCustom = !!(qDesde && qHasta);
     var desde = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
-    var u = await supabase.from('ia_uso').select('user_id, cost_usd, input_tokens, output_tokens').gte('created_at', desde).limit(100000);
+    var q = supabase.from('ia_uso').select('user_id, cost_usd, input_tokens, output_tokens');
+    if (rangoCustom) { q = q.gte('created_at', qDesde).lte('created_at', (qHasta.indexOf('T') >= 0 ? qHasta : qHasta + 'T23:59:59.999Z')); }
+    else { q = q.gte('created_at', desde); }
+    var u = await q.limit(100000);
     var rows = u.data || [];
     var totalCost = 0, totalIn = 0, totalOut = 0; var porCliente = {};
-    rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; totalCost += c; totalIn += r.input_tokens || 0; totalOut += r.output_tokens || 0; var pc = porCliente[r.user_id] || { cost: 0, msgs: 0 }; pc.cost += c; pc.msgs++; porCliente[r.user_id] = pc; });
+    rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; totalCost += c; totalIn += r.input_tokens || 0; totalOut += r.output_tokens || 0; var pc = porCliente[r.user_id] || { cost: 0, input_tokens: 0, output_tokens: 0, msgs: 0 }; pc.cost += c; pc.input_tokens += r.input_tokens || 0; pc.output_tokens += r.output_tokens || 0; pc.msgs++; porCliente[r.user_id] = pc; });
     var nombres = {};
     var keys = Object.keys(porCliente);
     if (keys.length) { try { var bs = await supabase.from('business_settings').select('user_id, company_name').in('user_id', keys); (bs.data || []).forEach(function(b){ nombres[b.user_id] = b.company_name; }); } catch(eN){} }
-    var ranking = keys.map(function(k){ return { user_id: k, empresa: nombres[k] || '(sin nombre)', cost: Math.round(porCliente[k].cost * 100) / 100, msgs: porCliente[k].msgs }; }).sort(function(a, b){ return b.cost - a.cost; });
+    var ranking = keys.map(function(k){ return { user_id: k, empresa: nombres[k] || '(sin nombre)', cost: Math.round(porCliente[k].cost * 1000000) / 1000000, input_tokens: porCliente[k].input_tokens, output_tokens: porCliente[k].output_tokens, msgs: porCliente[k].msgs }; }).sort(function(a, b){ return b.cost - a.cost; });
+    // ALERTA DE ANOMALIA por cliente: costo > 3x la MEDIANA de los costos>0 (con piso absoluto $1), o supera el tope absoluto.
+    var costosPos = ranking.map(function(it){ return it.cost; }).filter(function(c){ return c > 0; }).sort(function(a, b){ return a - b; });
+    var mediana = 0;
+    if (costosPos.length) { var mid = Math.floor(costosPos.length / 2); mediana = costosPos.length % 2 ? costosPos[mid] : (costosPos[mid - 1] + costosPos[mid]) / 2; }
+    ranking.forEach(function(it){
+      it.alerta = false; it.motivo = '';
+      if (it.cost > TOPE_ALERTA_USD) { it.alerta = true; it.motivo = 'supera $' + TOPE_ALERTA_USD; }
+      else if (mediana > 0 && it.cost > 1 && it.cost > 3 * mediana) { it.alerta = true; it.motivo = 'gasta ' + (Math.round((it.cost / mediana) * 10) / 10) + 'x la mediana'; }
+    });
+    var alertas = ranking.filter(function(it){ return it.alerta; }).map(function(it){ return { user_id: it.user_id, empresa: it.empresa, cost: it.cost, motivo: it.motivo }; });
     // saldo estimado
     var cfg = await supabase.from('superadmin_config').select('saldo_cargado, saldo_fecha').eq('id', 1).maybeSingle();
     var saldoCargado = (cfg.data && cfg.data.saldo_cargado != null) ? Number(cfg.data.saldo_cargado) : null;
@@ -4806,7 +4825,7 @@ app.get('/api/maestro/consumo', async function(req, res){
       var gastado = (ud.data || []).reduce(function(a, r){ return a + (Number(r.cost_usd) || 0); }, 0);
       saldoRestante = Math.round((saldoCargado - gastado) * 100) / 100;
     }
-    return res.json({ ok: true, periodo: periodo, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, ranking: ranking.slice(0, 50), saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
+    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

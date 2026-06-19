@@ -804,7 +804,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     try {
       const { data: convTrad } = await supabase.from('conversations').select('traductor_activo, idioma_lead').eq('id', conversation_id).maybeSingle();
       if (convTrad && convTrad.traductor_activo && convTrad.idioma_lead && convTrad.idioma_lead !== idiomaBase) {
-        const trad = await traducir(reply, convTrad.idioma_lead);
+        const trad = await traducir(reply, convTrad.idioma_lead, user_id);
         if (trad && trad.trim() && trad.trim() !== reply.trim()) { replyCliente = trad; idiomaAi = convTrad.idioma_lead; }
       }
     } catch (e) { console.error('trad saliente IA:', e && e.message); /* si falla, se envia el original en idioma base */ }
@@ -820,7 +820,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
 
 // Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
 // Conservador: solo devuelve un estado nuevo cuando la senal es clara; si no, devuelve null.
-async function clasificarEstado(mensajeCliente) {
+async function clasificarEstado(mensajeCliente, user_id) {
   try {
     const prompt = [
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
@@ -833,6 +833,7 @@ async function clasificarEstado(mensajeCliente) {
       'Mensaje del cliente: ' + mensajeCliente
     ].join('\n');
     const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 20, messages: [{ role: 'user', content: prompt }] });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_estado'); } catch(e){}
     const out = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim().toLowerCase() : '';
     console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> respuesta IA:', JSON.stringify(out));
     if (out.includes('listo_humano')) return 'listo_humano';
@@ -845,7 +846,7 @@ async function clasificarEstado(mensajeCliente) {
 // Mismo patron barato que clasificarEstado/clasificarTemperatura: una llamada chica a Anthropic que devuelve JSON.
 // Solo extrae lo que el lead DICE explicitamente; no inventa (campo vacio si no lo menciona).
 // datosPrevios se pasan como contexto para no duplicar lo ya sabido. Robusta a errores (try/catch).
-async function extraerDatosLead(texto, datosPrevios) {
+async function extraerDatosLead(texto, datosPrevios, user_id) {
   try {
     if (!texto || !texto.trim()) return { nombre: '', origen: '', interes: '', presupuesto: '' };
     const prev = datosPrevios || {};
@@ -863,6 +864,7 @@ async function extraerDatosLead(texto, datosPrevios) {
       'Mensaje del cliente: ' + JSON.stringify(texto)
     ].filter(Boolean).join('\n');
     const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 150, messages: [{ role: 'user', content: prompt }] });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'extraer_datos'); } catch(e){}
     let out = (r && r.content && r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
     // por si la IA envuelve en ```json ... ```
     const m = out.match(/\{[\s\S]*\}/);
@@ -953,7 +955,7 @@ function quitarEmojis(t) {
     .trim();
 }
 // Traduce un texto a un idioma destino usando el modelo. Devuelve el texto traducido (o el original si falla).
-async function traducir(texto, idiomaDestino) {
+async function traducir(texto, idiomaDestino, user_id) {
   try {
     if (!texto || !idiomaDestino) return texto;
     const NOMBRES = { es: 'espanol', en: 'ingles', pt: 'portugues', fr: 'frances', it: 'italiano', de: 'aleman', nl: 'holandes', ru: 'ruso', zh: 'chino mandarin', ja: 'japones', ko: 'coreano', ar: 'arabe', hi: 'hindi', tr: 'turco', pl: 'polaco' };
@@ -964,13 +966,14 @@ async function traducir(texto, idiomaDestino) {
       system: 'Sos un traductor profesional. Traduci el texto del usuario al ' + destino + '. Reglas: devolve UNICAMENTE la traduccion, sin comillas, sin explicaciones, sin notas. Manten el tono, la intencion y el estilo informal o formal del original. No agregues ni quites informacion. Si el texto incluye una palabra o expresion dicha a proposito en otro idioma (un saludo, una marca, un termino comun), mantenela como esta en lugar de forzar su traduccion. Traduci el sentido natural, no palabra por palabra.',
       messages: [ { role: 'user', content: texto } ]
     });
+    try { if (user_id && comp && comp.usage) await registrarUsoTokens(user_id, comp.usage, 'traducir'); } catch(e){}
     const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim() : '';
     return out || texto;
   } catch (e) { console.error('Error traduciendo:', e && e.message); return texto; }
 }
 
 // Detecta el idioma de un texto. Devuelve un codigo (es/en/pt/de/it/fr) o 'es' por defecto.
-async function detectarIdioma(texto) {
+async function detectarIdioma(texto, user_id) {
   try {
     if (!texto || texto.trim().length < 2) return 'es';
     const comp = await anthropic.messages.create({
@@ -979,6 +982,7 @@ async function detectarIdioma(texto) {
       system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Mira la ORACION completa, no palabras aisladas. Si el mensaje entero es un saludo o frase corta (ej. hi, hello, bonjour, hallo), ESE es el idioma. Solo si dentro de una oracion larga hay una palabra prestada de otro idioma, ignora esa palabra y usa el idioma dominante de la oracion. Responde SOLO con el codigo de dos letras del idioma (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl, u otro codigo ISO 639-1 si corresponde). Nada mas.',
       messages: [ { role: 'user', content: texto } ]
     });
+    try { if (user_id && comp && comp.usage) await registrarUsoTokens(user_id, comp.usage, 'detectar_idioma'); } catch(e){}
     const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : 'es';
     return ['es','en','pt','fr','it','de','nl','ru','zh','ja','ko','ar','hi','tr','pl'].indexOf(out) >= 0 ? out : 'es';
   } catch (e) { return 'es'; }
@@ -1168,6 +1172,7 @@ async function responderConsultaAdmin(user_id, pregunta) {
     const datos = { contactos_totales: resCont.count || 0, conversaciones_totales: lista.length, conversaciones_por_estado: porEstado, asesores: resumenAses };
     const sys = 'Sos el asistente de reportes de un CRM inmobiliario. El ADMINISTRADOR te hace una consulta por WhatsApp. Responde SOLO con los datos provistos (el JSON de abajo), en espanol rioplatense, claro y conciso, en formato WhatsApp (texto plano, podes usar *negrita* y saltos de linea, sin tablas). Si te piden un dato que no esta en los datos, deci que no lo tenes disponible. Nunca inventes numeros.';
     const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: [{ role: 'user', content: 'Datos actuales del CRM:\n' + JSON.stringify(datos, null, 1) + '\n\nConsulta del administrador: ' + pregunta }] });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'reporte_admin'); } catch(e){}
     return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : 'No pude generar el reporte.';
   } catch (e) { console.error('responderConsultaAdmin:', e && e.message); return 'No pude generar el reporte en este momento.'; }
 }
@@ -1292,9 +1297,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
     try {
       if (!_noTraducir) {
-        const idiomaDetectado = await detectarIdioma(texto);
+        const idiomaDetectado = await detectarIdioma(texto, user_id);
         if (idiomaDetectado && idiomaDetectado !== 'es') {
-          const trad = await traducir(texto, 'es');
+          const trad = await traducir(texto, 'es', user_id);
           if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
           // recordar el idioma del lead en la conversacion para el traductor saliente
           await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
@@ -1317,7 +1322,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       (async function(){
         try {
           const datosPrevios = { nombre: contacto.name, interes: contacto.interest, presupuesto: contacto.budget };
-          const ext = await extraerDatosLead(contentLead, datosPrevios);
+          const ext = await extraerDatosLead(contentLead, datosPrevios, user_id);
           if (!ext) return;
           const updContacto = {};
           // nombre: solo si el lead dio un nombre real Y el actual parece el pushName de WhatsApp
@@ -1360,7 +1365,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos
     if (convExistente && convExistente.status === 'recontacto') {
-      const tempLead = await clasificarTemperatura(texto);
+      const tempLead = await clasificarTemperatura(texto, user_id);
       let volverA = convExistente.estado_previo || 'en_conversacion';
       // Si el lead muestra interes (caliente), pasa a 'interesado' (sale de recontacto)
       if (tempLead === 'caliente') volverA = 'interesado';
@@ -1466,7 +1471,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const estadoActual = (convActual && convActual.status) || 'en_conversacion';
           // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
           if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
-            const nuevoEstado = await clasificarEstado(texto);
+            const nuevoEstado = await clasificarEstado(texto, user_id);
             if (nuevoEstado) {
               // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
               const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
@@ -1544,7 +1549,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     let textoEnviar = texto;
     let idiomaMsg = null;
     if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es') {
-      textoEnviar = await traducir(texto, conv.idioma_lead);
+      textoEnviar = await traducir(texto, conv.idioma_lead, user_id);
       idiomaMsg = conv.idioma_lead;
     }
     const { data: msgInsertado } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, content_original: (textoEnviar !== texto ? textoEnviar : null), idioma: idiomaMsg, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' }).select('id').single();
@@ -1855,7 +1860,7 @@ async function enviarRecontactosPendientes() {
       // Si el lead habla otro idioma y el traductor esta activo, traducir el recontacto antes de enviar (igual que el camino reactivo/manual)
       let textoEnviar = texto, idiomaRec = null;
       if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es') {
-        try { const tr = await traducir(texto, conv.idioma_lead); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto:', eTr && eTr.message); }
+        try { const tr = await traducir(texto, conv.idioma_lead, conv.user_id); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto:', eTr && eTr.message); }
       }
       // Registrar primero en messages (con id) para marcar estado de envio. content = lo que recibe el cliente; content_original = castellano para el asesor.
       const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
@@ -3345,7 +3350,7 @@ app.post('/api/scrape/detalle', async function(req, res) {
 });
 // ===== TEMPERATURA DE LEADS =====
 // Clasifica un lead segun su ultimo mensaje: frio (no responde / sin interes), tibio (responde sin interes claro), caliente (muestra interes en ver propiedades)
-async function clasificarTemperatura(textoUsuario) {
+async function clasificarTemperatura(textoUsuario, user_id) {
   try {
     if (!textoUsuario || !textoUsuario.trim()) return null;
     const prompt = 'Clasifica el interes de este mensaje de un posible cliente inmobiliario en UNA palabra: ' +
@@ -3353,6 +3358,7 @@ async function clasificarTemperatura(textoUsuario) {
       'tibio (responde pero sin interes claro), frio (no hay interes). ' +
       'Responde SOLO con: caliente, tibio o frio. Mensaje: ' + JSON.stringify(textoUsuario);
     const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_temperatura'); } catch(e){}
     const t = (r && r.content && r.content[0] && r.content[0].text ? r.content[0].text : '').toLowerCase().trim();
     if (t.indexOf('caliente') >= 0) return 'caliente';
     if (t.indexOf('tibio') >= 0) return 'tibio';
@@ -3386,7 +3392,7 @@ function matchearCategoriaFoto(textoCrudo) {
 }
 const PROMPT_CLASIFICAR_FOTO = 'Clasifica esta foto de una propiedad inmobiliaria en UNA sola palabra de esta lista exacta: dormitorio, baño, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Responde SOLO la palabra.';
 // Fallback: descarga la imagen y la manda como base64 (cuando source.type:'url' falla o hay duda).
-async function clasificarFotoBase64(url) {
+async function clasificarFotoBase64(url, user_id) {
   const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
   let mediaType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
@@ -3401,10 +3407,11 @@ async function clasificarFotoBase64(url) {
       { type: 'text', text: PROMPT_CLASIFICAR_FOTO }
     ] }]
   });
+  try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'vision_foto'); } catch(e){}
   return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
 }
 // Clasifica una sola foto: primero intenta source.type:'url' (soportado por el SDK 0.91), y si falla cae a base64.
-async function clasificarFotoUna(url) {
+async function clasificarFotoUna(url, user_id) {
   try {
     const r = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
@@ -3414,12 +3421,13 @@ async function clasificarFotoUna(url) {
         { type: 'text', text: PROMPT_CLASIFICAR_FOTO }
       ] }]
     });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'vision_foto'); } catch(e){}
     const t = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
     return matchearCategoriaFoto(t);
   } catch (eUrl) {
     console.log('clasificar-fotos url fallo, probando base64:', eUrl && eUrl.message);
     try {
-      const t2 = await clasificarFotoBase64(url);
+      const t2 = await clasificarFotoBase64(url, user_id);
       return matchearCategoriaFoto(t2);
     } catch (eB64) {
       console.log('clasificar-fotos base64 tambien fallo:', eB64 && eB64.message);
@@ -3442,7 +3450,7 @@ app.post('/api/clasificar-fotos', async (req, res) => {
       const lote = urls.slice(i, i + LOTE);
       const parciales = await Promise.all(lote.map(async function(u) {
         try {
-          const categoria = await clasificarFotoUna(u);
+          const categoria = await clasificarFotoUna(u, _uid);
           return { url: u, categoria: categoria };
         } catch (e) {
           console.log('clasificar-fotos error foto:', e && e.message);

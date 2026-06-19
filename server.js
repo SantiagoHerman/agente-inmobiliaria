@@ -4349,6 +4349,12 @@ app.post('/api/maestro/2fa/setup', async function(req, res){
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var cual = _gate2fa(req.body && req.body.cual);
     if (!cual) return res.status(400).json({ error: "cual debe ser 'ingreso' o 'eliminar'" });
+    // SEGURIDAD: una vez configurado un gate, NADIE (ni quien entre al Maestro) puede volver a ver ni regenerar
+    // el secreto desde el panel. Asi el codigo vive SOLO en el celular del dueno y no se puede capturar ni tomar
+    // control del gate. El setup solo se permite la PRIMERA vez (gate sin secreto). Para RESETEAR hay que borrar
+    // manualmente la fila de maestro_config en Supabase (accion deliberada y fuera del panel, a pedido del dueno).
+    var ya = await _getSecret2fa(cual);
+    if (ya) return res.status(409).json({ error: 'Ese codigo ya esta configurado. Por seguridad no se vuelve a mostrar; para resetearlo hay que borrar su fila en la base (a proposito).' });
     var secret = _secret2fa();
     var g = await _setSecret2fa(cual, secret);
     if (!g.ok) return res.status(503).json({ error: 'Falta la tabla maestro_config: ' + g.error });

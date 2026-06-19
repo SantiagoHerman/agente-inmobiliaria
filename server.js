@@ -259,12 +259,15 @@ async function debeBloquearAcceso(user_id) {
     // webhook ~1285). NO se bloquea past_due: el agente sigue atendiendo durante la gracia de 1 dia, y el
     // cron revisarSuscripciones pasa past_due -> suspended tras esa gracia (recien ahi se bloquea aca).
     if (est === 'cancelled' || est === 'suspended') return true;
-    // TRIAL SIN MERCADOPAGO: el trial automatico del registro (sin mp_preapproval_id = sin tarjeta) NO da acceso.
-    // Solo el trial REAL de MP (con tarjeta al inicio, trae mp_preapproval_id) o 'active' habilitan. Asi un
-    // usuario recien registrado queda bloqueado (solo Suscripcion/Ayuda/Soporte/Salir) hasta que se suscriba
-    // via MercadoPago. Esto ademas mata el bypass del boton Dashboard al volver atras (el candado es server-side).
-    if (est === 'trial' && !sub.mp_preapproval_id) return true;
-    return false; // trial-de-MP, active, past_due (en gracia), o estado desconocido -> no bloquear
+    // TRIAL = SIN ACCESO. MercadoPago NUNCA usa el estado "trial": una suscripcion autorizada (aun en su
+    // periodo de prueba con tarjeta) queda 'authorized' -> la mapeamos a 'active'. Por eso status 'trial' en
+    // nuestra base SOLO puede venir de: (a) el trial automatico del registro (sin tarjeta), o (b) una preapproval
+    // 'pending'/abandonada (el webhook mapea todo lo no-authorized/paused/cancelled a 'trial', y le pone
+    // mp_preapproval_id aunque NO este autorizada). Ninguno es un suscriptor real -> se bloquea SIEMPRE.
+    // Asi un usuario recien registrado queda bloqueado (solo Suscripcion/Ayuda/Soporte/Salir) hasta que MP
+    // confirme la suscripcion (authorized -> active). Tambien mata el bypass del boton Dashboard al volver atras.
+    if (est === 'trial') return true;
+    return false; // active, past_due (en gracia), o estado desconocido -> no bloquear
   } catch (e) { return false; } // ante cualquier error -> fail-open (no cortar el servicio)
 }
 
@@ -1396,8 +1399,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             return;
           }
         }
-        if (!_cortesia && (_est === 'cancelled' || _est === 'suspended')) {
-          await enviarWhatsapp(instanciaNombre, telefono, 'El servicio esta momentaneamente pausado. El administrador debe regularizar la suscripcion para continuar.');
+        // cancelled/suspended = lapso de pago; trial = suscripcion no autorizada todavia (pending/abandonada o
+        // trial automatico del registro, ver debeBloquearAcceso). En todos esos casos la IA no atiende.
+        if (!_cortesia && (_est === 'cancelled' || _est === 'suspended' || _est === 'trial')) {
+          await enviarWhatsapp(instanciaNombre, telefono, 'El servicio no esta activo. El administrador debe completar o regularizar la suscripcion para continuar.');
           return;
         }
         if (!(await dentroDelTopeIA(user_id))) {

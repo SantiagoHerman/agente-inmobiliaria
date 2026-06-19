@@ -890,6 +890,16 @@ async function extraerDatosLead(texto, datosPrevios, user_id) {
   } catch (e) { console.error('Error extrayendo datos del lead:', e && e.message); return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
 }
 
+// True si el mensaje es claramente TRIVIAL (saludo/confirmacion puro, sin datos): no vale gastar una llamada
+// de IA para extraerle datos al lead. CONSERVADOR: solo saltea si TODO el mensaje calza (^...$); cualquier
+// cosa con palabras de mas (ej "ok, 2 ambientes") NO calza -> se extrae igual. No se pierde ningun dato.
+function esMensajeTrivial(t) {
+  const s = String(t || '').trim().toLowerCase().replace(/[!.\s]+$/, '');
+  if (!s) return true;
+  if (s.length < 4) return true;
+  return /^(hola+|buenas|buen dia|buenos dias|buenas tardes|buenas noches|ok|oka|okey|okay|dale|listo|gracias|muchas gracias|mil gracias|perfecto|barbaro|joya|genial|buenisimo|si|sii|claro|no|nop|de acuerdo|entendido|ah ok|aja|jaja+|jeje+|ok gracias|👍|🙏|👌|🙌)$/.test(s);
+}
+
 // Enviar mensaje de WhatsApp via Evolution
 // Verifica si una instancia esta conectada (estado 'open')
 async function instanciaConectada(instancia) {
@@ -1327,7 +1337,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // === MEMORIA DEL LEAD: extraer datos (nombre/origen/interes/presupuesto) y guardarlos en contacts ===
     // NO bloquea el flujo (mismo criterio que clasificarEstado/clasificarTemperatura): fire-and-forget.
     // Solo para mensajes de texto (no media). Usa contentLead (ya traducido a espanol) para extraer bien.
-    if (!tipoMediaEntrante && contentLead && contentLead.trim()) {
+    if (!tipoMediaEntrante && contentLead && contentLead.trim() && !esMensajeTrivial(contentLead)) {
       (async function(){
         try {
           const datosPrevios = { nombre: contacto.name, interes: contacto.interest, presupuesto: contacto.budget };

@@ -4800,8 +4800,12 @@ app.get('/api/maestro/consumo', async function(req, res){
     else { q = q.gte('created_at', desde); }
     var u = await q.limit(100000);
     var rows = u.data || [];
-    var totalCost = 0, totalIn = 0, totalOut = 0; var porCliente = {};
-    rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; totalCost += c; totalIn += r.input_tokens || 0; totalOut += r.output_tokens || 0; var pc = porCliente[r.user_id] || { cost: 0, input_tokens: 0, output_tokens: 0, msgs: 0 }; pc.cost += c; pc.input_tokens += r.input_tokens || 0; pc.output_tokens += r.output_tokens || 0; pc.msgs++; porCliente[r.user_id] = pc; });
+    // SALVAGUARDA anti-dato-corrupto: una sola llamada a Claude no puede costar mas de ~$3-4 (1M tokens Sonnet = $3).
+    // Si una fila tiene un costo absurdo (> $10) es un dato corrupto (ej. un costo viejo logueado sin dividir por
+    // 1.000.000) -> NO se suma, para que el panel no se dispare. Se reportan aparte (filas_anomalas_ignoradas).
+    var MAX_COSTO_FILA = 10;
+    var totalCost = 0, totalIn = 0, totalOut = 0; var porCliente = {}; var corruptas = 0; var costoCorrupto = 0;
+    rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; if (c > MAX_COSTO_FILA) { corruptas++; costoCorrupto += c; return; } totalCost += c; totalIn += r.input_tokens || 0; totalOut += r.output_tokens || 0; var pc = porCliente[r.user_id] || { cost: 0, input_tokens: 0, output_tokens: 0, msgs: 0 }; pc.cost += c; pc.input_tokens += r.input_tokens || 0; pc.output_tokens += r.output_tokens || 0; pc.msgs++; porCliente[r.user_id] = pc; });
     var nombres = {};
     var keys = Object.keys(porCliente);
     if (keys.length) { try { var bs = await supabase.from('business_settings').select('user_id, company_name').in('user_id', keys); (bs.data || []).forEach(function(b){ nombres[b.user_id] = b.company_name; }); } catch(eN){} }
@@ -4825,7 +4829,7 @@ app.get('/api/maestro/consumo', async function(req, res){
       var gastado = (ud.data || []).reduce(function(a, r){ return a + (Number(r.cost_usd) || 0); }, 0);
       saldoRestante = Math.round((saldoCargado - gastado) * 100) / 100;
     }
-    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
+    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, filas_anomalas_ignoradas: corruptas, costo_anomalo_ignorado: Math.round(costoCorrupto * 100) / 100, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

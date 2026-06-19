@@ -259,7 +259,12 @@ async function debeBloquearAcceso(user_id) {
     // webhook ~1285). NO se bloquea past_due: el agente sigue atendiendo durante la gracia de 1 dia, y el
     // cron revisarSuscripciones pasa past_due -> suspended tras esa gracia (recien ahi se bloquea aca).
     if (est === 'cancelled' || est === 'suspended') return true;
-    return false; // trial, active, past_due (en gracia), o estado desconocido -> no bloquear
+    // TRIAL SIN MERCADOPAGO: el trial automatico del registro (sin mp_preapproval_id = sin tarjeta) NO da acceso.
+    // Solo el trial REAL de MP (con tarjeta al inicio, trae mp_preapproval_id) o 'active' habilitan. Asi un
+    // usuario recien registrado queda bloqueado (solo Suscripcion/Ayuda/Soporte/Salir) hasta que se suscriba
+    // via MercadoPago. Esto ademas mata el bypass del boton Dashboard al volver atras (el candado es server-side).
+    if (est === 'trial' && !sub.mp_preapproval_id) return true;
+    return false; // trial-de-MP, active, past_due (en gracia), o estado desconocido -> no bloquear
   } catch (e) { return false; } // ante cualquier error -> fail-open (no cortar el servicio)
 }
 

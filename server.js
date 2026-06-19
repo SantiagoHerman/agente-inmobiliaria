@@ -832,14 +832,30 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar };
 }
 
+// Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
+// forma, incluso como pregunta). Determinista (regex, sin acentos) -> nunca falla en el caso obvio ni gasta tokens.
+function _pideHumano(texto) {
+  const s = String(texto || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  // accion de contacto + sustantivo humano cerca: "puedo hablar con una persona/asesor", "que me atienda un asesor", "pasame con alguien"
+  if (/(hablar|hablo|comunicar(me)?|contactar|atienda|atender|atiende|pasa(me|s)?|paseme|derive|derivar|conect(ar|ame)|llame|llamar)[\s\S]{0,28}(asesor|persona|humano|agente|representante|vendedor|alguien|operador|encargad)/.test(s)) return true;
+  // "quiero/necesito un asesor/humano/agente/persona real"
+  if (/(quiero|necesito|dame|deme)\s+(?:hablar\s+con\s+)?(?:un|una)?\s*(asesor|humano|agente|representante|persona real|operador)/.test(s)) return true;
+  // "persona/asesor/humano real / de verdad"
+  if (/(persona|humano|asesor|agente|operador)\s*(real|de verdad|de carne)/.test(s)) return true;
+  return false;
+}
+
 // Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
 // Conservador: solo devuelve un estado nuevo cuando la senal es clara; si no, devuelve null.
 async function clasificarEstado(mensajeCliente, user_id) {
   try {
+    // ATAJO SIN IA: si el lead pide explicitamente un humano/asesor/persona -> listo_humano seguro (no falla
+    // ni gasta token). Resuelve el caso "puedo hablar con una persona real?" que la IA a veces sub-clasificaba.
+    if (_pideHumano(mensajeCliente)) return 'listo_humano';
     const prompt = [
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
       'Segun el mensaje del cliente, responde UNA sola palabra exacta:',
-      '- listo_humano  => si pide hablar con una persona/asesor/humano; O CONFIRMA o ACUERDA un paso concreto: ACEPTA o COORDINA una VISITA o cita (da fecha/dia/horario o dice que si a ir a verla), una reserva, sena, compra o alquiler; o quiere AVANZAR la operacion; o pide que lo contacten/llamen.',
+      '- listo_humano  => si pide hablar con / ser atendido por una persona, asesor, humano, agente o alguien real EN CUALQUIER FORMA, incluso como PREGUNTA (ej: "puedo hablar con una persona real?", "que me atienda un asesor") => SIEMPRE listo_humano, sin importar si pregunto o no por una propiedad. TAMBIEN si CONFIRMA o ACUERDA un paso concreto: ACEPTA o COORDINA una VISITA o cita (da fecha/dia/horario o dice que si a ir a verla), una reserva, sena, compra o alquiler; o quiere AVANZAR la operacion; o pide que lo contacten/llamen.',
       '- interesado    => todavia esta CONSULTANDO sin confirmar: pregunta por una propiedad, precio, disponibilidad, o (en hotel) alojamiento/fechas; pide datos para decidir; pregunta si puede visitar o cuando (SIN acordar todavia una fecha/horario concreto); o dice que le interesa. Basta con que pregunte por algo concreto del negocio.',
       '- sin_cambio    => SOLO si es un saludo inicial sin consulta (hola, buenas) o algo no relacionado al negocio. Si ya pregunto algo concreto, NO es sin_cambio.',
       'CLAVE: la diferencia entre listo_humano e interesado es el COMPROMISO. Si SOLO consulta o muestra interes => interesado. Si ACEPTA/COORDINA una visita, reserva o avanzar la operacion => listo_humano (hay que derivar a un humano). Ante la duda entre interesado y sin_cambio, elegi interesado.',

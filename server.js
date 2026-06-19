@@ -2656,7 +2656,10 @@ async function listarUrlsIA(html, base, user_id) {
 async function parsearDetalleIA(html, url, user_id) {
   try {
     if (!process.env.ANTHROPIC_KEY) return null;
-    var limpio = _htmlParaIA(html, 50000);
+    // TRUNCADO: la entrada (HTML de la ficha) es el gasto GRANDE del scraping con IA, y corre x CADA propiedad.
+    // Los datos de la propiedad (precio/ambientes/m2/descripcion) estan en la zona util; 20k chars (~5k tokens)
+    // alcanzan de sobra y bajan ~60% el costo por propiedad. (Antes 50k.) Sigue siendo el ultimo recurso.
+    var limpio = _htmlParaIA(html, 20000);
     if (limpio.length < 100) return null;
     var sys = 'Sos un extractor de fichas inmobiliarias. Te paso el TEXTO de la ficha de UNA propiedad. ' +
       'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor) con: ' +

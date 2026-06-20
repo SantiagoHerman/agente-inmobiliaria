@@ -1638,7 +1638,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     // Traduccion: si el traductor esta activo y el lead habla otro idioma, traducir antes de enviar
     let textoEnviar = texto;
     let idiomaMsg = null;
-    if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es') {
+    if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es' && await planPermite(user_id, 'audio_traduccion')) {
       textoEnviar = await traducir(texto, conv.idioma_lead, user_id);
       idiomaMsg = conv.idioma_lead;
     }
@@ -1949,7 +1949,7 @@ async function enviarRecontactosPendientes() {
       const texto = mensajeRecontacto(contacto.name, esPrimerContacto, empresaRec);
       // Si el lead habla otro idioma y el traductor esta activo, traducir el recontacto antes de enviar (igual que el camino reactivo/manual)
       let textoEnviar = texto, idiomaRec = null;
-      if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es') {
+      if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es' && await planPermite(conv.user_id, 'audio_traduccion')) {
         try { const tr = await traducir(texto, conv.idioma_lead, conv.user_id); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto:', eTr && eTr.message); }
       }
       // Registrar primero en messages (con id) para marcar estado de envio. content = lo que recibe el cliente; content_original = castellano para el asesor.

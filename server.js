@@ -731,9 +731,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
 
     let instruccionesRubro = '';
   if (rubro === 'hotel_cabanas') {
-    instruccionesRubro = 'RUBRO HOTEL, CABANAS O COMPLEJO. Hablas de alojamiento, no de venta de inmuebles. Vocabulario: noches, estadia, check-in y check-out, capacidad de personas, temporada alta o baja, tarifa por noche, servicios incluidos como pileta, parrilla, wifi, cochera y ropa de cama. Preguntas clave al huesped: fechas de entrada y salida, cuantas personas y cuantas noches. Al presentar opciones, deci capacidad, servicios y precio por noche. NUNCA hables de expensas, escrituras ni metros cuadrados.';
+    instruccionesRubro = 'RUBRO HOTEL, CABANAS O COMPLEJO DE ALOJAMIENTO. Hablas de RESERVAS de alojamiento, no de venta ni alquiler de inmuebles. Vocabulario: noches, estadia, reserva, disponibilidad, check-in y check-out, capacidad de personas, temporada alta o baja, tarifa por noche, servicios incluidos como pileta, parrilla, wifi, cochera y ropa de cama. Preguntas clave al huesped ANTES de cotizar: fechas de entrada y salida (asi calculas cuantas noches) y cuantas personas se alojan. Con esas fechas cruza la DISPONIBILIDAD del inventario: si una unidad figura OCUPADA en esas fechas, no la ofrezcas para ese periodo y proponé fechas u opciones libres. Al presentar opciones, deci capacidad, servicios y precio por noche (y si podes, el total estimado por la cantidad de noches). Cuando el huesped quiere confirmar una reserva o seña, derivá a un asesor del equipo segun tu objetivo configurado. NUNCA hables de expensas, escrituras ni metros cuadrados.';
   } else if (rubro === 'desarrolladora') {
-    instruccionesRubro = 'RUBRO DESARROLLADORA O EMPRENDIMIENTOS. Vendes unidades de emprendimientos, muchas veces en pozo o en construccion. Vocabulario: unidades, tipologias de 1, 2 o 3 ambientes, etapa de obra como pozo, en construccion o a estrenar, fecha estimada de entrega, financiacion, anticipo y cuotas, valor en pesos o dolares, ajuste por indice CAC. Preguntas clave: tipologia buscada, presupuesto o forma de pago, y si busca para vivienda o inversion. Resalta financiacion y avance de obra. Aclara que valores y entregas pueden estar sujetos a ajuste.';
+    instruccionesRubro = 'RUBRO DESARROLLADORA O EMPRENDIMIENTOS. Vendes unidades de emprendimientos o proyectos, muchas veces en POZO o en construccion. Vocabulario: proyecto o emprendimiento, unidades, tipologias de 1, 2 o 3 ambientes, etapa de obra (pozo, en construccion o a estrenar), fecha estimada de ENTREGA, financiacion, anticipo y CUOTAS, valor en pesos o dolares, ajuste por indice CAC. Preguntas clave: tipologia buscada, presupuesto o forma de pago (cuanto de anticipo y en cuantas cuotas), y si busca para vivienda o inversion. Al presentar, resalta la financiacion (anticipo + cuotas), la etapa de obra y la fecha de entrega estimada. Aclara siempre que los valores, las cuotas y las fechas de entrega son estimados y pueden estar sujetos a ajuste por avance de obra o indice. Cuando el lead quiere reservar una unidad o avanzar con la sena, derivá a un asesor del equipo segun tu objetivo configurado.';
   } else {
     instruccionesRubro = 'RUBRO INMOBILIARIA. Vocabulario: venta y alquiler, ambientes, dormitorios, metros cuadrados, expensas, zona o barrio, apto credito, escritura. Preguntas clave: si busca comprar o alquilar, zona, cantidad de ambientes y presupuesto. Al presentar, deci operacion, ambientes, zona y precio.';
   }
@@ -1303,6 +1303,13 @@ async function responderConsultaAdmin(user_id, pregunta) {
     const convAsesor = {}; lista.forEach(function (c) { convAsesor[c.id] = c.asesor_id; });
     const porEstado = {}; lista.forEach(function (c) { porEstado[c.status] = (porEstado[c.status] || 0) + 1; });
     const asignados = {}; lista.forEach(function (c) { if (c.asesor_id) asignados[c.asesor_id] = (asignados[c.asesor_id] || 0) + 1; });
+    // METRICAS POR ASESOR (additivo): cierres y leads "calientes" (interesado/listo_humano) por asesor, para % de conversion.
+    const cerradosAsesor = {}, calientesAsesor = {};
+    lista.forEach(function (c) {
+      if (!c.asesor_id) return;
+      if (c.status === 'cerrado') cerradosAsesor[c.asesor_id] = (cerradosAsesor[c.asesor_id] || 0) + 1;
+      if (c.status === 'interesado' || c.status === 'listo_humano') calientesAsesor[c.asesor_id] = (calientesAsesor[c.asesor_id] || 0) + 1;
+    });
     // Tiempos de respuesta (contact -> human) y ultima actividad, ultimos 30 dias
     const hace30 = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
     const resMsg = await supabase.from('messages').select('conversation_id, role, created_at').eq('user_id', user_id).gte('created_at', hace30).order('created_at', { ascending: true }).limit(4000);
@@ -1317,9 +1324,84 @@ async function responderConsultaAdmin(user_id, pregunta) {
     });
     function fmtDur(ms) { const min = Math.round(ms / 60000); if (min < 60) return min + ' min'; return Math.floor(min / 60) + 'h ' + (min % 60) + 'm'; }
     const resumenAses = ases.map(function (a) {
-      return { nombre: a.nombre || a.usuario, activo: a.activo, leads_asignados: asignados[a.id] || 0, tiempo_respuesta_promedio: respCnt[a.id] ? fmtDur(respSum[a.id] / respCnt[a.id]) : 'sin datos', ultima_actividad: lastHuman[a.id] ? new Date(lastHuman[a.id]).toLocaleString('es-AR') : 'sin actividad reciente' };
+      const asig = asignados[a.id] || 0;
+      const cerr = cerradosAsesor[a.id] || 0;
+      const conv = asig > 0 ? Math.round((cerr / asig) * 100) : 0;
+      return {
+        nombre: a.nombre || a.usuario, activo: a.activo,
+        leads_asignados: asig,
+        leads_cerrados: cerr,
+        leads_calientes: calientesAsesor[a.id] || 0,
+        porcentaje_conversion: asig > 0 ? (conv + '%') : 'sin leads',
+        tiempo_respuesta_promedio: respCnt[a.id] ? fmtDur(respSum[a.id] / respCnt[a.id]) : 'sin datos',
+        ultima_actividad: lastHuman[a.id] ? new Date(lastHuman[a.id]).toLocaleString('es-AR') : 'sin actividad reciente'
+      };
     });
+    // COMPARATIVA ENTRE ASESORES (additivo): ranking simple por conversion y por velocidad de respuesta.
+    let comparativaAsesores = null;
+    try {
+      const conLeads = resumenAses.filter(function (a) { return a.leads_asignados > 0; });
+      const porConv = conLeads.slice().sort(function (x, y) { return parseInt(y.porcentaje_conversion) - parseInt(x.porcentaje_conversion); });
+      const conTiempo = resumenAses.filter(function (a) { return a.tiempo_respuesta_promedio !== 'sin datos'; });
+      const idPorNombre = {}; ases.forEach(function (a) { idPorNombre[a.nombre || a.usuario] = a.id; });
+      const porVel = conTiempo.slice().sort(function (x, y) {
+        return (respSum[idPorNombre[x.nombre]] / respCnt[idPorNombre[x.nombre]]) - (respSum[idPorNombre[y.nombre]] / respCnt[idPorNombre[y.nombre]]);
+      });
+      comparativaAsesores = {
+        mejor_conversion: porConv.length ? (porConv[0].nombre + ' (' + porConv[0].porcentaje_conversion + ')') : 'sin datos',
+        mas_rapido_en_responder: porVel.length ? (porVel[0].nombre + ' (' + porVel[0].tiempo_respuesta_promedio + ')') : 'sin datos',
+        ranking_conversion: porConv.map(function (a) { return a.nombre + ': ' + a.porcentaje_conversion + ' (' + a.leads_cerrados + '/' + a.leads_asignados + ')'; })
+      };
+    } catch (eCmp) { /* la comparativa es best-effort */ }
+    // MATCHING PROPIEDAD<->LEAD (additivo, best-effort): leads que buscaban algo similar a las propiedades activas y NO cerraron.
+    let matchingPropLead = null;
+    try {
+      const resProps = await supabase.from('properties').select('id, numero, title, type, zone, price, operation').eq('user_id', user_id).eq('activa', true).limit(200);
+      const resLeads = await supabase.from('contacts').select('id, name, interest, budget, notes').eq('user_id', user_id).limit(2000);
+      const props = resProps.data || [];
+      const leads = resLeads.data || [];
+      // Solo leads de conversaciones NO cerradas (abiertas/calientes). contact_id -> mejor status.
+      const resConvC = await supabase.from('conversations').select('contact_id, status').eq('user_id', user_id);
+      const estadoContacto = {};
+      (resConvC.data || []).forEach(function (c) { if (c.contact_id) estadoContacto[c.contact_id] = c.status; });
+      const norm = function (s) { return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); };
+      const tokensZona = function (s) { return norm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(function (w) { return w.length >= 4; }); };
+      const numPresupuesto = function (s) { const m = norm(s).replace(/\./g, '').match(/\d{4,}/g); return m ? m.map(Number) : []; };
+      const matches = [];
+      props.forEach(function (p) {
+        const zonaP = norm(p.zone), tipoP = norm(p.type), tokP = tokensZona(p.zone);
+        const precioP = typeof p.price === 'number' ? p.price : Number(String(p.price || '').replace(/[^0-9]/g, '')) || 0;
+        const candidatos = [];
+        leads.forEach(function (l) {
+          const est = estadoContacto[l.id];
+          if (est === 'cerrado') return; // ya cerro: no nos interesa
+          if (est == null) return; // sin conversacion registrada: lo salteamos
+          const texto = norm((l.interest || '') + ' ' + (l.notes || '') + ' ' + (l.budget || ''));
+          if (!texto.trim()) return;
+          let score = 0; const motivos = [];
+          if (zonaP && (texto.indexOf(zonaP) >= 0)) { score += 2; motivos.push('zona'); }
+          else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
+          if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
+          if (precioP > 0) {
+            const presup = numPresupuesto((l.budget || '') + ' ' + (l.interest || ''));
+            if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
+          }
+          if (score >= 1) candidatos.push({ lead: l.name || ('contacto ' + l.id), estado: est, motivos: motivos.join('+'), score: score });
+        });
+        if (candidatos.length) {
+          candidatos.sort(function (a, b) { return b.score - a.score; });
+          matches.push({
+            propiedad: (p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : ''),
+            operacion: p.operation || null,
+            leads_interesados_no_cerrados: candidatos.slice(0, 5).map(function (c) { return c.lead + ' (' + c.estado + ', match: ' + c.motivos + ')'; })
+          });
+        }
+      });
+      matchingPropLead = matches.slice(0, 15);
+    } catch (eMatch) { console.error('matching prop-lead:', eMatch && eMatch.message); /* best-effort: no rompe el reporte */ }
     const datos = { contactos_totales: resCont.count || 0, conversaciones_totales: lista.length, conversaciones_por_estado: porEstado, asesores: resumenAses };
+    if (comparativaAsesores) datos.comparativa_asesores = comparativaAsesores;
+    if (matchingPropLead && matchingPropLead.length) datos.matching_propiedad_lead = matchingPropLead;
     const sys = 'Sos el asistente de reportes de un CRM inmobiliario. El ADMINISTRADOR te hace una consulta por WhatsApp. Responde SOLO con los datos provistos (el JSON de abajo), en espanol rioplatense, claro y conciso, en formato WhatsApp (texto plano, podes usar *negrita* y saltos de linea, sin tablas). Si te piden un dato que no esta en los datos, deci que no lo tenes disponible. Nunca inventes numeros.';
     const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: [{ role: 'user', content: 'Datos actuales del CRM:\n' + JSON.stringify(datos, null, 1) + '\n\nConsulta del administrador: ' + pregunta }] });
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'reporte_admin'); } catch(e){}
@@ -1441,7 +1523,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // subimos el archivo si lo hay (Storage no gasta tokens) y cortamos. Diferencia: en pausa total avisamos al
     // asesor por push (un humano debe atender; el push es FCM, NO gasta tokens); en papelera no (cliente removido).
     const _enPapelera = !!(_bsGate && _bsGate.eliminado_at);
-    const _enPausaTotal = !!(_bsGate && _bsGate.crm_pausado === true);
+    // Pausa TOTAL = pausa de ESTE cliente (crm_pausado) O kill-switch GLOBAL del Maestro (_pausaGlobal, cache en memoria
+    // refrescada c/30s; NO hace query por mensaje). El kill-switch global frena el gasto de IA de TODOS los clientes a la vez.
+    const _enPausaTotal = !!(_pausaGlobal === true) || !!(_bsGate && _bsGate.crm_pausado === true);
     if (_enPapelera || _enPausaTotal) {
       let _mU = null, _mT = null;
       if (tipoMediaEntrante) { try { const _ms = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, true); if (_ms) { _mU = _ms.url; _mT = _ms.tipo; } } catch (e) {} }
@@ -2396,9 +2480,10 @@ function parsearDetalleTokko(html, url) {
 // Objetivo: que el importador lea la MAYORIA de las inmobiliarias. El orden de la cascada es:
 //   1) Sitemap WordPress / wp-json (Houzez)        [ya existia]
 //   2) Tokko Broker (HTML server-rendered)          [ya existia]
-//   3) Datos estructurados: JSON-LD / OpenGraph / microdata
+//   3) Datos estructurados: JSON-LD / OpenGraph / microdata  [endurecido: entidades + objetos concatenados]
 //   4) Heuristica HTML generica (tarjetas: precio + m2 + link a ficha + ref)
-//   5) Extraccion con IA (ultimo recurso; solo si 1-4 no extrajeron nada util)
+//   4b) Sitemap GENERICO (robots.txt + sitemap.xml/index) para sitios no-WP — TOKEN-SAVING, antes de IA
+//   5) Extraccion con IA (ULTIMO recurso; solo si 1-4b no extrajeron nada util)
 //   6) Tolerancia TLS (https.Agent rejectUnauthorized:false) SOLO para descargas del scraper
 //   7) Paginacion robusta + dedup
 // Sin dependencias npm nuevas: fetch global + regex + https nativo + el SDK anthropic ya presente.
@@ -2551,6 +2636,46 @@ function _parseJsonObjetoDefensivo(texto) {
 }
 
 // (3) DATOS ESTRUCTURADOS — extrae bloques JSON-LD de un HTML y los devuelve como array de objetos.
+// Aplana @graph y arrays. Endurecido (ADITIVO, sin libs): tolera JSON con entidades HTML
+// (&quot; &amp; &#34;), comas finales, comentarios JS, y VARIOS objetos JSON concatenados en
+// un mismo <script> (}{ pegados) — caso comun en plugins de WP/Tokko/Inmoup. La forma de
+// salida (array de nodos {@type,...}) NO cambia: las funciones que la consumen siguen igual.
+function _decodeEntidadesJson(s) {
+  if (!s || s.indexOf('&') === -1) return s;
+  return String(s)
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*34;/g, '"')
+    .replace(/&#x0*22;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#0*39;/g, "'")
+    .replace(/&#x0*27;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .replace(/&#0*38;/g, '&')
+    .replace(/&#x0*26;/gi, '&');
+}
+// Intenta parsear un texto JSON-LD con varios niveles de tolerancia. Devuelve el objeto/array
+// parseado o null. No lanza.
+function _parseJsonLdTexto(raw) {
+  if (!raw) return null;
+  // 1) intento directo
+  try { return JSON.parse(raw); } catch (e) {}
+  // 2) sacar comentarios //... y /*...*/ + comas finales
+  var limpio = raw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/,\s*([}\]])/g, '$1');
+  try { return JSON.parse(limpio); } catch (e) {}
+  // 3) entidades HTML dentro del JSON (sitios que escapan el bloque)
+  try { return JSON.parse(_decodeEntidadesJson(limpio)); } catch (e) {}
+  return null;
+}
+// Separa varios objetos JSON concatenados ("}{", "} {", "}\n{") en uno o mas trozos parseables.
+function _splitJsonConcatenado(raw) {
+  if (!raw || raw.indexOf('}') === -1) return [raw];
+  // solo intentar el split si NO es un array y aparece el patron de objetos pegados
+  if (/^\s*\[/.test(raw) || !/\}\s*\{/.test(raw)) return [raw];
+  return raw.replace(/\}\s*\{/g, '}\u0000{').split('\u0000');
+}
 function _extraerJsonLd(html) {
   var out = [];
   if (!html) return out;
@@ -2559,16 +2684,21 @@ function _extraerJsonLd(html) {
   while ((m = re.exec(html)) !== null) {
     var raw = m[1].trim();
     if (!raw) continue;
-    var parsed = null;
-    try { parsed = JSON.parse(raw); }
-    catch (e) {
-      // algunos sitios meten varios objetos o comas finales; intento defensivo
-      try { parsed = JSON.parse(raw.replace(/,\s*([}\]])/g, '$1')); } catch (e2) { parsed = null; }
+    var trozos = _splitJsonConcatenado(raw);
+    for (var ti = 0; ti < trozos.length; ti++) {
+      var parsed = _parseJsonLdTexto(trozos[ti]);
+      if (!parsed) continue;
+      // aplanar @graph y arrays
+      var lista = Array.isArray(parsed) ? parsed : (parsed['@graph'] && Array.isArray(parsed['@graph']) ? parsed['@graph'] : [parsed]);
+      for (var i = 0; i < lista.length; i++) {
+        if (!lista[i] || typeof lista[i] !== 'object') continue;
+        out.push(lista[i]);
+        // un nodo puede a su vez anidar @graph (raro pero pasa): aplanarlo tambien.
+        if (Array.isArray(lista[i]['@graph'])) {
+          for (var g = 0; g < lista[i]['@graph'].length; g++) if (lista[i]['@graph'][g] && typeof lista[i]['@graph'][g] === 'object') out.push(lista[i]['@graph'][g]);
+        }
+      }
     }
-    if (!parsed) continue;
-    // aplanar @graph y arrays
-    var lista = Array.isArray(parsed) ? parsed : (parsed['@graph'] && Array.isArray(parsed['@graph']) ? parsed['@graph'] : [parsed]);
-    for (var i = 0; i < lista.length; i++) if (lista[i] && typeof lista[i] === 'object') out.push(lista[i]);
   }
   return out;
 }
@@ -2579,9 +2709,10 @@ function _tipoJsonLd(o) {
   return String(t || '').toLowerCase();
 }
 // True si un nodo JSON-LD parece una propiedad inmobiliaria / producto vendible.
+// Cubre los @type pedidos (Product/Offer/RealEstateListing) + tipos reales habituales en inmobiliarias.
 function _esNodoPropiedad(o) {
   var t = _tipoJsonLd(o);
-  return /realestatelisting|residence|house|apartment|singlefamilyresidence|product|offer|accommodation|place|property/i.test(t);
+  return /realestatelisting|residence|house|apartment|singlefamilyresidence|condominium|apartmentcomplex|product|offer|accommodation|lodgingbusiness|place|property|realestate/i.test(t);
 }
 // Extrae la URL de detalle de un nodo JSON-LD.
 function _urlDeNodo(o, base) {
@@ -2660,6 +2791,97 @@ function parsearDetalleEstructurado(html, url) {
   var hayCampos = Object.keys(campos).length > 0;
   if (!titulo && !descripcion && !hayCampos) return null;
   return { url: url, titulo: _limpiarHtmlScrape(titulo), descripcion: _limpiarHtmlScrape(descripcion), campos: campos };
+}
+
+// (3b) SITEMAP GENERICO — descubrimiento de URLs de propiedades via sitemap.xml para sitios que
+// NO son Houzez/WP (esos ya los cubre la estrategia 1 con sus nombres de sitemap propios). Esto
+// es TOKEN-SAVING: si el sitemap lista las fichas, no hace falta IA para descubrir URLs.
+// ADITIVO: corre como estrategia nueva en la cascada, ANTES del fallback con IA. No toca wp-json.
+// Sin libs: fetch (fetchScrape) + regex sobre el XML.
+
+// Saca todos los <loc>...</loc> de un XML de sitemap.
+function _locsDeSitemapXml(xml) {
+  if (!xml) return [];
+  var out = [];
+  var re = /<loc>\s*([^<\s][^<]*?)\s*<\/loc>/gi;
+  var m;
+  while ((m = re.exec(xml)) !== null) {
+    var u = m[1].replace(/<!\[CDATA\[/i, '').replace(/\]\]>/g, '').trim();
+    u = u.replace(/&amp;/gi, '&');
+    if (u) out.push(u);
+  }
+  return out;
+}
+// True si una URL "parece" la ficha de detalle de una propiedad (no categoria/pagina/blog).
+function _urlPareceFicha(u) {
+  if (!u) return false;
+  if (/\.(?:jpg|jpeg|png|webp|gif|css|js|pdf|xml)(?:\?|$)/i.test(u)) return false;
+  if (/(\/category\/|\/categoria\/|\/tag\/|\/etiqueta\/|\/page\/|\/author\/|\/autor\/|\/blog\/|\/noticias?\/|\/buscar|\/search|\/contacto|\/nosotros|\/tasaci)/i.test(u)) return false;
+  return /(\/propiedad|\/propiedades\/|\/property\b|\/properties\/|\/inmueble|\/inmuebles\/|\/aviso|\/ficha|\/listing|\/emprendimiento|\/desarrollo|id-?\d{2,}|\/p\/\d|\/MLA-?\d)/i.test(u);
+}
+// True si una URL de sitemap apunta a OTRO sitemap (indice de sitemaps).
+function _esUrlSitemap(u) { return /sitemap[^/]*\.xml(\.gz)?(\?|$)/i.test(u || '') || /\.xml(\?|$)/i.test(u || ''); }
+
+// Descubre URLs de fichas de propiedad recorriendo el/los sitemap.xml del sitio.
+// Best-effort: prueba robots.txt + rutas tipicas de sitemap, desciende a sub-sitemaps que parezcan
+// de propiedades, y devuelve [{url, numero}]. Tope de sitemaps visitados para no explotar.
+async function descubrirUrlsSitemap(base, limiteProps) {
+  var props = [];
+  var vistos = {};
+  var sitemapsVistos = {};
+  var cola = [];
+  var TOPE_SITEMAPS = 12;
+  var TOPE_PROPS = limiteProps || 3000;
+
+  function pushProp(u) {
+    var abs = u;
+    try { abs = new URL(u, base + '/').toString(); } catch (e) {}
+    if (!vistos[abs] && _urlPareceFicha(abs)) {
+      vistos[abs] = 1;
+      var num = (abs.match(/id-?(\d{2,})/i) || [])[1] || (abs.match(/(\d{4,})/) || [])[1] || '';
+      props.push({ url: abs, numero: num });
+    }
+  }
+  function encolarSitemap(u) {
+    var abs = u;
+    try { abs = new URL(u, base + '/').toString(); } catch (e) {}
+    if (!sitemapsVistos[abs]) { sitemapsVistos[abs] = 1; cola.push(abs); }
+  }
+
+  // 1) sitemaps declarados en robots.txt
+  try {
+    var rr = await fetchScrape(base + '/robots.txt');
+    if (rr && rr.ok) {
+      var txt = await rr.text();
+      var rmx = /sitemap:\s*(\S+)/gi, mm;
+      while ((mm = rmx.exec(txt)) !== null) encolarSitemap(mm[1].trim());
+    }
+  } catch (e) { /* seguir con rutas tipicas */ }
+  // 2) rutas tipicas de sitemap (si robots no declaro ninguna util)
+  var rutas = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml', '/sitemap/sitemap.xml'];
+  for (var i = 0; i < rutas.length; i++) encolarSitemap(base + rutas[i]);
+
+  var visitados = 0;
+  while (cola.length > 0 && visitados < TOPE_SITEMAPS && props.length < TOPE_PROPS) {
+    var sm = cola.shift();
+    visitados++;
+    var xml = '';
+    try { var r = await fetchScrape(sm); if (!r || !r.ok) continue; xml = await r.text(); } catch (e) { continue; }
+    if (!xml || (xml.indexOf('<loc') === -1)) continue;
+    var locs = _locsDeSitemapXml(xml);
+    var esIndice = /<sitemapindex/i.test(xml);
+    for (var j = 0; j < locs.length && props.length < TOPE_PROPS; j++) {
+      var loc = locs[j];
+      if (esIndice || _esUrlSitemap(loc)) {
+        // priorizar sub-sitemaps que mencionen propiedades; igual encolar el resto si hay cupo.
+        if (/propiedad|propert|inmueb|listing|aviso|emprendim/i.test(loc)) encolarSitemap(loc);
+        else if (cola.length + visitados < TOPE_SITEMAPS) encolarSitemap(loc);
+      } else {
+        pushProp(loc);
+      }
+    }
+  }
+  return props;
 }
 
 // (4) HEURISTICA HTML GENERICA — busca links de ficha de propiedad por patrones de URL,
@@ -3416,7 +3638,18 @@ app.get('/api/scrape/lista', async function(req, res) {
       }
     } catch (e) { /* seguir */ }
 
-    // (5) Extraccion con IA (ultimo recurso; solo si 2-4 no extrajeron nada util).
+    // (4b) SITEMAP GENERICO (ANTES de la IA) — TOKEN-SAVING. Para sitios que NO son Houzez/WP pero
+    // SI exponen sitemap.xml (Tokko propio, Mediacore, custom, etc.), descubrimos las URLs de fichas
+    // desde el sitemap en vez de gastar una llamada a la IA. La estrategia 1/1b ya cubrio los sitemaps
+    // WordPress; esto cubre el resto. Si encuentra fichas, corta aca y la IA no se usa.
+    try {
+      var smItems = await descubrirUrlsSitemap(base, null);
+      if (smItems.length > 0) {
+        return res.json({ ok: true, total: smItems.length, urls: smItems, plataforma: 'sitemap', estrategia: 'sitemap-generico' });
+      }
+    } catch (e) { /* seguir a la IA */ }
+
+    // (5) Extraccion con IA (ultimo recurso; solo si 2-4b no extrajeron nada util).
     // Elegimos el HTML de listado MAS GRANDE (suele ser el que trae mas propiedades) para
     // darle a la IA el mejor material posible dentro del cap de chars.
     try {
@@ -3428,7 +3661,7 @@ app.get('/api/scrape/lista', async function(req, res) {
       }
     } catch (e) { /* nada mas que probar */ }
 
-    return res.json({ ok: true, total: 0, urls: [], nota: 'No se pudieron extraer propiedades con ninguna estrategia (sitemap/Tokko/JSON-LD/heuristica/IA). La web puede no ser compatible o requerir JavaScript.' });
+    return res.json({ ok: true, total: 0, urls: [], nota: 'No se pudieron extraer propiedades con ninguna estrategia (wp-json/sitemap/Tokko/JSON-LD/heuristica/sitemap-generico/IA). La web puede no ser compatible o requerir JavaScript.' });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/scrape/detalle', async function(req, res) {
@@ -4638,6 +4871,23 @@ function _maestroToken(){ var payload=Buffer.from(JSON.stringify({ exp: Math.flo
 function _maestroTokenOk(tok){ try{ if(!tok) return false; var parts=String(tok).split('.'); if(parts.length!==2) return false; var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(parts[0]).digest('hex'); if(sig!==parts[1]) return false; var p=JSON.parse(Buffer.from(parts[0],'base64').toString()); return p.exp > Math.floor(Date.now()/1000); }catch(e){ return false; } }
 function maestroAuth(req){ var auth=req.headers.authorization||req.headers.Authorization||''; var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null; return _maestroTokenOk(tok); }
 
+// ===== KILL-SWITCH GLOBAL (#15): "Pausar TODO el sistema" =====
+// Flag global persistido en superadmin_config.pausa_global (fila id=1). Cuando esta en true, el GATE TEMPRANO del
+// webhook lo trata como pausa TOTAL para TODOS los clientes -> cero tokens de IA, mensaje crudo guardado, igual que
+// la pausa por-cliente (crm_pausado). Para NO hacer una query por mensaje, se cachea en memoria (_pausaGlobal) y se
+// refresca con un setInterval cada 30s. El endpoint /api/maestro/pausa-global ademas la setea al instante (sin esperar
+// los 30s). Es ADITIVO: si la tabla/columna no existe todavia, _pausaGlobal queda en false (fail-open, no rompe nada).
+var _pausaGlobal = false;
+async function refrescarPausaGlobal() {
+  try {
+    var r = await supabase.from('superadmin_config').select('pausa_global').eq('id', 1).maybeSingle();
+    if (r && r.error) return; // tabla/columna inexistente o error transitorio: NO tocar el valor cacheado
+    _pausaGlobal = !!(r && r.data && r.data.pausa_global === true);
+  } catch (e) { /* best-effort: ante error se mantiene el ultimo valor conocido */ }
+}
+setInterval(refrescarPausaGlobal, 30 * 1000);
+setTimeout(refrescarPausaGlobal, 5 * 1000); // primera lectura al arrancar (despues de que Supabase este listo)
+
 // ===== 2FA GATES ('ingreso' / 'eliminar') + PAPELERA — almacen en tabla maestro_config (service key) =====
 // Genera un secreto base32 de 20 bytes aleatorios (estandar Google Authenticator; reusa _b32enc).
 function _b32enc(buf){ var a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; var bits=''; for(var i=0;i<buf.length;i++){ bits+=buf[i].toString(2).padStart(8,'0'); } var out=''; for(var j=0;j<bits.length;j+=5){ var chunk=bits.slice(j,j+5); if(chunk.length<5) chunk=chunk.padEnd(5,'0'); out+=a[parseInt(chunk,2)]; } return out; }
@@ -5022,7 +5272,7 @@ app.get('/api/maestro/consumo', async function(req, res){
       var gastado = (ud.data || []).reduce(function(a, r){ var c = Number(r.cost_usd) || 0; return (c > MAX_COSTO_FILA || c < 0) ? a : a + c; }, 0); // misma salvaguarda anti-dato-corrupto que el total
       saldoRestante = Math.round((saldoCargado - gastado) * 100) / 100;
     }
-    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, mensajes_validos: rows.length - corruptas, filas_anomalas_ignoradas: corruptas, costo_anomalo_ignorado: Math.round(costoCorrupto * 100) / 100, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null });
+    return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, mensajes_validos: rows.length - corruptas, filas_anomalas_ignoradas: corruptas, costo_anomalo_ignorado: Math.round(costoCorrupto * 100) / 100, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null, pausa_global: _pausaGlobal === true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -5088,6 +5338,32 @@ app.post('/api/maestro/saldo', async function(req, res){
     if (isNaN(monto)) return res.status(400).json({ error: 'Monto invalido' });
     await supabase.from('superadmin_config').update({ saldo_cargado: monto, saldo_fecha: new Date().toISOString() }).eq('id', 1);
     return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// KILL-SWITCH GLOBAL (#15): pausar/reactivar TODO el sistema de una. { activar: bool }.
+// Persiste en superadmin_config.pausa_global + actualiza el cache en memoria (_pausaGlobal) al instante (sin esperar
+// el refresh de 30s) + deja una notif 'sistema' critica en el Maestro. Cuando esta activo, el GATE TEMPRANO frena el
+// gasto de IA de TODOS los clientes (cero tokens, el mensaje crudo igual se guarda). ADITIVO: no toca otra logica.
+app.post('/api/maestro/pausa-global', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var activar = !!(req.body && req.body.activar === true);
+    var up = await supabase.from('superadmin_config').update({ pausa_global: activar }).eq('id', 1);
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo guardar la pausa global (revisa la columna pausa_global en superadmin_config): ' + up.error.message });
+    _pausaGlobal = activar; // efecto inmediato, sin esperar el refresh de 30s
+    // Notif critica al Maestro (best-effort, no bloquea la respuesta)
+    if (activar) crearNotifMaestro('sistema', 'Sistema PAUSADO globalmente', 'Se activo el kill-switch global: la IA dejo de responder para TODOS los clientes (cero gasto de tokens). Reactivalo cuando quieras volver a la normalidad.', { severidad: 'critico' }).catch(function(){});
+    else crearNotifMaestro('sistema', 'Sistema REACTIVADO globalmente', 'Se desactivo el kill-switch global: la IA vuelve a responder normalmente para todos los clientes (salvo los que tengan pausa individual).', { severidad: 'critico' }).catch(function(){});
+    return res.json({ ok: true, pausa_global: _pausaGlobal });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Estado actual del kill-switch global (para que el front lo muestre sin depender del consumo). Lee el cache en memoria.
+app.get('/api/maestro/pausa-global', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    return res.json({ ok: true, pausa_global: _pausaGlobal === true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

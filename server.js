@@ -370,7 +370,7 @@ async function enviarPushMaestro(titulo, cuerpo) {
     var resp = await _fcmAdmin.messaging().sendEachForMulticast({
       tokens: tokens,
       notification: { title: String(titulo || 'Raices Maestro'), body: String(cuerpo || '') },
-      android: { priority: 'high', notification: { channelId: 'maestro', sound: 'default', priority: 'high' } }
+      android: { priority: 'high' }
     });
     if (resp && resp.responses) {
       for (var i = 0; i < resp.responses.length; i++) {

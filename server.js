@@ -338,6 +338,44 @@ async function registrarUsoTokens(user_id, usage) {
   } catch (e) {}
 }
 
+// Crea una notificacion en el Panel Maestro (best-effort y SILENCIOSO). CRITICO: todo va dentro de un try/catch
+// que TRAGA cualquier error (tabla inexistente, fallo de red, etc.) para NO romper NUNCA al que lo llama.
+// tipo: nuevo_cliente|suscripcion_nueva|suscripcion_cambio|suscripcion_cancelada|soporte|consumo_anomalo|ia_sin_saldo|sistema
+// opts: { ref_user_id, ref_id, severidad } (severidad: info|warning|critico; default 'info').
+async function crearNotifMaestro(tipo, titulo, cuerpo, opts) {
+  try {
+    var o = opts || {};
+    var fila = {
+      tipo: String(tipo || 'sistema'),
+      titulo: String(titulo || ''),
+      cuerpo: cuerpo != null ? String(cuerpo) : null,
+      ref_user_id: o.ref_user_id || null,
+      ref_id: o.ref_id != null ? String(o.ref_id) : null,
+      severidad: o.severidad || 'info'
+    };
+    await supabase.from('maestro_notificaciones').insert(fila);
+  } catch (e) {}
+}
+
+// Detecta si un error de anthropic.messages.create es por SALDO agotado/insuficiente y, si lo es, crea una
+// notif 'ia_sin_saldo' (critico) con DEDUPE de 6h (no mas de 1 cada 6 horas). Best-effort: jamas relanza.
+async function avisarSiIaSinSaldo(err) {
+  try {
+    var msg = String((err && err.message) || err || '').toLowerCase();
+    var status = err && (err.status || err.statusCode);
+    var esSaldo = msg.indexOf('credit balance') >= 0 || msg.indexOf('too low') >= 0 ||
+                  (msg.indexOf('balance') >= 0 && (msg.indexOf('insufficient') >= 0 || status === 400));
+    if (!esSaldo) return;
+    // DEDUPE: no crear si ya hay una ia_sin_saldo en las ultimas 6h
+    try {
+      var desde6h = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+      var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'ia_sin_saldo').gte('created_at', desde6h).limit(1);
+      if (ya && ya.data && ya.data.length) return;
+    } catch (eDup) { /* si la consulta falla, igual avisamos (mejor avisar de mas que callar un corte de IA) */ }
+    crearNotifMaestro('ia_sin_saldo', 'La IA dejo de responder', 'Saldo de Anthropic agotado o insuficiente. Recarga creditos.', { severidad: 'critico' }).catch(function(){});
+  } catch (e) {}
+}
+
 // ---- MercadoPago via REST (sin SDK, sin dependencias nuevas; fetch es global en Node 18+) ----
 async function mpFetch(path, metodo, cuerpo) {
   if (!MP_TOKEN) throw new Error('MercadoPago no configurado (falta MERCADOPAGO_ACCESS_TOKEN)');
@@ -1647,7 +1685,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
           }
         }
-      } catch (eGen) { console.error('Error generando respuesta (debounce):', eGen && eGen.message); }
+      } catch (eGen) { console.error('Error generando respuesta (debounce):', eGen && eGen.message); try { avisarSiIaSinSaldo(eGen); } catch (eSaldo) {} }
       finally {
         // Siempre liberar _genEnCurso: la conv nunca queda trabada y un eventual reintento ya
         // agendado por un mensaje nuevo podra disparar y responder.
@@ -4427,9 +4465,29 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
     var planNivel = null;
     var ppId = sus.preapproval_plan_id || null;
     if (ppId) { Object.keys(PLANES_MP).forEach(function(k){ if (PLANES_MP[k] === ppId) planNivel = k; }); }
+    // Leer el estado/plan ANTERIOR para distinguir suscripcion NUEVA vs CAMBIO de plan (best-effort).
+    var prevSub = null;
+    try { var ps = await supabase.from('subscriptions').select('status, plan').eq('user_id', user_id).maybeSingle(); prevSub = ps && ps.data ? ps.data : null; } catch (ePrev) {}
     var fila = { user_id: user_id, status: estado, mp_preapproval_id: sus.id, current_period_end: sus.next_payment_date || null };
     if (planNivel) fila.plan = planNivel;
     await supabase.from('subscriptions').upsert(fila, { onConflict: 'user_id' });
+    // NOTIF MAESTRO (best-effort, nunca rompe el webhook). Criterio:
+    //  - cancelled            -> 'suscripcion_cancelada'
+    //  - active 1ra vez       -> 'suscripcion_nueva' (antes NO estaba 'active')
+    //  - active + cambio plan -> 'suscripcion_cambio' (ya estaba 'active' pero cambio el nivel del plan)
+    try {
+      var prevEstado = prevSub && prevSub.status ? prevSub.status : null;
+      var prevPlan = prevSub && prevSub.plan ? prevSub.plan : null;
+      if (estado === 'cancelled' && prevEstado !== 'cancelled') {
+        crearNotifMaestro('suscripcion_cancelada', 'Suscripcion cancelada', 'Un cliente cancelo su suscripcion' + (prevPlan ? ' (plan ' + prevPlan + ')' : '') + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'warning' }).catch(function(){});
+      } else if (estado === 'active') {
+        if (prevEstado !== 'active') {
+          crearNotifMaestro('suscripcion_nueva', 'Suscripcion nueva', 'Un cliente activo su suscripcion' + (planNivel ? ' (plan ' + planNivel + ')' : '') + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'info' }).catch(function(){});
+        } else if (planNivel && prevPlan && planNivel !== prevPlan) {
+          crearNotifMaestro('suscripcion_cambio', 'Cambio de plan', 'Un cliente cambio de plan: ' + prevPlan + ' -> ' + planNivel + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'info' }).catch(function(){});
+        }
+      }
+    } catch (eNotif) {}
   } catch (e) { console.error('webhook mercadopago:', e && e.message); }
 });
 
@@ -4464,6 +4522,8 @@ app.post('/api/soporte', async function(req, res) {
       ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto' });
     }
     if (ins.error) { console.error('soporte insert:', ins.error.message); return res.status(503).json({ error: 'El soporte se esta habilitando, intenta mas tarde' }); }
+    // NOTIF MAESTRO (best-effort, nunca rompe el soporte)
+    crearNotifMaestro('soporte', 'Nuevo ticket de soporte', '[' + categoria + '] ' + mensaje.slice(0, 280), { ref_user_id: user_id, severidad: 'info' }).catch(function(){});
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -4527,6 +4587,8 @@ app.post('/api/soporte/agente', async function(req, res) {
         ins = await supabase.from('support_messages').insert(fila);
       }
       if (ins.error) console.error('soporte/agente escalar insert:', ins.error.message);
+      // NOTIF MAESTRO: el agente de soporte ESCALO a humano (best-effort, nunca rompe). Mas urgente -> warning.
+      crearNotifMaestro('soporte', 'Soporte escalado a humano', pregunta.slice(0, 280), { ref_user_id: user_id, severidad: 'warning' }).catch(function(){});
     }
 
     return res.json({ ok: true, respuesta: respuesta, escalado: escalado });
@@ -4819,6 +4881,8 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
     }
     // 4) Auditoria (no critico)
     try { await supabase.from('admin_audit').insert({ accion: 'crear_cliente', target_user_id: uid, detalle: JSON.stringify({ email: email, company: company, cortesia: cortesia }) }); } catch(eA){}
+    // 5) Notif Maestro (best-effort, nunca rompe el alta)
+    crearNotifMaestro('nuevo_cliente', 'Nuevo cliente: ' + company, 'Alta desde el Maestro. Email: ' + email + (cortesia ? ' (cortesia)' : ''), { ref_user_id: uid, severidad: 'info' }).catch(function(){});
     return res.json({ ok: true, user_id: uid, email: email, password: password });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
@@ -4935,6 +4999,48 @@ app.get('/api/maestro/consumo', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== NOTIFICACIONES DEL MAESTRO (campana del panel). Service key, mismo gate que el resto de /api/maestro/* =====
+// Listar notificaciones. Por defecto NO incluye eliminadas; ?incluir_eliminadas=1 para verlas tambien. Orden desc, limit 200.
+app.get('/api/maestro/notificaciones', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var incluirElim = String((req.query && req.query.incluir_eliminadas) || '0') === '1';
+    var q = supabase.from('maestro_notificaciones').select('id, tipo, titulo, cuerpo, ref_user_id, ref_id, severidad, created_at, leida_at, eliminada_at');
+    if (!incluirElim) q = q.is('eliminada_at', null);
+    var r = await q.order('created_at', { ascending: false }).limit(200);
+    var notifs = (r && r.data) || [];
+    var noLeidas = notifs.filter(function(n){ return !n.leida_at && !n.eliminada_at; }).length;
+    return res.json({ ok: true, notificaciones: notifs, no_leidas: noLeidas });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Marcar UNA notificacion como leida.
+app.post('/api/maestro/notificaciones/:id/leer', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    await supabase.from('maestro_notificaciones').update({ leida_at: new Date().toISOString() }).eq('id', req.params.id);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Marcar TODAS las no leidas (y no eliminadas) como leidas.
+app.post('/api/maestro/notificaciones/leer-todas', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    await supabase.from('maestro_notificaciones').update({ leida_at: new Date().toISOString() }).is('leida_at', null).is('eliminada_at', null);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Eliminar (SOFT): marca eliminada_at. Queda en el historial (?incluir_eliminadas=1), no se borra fisico.
+app.post('/api/maestro/notificaciones/:id/eliminar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    await supabase.from('maestro_notificaciones').update({ eliminada_at: new Date().toISOString() }).eq('id', req.params.id);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // Cargar saldo manual de Anthropic (la API no expone el saldo; el dueno lo ingresa al recargar)
 app.post('/api/maestro/saldo', async function(req, res){
   try{
@@ -5000,6 +5106,53 @@ app.post('/api/conversations/resumen', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// CHEQUEO DIARIO de CONSUMO ANOMALO de IA por cliente (best-effort, jamas rompe). Reusa la MISMA logica
+// de anomalia del endpoint /api/maestro/consumo (costo > 3x la mediana con piso $1, o supera el tope $15)
+// sobre las ULTIMAS 24h. Por cada cliente anomalo nuevo crea una notif 'consumo_anomalo' (warning), con
+// DEDUPE: no se crea si ya existe una notif consumo_anomalo de ese ref_user_id en las ultimas 24h.
+// Se ejecuta como mucho 1 vez por dia (el cron corre c/6h; este flag evita repetir en cada corrida).
+var _ultimaRevisionAnomalia = 0;
+async function revisarConsumoAnomalo() {
+  try {
+    var ahora = Date.now();
+    if (ahora - _ultimaRevisionAnomalia < 24 * 3600 * 1000) return; // a lo sumo 1 vez al dia
+    var TOPE_ALERTA_USD = 15;            // mismo tope que /api/maestro/consumo
+    var MAX_COSTO_FILA = 10;             // misma salvaguarda anti-dato-corrupto
+    var desde = new Date(ahora - 24 * 3600 * 1000).toISOString();
+    var u = await supabase.from('ia_uso').select('user_id, cost_usd').gte('created_at', desde).limit(100000);
+    var rows = (u && u.data) || [];
+    var porCliente = {};
+    rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; if (c > MAX_COSTO_FILA) return; if (!r.user_id) return; porCliente[r.user_id] = (porCliente[r.user_id] || 0) + c; });
+    var ranking = Object.keys(porCliente).map(function(k){ return { user_id: k, cost: porCliente[k] }; });
+    if (!ranking.length) { _ultimaRevisionAnomalia = ahora; return; }
+    // Mediana de los costos > 0 (misma definicion que el endpoint)
+    var costosPos = ranking.map(function(it){ return it.cost; }).filter(function(c){ return c > 0; }).sort(function(a, b){ return a - b; });
+    var mediana = 0;
+    if (costosPos.length) { var mid = Math.floor(costosPos.length / 2); mediana = costosPos.length % 2 ? costosPos[mid] : (costosPos[mid - 1] + costosPos[mid]) / 2; }
+    // Detectar anomalos con el MISMO criterio del endpoint
+    var anomalos = ranking.filter(function(it){
+      if (it.cost > TOPE_ALERTA_USD) { it.motivo = 'supera $' + TOPE_ALERTA_USD + ' en 24h'; return true; }
+      if (mediana > 0 && it.cost > 1 && it.cost > 3 * mediana) { it.motivo = 'gasta ' + (Math.round((it.cost / mediana) * 10) / 10) + 'x la mediana en 24h'; return true; }
+      return false;
+    });
+    if (!anomalos.length) { _ultimaRevisionAnomalia = ahora; return; }
+    // Nombres de empresa para el cuerpo de la notif (no critico)
+    var nombres = {};
+    try { var bs = await supabase.from('business_settings').select('user_id, company_name').in('user_id', anomalos.map(function(a){ return a.user_id; })); (bs.data || []).forEach(function(b){ nombres[b.user_id] = b.company_name; }); } catch (eN) {}
+    for (var i = 0; i < anomalos.length; i++) {
+      var it = anomalos[i];
+      // DEDUPE: saltear si ya hay una notif consumo_anomalo de este cliente en las ultimas 24h
+      try {
+        var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'consumo_anomalo').eq('ref_user_id', it.user_id).gte('created_at', desde).limit(1);
+        if (ya && ya.data && ya.data.length) continue;
+      } catch (eDup) { /* si la consulta falla, igual creamos la notif (mejor avisar que silenciar) */ }
+      var empresa = nombres[it.user_id] || '(sin nombre)';
+      crearNotifMaestro('consumo_anomalo', 'Consumo anomalo de IA: ' + empresa, 'El cliente ' + empresa + ' ' + it.motivo + ' (gasto ~$' + (Math.round(it.cost * 100) / 100) + ' en las ultimas 24h).', { ref_user_id: it.user_id, severidad: 'warning' }).catch(function(){});
+    }
+    _ultimaRevisionAnomalia = ahora;
+  } catch (e) { console.error('revisarConsumoAnomalo:', e && e.message); }
+}
+
 // CRON suscripciones: dunning (past_due con +1 dia de gracia -> suspended) + reset mensual del contador de mensajes IA. Inerte si SUBSCRIPTIONS_ENABLED=false.
 async function revisarSuscripciones() {
   try {
@@ -5016,6 +5169,8 @@ async function revisarSuscripciones() {
       if (Object.keys(updates).length) { try { await supabase.from('subscriptions').update(updates).eq('user_id', s.user_id); } catch (eU) {} }
     }
   } catch (e) { console.error('revisarSuscripciones:', e && e.message); }
+  // Chequeo diario de consumo anomalo (aislado: nunca afecta al dunning de arriba)
+  try { await revisarConsumoAnomalo(); } catch (eA) {}
 }
 setInterval(revisarSuscripciones, 6 * 60 * 60 * 1000);
 setTimeout(revisarSuscripciones, 120 * 1000);

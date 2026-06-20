@@ -1547,6 +1547,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 if (_m && _m.url) {
                   try { await enviarWhatsappMedia(instanciaNombre, telefono, _m.url, 'imagen', _m.caption || ''); }
                   catch (eM1) { console.error('envio foto propiedad:', eM1 && eM1.message); }
+                  // Guardar la foto como mensaje para que TAMBIEN se vea en el chat de la app (no solo en WhatsApp). NO gasta IA.
+                  try { await supabase.from('messages').insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: _m.caption || '', media_url: _m.url, media_tipo: 'imagen', enviado_por: 'Agente IA' }); }
+                  catch (eM2) { console.error('guardar foto IA en chat:', eM2 && eM2.message); }
                 }
               }
             } catch (eMedia) { console.error('loop fotos propiedad:', eMedia && eMedia.message); }

@@ -80,7 +80,7 @@ try {
 } catch (e) { console.error('Error init firebase-admin:', e && e.message); }
 
 // Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
-async function enviarPushAsesor(authUserId, leadNombre, texto) {
+async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
   try {
     if (!_fcmReady || !authUserId) return;
     const { data: toks } = await supabase.from('device_tokens').select('token').eq('user_id', authUserId);
@@ -88,9 +88,11 @@ async function enviarPushAsesor(authUserId, leadNombre, texto) {
     const tokens = toks.map(function (t) { return t.token; }).filter(Boolean);
     if (!tokens.length) return;
     const palabras = String(texto || '').trim().split(/\s+/).slice(0, 3).join(' ');
+    // bodyLiteral: para avisos que NO son un mensaje de lead (ej. cupo IA al 80/100%), se respeta el cuerpo tal cual.
+    const _body = bodyLiteral ? String(bodyLiteral) : ('Nuevo mensaje · ' + palabras);
     const resp = await _fcmAdmin.messaging().sendEachForMulticast({
       tokens: tokens,
-      notification: { title: leadNombre || 'Nuevo lead', body: 'Nuevo mensaje · ' + palabras },
+      notification: { title: leadNombre || 'Nuevo lead', body: _body },
       android: { priority: 'high', notification: { channelId: 'mensajes', sound: 'default', priority: 'high' } }
     });
     // Limpiar tokens invalidos (desinstalados / expirados)
@@ -304,16 +306,16 @@ async function registrarUsoIA(user_id) {
     // a cruzar el mes que viene). El push es FCM al dueno -> NO gasta tokens de IA.
     try {
       if (sub.cortesia !== true) {
-        const planN = PLAN_LIMITS[sub.plan] ? sub.plan : PLAN_DEFECTO;
+        const planN = await planActual(user_id); // mismo criterio que dentroDelTopeIA (degrada a basico si la sub no esta vigente)
         let tope = topeMensajesPlan(planN, sub);
         if (sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages;
         else if (typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override;
         if (tope && tope !== Infinity && tope > 0) {
           const p80 = Math.floor(tope * 0.8);
           if (usadoAntes < tope && nuevo >= tope) {
-            await enviarPushAsesor(user_id, 'Se agoto tu cupo de mensajes IA', 'El agente dejo de responder automaticamente este mes. Podes mejorar tu plan para reactivarlo o esperar al proximo periodo.');
+            await enviarPushAsesor(user_id, 'Se agoto tu cupo de mensajes IA', '', 'El agente dejo de responder automaticamente este mes. Podes mejorar tu plan para reactivarlo o esperar al proximo periodo.');
           } else if (usadoAntes < p80 && nuevo >= p80) {
-            await enviarPushAsesor(user_id, 'Cupo de mensajes IA al 80%', 'Usaste el 80% de tus mensajes IA del mes. Cuando se agote, el agente deja de responder hasta el proximo periodo o un upgrade.');
+            await enviarPushAsesor(user_id, 'Cupo de mensajes IA al 80%', '', 'Usaste el 80% de tus mensajes IA del mes. Cuando se agote, el agente deja de responder hasta el proximo periodo o un upgrade.');
           }
         }
       }
@@ -873,12 +875,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
 // forma, incluso como pregunta). Determinista (regex, sin acentos) -> nunca falla en el caso obvio ni gasta tokens.
 function _pideHumano(texto) {
   const s = String(texto || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
-  // accion de contacto + sustantivo humano cerca: "puedo hablar con una persona/asesor", "que me atienda un asesor", "pasame con alguien"
-  if (/(hablar|hablo|comunicar(me)?|contactar|atienda|atender|atiende|pasa(me|s)?|paseme|derive|derivar|conect(ar|ame)|llame|llamar)[\s\S]{0,28}(asesor|persona|humano|agente|representante|vendedor|alguien|operador|encargad)/.test(s)) return true;
-  // "quiero/necesito un asesor/humano/agente/persona real"
-  if (/(quiero|necesito|dame|deme)\s+(?:hablar\s+con\s+)?(?:un|una)?\s*(asesor|humano|agente|representante|persona real|operador)/.test(s)) return true;
-  // "persona/asesor/humano real / de verdad"
-  if (/(persona|humano|asesor|agente|operador)\s*(real|de verdad|de carne)/.test(s)) return true;
+  // GUARDAS: consultas/narracion que NO son un pedido de derivacion (las responde la IA) -> evitan el over-handoff.
+  if (/\bbot\b/.test(s)) return false;                                                   // "sos un bot?", "es un bot"
+  if (/\b(sos|eres|sois)\b[\s\S]{0,15}(persona|humano|robot|maquina|ia|real|chatbot|automat)/.test(s)) return false; // "sos una persona real?"
+  if (/(me dijeron|me dijo|dijeron que|mi asesor|mi asesora|su asesor|el asesor me|la asesora me|que vi)/.test(s)) return false; // narracion (el lead cuenta, no pide)
+  if (/(pasa(me|s|r)?|manda(me|s|r)?|envia(me|s|r)?|mostra(me|r)?)\s+(?:l[ao]s?\s+|el\s+|un[ao]?\s+|mas\s+)*(foto|imagen|video|dato|precio|valor|direccion|ubicacion|info|ficha|detalle|link|catalogo|plano|medida|metro)/.test(s)) return false; // pide contenido, no un humano
+  if (/atiende\s+alguien/.test(s) && !/me\s+atien/.test(s)) return false;                 // "atiende alguien?" (pregunta de disponibilidad)
+  // PEDIDOS EXPLICITOS de hablar/ser atendido por una persona/asesor/humano:
+  if (/(hablar|hablo|comunicar(me)?|comunicame|contactar|conect(ar|ame)|derive|derivar|llame|llamar)[\s\S]{0,28}(asesor|persona|humano|agente|representante|vendedor|alguien|operador|encargad)/.test(s)) return true;
+  if (/(pasa(me|s)?|paseme|deriva(me)?|conecta(me)?)\s+con\s+(un|una|el|la|algun|alguna)?\s*(asesor|persona|humano|agente|alguien|vendedor|operador|encargad)/.test(s)) return true; // "pasame con un asesor"
+  if (/(me atienda|me atiendan|que me atienda|que me atiendan)/.test(s)) return true;     // "que me atienda un asesor"
+  if (/(quiero|necesito|dame|deme|requiero)\s+(?:hablar\s+con\s+)?(?:un|una)?\s*(asesor|humano|agente|representante|persona real|operador)/.test(s)) return true;
+  if (/(quiero|necesito|pasame|paseme|hablar con|comunicame con|hay algun|con un|con una)[\s\S]{0,18}(persona|humano|asesor|agente|operador)\s*(real|de verdad|de carne)/.test(s)) return true;
   return false;
 }
 

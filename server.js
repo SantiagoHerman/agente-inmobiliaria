@@ -239,6 +239,7 @@ async function usoMensajesIA(user_id) {
 async function dentroDelTopeIA(user_id) {
   if (!SUBSCRIPTIONS_ENABLED) return true;
   const sub = await getSubscription(user_id);
+  if (sub && sub.cortesia === true) return true; // cortesia: saldo ILIMITADO (sin tope) hasta que se le saca la cortesia
   const plan = await planActual(user_id);
   let tope = topeMensajesPlan(plan, sub); // grandfathering: clientes viejos conservan el tope legacy
   if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages; // override por cliente (panel maestro)
@@ -4676,12 +4677,15 @@ app.get('/api/suscripcion', async function(req, res) {
     // El cliente ve su tope de mensajes EFECTIVO (grandfathered o nuevo; y si tiene override del Maestro, ese manda).
     var topeEfectivo = topeMensajesPlan(plan, sub);
     if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') topeEfectivo = sub.limits_override.ai_messages;
+    // Cortesia = saldo ILIMITADO: tope null -> el dashboard NO muestra contador en reversa (no hay tope que contar).
+    var esCortesia = !!(sub && sub.cortesia === true);
+    if (esCortesia) topeEfectivo = null;
     lim = Object.assign({}, lim, { ai_messages: topeEfectivo });
     var usado = await usoMensajesIA(user_id);
     // Senal AUTORITATIVA para el frontend: congelar el acceso si el tenant debe pagar y no lo hizo.
     // Misma logica EXACTA con la que el agente corta el servicio (debeBloquearAcceso). FAIL-OPEN.
     var bloqueado = await debeBloquearAcceso(user_id);
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado });
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -5121,7 +5125,26 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
       ['ai_messages', 'asesores', 'contactos', 'propiedades'].forEach(function(k){ var v = req.body && req.body[k]; if (v === '' || v === null || typeof v === 'undefined') return; var n = parseInt(v, 10); if (!isNaN(n)) ov[k] = n; });
       await supabase.from('subscriptions').upsert({ user_id: uid, limits_override: ov }, { onConflict: 'user_id' });
     } else if (accion === 'cortesia') {
-      await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: (req.body && req.body.activo === true) }, { onConflict: 'user_id' });
+      var darCortesia = (req.body && req.body.activo === true);
+      if (darCortesia) {
+        // Dar cortesia: acceso libre e ILIMITADO. cortesia=true ya manda sobre el estado en debeBloquearAcceso/planActual.
+        await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' });
+      } else {
+        // Sacar la cortesia: si NO tiene una suscripcion REAL de MercadoPago, congelar la cuenta (suspended ->
+        // paywall: solo Ayuda/Soporte/Suscripcion/Salir) hasta que cargue tarjeta y compre un plan. Si tuviera
+        // una suscripcion MP real (active o en gracia past_due), NO le pisamos el estado (que la gobierne su suscripcion).
+        var subC = await getSubscription(uid);
+        var tieneMPreal = !!(subC && subC.mp_preapproval_id && (subC.status === 'active' || subC.status === 'past_due'));
+        var updC = { user_id: uid, cortesia: false };
+        if (!tieneMPreal) {
+          // Congelar + arrancar el periodo de pago LIMPIO: durante la cortesia el contador igual se
+          // incrementaba (aunque no topeaba), asi evitamos avisos falsos de tope y un "usado" inflado.
+          updC.status = 'suspended';
+          updC.ai_messages_this_period = 0;
+          updC.period_start = new Date().toISOString();
+        }
+        await supabase.from('subscriptions').upsert(updC, { onConflict: 'user_id' });
+      }
     } else { return res.status(400).json({ error: 'Accion invalida' }); }
     try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify(req.body || {}) }); } catch(eA){}
     return res.json({ ok: true });
@@ -5684,6 +5707,21 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
 
     // Pausa por-conversacion (ai_enabled) o pausa de IA por-cliente del Maestro (agente_pausado): no responder.
     if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) return;
+
+    // Gate de suscripcion (mismo criterio que WA ~1668-1686): cuenta NUEVA sin suscripcion, o cuenta no al dia
+    // (cancelled/suspended/trial), la IA no responde. La cortesia siempre pasa. En Meta retornamos sin enviar
+    // mensaje (multicanal minimo). Asi el congelamiento por falta de pago corta tambien Messenger/Instagram.
+    if (SUBSCRIPTIONS_ENABLED) {
+      try {
+        const _subM = await getSubscription(tenantUserId);
+        const _corM = _subM && _subM.cortesia === true;
+        const _estM = _subM ? _subM.status : null;
+        if (!_subM && TRIAL_DESDE) {
+          try { const _uM = await supabase.auth.admin.getUserById(tenantUserId); const _caM = _uM && _uM.data && _uM.data.user && _uM.data.user.created_at; if (_caM && new Date(_caM).getTime() >= new Date(TRIAL_DESDE).getTime()) return; } catch (eC) {}
+        }
+        if (!_corM && (_estM === 'cancelled' || _estM === 'suspended' || _estM === 'trial')) return;
+      } catch (e) {}
+    }
 
     // Tope de mensajes IA del plan (mismo gate que WA). Si no entra en el tope, no responde.
     try { if (!(await dentroDelTopeIA(tenantUserId))) return; } catch (e) {}

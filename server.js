@@ -1515,7 +1515,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // (Groq) y de traducir/clasificar/responder (Claude) -> CERO gasto de tokens. La pausa POR-CONVERSACION
     // (ai_enabled) NO entra aca: esa deja transcribir+traducir para el humano y solo frena al agente (mas abajo).
     let _bsGate = null;
-    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
+    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado').eq('user_id', user_id).maybeSingle();
       if (_gq && _gq.error) { const _gq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsGate = _gq2 && _gq2.data; }
       else { _bsGate = _gq && _gq.data; } }
     // Papelera (eliminado_at) o pausa TOTAL del Maestro (crm_pausado): NO se gasta ningun token de IA.
@@ -1654,7 +1654,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // (La pausa TOTAL del Maestro -crm_pausado- y la papelera -eliminado_at- ya cortaron mas arriba, ANTES de
     //  gastar un solo token. Aca queda solo la pausa POR-CONVERSACION: el agente no responde, pero el mensaje
     //  ya se transcribio/tradujo para que lo tome un humano. Esta es tu distincion: app vs Maestro.)
-    if (conv.ai_enabled === false) return;
+    // Pausa por-conversacion (ai_enabled) O pausa de IA por-cliente del Maestro (agente_pausado = "solo atencion":
+    // el agente NO contesta para ESTE cliente, pero ya se transcribio/tradujo para que lo atienda un humano).
+    if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) return;
     // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)
     if (SUBSCRIPTIONS_ENABLED) {
       try {
@@ -5090,7 +5092,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var nConv = stats.conversaciones || 0;
     var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
     var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
-    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, suscripcion: S });
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -5101,7 +5103,11 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
     var uid = req.params.id;
     var accion = (req.body && req.body.accion) ? String(req.body.accion) : '';
     if (accion === 'pausar' || accion === 'reactivar') {
+      // Pausa TOTAL del cliente (cero tokens: ni transcribe ni traduce ni responde).
       await supabase.from('business_settings').update({ crm_pausado: (accion === 'pausar') }).eq('user_id', uid);
+    } else if (accion === 'pausar_agente' || accion === 'reactivar_agente') {
+      // Pausa SOLO el agente de ese cliente (no contesta), pero sigue transcribiendo/traduciendo para el humano.
+      await supabase.from('business_settings').update({ agente_pausado: (accion === 'pausar_agente') }).eq('user_id', uid);
     } else if (accion === 'limite') {
       var lim = parseInt(req.body && req.body.ai_messages, 10);
       if (!isNaN(lim)) await supabase.from('subscriptions').upsert({ user_id: uid, ai_messages_limit_override: lim }, { onConflict: 'user_id' });

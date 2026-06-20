@@ -296,8 +296,28 @@ async function registrarUsoIA(user_id) {
     if (!SUBSCRIPTIONS_ENABLED || !user_id) return;
     const sub = await getSubscription(user_id);
     if (!sub) return;
-    const nuevo = ((typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0) + 1;
+    const usadoAntes = (typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
+    const nuevo = usadoAntes + 1;
     await supabase.from('subscriptions').update({ ai_messages_this_period: nuevo }).eq('user_id', user_id);
+    // AVISO al dueno al CRUZAR el 80% y el 100% del tope. Deteccion por CRUCE (usadoAntes<umbral && nuevo>=umbral):
+    // dispara una sola vez por umbral y por periodo, SIN columnas/migracion (al resetear el contador mensual, vuelve
+    // a cruzar el mes que viene). El push es FCM al dueno -> NO gasta tokens de IA.
+    try {
+      if (sub.cortesia !== true) {
+        const planN = PLAN_LIMITS[sub.plan] ? sub.plan : PLAN_DEFECTO;
+        let tope = topeMensajesPlan(planN, sub);
+        if (sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages;
+        else if (typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override;
+        if (tope && tope !== Infinity && tope > 0) {
+          const p80 = Math.floor(tope * 0.8);
+          if (usadoAntes < tope && nuevo >= tope) {
+            await enviarPushAsesor(user_id, 'Se agoto tu cupo de mensajes IA', 'El agente dejo de responder automaticamente este mes. Podes mejorar tu plan para reactivarlo o esperar al proximo periodo.');
+          } else if (usadoAntes < p80 && nuevo >= p80) {
+            await enviarPushAsesor(user_id, 'Cupo de mensajes IA al 80%', 'Usaste el 80% de tus mensajes IA del mes. Cuando se agote, el agente deja de responder hasta el proximo periodo o un upgrade.');
+          }
+        }
+      }
+    } catch (eAviso) {}
   } catch (e) {}
 }
 
@@ -1533,6 +1553,26 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       _debounceConv.delete(_convId);
       try {
         {
+          // HANDOFF LIMPIO: si el lead pide hablar con un humano, derivar YA con un mensaje claro y SIN gastar la
+          // respuesta de la IA (ahorra tokens). Evita que el agente conteste algo fuera de tema antes de pasar al asesor.
+          if (_pideHumano(texto)) {
+            const _msgHandoff = 'Dale, te paso con un compañero del equipo que te ayuda enseguida 🙌';
+            try {
+              await enviarWhatsapp(instanciaNombre, telefono, _msgHandoff);
+              await supabase.from('messages').insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: _msgHandoff, enviado_por: 'Agente IA' });
+              await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, last_message: _msgHandoff, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', _convId);
+              // asignar asesor si no tiene + avisarle por push + resumen para que se ponga al dia (mismo criterio que la derivacion normal)
+              const { data: _cvH } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', _convId).maybeSingle();
+              let _aseH = _cvH && _cvH.asesor_id;
+              if (_cvH && !_cvH.asesor_id && !_cvH.admin_tomo) {
+                _aseH = await elegirAsesorActivo(user_id);
+                if (_aseH) await supabase.from('conversations').update({ asesor_id: _aseH, ultimo_asesor_id: _aseH }).eq('id', _convId);
+              }
+              if (_aseH) { try { const { data: _aseRow } = await supabase.from('asesores').select('auth_user_id').eq('id', _aseH).maybeSingle(); if (_aseRow && _aseRow.auth_user_id) await enviarPushAsesor(_aseRow.auth_user_id, 'Un lead pide un asesor', (data.pushName || telefono)); } catch (eP) {} }
+              try { const _resH = await generarResumenConversacion(_convId, user_id); if (_resH) await supabase.from('conversations').update({ summary: _resH }).eq('id', _convId); } catch (eR) {}
+            } catch (eHand) { console.error('handoff humano:', eHand && eHand.message); }
+            return; // saltea la generacion de la IA; el finally libera _genEnCurso
+          }
           const resultado = await generarRespuestaAgente(user_id, _convId, texto);
           if (resultado && resultado.reply) {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);

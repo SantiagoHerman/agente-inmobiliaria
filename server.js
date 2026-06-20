@@ -354,7 +354,34 @@ async function crearNotifMaestro(tipo, titulo, cuerpo, opts) {
       severidad: o.severidad || 'info'
     };
     await supabase.from('maestro_notificaciones').insert(fila);
+    // Push FCM al celular del Maestro (best-effort, fire-and-forget): asi las notifs llegan al telefono.
+    enviarPushMaestro(fila.titulo, (fila.cuerpo || '').slice(0, 180)).catch(function(){});
   } catch (e) {}
+}
+
+// Push FCM a TODOS los dispositivos del Maestro (la app del dueno, tabla maestro_device_tokens). Best-effort.
+async function enviarPushMaestro(titulo, cuerpo) {
+  try {
+    if (!_fcmReady) return;
+    var q = await supabase.from('maestro_device_tokens').select('token');
+    var toks = (q && q.data) || [];
+    var tokens = toks.map(function(t){ return t.token; }).filter(Boolean);
+    if (!tokens.length) return;
+    var resp = await _fcmAdmin.messaging().sendEachForMulticast({
+      tokens: tokens,
+      notification: { title: String(titulo || 'Raices Maestro'), body: String(cuerpo || '') },
+      android: { priority: 'high', notification: { channelId: 'maestro', sound: 'default', priority: 'high' } }
+    });
+    if (resp && resp.responses) {
+      for (var i = 0; i < resp.responses.length; i++) {
+        var r = resp.responses[i];
+        var code = (r && r.error && r.error.code) || '';
+        if (!r.success && /not-registered|invalid-registration-token|invalid-argument/.test(code)) {
+          try { await supabase.from('maestro_device_tokens').delete().eq('token', tokens[i]); } catch (eDel) {}
+        }
+      }
+    }
+  } catch (e) { console.error('enviarPushMaestro:', e && e.message); }
 }
 
 // Detecta si un error de anthropic.messages.create es por SALDO agotado/insuficiente y, si lo es, crea una
@@ -5037,6 +5064,18 @@ app.post('/api/maestro/notificaciones/:id/eliminar', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     await supabase.from('maestro_notificaciones').update({ eliminada_at: new Date().toISOString() }).eq('id', req.params.id);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Registrar el token FCM del celular del Maestro (la app del dueno) para recibir las notificaciones por push.
+app.post('/api/maestro/device-token', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var token = (req.body && req.body.token) ? String(req.body.token).slice(0, 4000) : '';
+    var plataforma = (req.body && req.body.plataforma) ? String(req.body.plataforma).slice(0, 40) : 'android';
+    if (!token) return res.status(400).json({ error: 'Falta token' });
+    await supabase.from('maestro_device_tokens').upsert({ token: token, plataforma: plataforma, ultimo_uso: new Date().toISOString() }, { onConflict: 'token' });
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });

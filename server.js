@@ -5175,4 +5175,35 @@ async function revisarSuscripciones() {
 setInterval(revisarSuscripciones, 6 * 60 * 60 * 1000);
 setTimeout(revisarSuscripciones, 120 * 1000);
 
+// MONITOREO (#19): chequea que Supabase y el servidor de WhatsApp (Evolution) respondan. Si algo se cae,
+// crea una notificacion 'sistema' (critico) en el Maestro -> llega al panel y (con FCM) al celular. Best-effort.
+var _saludDedup = {}; // dedupe en memoria: ultimo aviso por componente (ms). Evita spamear el mismo problema.
+async function _notifSistema(comp, titulo, cuerpo) {
+  try {
+    var ahora = Date.now();
+    if (_saludDedup[comp] && (ahora - _saludDedup[comp]) < 60 * 60 * 1000) return; // 1 aviso/hora por componente
+    _saludDedup[comp] = ahora;
+    await crearNotifMaestro('sistema', titulo, cuerpo, { ref_id: comp, severidad: 'critico' });
+  } catch (e) {}
+}
+async function revisarSaludSistema() {
+  // Supabase (base de datos)
+  try {
+    var sb = await supabase.from('business_settings').select('user_id').limit(1);
+    if (sb && sb.error) await _notifSistema('supabase', 'Supabase con problemas', 'La base de datos respondio con error: ' + String(sb.error.message || '').slice(0, 180) + '. Revisa el estado de Supabase.');
+  } catch (eSb) { await _notifSistema('supabase', 'Supabase no responde', 'No se pudo consultar la base de datos. Revisa el estado de Supabase (los datos y la IA dependen de esto).'); }
+  // Evolution (servidor de WhatsApp)
+  if (EVOLUTION_URL) {
+    try {
+      var ctrl = new AbortController();
+      var to = setTimeout(function(){ try { ctrl.abort(); } catch (e) {} }, 8000);
+      var r = await fetch(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY }, signal: ctrl.signal });
+      clearTimeout(to);
+      if (!r.ok) await _notifSistema('evolution', 'WhatsApp (Evolution) con problemas', 'El servidor de WhatsApp respondio ' + r.status + '. Si persiste, los agentes podrian dejar de recibir/responder mensajes.');
+    } catch (eEv) { await _notifSistema('evolution', 'WhatsApp (Evolution) caido', 'El servidor de WhatsApp no responde. Los agentes NO van a recibir ni responder mensajes hasta que vuelva. Revisa el VPS/EasyPanel.'); }
+  }
+}
+setInterval(revisarSaludSistema, 10 * 60 * 1000); // cada 10 min
+setTimeout(revisarSaludSistema, 75 * 1000);       // primer chequeo a los 75s del arranque
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

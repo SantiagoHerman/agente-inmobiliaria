@@ -166,13 +166,31 @@ const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c2
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
   trial:      { ai_messages: 200,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  basico:     { ai_messages: 1000,  asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
-  pro:        { ai_messages: 4000,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  premium:    { ai_messages: 12000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
-  enterprise: { ai_messages: 20000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+  basico:     { ai_messages: 700,   asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
+  pro:        { ai_messages: 1700,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  premium:    { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
+  enterprise: { ai_messages: 7000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
 };
+// TOPES VIEJOS (grandfathering). Los clientes creados ANTES de PLANES_NUEVOS_DESDE conservan estos topes de mensajes
+// (no se les recorta a mitad de camino); los clientes NUEVOS arrancan con los topes nuevos de arriba (mas bajos, para
+// blindar el margen ~70% aun a uso pleno). Solo difiere ai_messages; las features son las mismas que en PLAN_LIMITS.
+const PLAN_LIMITS_LEGACY = { trial: 200, basico: 1000, pro: 4000, premium: 12000, enterprise: 20000 };
+// Fecha de corte del nuevo esquema de planes (margen maximo). Configurable por env; default = el dia del cambio.
+const PLANES_NUEVOS_DESDE = process.env.PLANES_NUEVOS_DESDE || '2026-06-19T00:00:00.000Z';
 // Plan por defecto cuando la funcion esta apagada o el tenant no tiene fila: acceso total.
 const PLAN_DEFECTO = 'premium';
+
+// Tope de mensajes EFECTIVO de un plan, segun si el cliente es viejo (grandfathered -> tope legacy) o nuevo (tope nuevo).
+// Usa sub.created_at (ya disponible, sin costo extra). Sin fecha confiable o creado antes del corte -> legacy (no recortar).
+function topeMensajesPlan(plan, sub) {
+  var nuevo = (PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO]).ai_messages;
+  var legacy = PLAN_LIMITS_LEGACY[plan];
+  if (legacy == null) return nuevo;
+  var corte = new Date(PLANES_NUEVOS_DESDE).getTime();
+  var ca = (sub && sub.created_at) ? new Date(sub.created_at).getTime() : null;
+  if (ca == null || ca < corte) return legacy; // grandfathered
+  return nuevo;
+}
 
 // Lee la suscripcion del tenant. Si la tabla no existe o no hay fila, devuelve null (no rompe).
 async function getSubscription(user_id) {
@@ -215,8 +233,7 @@ async function dentroDelTopeIA(user_id) {
   if (!SUBSCRIPTIONS_ENABLED) return true;
   const sub = await getSubscription(user_id);
   const plan = await planActual(user_id);
-  const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
-  let tope = lim.ai_messages;
+  let tope = topeMensajesPlan(plan, sub); // grandfathering: clientes viejos conservan el tope legacy
   if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages; // override por cliente (panel maestro)
   else if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // compat override viejo
   if (tope === Infinity) return true;
@@ -817,7 +834,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (conversation_id && !modoPrueba) {
     try {
       const { data: convTrad } = await supabase.from('conversations').select('traductor_activo, idioma_lead').eq('id', conversation_id).maybeSingle();
-      if (convTrad && convTrad.traductor_activo && convTrad.idioma_lead && convTrad.idioma_lead !== idiomaBase) {
+      if (convTrad && convTrad.traductor_activo && convTrad.idioma_lead && convTrad.idioma_lead !== idiomaBase && await planPermite(user_id, 'audio_traduccion')) {
         const trad = await traducir(reply, convTrad.idioma_lead, user_id);
         if (trad && trad.trim() && trad.trim() !== reply.trim()) { replyCliente = trad; idiomaAi = convTrad.idioma_lead; }
       }
@@ -1372,7 +1389,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // Traducir SOLO texto/audio/imagen; NO traducir videos ni documentos.
     const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
     try {
-      if (!_noTraducir) {
+      // El traductor es feature de plan (Pro+). El Basico NO traduce (se guarda el mensaje en su idioma original;
+      // un humano lo atiende). El AUDIO en cambio NO se gatea (Groq, casi gratis) -> queda en todos los planes.
+      if (!_noTraducir && await planPermite(user_id, 'audio_traduccion')) {
         const idiomaDetectado = await detectarIdioma(texto, user_id);
         if (idiomaDetectado && idiomaDetectado !== 'es') {
           const trad = await traducir(texto, 'es', user_id);
@@ -4298,6 +4317,10 @@ app.get('/api/suscripcion', async function(req, res) {
     var sub = await getSubscription(user_id);
     var plan = await planActual(user_id);
     var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+    // El cliente ve su tope de mensajes EFECTIVO (grandfathered o nuevo; y si tiene override del Maestro, ese manda).
+    var topeEfectivo = topeMensajesPlan(plan, sub);
+    if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') topeEfectivo = sub.limits_override.ai_messages;
+    lim = Object.assign({}, lim, { ai_messages: topeEfectivo });
     var usado = await usoMensajesIA(user_id);
     // Senal AUTORITATIVA para el frontend: congelar el acceso si el tenant debe pagar y no lo hizo.
     // Misma logica EXACTA con la que el agente corta el servicio (debeBloquearAcceso). FAIL-OPEN.

@@ -4,7 +4,11 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+// ADITIVO (multicanal Meta): capturar el body crudo SIN cambiar el parseo JSON existente.
+// Solo se usa para validar la firma X-Hub-Signature-256 de los webhooks de Meta (HMAC sobre
+// los bytes exactos recibidos). NO afecta a WhatsApp ni a ningun otro endpoint: solo agrega
+// la propiedad req.rawBody. El parseo a req.body sigue identico a antes.
+app.use(express.json({ limit: '2mb', verify: function(req, res, buf){ try { req.rawBody = buf; } catch(e){} } }));
 
 app.use((req, res, next) => {
   // Lista blanca de origenes permitidos (solo la app de Raices CRM)
@@ -48,6 +52,7 @@ app.use((req, res, next) => {
     // el webhook de WhatsApp no se limita
     if (req.path === '/api/webhook/whatsapp') return next();
     if (req.path === '/api/webhook/mercadopago') return next();
+    if (req.path === '/api/webhook/meta') return next(); // webhook Meta (Messenger/Instagram): Meta exige <2s y reintenta
     if (req.path === '/health') return next();
     const ip = (req.headers['x-forwarded-for'] || req.ip || 'sin-ip').split(',')[0].trim();
     const n = (_rlHits.get(ip) || 0) + 1;
@@ -5526,5 +5531,267 @@ async function revisarSaludSistema() {
 }
 setInterval(revisarSaludSistema, 10 * 60 * 1000); // cada 10 min
 setTimeout(revisarSaludSistema, 75 * 1000);       // primer chequeo a los 75s del arranque
+
+// ============================================================================
+// MULTICANAL META (Messenger + Instagram) - estructura ADITIVA e INERTE.
+// ----------------------------------------------------------------------------
+// Messenger e Instagram usan la MISMA plataforma de webhooks de Meta. El mismo
+// endpoint (/api/webhook/meta) recibe ambos; el campo body.object del payload
+// distingue 'page' (Messenger) de 'instagram' (Instagram).
+//
+// REGLA DURA: NO toca el webhook de WhatsApp ni generarRespuestaAgente ni los
+// gates. SOLO los REUSA. Mientras la tabla messenger_credentials este vacia,
+// estos endpoints responden (verificacion GET / 200 en POST) pero NO procesan
+// nada -> el sistema queda completamente INERTE hasta configurar credenciales.
+//
+// generarRespuestaAgente(user_id, conversation_id, texto) es agnostico al canal:
+// se reusa tal cual. Los gates (crm_pausado / pausa_global / agente_pausado /
+// eliminado_at / dentroDelTopeIA) se replican leyendo las MISMAS columnas que el
+// webhook de WhatsApp, sin alterar nada.
+// ============================================================================
+
+const META_GRAPH_VERSION = 'v21.0';
+const META_VERIFY_TOKEN_ENV = process.env.META_VERIFY_TOKEN || '';
+
+// --- ENVIO via Graph API (Send API). Best-effort: una falla nunca rompe el flujo. ---
+// POST https://graph.facebook.com/v21.0/me/messages?access_token=...
+// Sirve igual para Messenger e Instagram (misma Send API). Devuelve true/false.
+async function enviarMensajeMeta(pageAccessToken, recipientId, texto) {
+  try {
+    if (!pageAccessToken || !recipientId || !texto) return false;
+    const url = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/me/messages?access_token=' + encodeURIComponent(pageAccessToken);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recipient: { id: String(recipientId) },
+        messaging_type: 'RESPONSE',
+        message: { text: String(texto) }
+      })
+    });
+    if (!resp.ok) {
+      let _det = '';
+      try { _det = await resp.text(); } catch (e) {}
+      console.error('enviarMensajeMeta HTTP ' + resp.status + ': ' + String(_det).slice(0, 300));
+      return false;
+    }
+    return true;
+  } catch (e) { console.error('enviarMensajeMeta error:', e && e.message); return false; }
+}
+
+// OPCIONAL/TODO: envio de imagenes con attachment (message:{attachment:{type:'image',payload:{url}}}).
+// Por ahora multicanal manda SOLO texto (es lo minimo). Las fotos de propiedad que arma
+// generarRespuestaAgente (resultado.mediaAEnviar) quedan anotadas como TODO mas abajo.
+
+// --- Resolver el verify_token: cualquier credencial activa que tenga ese token, o el env. ---
+// INERTE: si no hay credenciales ni env, no valida nada (responde 403 en la verificacion).
+async function _metaVerifyTokenValido(tokenRecibido) {
+  if (!tokenRecibido) return false;
+  if (META_VERIFY_TOKEN_ENV && tokenRecibido === META_VERIFY_TOKEN_ENV) return true;
+  try {
+    const { data, error } = await supabase
+      .from('messenger_credentials')
+      .select('verify_token')
+      .eq('activo', true)
+      .eq('verify_token', tokenRecibido)
+      .limit(1);
+    if (error) return false;
+    return !!(data && data.length > 0);
+  } catch (e) { return false; }
+}
+
+// --- Validar firma X-Hub-Signature-256 (HMAC sha256 con app_secret) sobre el body crudo. ---
+// Si NO hay app_secret configurado para el tenant, no se valida (se acepta): asi sigue
+// funcionando una config minima. Si hay app_secret y la firma no coincide -> se rechaza ese tenant.
+function _metaFirmaOk(rawBody, firmaHeader, appSecret) {
+  try {
+    if (!appSecret) return false; // sin secret configurado NO se procesa: app_secret es obligatorio (evita payloads falsificados)
+    if (!firmaHeader || !rawBody) return false;
+    const esperado = 'sha256=' + _cripto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+    const a = Buffer.from(firmaHeader);
+    const b = Buffer.from(esperado);
+    if (a.length !== b.length) return false;
+    return _cripto.timingSafeEqual(a, b);
+  } catch (e) { return false; }
+}
+
+// --- Resolver el tenant (credencial) por page_id (Messenger) o ig_user_id (Instagram). ---
+// Si no matchea ninguna credencial activa -> devuelve null -> el mensaje se IGNORA (inerte).
+async function _resolverCredMeta(canal, idCuenta) {
+  try {
+    if (!idCuenta) return null;
+    const columna = (canal === 'instagram') ? 'ig_user_id' : 'page_id';
+    const { data, error } = await supabase
+      .from('messenger_credentials')
+      .select('id, user_id, canal, page_id, page_access_token, ig_user_id, app_secret, verify_token, activo')
+      .eq('activo', true)
+      .eq(columna, String(idCuenta))
+      .maybeSingle();
+    if (error || !data) return null;
+    return data;
+  } catch (e) { return null; }
+}
+
+// --- PROCESAMIENTO de un mensaje entrante de Meta. Best-effort de punta a punta. ---
+// Reusa el patron del webhook de WhatsApp (contacto -> conversacion -> messages -> gates ->
+// generarRespuestaAgente) pero MAS SIMPLE: solo texto, sin debounce ni media (TODO mas abajo).
+// channel = 'messenger' | 'instagram'. senderId = PSID (Messenger) o IGSID (Instagram).
+async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) {
+  try {
+    if (!tenantUserId || !senderId || !texto) return;
+
+    // 1) Buscar/crear contacto por (user_id, phone=senderId). Reusamos la columna 'phone' como
+    //    identificador del canal (PSID/IGSID) igual que el webhook WA usa el telefono. Proyeccion
+    //    minima segura (solo 'id') para no depender de columnas de enriquecimiento.
+    let contacto;
+    const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', tenantUserId).eq('phone', String(senderId)).maybeSingle();
+    if (existente) { contacto = existente; }
+    else {
+      const { data: nuevo } = await supabase.from('contacts').insert({ user_id: tenantUserId, name: String(senderId), phone: String(senderId), channel: canal }).select('id').single();
+      contacto = nuevo;
+    }
+    if (!contacto) return;
+
+    // 2) Buscar/crear conversation (channel = canal).
+    let conv;
+    const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, asesor_id').eq('user_id', tenantUserId).eq('contact_id', contacto.id).maybeSingle();
+    if (convExistente) { conv = convExistente; }
+    else {
+      let asesorAsignado = null;
+      try { asesorAsignado = await elegirAsesorActivo(tenantUserId); } catch (e) {}
+      const { data: convNueva } = await supabase.from('conversations').insert({ user_id: tenantUserId, contact_id: contacto.id, channel: canal, status: 'en_conversacion', ai_enabled: true, asesor_id: asesorAsignado, ultimo_asesor_id: asesorAsignado }).select('id, ai_enabled, asesor_id').single();
+      conv = convNueva;
+    }
+    if (!conv) return;
+
+    // ===== GATE TEMPRANO (mismas columnas que el webhook WA, sin alterarlas) =====
+    let _bsGate = null;
+    try {
+      const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado').eq('user_id', tenantUserId).maybeSingle();
+      _bsGate = _gq && _gq.data;
+    } catch (e) {}
+    const _enPapelera = !!(_bsGate && _bsGate.eliminado_at);
+    const _enPausaTotal = !!(_pausaGlobal === true) || !!(_bsGate && _bsGate.crm_pausado === true);
+
+    // 3) Guardar SIEMPRE el mensaje entrante (role 'contact'), aun en pausa/papelera (no se pierde).
+    try {
+      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: tenantUserId, role: 'contact', content: texto });
+      await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    } catch (e) { console.error('meta guardar msg entrante:', e && e.message); }
+
+    // Papelera o pausa TOTAL: no responder (cero tokens). El mensaje ya quedo guardado arriba.
+    if (_enPapelera || _enPausaTotal) return;
+
+    // Pausa por-conversacion (ai_enabled) o pausa de IA por-cliente del Maestro (agente_pausado): no responder.
+    if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) return;
+
+    // Tope de mensajes IA del plan (mismo gate que WA). Si no entra en el tope, no responde.
+    try { if (!(await dentroDelTopeIA(tenantUserId))) return; } catch (e) {}
+
+    // 4) Generar la respuesta (agnostico al canal) y enviarla por la Send API de Meta.
+    const resultado = await generarRespuestaAgente(tenantUserId, conv.id, texto);
+    if (resultado && resultado.reply) {
+      const _txt = resultado.replyCliente || resultado.reply;
+      const _ok = await enviarMensajeMeta(creds.page_access_token, senderId, _txt);
+      // Registrar uso (best-effort), igual que el webhook WA.
+      try { await registrarUsoTokens(tenantUserId, resultado.usage); } catch (e) {}
+      try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
+      // NOTA: NO re-insertamos el mensaje 'ai' ni actualizamos la conversation aca.
+      // generarRespuestaAgente() YA persiste la fila role='ai' y actualiza last_message/last_role
+      // internamente (cuando hay conversation_id y no es modoPrueba). Igual que el webhook WA, que
+      // tras generarRespuestaAgente solo envia el mensaje y registra uso, sin re-insertar el texto.
+      // TODO (multicanal v2): debounce de rafagas, envio de fotos de propiedad (resultado.mediaAEnviar)
+      // via attachment de la Send API, transcripcion de audio, traduccion entrante/saliente. Por ahora
+      // multicanal hace lo minimo: texto. El envio de _ok=false ya quedo logueado en enviarMensajeMeta.
+    }
+  } catch (e) { console.error('procesarMensajeMeta error:', e && e.message); }
+}
+
+// --- GET /api/webhook/meta : verificacion del webhook (handshake de Meta). ---
+app.get('/api/webhook/meta', async function(req, res) {
+  try {
+    const modo = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (modo === 'subscribe' && await _metaVerifyTokenValido(token)) {
+      return res.status(200).send(String(challenge == null ? '' : challenge));
+    }
+    return res.sendStatus(403);
+  } catch (e) {
+    console.error('GET /api/webhook/meta error:', e && e.message);
+    return res.sendStatus(403);
+  }
+});
+
+// --- POST /api/webhook/meta : recepcion de eventos (Messenger + Instagram). ---
+// Responde 200 RAPIDO SIEMPRE (Meta exige <2s y reintenta si no). Todo el procesamiento
+// va en segundo plano y es best-effort: una falla NUNCA debe cambiar el 200.
+app.post('/api/webhook/meta', function(req, res) {
+  // 200 inmediato, pase lo que pase.
+  res.sendStatus(200);
+  try {
+    const body = req.body || {};
+    const objeto = body.object; // 'page' (Messenger) | 'instagram' (Instagram)
+    if (objeto !== 'page' && objeto !== 'instagram') return;
+    const canal = (objeto === 'instagram') ? 'instagram' : 'messenger';
+    const entradas = Array.isArray(body.entry) ? body.entry : [];
+
+    // Procesar en segundo plano (no bloquea el 200 ya enviado).
+    (async function(){
+      for (let i = 0; i < entradas.length; i++) {
+        const entry = entradas[i] || {};
+        try {
+          if (canal === 'messenger') {
+            // Messenger: entry[].messaging[] con { sender:{id}, recipient:{id=page_id}, message:{text} }
+            const mensajes = Array.isArray(entry.messaging) ? entry.messaging : [];
+            for (let j = 0; j < mensajes.length; j++) {
+              const ev = mensajes[j] || {};
+              const senderId = ev.sender && ev.sender.id;
+              const pageId = (ev.recipient && ev.recipient.id) || entry.id;
+              const texto = ev.message && typeof ev.message.text === 'string' ? ev.message.text : '';
+              // Ignorar echoes (mensajes salientes propios) y todo lo que no sea texto entrante.
+              if (!texto || (ev.message && ev.message.is_echo)) continue;
+              const creds = await _resolverCredMeta('messenger', pageId);
+              if (!creds) continue; // sin credencial -> INERTE, se ignora
+              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], creds.app_secret)) continue;
+              await procesarMensajeMeta('messenger', creds.user_id, senderId, texto, creds);
+            }
+          } else {
+            // Instagram: entry[].changes[] con value (mensajes/comentarios). El messaging de IG
+            // suele venir como entry[].messaging[] tambien, pero la suscripcion de campos llega en changes[].
+            // Soportamos AMBAS formas para robustez (Meta envia messaging[] para DMs de IG).
+            const cambios = Array.isArray(entry.changes) ? entry.changes : [];
+            const igUserId = entry.id; // en IG, entry.id es el ig_user_id de la cuenta
+            // a) formato messaging[] (DMs de Instagram, igual estructura que Messenger)
+            const mensajesIg = Array.isArray(entry.messaging) ? entry.messaging : [];
+            for (let m = 0; m < mensajesIg.length; m++) {
+              const ev = mensajesIg[m] || {};
+              const senderId = ev.sender && ev.sender.id;
+              const texto = ev.message && typeof ev.message.text === 'string' ? ev.message.text : '';
+              if (!texto || (ev.message && ev.message.is_echo)) continue;
+              const creds = await _resolverCredMeta('instagram', igUserId);
+              if (!creds) continue;
+              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], creds.app_secret)) continue;
+              await procesarMensajeMeta('instagram', creds.user_id, senderId, texto, creds);
+            }
+            // b) formato changes[] (suscripcion de campo 'messages')
+            for (let c = 0; c < cambios.length; c++) {
+              const cambio = cambios[c] || {};
+              const val = cambio.value || {};
+              const senderId = (val.sender && val.sender.id) || val.from && val.from.id;
+              const texto = (val.message && typeof val.message.text === 'string') ? val.message.text
+                : (typeof val.text === 'string' ? val.text : '');
+              if (!texto || !senderId || (val.message && val.message.is_echo)) continue;
+              const creds = await _resolverCredMeta('instagram', igUserId);
+              if (!creds) continue;
+              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], creds.app_secret)) continue;
+              await procesarMensajeMeta('instagram', creds.user_id, senderId, texto, creds);
+            }
+          }
+        } catch (eEntry) { console.error('meta entry:', eEntry && eEntry.message); }
+      }
+    })().catch(function(e){ console.error('meta proc bg:', e && e.message); });
+  } catch (e) { console.error('POST /api/webhook/meta error:', e && e.message); }
+});
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

@@ -62,6 +62,39 @@ app.use((req, res, next) => {
   } catch (e) { next(); }
 });
 
+// === GATE DE SUSCRIPCION SERVER-SIDE (Puerta 2) ===
+// Un UNICO guardian (facil de auditar y de revertir: borrar este bloque) que bloquea las rutas de
+// DATOS/IA del cliente cuando la cuenta NO esta al dia (debeBloquearAcceso). FAIL-OPEN: nunca corta a
+// quien paga (debeBloquearAcceso solo da true con CERTEZA de estado malo; ante error/duda -> false).
+// NO gatea: webhooks, /api/suscripcion* (debe poder pagar), /api/soporte* (debe poder pedir ayuda),
+// /api/maestro* (auth propia), /health ni rutas publicas (no estan en la lista).
+// Si no hay token de usuario valido (uid null) deja pasar: el handler resuelve su propia auth -> no
+// rompe endpoints internos/cron ni el flujo sin sesion. Ante CUALQUIER error -> next() (no cortar).
+const _PREFIJOS_GATE_SUSCRIPCION = [
+  '/api/whatsapp/',       // send, conectar, desconectar, listar-chats, importar-leads, estado (NO el webhook /api/webhook/whatsapp)
+  '/api/enviar-media',
+  '/api/clasificar-fotos',
+  '/api/scrape/',         // lista, detalle, v2, universal (OJO: lista/detalle hoy NO exigen token -> ver hardening aparte)
+  '/api/propiedades',
+  '/api/scraping-config',
+  '/api/scraping-pendientes',
+  '/api/probar-agente',
+  '/api/agent/',          // /api/agent/respond
+  '/api/conversations/',  // /api/conversations/resumen
+  '/api/asesores/'        // crear, activar (reparte leads), cambiar-clave, eliminar
+];
+app.use(async function(req, res, next) {
+  try {
+    const p = req.path || '';
+    const gateada = _PREFIJOS_GATE_SUSCRIPCION.some(function(pre){ return p === pre || p.indexOf(pre) === 0; });
+    if (!gateada) return next();
+    const uid = await verificarUsuario(req);
+    if (!uid) return next(); // sin sesion valida: que el handler haga su propia auth (no rompe internos/sin-token)
+    if (await debeBloquearAcceso(uid)) return res.status(403).json({ error: 'Suscripcion inactiva. Regulariza tu pago para continuar.' });
+    return next();
+  } catch (e) { return next(); } // FAIL-OPEN: ante cualquier error, no cortar el servicio
+});
+
 const PORT = process.env.PORT || 3001;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '' });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');

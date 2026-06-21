@@ -81,7 +81,8 @@ const _PREFIJOS_GATE_SUSCRIPCION = [
   '/api/probar-agente',
   '/api/agent/',          // /api/agent/respond
   '/api/conversations/',  // /api/conversations/resumen
-  '/api/asesores/'        // crear, activar (reparte leads), cambiar-clave, eliminar
+  '/api/asesores/',       // crear, activar (reparte leads), cambiar-clave, eliminar
+  '/api/citas'            // ver/crear/actualizar citas (agenda)
 ];
 app.use(async function(req, res, next) {
   try {
@@ -1516,6 +1517,79 @@ async function actualizarMemoriaViva(user_id, conversation_id) {
   } catch (e) { console.error('actualizarMemoriaViva:', e && e.message); }
 }
 
+// CITAS: al derivar (handoff), detectar si el lead ACORDO una cita concreta (fecha+hora) y agendarla en la tabla
+// `citas` + avisar al asesor (push, sin tokens). Usa Haiku (barato) y SOLO corre en el momento del handoff (raro).
+// No duplica si ya hay una cita futura agendada para esa conversacion. Best-effort: nunca rompe el flujo.
+async function detectarYAgendarCita(user_id, conversation_id) {
+  try {
+    if (!conversation_id) return;
+    const nowISO = new Date().toISOString();
+    const { data: yaHay } = await supabase.from('citas').select('id').eq('conversation_id', conversation_id).eq('estado', 'agendada').gte('fecha_hora', nowISO).limit(1);
+    if (yaHay && yaHay.length > 0) return; // ya hay una cita futura -> no duplicar
+    const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: false }).limit(10);
+    if (!prev || prev.length === 0) return;
+    const chat = prev.slice().reverse().map(function(m){ var t=(m.role==='ai')?(m.content_original||m.content):m.content; return (m.role==='contact'?'Lead':'Asesor')+': '+t; }).join('\n');
+    const sys = 'Detecta si en esta conversacion el LEAD ACORDO una CITA concreta (visita/reunion/llamada) con FECHA y HORA. Hoy es ' + nowISO + ' (zona Argentina -03:00). Devolve SOLO un JSON valido, sin texto extra ni markdown: {"hay_cita": true|false, "fecha_hora": "YYYY-MM-DDTHH:MM:00-03:00" o null, "tipo": "visita|llamada|reunion", "titulo": "frase breve"}. Si NO hay fecha Y hora concretas acordadas, hay_cita=false y fecha_hora=null. NUNCA inventes una fecha.';
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 130, system: sys, messages: [{ role: 'user', content: chat }] });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'detectar_cita', PRECIO_HAIKU); } catch(e){}
+    let txt = ((r && r.content && r.content[0] && r.content[0].text) || '').trim();
+    txt = txt.replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+    let obj = null; try { obj = JSON.parse(txt); } catch(e){ return; }
+    if (!obj || obj.hay_cita !== true || !obj.fecha_hora) return;
+    const fh = new Date(obj.fecha_hora);
+    if (isNaN(fh.getTime()) || fh.getTime() < Date.now()) return; // fecha invalida o pasada
+    const { data: conv } = await supabase.from('conversations').select('asesor_id, contact_id').eq('id', conversation_id).maybeSingle();
+    if (!conv) return;
+    let leadNombre = '', leadTel = '';
+    if (conv.contact_id) { const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle(); if (ct) { leadNombre = ct.name || ''; leadTel = ct.phone || ''; } }
+    const tipo = (['visita','llamada','reunion'].indexOf(obj.tipo) >= 0) ? obj.tipo : 'visita';
+    const titulo = (obj.titulo && String(obj.titulo).trim()) ? String(obj.titulo).trim().slice(0,120) : ((tipo === 'visita' ? 'Visita' : 'Cita') + (leadNombre ? (' con ' + leadNombre) : ''));
+    await supabase.from('citas').insert({ user_id: user_id, conversation_id: conversation_id, contact_id: conv.contact_id || null, asesor_id: conv.asesor_id || null, fecha_hora: fh.toISOString(), tipo: tipo, titulo: titulo, estado: 'agendada', lead_nombre: leadNombre, lead_telefono: leadTel, origen: 'agente' });
+    try {
+      if (conv.asesor_id) {
+        const { data: ase } = await supabase.from('asesores').select('auth_user_id').eq('id', conv.asesor_id).maybeSingle();
+        if (ase && ase.auth_user_id) {
+          let cuando = obj.fecha_hora;
+          try { cuando = fh.toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch(eF){}
+          await enviarPushAsesor(ase.auth_user_id, 'Nueva cita agendada', '', titulo + ' — ' + cuando);
+        }
+      }
+    } catch (ePush) {}
+  } catch (e) { console.error('detectarYAgendarCita:', e && e.message); }
+}
+
+// CRON: recordatorio de cita al LEAD (WhatsApp) + aviso al asesor (push), para citas agendadas en las proximas 24h
+// que aun no se recordaron. NO gasta tokens (solo WhatsApp + push). Marca recordatorio_enviado para no repetir.
+async function enviarRecordatoriosCitas() {
+  try {
+    const ahoraMs = Date.now();
+    const ahoraISO = new Date(ahoraMs).toISOString();
+    const en24hISO = new Date(ahoraMs + 24 * 60 * 60 * 1000).toISOString();
+    const { data: citas } = await supabase.from('citas').select('*').eq('estado', 'agendada').eq('recordatorio_enviado', false).gte('fecha_hora', ahoraISO).lte('fecha_hora', en24hISO);
+    if (!citas || citas.length === 0) return;
+    for (const c of citas) {
+      try {
+        // CLAIM optimista: marcar recordado ANTES de enviar (evita doble envio si dos ejecuciones se solapan
+        // o si el proceso muere a mitad). Update condicional: solo gana si seguia en false; si no, saltar.
+        const claim = await supabase.from('citas').update({ recordatorio_enviado: true }).eq('id', c.id).eq('recordatorio_enviado', false).select('id');
+        if (!claim || !claim.data || claim.data.length === 0) continue;
+        let tel = c.lead_telefono;
+        if (!tel && c.contact_id) { const { data: ct } = await supabase.from('contacts').select('phone').eq('id', c.contact_id).maybeSingle(); if (ct) tel = ct.phone; }
+        const fh = new Date(c.fecha_hora);
+        let cuando = c.fecha_hora;
+        try { cuando = fh.toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch(eF){}
+        if (tel) {
+          const inst = nombreInstancia(c.user_id);
+          const saludo = c.lead_nombre ? (' ' + String(c.lead_nombre).split(' ')[0]) : '';
+          const txt = 'Hola' + saludo + ', te recordamos tu ' + (c.tipo || 'cita') + ' para el ' + cuando + '. Si necesitas reprogramar, avisanos. Te esperamos!';
+          await enviarWhatsapp(inst, tel, txt, null);
+        }
+        if (c.asesor_id) { const { data: ase } = await supabase.from('asesores').select('auth_user_id').eq('id', c.asesor_id).maybeSingle(); if (ase && ase.auth_user_id) await enviarPushAsesor(ase.auth_user_id, 'Recordatorio de cita', '', (c.titulo || 'Cita') + ' — ' + cuando); }
+      } catch (eC) { console.error('recordatorio cita:', eC && eC.message); }
+    }
+  } catch (e) { console.error('enviarRecordatoriosCitas:', e && e.message); }
+}
+
 app.post('/api/webhook/whatsapp', async (req, res) => {
   res.json({ received: true });
   try {
@@ -1908,6 +1982,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     var _res = await generarResumenConversacion(_convId, user_id);
                     if (_res) await supabase.from('conversations').update({ summary: _res, updated_at: new Date().toISOString() }).eq('id', _convId);
                   } catch (eResumen) { console.error('Error resumen auto listo_humano:', eResumen && eResumen.message); }
+                  // CITAS: si el lead acordo una cita concreta (fecha+hora) en este handoff, agendarla + avisar al asesor.
+                  // Fire-and-forget: no bloquea ni rompe la respuesta. Solo corre en el momento del handoff (raro).
+                  detectarYAgendarCita(user_id, _convId).catch(function(){});
                 }
               }
             }
@@ -2337,6 +2414,9 @@ setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)
 setInterval(enviarRecontactosPendientes, 15 * 60 * 1000);
 setTimeout(enviarRecontactosPendientes, 60 * 1000);
+// Recordatorios de citas: revisar cada 30 min (recordatorio al lead + aviso al asesor de citas en las proximas 24h)
+setInterval(enviarRecordatoriosCitas, 30 * 60 * 1000);
+setTimeout(enviarRecordatoriosCitas, 70 * 1000);
 // Backup automatico cada 30 minutos (foto completa de todos los datos por user)
 setInterval(hacerBackup, 30 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
@@ -4559,6 +4639,68 @@ app.get('/api/propiedades', async function(req, res) {
     var q = await supabase.from('properties').select('*').eq('user_id', ownerId).order('numero');
     if (q.error) return res.status(500).json({ error: q.error.message });
     return res.json({ ok: true, propiedades: q.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== CITAS / AGENDA (nativo, sin Google) =====
+// Account-scoped por JWT (service key bypassa RLS): el dueno ve TODAS las citas de su cuenta; el asesor comun
+// solo las suyas; el asesor 'administrador' ve todas. Las crea el agente (al agendar) o se cargan a mano aca.
+app.get('/api/citas', async function(req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = userId, soloAsesorId = null;
+    var ase = await supabase.from('asesores').select('id, admin_id, rol').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (ase.data.rol !== 'administrador') soloAsesorId = ase.data.id; }
+    var q = supabase.from('citas').select('*').eq('user_id', ownerId).order('fecha_hora', { ascending: true });
+    if (soloAsesorId) q = q.eq('asesor_id', soloAsesorId);
+    var r = await q;
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, citas: r.data || [], esDueno: !(ase && ase.data) });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/citas', async function(req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = userId, asesorIdProp = null, esAsesorComun = false;
+    var ase = await supabase.from('asesores').select('id, admin_id, rol').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; asesorIdProp = ase.data.id; esAsesorComun = (ase.data.rol !== 'administrador'); }
+    var b = req.body || {};
+    if (!b.fecha_hora) return res.status(400).json({ error: 'Falta fecha_hora' });
+    var fh = new Date(b.fecha_hora);
+    if (isNaN(fh.getTime())) return res.status(400).json({ error: 'fecha_hora invalida' });
+    // Un asesor comun solo puede crear citas a SU nombre (no asignarlas a otro); dueno/admin pueden elegir.
+    var asesorCita = esAsesorComun ? asesorIdProp : (b.asesor_id || asesorIdProp || null);
+    var fila = { user_id: ownerId, fecha_hora: fh.toISOString(), tipo: (['visita','llamada','reunion'].indexOf(b.tipo) >= 0 ? b.tipo : 'visita'), titulo: (b.titulo ? String(b.titulo).slice(0,160) : 'Cita'), estado: 'agendada', notas: (b.notas ? String(b.notas).slice(0,500) : null), lead_nombre: (b.lead_nombre ? String(b.lead_nombre).slice(0,120) : null), lead_telefono: (b.lead_telefono ? String(b.lead_telefono).slice(0,40) : null), asesor_id: asesorCita, contact_id: b.contact_id || null, conversation_id: b.conversation_id || null, origen: 'manual' };
+    var r = await supabase.from('citas').insert(fila).select('id').single();
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, id: r.data && r.data.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/citas/actualizar', async function(req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = userId, soloAsesorId = null;
+    var ase = await supabase.from('asesores').select('id, admin_id, rol').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (ase.data.rol !== 'administrador') soloAsesorId = ase.data.id; }
+    var b = req.body || {};
+    if (!b.id) return res.status(400).json({ error: 'Falta id' });
+    var verq = supabase.from('citas').select('id').eq('id', b.id).eq('user_id', ownerId);
+    if (soloAsesorId) verq = verq.eq('asesor_id', soloAsesorId);
+    var dueno = await verq.maybeSingle();
+    if (!dueno || !dueno.data) return res.status(404).json({ error: 'Cita no encontrada' });
+    var upd = {};
+    if (b.estado && ['agendada','confirmada','cumplida','cancelada'].indexOf(b.estado) >= 0) upd.estado = b.estado;
+    if (b.fecha_hora) { var fh2 = new Date(b.fecha_hora); if (!isNaN(fh2.getTime())) { upd.fecha_hora = fh2.toISOString(); upd.recordatorio_enviado = false; } }
+    if (typeof b.notas === 'string') upd.notas = b.notas.slice(0,500);
+    if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
+    var updq = supabase.from('citas').update(upd).eq('id', b.id).eq('user_id', ownerId);
+    if (soloAsesorId) updq = updq.eq('asesor_id', soloAsesorId);
+    var r = await updq;
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

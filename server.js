@@ -3549,6 +3549,8 @@ async function scrapeUrlPermitida(user_id, urlPedida) {
 // ===== SCRAPING DE INVENTARIO (webs Houzez/WordPress + Tokko Broker) =====
 app.get('/api/scrape/lista', async function(req, res) {
   try {
+    const user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     let sitio = (req.query.url || '').trim();
     if (!sitio) return res.status(400).json({ error: 'Falta el parametro url' });
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
@@ -3557,7 +3559,6 @@ app.get('/api/scrape/lista', async function(req, res) {
     try { const u = new URL(sitio); base = u.protocol + '//' + u.host; } catch(e){ return res.status(400).json({ error: 'URL invalida' }); }
 
     // restringir al dominio propio del tenant (anti-scrape de competencia / explosion de costo IA)
-    var user_id = (req.query.user_id || (req.body && req.body.user_id) || '').trim();
     const _perm = await scrapeUrlPermitida(user_id, sitio);
     if (!_perm.ok) return res.status(400).json({ error: _perm.error });
 
@@ -3711,7 +3712,8 @@ app.post('/api/scrape/detalle', async function(req, res) {
     if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: 'Falta el array urls' });
     // limite sano: con wp-json el lote viaja en 1 sola llamada, asi que toleramos lotes mas grandes.
     if (urls.length > 60) return res.status(400).json({ error: 'Maximo 60 por lote' });
-    const user_id = (req.body && req.body.user_id ? String(req.body.user_id).trim() : '');
+    const user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
 
     // restringir al dominio propio del tenant: el lote viene de /api/scrape/lista (mismo sitio),
     // asi que validamos el dominio de la primera url del array.

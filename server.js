@@ -784,6 +784,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     'PRIMERO conecta: mostrate humano, calido y con interes genuino. Adapta el trato al lead segun como te escribe.',
     'DETECTA que motiva a este lead a avanzar: puede ser inversion, una mejor calidad de vida, disfrutar en pareja, vision a futuro, un proyecto para la familia, o seguridad. No lo interrogues ni preguntes el dolor de forma directa: descubrilo con preguntas naturales y escuchando lo que dice.',
     'CONECTA la oferta con eso que lo mueve: cuando presentes una opcion, relacionala con su motivacion (ejemplo: si busca invertir, resalta valor y proyeccion; si es para la familia, resalta espacio y comodidad). Siempre con datos reales.',
+    'PENSA COMO EL DUENO DEL NEGOCIO: tu meta no es empujar cualquier cosa, sino que el cliente encuentre la MEJOR opcion para EL. Recomendar lo que de verdad le conviene genera confianza y es lo que mas cierra. Razona que le sirve segun lo que busca, su presupuesto y su situacion, con criterio del negocio.',
+    'CUANDO EL LEAD NO ESTA DECIDIDO (lo mas comun): no lo dejes en el aire ni le tires todo el catalogo. Hace 1 o 2 preguntas clave para entender que necesita (uso, zona, presupuesto, prioridades) y propone la MEJOR o las 2 mejores opciones del inventario que encajan, explicando en criollo POR QUE le sirven a EL. Si dudas entre dos, ofrece ambas y ayudalo a elegir.',
+    'HABLA COMO UNA PERSONA REAL: natural, con calidez y criterio, nunca como un guion o un robot. Aprovecha el contexto del negocio que tengas cargado para sonar como alguien que conoce de verdad lo que vende.',
     'NUNCA inventes datos, precios, caracteristicas ni beneficios. Si no tenes la info, decis que la consultas. Persuadir es conectar lo real con lo que el lead necesita, no exagerar ni presionar.',
     'PROGRESA la charla: en cada respuesta haces avanzar un paso (entender mejor su necesidad, mostrar una opcion que encaje, o proponer el siguiente paso). Evita respuestas que cierren la conversacion.',
     'AVANZA hacia el cierre SOLO hasta el limite que define tu objetivo configurado (ver arriba). Cuando el lead ACEPTA o COORDINA ese paso (por ejemplo acuerda una visita o cita, da fecha/horario, o quiere avanzar una reserva/sena), DERIVA de inmediato: decile de forma natural que lo pasas con un asesor del equipo para confirmarlo/coordinarlo, y NO sigas vos gestionando ese cierre. Nunca te pases del limite de tu objetivo configurado.',
@@ -825,6 +828,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
     instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
+    (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
     'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:', inventario, '',
     'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
@@ -1448,6 +1452,37 @@ async function responderConsultaAdmin(user_id, pregunta) {
   } catch (e) { console.error('responderConsultaAdmin:', e && e.message); return 'No pude generar el reporte en este momento.'; }
 }
 
+// Clasifica un AUDIO del dueno a su propio asistente: ¿esta CONTANDO/describiendo su negocio (para configurar
+// al agente) o PIDIENDO un reporte/consulta de datos? Usa Haiku (barato). DEFAULT 'reporte' ante duda/error
+// (preserva el canal de reportes). Registra el uso en el panel.
+async function clasificarIntencionDueno(user_id, texto) {
+  try {
+    if (!texto) return 'reporte';
+    const sys = 'Clasificas el mensaje del DUENO de un negocio a su propio asistente. Responde UNA sola palabra: ' +
+      '"negocio" si esta CONTANDO o DESCRIBIENDO su negocio/emprendimiento/desarrollo/propiedades/servicios/forma de atender ' +
+      '(informacion para configurar al agente), o "reporte" si esta PIDIENDO datos, metricas, un reporte, o haciendo una ' +
+      'consulta sobre sus leads/asesores/ventas. Ante la duda responde "reporte".';
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 5, system: sys, messages: [{ role: 'user', content: texto }] });
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_intencion_dueno'); } catch(e){}
+    const out = ((r && r.content && r.content[0] && r.content[0].text) || '').toLowerCase();
+    return out.indexOf('negocio') >= 0 ? 'negocio' : 'reporte';
+  } catch (e) { console.error('clasificarIntencionDueno:', e && e.message); return 'reporte'; }
+}
+
+// Guarda (APPEND) la descripcion del negocio que dicta el dueno, en business_settings.negocio_descripcion.
+// Se concatena para no perder lo anterior; el dueno lo ve/edita/limpia en Configuracion -> Sobre tu negocio.
+// Ese texto se inyecta en el system prompt del agente (bloque cacheado) para que atienda con criterio del negocio.
+async function guardarDescripcionNegocio(user_id, texto) {
+  try {
+    if (!user_id || !texto) return false;
+    const { data: bs } = await supabase.from('business_settings').select('negocio_descripcion').eq('user_id', user_id).maybeSingle();
+    const prev = (bs && bs.negocio_descripcion) ? String(bs.negocio_descripcion).trim() : '';
+    const nuevo = prev ? (prev + '\n\n' + String(texto).trim()) : String(texto).trim();
+    await supabase.from('business_settings').upsert({ user_id: user_id, negocio_descripcion: nuevo }, { onConflict: 'user_id' });
+    return true;
+  } catch (e) { console.error('guardarDescripcionNegocio:', e && e.message); return false; }
+}
+
 app.post('/api/webhook/whatsapp', async (req, res) => {
   res.json({ received: true });
   try {
@@ -1502,12 +1537,30 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const soloNumTel = String(telefono).replace(/[^0-9]/g, '');
         // comparar por los ultimos 8 digitos (evita lios de prefijos/0/15)
         const coincide = soloNumRep.length >= 8 && soloNumTel.length >= 8 && soloNumRep.slice(-8) === soloNumTel.slice(-8);
-        if (coincide && texto && !tipoMediaEntrante) {
-          // Pausa total del Maestro o cliente en papelera: NO gastar tokens ni siquiera en el canal de reportes.
+        if (coincide && (!tipoMediaEntrante || tipoMediaEntrante === 'audio')) {
+          // Pausa total del Maestro o cliente en papelera: NO gastar tokens ni siquiera en el canal del dueno.
           if (bsRep && (bsRep.crm_pausado === true || bsRep.eliminado_at)) return;
-          const respuestaAdmin = await responderConsultaAdmin(user_id, texto);
+          let textoAdmin = texto;
+          const _esAudioDueno = (tipoMediaEntrante === 'audio');
+          if (_esAudioDueno) {
+            // Transcribir el audio del dueno (reusa el pipeline Groq de subirMediaAStorage). Sin transcripcion -> avisar y cortar.
+            try { const _msA = await subirMediaAStorage(instanciaNombre, data, 'audio'); if (_msA && _msA.transcripcion) textoAdmin = _msA.transcripcion; } catch (eT) {}
+            if (!textoAdmin || textoAdmin === '[audio]') { await enviarWhatsapp(instanciaNombre, telefono, 'No pude transcribir el audio. Proba de nuevo o escribime el mensaje.'); return; }
+          }
+          if (!textoAdmin) return;
+          // El AUDIO se clasifica: CONTAR el negocio (guardar en config) vs PEDIR un reporte. El TEXTO va directo a
+          // reporte (comportamiento de siempre). Ante duda/error -> reporte.
+          let _intic = 'reporte';
+          if (_esAudioDueno) { try { _intic = await clasificarIntencionDueno(user_id, textoAdmin); } catch (eC) { _intic = 'reporte'; } }
+          if (_intic === 'negocio') {
+            await guardarDescripcionNegocio(user_id, textoAdmin);
+            const _resumen = (textoAdmin.length > 280) ? (textoAdmin.slice(0, 280) + '…') : textoAdmin;
+            await enviarWhatsapp(instanciaNombre, telefono, 'Listo, guarde esto en la configuracion de tu negocio (lo ves y editas en Configuracion -> Sobre tu negocio). El agente lo va a tener en cuenta al atender:\n\n"' + _resumen + '"');
+            return;
+          }
+          const respuestaAdmin = await responderConsultaAdmin(user_id, textoAdmin);
           await enviarWhatsapp(instanciaNombre, telefono, respuestaAdmin);
-          return; // el numero del admin es canal de reportes; no se procesa como lead
+          return; // el numero del dueno es canal de reportes/config; no se procesa como lead
         }
       }
     } catch (e) { /* si falla el reporte, seguir con el flujo normal */ }

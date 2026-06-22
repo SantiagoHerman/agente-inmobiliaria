@@ -2242,14 +2242,15 @@ function dentroHorarioOficina(horario) {
 }
 
 // Plantillas variadas de primer recontacto (anti-baneo: nunca el mismo texto).
-function mensajeRecontacto(nombre, esPrimerContacto, empresa) {
+function mensajeRecontacto(nombre, esPrimerContacto, empresa, agentName) {
   const n = nombre ? (' ' + nombre) : '';
   const emp = empresa ? (' de ' + empresa) : '';
+  const ag = (agentName && String(agentName).trim()) ? String(agentName).trim() : 'tu asesor/a'; // usar el nombre CONFIGURADO del cliente, no "Sofia"
   if (esPrimerContacto) {
     const nuevas = [
-      'Hola' + n + ', como estas? Soy Sofia' + emp + '. Te escribo para ponerme a disposicion por si estas buscando o pensando en algo. En que te puedo ayudar?',
-      'Hola' + n + '! Soy Sofia' + emp + '. Me pongo a disposicion para acompanarte en la busqueda. Contame que es lo que estas necesitando y vemos como te puedo ayudar.',
-      'Hola' + n + ', un gusto! Soy Sofia' + emp + '. Te contacto por si te puedo dar una mano buscando algo que se ajuste a lo que necesitas. Que tenias en mente?'
+      'Hola' + n + ', como estas? Soy ' + ag + emp + '. Te escribo para ponerme a disposicion por si estas buscando o pensando en algo. En que te puedo ayudar?',
+      'Hola' + n + '! Soy ' + ag + emp + '. Me pongo a disposicion para acompanarte en la busqueda. Contame que es lo que estas necesitando y vemos como te puedo ayudar.',
+      'Hola' + n + ', un gusto! Soy ' + ag + emp + '. Te contacto por si te puedo dar una mano buscando algo que se ajuste a lo que necesitas. Que tenias en mente?'
     ];
     return nuevas[Math.floor(Math.random() * nuevas.length)];
   }
@@ -2339,14 +2340,19 @@ async function revisarInactividad() {
 }
 
 // ---- Envio del primer recontacto, solo en horario de oficina, con salvaguardas ----
+var _recontactoEnCurso = false;
 async function enviarRecontactosPendientes() {
+  if (_recontactoEnCurso) return; // evitar que dos corridas se solapen (con el espaciado una tanda puede tardar)
+  _recontactoEnCurso = true;
   try {
     const ahoraMs = Date.now();
     const UN_DIA_MS = 24 * 60 * 60 * 1000;
+    const RECONTACTO_CAP = 20; // tope de envios por tanda (anti-baneo): el resto va en las proximas corridas
+    let enviados = 0;
     // Conversaciones en recontacto
     const { data: enRecontacto } = await supabase
       .from('conversations')
-      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead')
+      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at')
       .eq('status', 'recontacto');
     if (!enRecontacto || enRecontacto.length === 0) return;
     for (const conv of enRecontacto) {
@@ -2366,13 +2372,18 @@ async function enviarRecontactosPendientes() {
         const desdeUltimo = ahoraMs - new Date(ultimoRec.enviado_at).getTime();
         if (desdeUltimo < UN_DIA_MS) continue; // ya se mando uno hoy
       }
-      // Leer config de horario del user (fail-safe: si no hay, no enviar)
+      // Leer config del user (fail-safe: si no hay, no enviar)
       const { data: settings } = await supabase
         .from('business_settings')
-        .select('horario_oficina')
+        .select('horario_oficina, crm_pausado, agente_pausado, eliminado_at')
         .eq('user_id', conv.user_id)
         .maybeSingle();
       if (!settings || !dentroHorarioOficina(settings.horario_oficina)) continue;
+      // PAUSA: si la cuenta esta pausada (total o agente), en papelera, o el sistema en pausa GLOBAL -> NO mandar.
+      // Asi pausar frena TODO (respuestas Y recontactos), durable (la pausa vive en la base, no en memoria).
+      if (_pausaGlobal === true || settings.crm_pausado === true || settings.agente_pausado === true || settings.eliminado_at) continue;
+      // GRACIA 24hs: a un contacto NUEVO (sin recontacto previo) NO contactarlo hasta 24hs despues de creado/importado.
+      if (!ultimoRec && conv.created_at && (ahoraMs - new Date(conv.created_at).getTime()) < UN_DIA_MS) continue;
       // Datos del contacto + instancia conectada
       const { data: contacto } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle();
       if (!contacto || !contacto.phone) continue;
@@ -2384,12 +2395,14 @@ async function enviarRecontactosPendientes() {
       // nombre de la empresa para presentarse
       const { data: bsRec } = await supabase.from('business_settings').select('company_name, agent_name').eq('user_id', conv.user_id).maybeSingle();
       const empresaRec = bsRec && bsRec.company_name ? bsRec.company_name : '';
-      const agentNameRec = (bsRec && bsRec.agent_name) ? bsRec.agent_name : 'Sofia';
+      const agentNameRec = (bsRec && bsRec.agent_name) ? bsRec.agent_name : '';
       // Si el lead YA tuvo conversacion (hay memoria), el recontacto se arma DESDE su memoria (Sonnet, retoma lo
       // que le interesaba sin inventar). Si es primer contacto (lead importado sin charla) o si falla -> plantilla.
       let texto = null;
       if (!esPrimerContacto) { try { texto = await mensajeRecontactoIA(conv.user_id, conv.id, contacto.name, empresaRec, agentNameRec); } catch (eRcIA) {} }
-      if (!texto) texto = mensajeRecontacto(contacto.name, esPrimerContacto, empresaRec);
+      // En el PRIMER contacto (importado, sin charla) NO usamos el nombre importado (suele estar mal: "Agua Y Soda V G",
+      // telefonos, etc.) -> saludo sin nombre. El nombre solo se usa cuando el lead lo dio en el chat.
+      if (!texto) texto = mensajeRecontacto(esPrimerContacto ? '' : contacto.name, esPrimerContacto, empresaRec, agentNameRec);
       if (!texto || !texto.trim()) continue; // defensa: nunca mandar un WhatsApp vacio
       // Si el lead habla otro idioma y el traductor esta activo, traducir el recontacto antes de enviar (igual que el camino reactivo/manual)
       let textoEnviar = texto, idiomaRec = null;
@@ -2404,8 +2417,12 @@ async function enviarRecontactosPendientes() {
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
       console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
+      enviados++;
+      if (enviados >= RECONTACTO_CAP) break; // tope por tanda: el resto sale en las proximas corridas (cada 15 min)
+      await new Promise(function(r){ setTimeout(r, 8000 + Math.floor(Math.random() * 12000)); }); // espaciar 8-20s entre envios (anti-baneo)
     }
   } catch (e) { console.error('Error en enviarRecontactosPendientes:', e && e.message); }
+  finally { _recontactoEnCurso = false; }
 }
 
 // Reintenta automaticamente los mensajes que quedaron 'fallido' (WhatsApp estaba desconectado)
@@ -2472,9 +2489,11 @@ app.post('/api/asesores/crear', async (req, res) => {
     // de la auto-asignacion/rotacion de leads y de las notificaciones push automaticas de la IA.
     const rolFinal = (rol === 'administrador') ? 'administrador' : 'asesor';
     if (rol && rol !== 'asesor' && rol !== 'administrador') return res.status(400).json({ error: 'Rol invalido (debe ser asesor o administrador)' });
-    // Limite de 5 asesores por admin
+    // Limite de usuarios por admin: por defecto 5, salvo override por cliente (limits_override.asesores, seteable desde el Maestro).
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
-    if (existentes && existentes.length >= 5) return res.status(400).json({ error: 'Maximo 5 asesores' });
+    let topeAsesores = 5;
+    try { const { data: subA } = await supabase.from('subscriptions').select('limits_override').eq('user_id', admin_id).maybeSingle(); if (subA && subA.limits_override && typeof subA.limits_override.asesores === 'number' && subA.limits_override.asesores > 0) topeAsesores = subA.limits_override.asesores; } catch (eLim) {}
+    if (existentes && existentes.length >= topeAsesores) return res.status(400).json({ error: 'Maximo ' + topeAsesores + ' usuarios' });
     // El email interno se arma con el usuario (no se usa para login real, pero Auth lo requiere)
     // Obtener el email del admin para derivar el del asesor (emailAdmin + alias)
     const { data: adminData, error: errAdmin } = await supabase.auth.admin.getUserById(admin_id);

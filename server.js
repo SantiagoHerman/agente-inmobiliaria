@@ -2434,6 +2434,9 @@ async function reintentarFallidos() {
       .from('messages')
       .select('id, conversation_id, content, created_at')
       .eq('estado_envio', 'fallido')
+      .eq('role', 'human') // SOLO manuales/humanos (asesor): si WhatsApp estaba caido, se reenvian al reconectar.
+      // Los de la IA (recontacto/respuestas, role 'ai') NO se reintentan aca: causaban tormenta de duplicados
+      // si Evolution marcaba 'fallido' un mensaje que igual entrego. Los recontactos ya tienen su propio cron (1/dia).
       .gte('created_at', desde)
       .order('created_at', { ascending: true })
       .limit(50);

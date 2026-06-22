@@ -1196,35 +1196,57 @@ async function detectarIdioma(texto, user_id) {
   } catch (e) { return 'es'; }
 }
 async function enviarWhatsapp(instancia, numero, texto, messageId) {
-  async function registrar(ok) {
+  async function registrar(estado) { // estado: 'enviado' | 'fallido' | 'indeterminado'
     if (!messageId) return;
-    try { await supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', messageId); } catch (e) { console.error('No se pudo registrar estado_envio:', e && e.message); }
+    try { await supabase.from('messages').update({ estado_envio: estado }).eq('id', messageId); } catch (e) { console.error('No se pudo registrar estado_envio:', e && e.message); }
   }
-  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); await registrar(false); return false; }
+  if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); await registrar('fallido'); return false; }
   const conectada = await instanciaConectada(instancia);
-  if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); await registrar(false); return false; }
+  if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); await registrar('fallido'); return false; }
   // envio con realismo humano: partir en mensajes y simular escritura
   try {
     const partes = partirMensaje(texto);
-    let algunoFallo = false;
+    let huboFalloCliente = false;  // 4xx sin key.id: el mensaje NO se envio (reintentar no sirve)
+    let huboIndeterminado = false; // timeout/5xx/excepcion sin key.id: PUDO entregarse igual (Evolution issue #1613) -> NO reintentar a ciegas
     for (let i = 0; i < partes.length; i++) {
       const parte = partes[i];
       // tiempo de tipeo aleatorio segun largo: ~40-70ms por caracter, con tope y piso
       const base = Math.min(6000, Math.max(1200, parte.length * aleatorio(40, 70)));
       const tipeo = base + aleatorio(0, 800);
-      await mostrarEscribiendo(instancia, numero, tipeo);
-      const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-        body: JSON.stringify({ number: numero, text: parte, delay: tipeo, presence: 'composing' })
-      });
-      if (!resp.ok) { const t = await resp.text(); console.error('Error enviando WhatsApp:', resp.status, t); algunoFallo = true; }
+      try { await mostrarEscribiendo(instancia, numero, tipeo); } catch (eEsc) { /* el indicador "escribiendo" no debe romper el envio */ }
+      try {
+        const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+          body: JSON.stringify({ number: numero, text: parte, delay: tipeo, presence: 'composing' })
+        });
+        // Leer el cuerpo SIEMPRE: Evolution/Baileys devuelve key.id cuando ACEPTO el mensaje, aunque el HTTP no sea 2xx.
+        let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+        let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
+        const aceptado = !!(body && body.key && body.key.id); // senal fiable de aceptacion de Evolution/Baileys
+        // LOG TEMPORAL: ver en vivo la forma de la respuesta (key.id / status) de esta instancia de Evolution.
+        console.log('Evolution sendText:', resp.status, 'aceptado=' + aceptado, 'keyId=' + (body && body.key && body.key.id), 'status=' + (body && body.status), (bodyTxt || '').slice(0, 250));
+        if (resp.ok || aceptado) {
+          // salio, o Evolution lo acepto (key.id presente): NO marcar fallido aunque el HTTP no sea 2xx.
+        } else if (resp.status >= 400 && resp.status < 500) {
+          console.error('Error enviando WhatsApp (cliente):', resp.status, bodyTxt);
+          huboFalloCliente = true;
+        } else {
+          console.error('Envio WhatsApp INDETERMINADO (5xx/sin key.id):', resp.status, bodyTxt);
+          huboIndeterminado = true;
+        }
+      } catch (eFetch) {
+        console.error('Timeout/excepcion enviando WhatsApp (indeterminado):', eFetch && eFetch.message);
+        huboIndeterminado = true; // pudo entregarse igual -> no reintentar a ciegas
+      }
       // pequena pausa entre mensajes (no en el ultimo)
       if (i < partes.length - 1) await esperar(aleatorio(400, 1200));
     }
-    await registrar(!algunoFallo);
-    return !algunoFallo;
-  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar(false); return false; }
+    // Resolucion: si algo quedo indeterminado -> 'indeterminado' (no se reintenta). Si hubo fallo claro de cliente -> 'fallido'. Si no -> 'enviado'.
+    let estadoFinal = huboIndeterminado ? 'indeterminado' : (huboFalloCliente ? 'fallido' : 'enviado');
+    await registrar(estadoFinal);
+    return estadoFinal !== 'fallido'; // 'enviado' e 'indeterminado' cuentan como "no reintentar"
+  } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar('indeterminado'); return true; }
 }
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });

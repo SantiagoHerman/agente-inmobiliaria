@@ -2151,6 +2151,32 @@ async function configurarWebhookInstancia(instancia) {
   } catch (e) { console.error('Error configurando webhook:', e && e.message); }
 }
 
+// NIVEL 2: re-configura el webhook de TODAS las instancias ya existentes para que incluyan MESSAGES_UPDATE (acks de entrega).
+// Es ADITIVO e IDEMPOTENTE: reusa configurarWebhookInstancia (misma url + MESSAGES_UPSERT), solo agrega el evento de entrega.
+// /webhook/set NO corta la sesion de WhatsApp (no requiere re-escanear QR). Corre una vez al arrancar -> auto-reparacion.
+async function resetearWebhooksNivel2() {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return;
+    let lista = [];
+    try {
+      const r = await fetch(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY } });
+      const j = await r.json();
+      lista = Array.isArray(j) ? j : ((j && Array.isArray(j.instances)) ? j.instances : []);
+    } catch (eF) { console.error('resetearWebhooksNivel2 fetchInstances:', eF && eF.message); return; }
+    let ok = 0, tot = 0;
+    for (const it of lista) {
+      // distintas versiones de Evolution exponen el nombre distinto
+      const nombre = (it && (it.name || it.instanceName || (it.instance && (it.instance.instanceName || it.instance.name)))) || null;
+      if (!nombre || String(nombre).indexOf('cliente_') !== 0) continue;
+      tot++;
+      try { await configurarWebhookInstancia(nombre); ok++; } catch (eC) {}
+      await new Promise(function(res){ setTimeout(res, 400); }); // espaciar para no saturar Evolution
+    }
+    console.log('Webhooks nivel 2 reconfigurados:', ok + '/' + tot, 'instancias cliente_');
+  } catch (e) { console.error('resetearWebhooksNivel2:', e && e.message); }
+}
+setTimeout(resetearWebhooksNivel2, 120 * 1000); // ~2 min despues de arrancar (cuando ya esta estable)
+
 // POST /api/whatsapp/conectar -> crea (o reusa) la instancia del user y devuelve el QR
 app.post('/api/whatsapp/conectar', async (req, res) => {
   try {

@@ -1196,9 +1196,11 @@ async function detectarIdioma(texto, user_id) {
   } catch (e) { return 'es'; }
 }
 async function enviarWhatsapp(instancia, numero, texto, messageId) {
-  async function registrar(estado) { // estado: 'enviado' | 'fallido' | 'indeterminado'
+  async function registrar(estado, waId) { // estado: 'enviado'|'fallido'|'indeterminado'; waId: key.id de WhatsApp (para confirmar entrega via ack)
     if (!messageId) return;
-    try { await supabase.from('messages').update({ estado_envio: estado }).eq('id', messageId); } catch (e) { console.error('No se pudo registrar estado_envio:', e && e.message); }
+    const upd = { estado_envio: estado };
+    if (waId) upd.wa_message_id = waId; // guardar el id de WhatsApp -> permite confirmar la entrega con el webhook messages.update (nivel 2)
+    try { await supabase.from('messages').update(upd).eq('id', messageId); } catch (e) { console.error('No se pudo registrar estado_envio:', e && e.message); }
   }
   if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('Faltan EVOLUTION_URL o EVOLUTION_KEY'); await registrar('fallido'); return false; }
   const conectada = await instanciaConectada(instancia);
@@ -1208,6 +1210,7 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
     const partes = partirMensaje(texto);
     let huboFalloCliente = false;  // 4xx sin key.id: el mensaje NO se envio (reintentar no sirve)
     let huboIndeterminado = false; // timeout/5xx/excepcion sin key.id: PUDO entregarse igual (Evolution issue #1613) -> NO reintentar a ciegas
+    let primerKeyId = null;        // primer key.id que devuelva Evolution -> se guarda para confirmar entrega despues (nivel 2)
     for (let i = 0; i < partes.length; i++) {
       const parte = partes[i];
       // tiempo de tipeo aleatorio segun largo: ~40-70ms por caracter, con tope y piso
@@ -1224,6 +1227,7 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
         let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
         let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
         const aceptado = !!(body && body.key && body.key.id); // senal fiable de aceptacion de Evolution/Baileys
+        if (aceptado && !primerKeyId) primerKeyId = body.key.id;
         // LOG TEMPORAL: ver en vivo la forma de la respuesta (key.id / status) de esta instancia de Evolution.
         console.log('Evolution sendText:', resp.status, 'aceptado=' + aceptado, 'keyId=' + (body && body.key && body.key.id), 'status=' + (body && body.status), (bodyTxt || '').slice(0, 250));
         if (resp.ok || aceptado) {
@@ -1244,7 +1248,7 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
     }
     // Resolucion: si algo quedo indeterminado -> 'indeterminado' (no se reintenta). Si hubo fallo claro de cliente -> 'fallido'. Si no -> 'enviado'.
     let estadoFinal = huboIndeterminado ? 'indeterminado' : (huboFalloCliente ? 'fallido' : 'enviado');
-    await registrar(estadoFinal);
+    await registrar(estadoFinal, primerKeyId);
     return estadoFinal !== 'fallido'; // 'enviado' e 'indeterminado' cuentan como "no reintentar"
   } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar('indeterminado'); return true; }
 }
@@ -1618,6 +1622,20 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
   try {
     const body = req.body || {};
     const evento = body.event || '';
+    // NIVEL 2 - confirmacion de ENTREGA de un mensaje SALIENTE (ack de WhatsApp). Es ADITIVO: solo SUBE estado_envio a
+    // 'enviado' cuando WhatsApp confirma; si no hay match por wa_message_id es un no-op. No afecta la recepcion de entrantes.
+    if (evento === 'messages.update') {
+      try {
+        const d = body.data || {};
+        const keyId = d.keyId || (d.key && d.key.id) || null;
+        const est = (d.status != null) ? d.status : (d.update && d.update.status); // 'SERVER_ACK'|'DELIVERY_ACK'|'READ'|'PLAYED' o numero 2..5
+        const entregado = ['SERVER_ACK', 'DELIVERY_ACK', 'READ', 'PLAYED'].indexOf(String(est)) >= 0 || (typeof est === 'number' && est >= 2);
+        if (keyId && entregado) {
+          await supabase.from('messages').update({ estado_envio: 'enviado' }).eq('wa_message_id', keyId).neq('estado_envio', 'enviado');
+        }
+      } catch (eAck) { console.error('ack messages.update:', eAck && eAck.message); }
+      return;
+    }
     if (evento !== 'messages.upsert') return;
 
     const data = body.data || {};
@@ -2126,7 +2144,7 @@ async function configurarWebhookInstancia(instancia) {
         webhook: {
           enabled: true,
           url: BACKEND_PUBLIC_URL + '/api/webhook/whatsapp',
-          events: ['MESSAGES_UPSERT']
+          events: ['MESSAGES_UPSERT', 'MESSAGES_UPDATE'] // UPSERT = mensajes entrantes; UPDATE = confirmacion de entrega/ack (nivel 2)
         }
       })
     });

@@ -81,8 +81,9 @@ const _PREFIJOS_GATE_SUSCRIPCION = [
   '/api/probar-agente',
   '/api/agent/',          // /api/agent/respond
   '/api/conversations/',  // /api/conversations/resumen
-  '/api/asesores/',       // crear, activar (reparte leads), cambiar-clave, eliminar
   '/api/citas'            // ver/crear/actualizar citas (agenda)
+  // NOTA: /api/asesores/ NO se gatea: gestionar el equipo (crear/activar usuarios) es CONFIGURACION, no consumo de
+  // IA; bloquearlo rompia el onboarding de una cuenta nueva y el setup del dueno impersonando un cliente sin pagar.
 ];
 app.use(async function(req, res, next) {
   try {

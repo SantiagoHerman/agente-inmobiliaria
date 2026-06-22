@@ -5006,6 +5006,8 @@ app.get('/api/suscripcion', async function(req, res) {
     var esCortesia = !!(sub && sub.cortesia === true);
     if (esCortesia) topeEfectivo = null;
     lim = Object.assign({}, lim, { ai_messages: topeEfectivo });
+    // Tope de asesores EFECTIVO: si hay override por cliente (Maestro), ese manda (misma logica que /api/asesores/crear).
+    if (sub && sub.limits_override && typeof sub.limits_override.asesores === 'number' && sub.limits_override.asesores > 0) lim = Object.assign({}, lim, { asesores: sub.limits_override.asesores });
     var usado = await usoMensajesIA(user_id);
     // Senal AUTORITATIVA para el frontend: congelar el acceso si el tenant debe pagar y no lo hizo.
     // Misma logica EXACTA con la que el agente corta el servicio (debeBloquearAcceso). FAIL-OPEN.

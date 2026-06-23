@@ -556,12 +556,32 @@ async function hacerBackup() {
   } catch (e) { console.error('Error en hacerBackup:', e && e.message); }
 }
 
+// PARTE A (punto 10 - migracion rol-administrador, DEFENSIVA): "administrador" deja de ser un valor de
+// `rol` y pasa a ser una CAPACIDAD derivada de la visibilidad. Un usuario es administrador (ve-todo) si su
+// visibilidad incluye 'generales'. COMPAT: las filas viejas que todavia tengan rol='administrador' se siguen
+// respetando. `rol` queda como columna legacy de solo-lectura. Centralizado en este helper para un solo criterio.
+function esAdministrador(ase) {
+  if (!ase) return false;
+  if (ase.rol === 'administrador') return true; // compat datos viejos
+  return Array.isArray(ase.visibilidad) && ase.visibilidad.indexOf('generales') >= 0;
+}
+
 // Elige el asesor ACTIVO con menos leads asignados (reparto equitativo). Devuelve su id o null.
 // Los usuarios con rol 'administrador' quedan EXCLUIDOS de la auto-asignacion/rotacion
 // (un admin no recibe leads automaticamente). El filtro deja pasar rol='asesor' y rol NULL (legacy).
+// PARTE A (punto 10): con reparto_v2 ON, "administrador/empleado" se mapean ahora por disponibilidad='no_recibe',
+// asi que ADITIVAMENTE tambien se excluye a quien tenga disponibilidad='no_recibe'. Con flag OFF, el filtro
+// queda EXACTAMENTE como antes (solo excluye rol='administrador') para no cambiar el comportamiento actual.
 async function elegirAsesorActivo(admin_id) {
   try {
-    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+    let q = supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+    let v2 = false;
+    try { v2 = await repartoV2Activo(admin_id, null); } catch (eV2) { v2 = false; }
+    let { data: activos } = await q;
+    if (v2 && Array.isArray(activos)) {
+      // ADITIVO solo con flag ON: descartar a los que no reciben (disponibilidad='no_recibe').
+      activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe'; });
+    }
     if (!activos || activos.length === 0) return null;
     // contar leads asignados a cada asesor activo
     let mejor = null; let menos = Infinity;
@@ -601,7 +621,10 @@ async function repartoV2Activo(user_id, bs) {
 //   (b) asesores.activo = true,
 //   (c) reciben: disponibilidad = 'conectado' (o null/ausente = legacy nunca configurado -> recibe;
 //       se EXCLUYE solo 'pausa' y 'no_recibe'),
-//   (d) rol = 'asesor' (se EXCLUYE rol 'empleado', rol null y rol 'administrador' - D4=B),
+//   (d) PARTE A (punto 8): el filtro por rol='asesor' YA NO va (Diego: "el rol no va mas"). El criterio
+//       de elegibilidad ahora es: membresia con modo='recibe' (o null/legacy=recibe; se EXCLUYE 'visualiza')
+//       + asesores.activo + disponibilidad que recibe + dentro de horario. Humano vs IA se decide por
+//       es_ia (preferencia humano, IA cubre fuera de horario). NO se filtra por rol.
 //   (e) menor carga = count de conversations con status='listo_humano' asignadas (D1=B).
 // modo_reparto: 'equitativo' (default) => el de menor carga; 'responsable_fijo' => el responsable del
 //   depto si esta disponible, con fallback al equitativo si no lo esta. El responsable se lee de una
@@ -611,11 +634,24 @@ async function repartoV2Activo(user_id, bs) {
 async function elegirAsesorParaDepartamento(user_id, departamentoId) {
   try {
     if (!user_id || !departamentoId) return null;
-    // 1) Miembros del departamento.
-    const { data: membres } = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId);
-    const idsMiembros = (membres || []).map(function(m){ return m.asesor_id; });
+    // 1) Miembros del departamento. PARTE A (punto 8): ademas del asesor_id traemos `modo` para quedarnos
+    //    SOLO con los que RECIBEN reparto (modo='recibe' o null/legacy=recibe; se EXCLUYE 'visualiza').
+    //    DEFENSIVO: si la columna `modo` no existe todavia, reintentamos sin ella (todos = legacy recibe).
+    let membres = null;
+    try {
+      const rm = await supabase.from('usuario_departamento').select('asesor_id, modo').eq('departamento_id', departamentoId);
+      if (rm.error) throw rm.error;
+      membres = rm.data;
+    } catch (eModo) {
+      const rm2 = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId);
+      membres = (rm2.data || []).map(function(m){ return { asesor_id: m.asesor_id, modo: null }; });
+    }
+    const idsMiembros = (membres || [])
+      .filter(function(m){ return m.modo == null || m.modo === 'recibe'; }) // excluir 'visualiza'
+      .map(function(m){ return m.asesor_id; });
     if (!idsMiembros.length) return null;
-    // 2) Filtrar a asesores de ESTA cuenta, activos, rol='asesor' (excluye empleado/null/admin), que reciben.
+    // 2) Filtrar a asesores de ESTA cuenta, activos, que reciben. PARTE A (punto 8): SIN filtro por rol
+    //    (el rol ya no decide elegibilidad). Humano/IA se distingue por es_ia (preferencia humano mas abajo).
     // ETAPA 9a: ademas traemos horario_modo/horario_json (DEFENSIVO: si las columnas no existen, reintentamos sin ellas).
     // ETAPA 9b: ademas traemos es_ia (DEFENSIVO: si la columna no existe, reintentamos sin ella).
     let ases = null;
@@ -624,17 +660,15 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId) {
         .select('id, disponibilidad, horario_modo, horario_json, es_ia')
         .eq('admin_id', user_id)
         .eq('activo', true)
-        .or('rol.eq.asesor,es_ia.eq.true') // D4=B + Usuario IA: elegible si rol='asesor' O es_ia=true (excluye 'empleado'/'administrador'/null que no sean IA)
         .in('id', idsMiembros);
       if (r.error) throw r.error;
       ases = r.data;
     } catch (eHor) {
-      // columnas horario_*/es_ia ausentes u otro error: reintentar con el set minimo (comportamiento previo a 9a/9b)
+      // columnas horario_*/es_ia ausentes u otro error: reintentar con el set minimo (sin esas columnas, SIN filtro de rol)
       const r2 = await supabase.from('asesores')
         .select('id, disponibilidad')
         .eq('admin_id', user_id)
         .eq('activo', true)
-        .eq('rol', 'asesor')
         .in('id', idsMiembros);
       ases = r2.data;
     }
@@ -3155,33 +3189,68 @@ function _camposUsuarioNuevos(b) {
   if (['oficina', 'personalizado'].indexOf(b.horario_modo) >= 0) out.horario_modo = b.horario_modo;
   if (b.horario_json && typeof b.horario_json === 'object') out.horario_json = b.horario_json;
   if (typeof b.es_ia === 'boolean') out.es_ia = b.es_ia;
+  // PARTE A (punto 9): config del agente IA (jsonb). Acepta objeto (config) o null (limpiar al pasar a Humano).
+  if (b.agente_config && typeof b.agente_config === 'object') out.agente_config = b.agente_config;
+  else if (b.agente_config === null) out.agente_config = null;
   return out;
 }
 // Reemplaza la membresia de departamentos de un usuario (valida que los deptos sean de la cuenta).
+// PARTE A (punto 9): `departamentos` acepta DOS formatos:
+//   (a) legacy: array de IDs (string[])  -> modo='recibe' por defecto.
+//   (b) nuevo:  array de objetos { departamento_id|id, modo:'recibe'|'visualiza' }.
+// Normaliza cada entrada a {id, modo}, valida el id contra los deptos de la cuenta e inserta con `modo`.
+// DEFENSIVO: si la columna `modo` no existe, reintenta el insert sin ella (compat con base vieja).
 async function _setDepartamentosUsuario(asesorId, adminId, departamentos) {
   if (!Array.isArray(departamentos)) return;
-  let ids = [];
-  if (departamentos.length) {
-    const { data: validos } = await supabase.from('departamentos').select('id').eq('user_id', adminId).in('id', departamentos);
-    ids = (validos || []).map(function(d){ return d.id; });
+  // Normalizar entradas a { id, modo }.
+  const pedidos = [];
+  departamentos.forEach(function(d){
+    let id = null, modo = 'recibe';
+    if (d && typeof d === 'object') {
+      id = d.departamento_id || d.id || null;
+      if (d.modo === 'visualiza' || d.modo === 'recibe') modo = d.modo;
+    } else {
+      id = d; // legacy: string id
+    }
+    if (id) pedidos.push({ id: id, modo: modo });
+  });
+  let filas = [];
+  if (pedidos.length) {
+    const idsPedidos = pedidos.map(function(p){ return p.id; });
+    const { data: validos } = await supabase.from('departamentos').select('id').eq('user_id', adminId).in('id', idsPedidos);
+    const idsValidos = (validos || []).map(function(d){ return d.id; });
+    filas = pedidos
+      .filter(function(p){ return idsValidos.indexOf(p.id) >= 0; })
+      .map(function(p){ return { asesor_id: asesorId, departamento_id: p.id, modo: p.modo }; });
   }
   await supabase.from('usuario_departamento').delete().eq('asesor_id', asesorId);
-  if (ids.length) await supabase.from('usuario_departamento').insert(ids.map(function(did){ return { asesor_id: asesorId, departamento_id: did }; }));
+  if (filas.length) {
+    const { error } = await supabase.from('usuario_departamento').insert(filas);
+    if (error) {
+      // DEFENSIVO: columna `modo` ausente u otro error -> reintentar sin `modo`.
+      const filasSinModo = filas.map(function(f){ return { asesor_id: f.asesor_id, departamento_id: f.departamento_id }; });
+      await supabase.from('usuario_departamento').insert(filasSinModo);
+    }
+  }
 }
 
 app.post('/api/asesores/crear', async (req, res) => {
   try {
     const { admin_id, nombre, usuario, clave, cargo, rol } = req.body || {};
     const _nuevos = _camposUsuarioNuevos(req.body);
+    const esIa = req.body && req.body.es_ia === true;
     // SEGURIDAD: validar identidad por token
     const _uidToken = await verificarUsuario(req);
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
-    if (!admin_id || !nombre || !usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
-    // Rol del usuario: 'asesor' (default) o 'administrador'. Los administradores quedan excluidos
-    // de la auto-asignacion/rotacion de leads y de las notificaciones push automaticas de la IA.
-    const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : 'asesor');
+    // PARTE A (punto 9): la CLAVE es OPCIONAL si es un usuario IA (no necesita acceso/login). Para humanos sigue siendo obligatoria.
+    if (!admin_id || !nombre || !usuario) return res.status(400).json({ error: 'Faltan datos' });
+    if (!esIa && !clave) return res.status(400).json({ error: 'Faltan datos' });
+    // PARTE A (punto 10 - migracion rol-administrador, defensivo): el front YA NO envia `rol`. Si llega
+    // (retrocompat) se respeta y valida; si NO llega, `rol` queda en null y la "capacidad administrador"
+    // se deriva de la visibilidad ('generales' = ver-todo). El rol queda como columna legacy de solo-lectura.
     if (rol && rol !== 'asesor' && rol !== 'administrador' && rol !== 'empleado') return res.status(400).json({ error: 'Rol invalido (debe ser asesor, administrador o empleado)' });
+    const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : (rol === 'asesor' ? 'asesor' : null));
     // Limite de usuarios por admin: por defecto 5, salvo override por cliente (limits_override.asesores, seteable desde el Maestro).
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
     let topeAsesores = 5;
@@ -3195,10 +3264,15 @@ app.post('/api/asesores/crear', async (req, res) => {
     const aliasLimpio = usuario.toLowerCase().replace(/[^a-z0-9]/g, '');
     const partes = adminEmail.split('@');
     const email = partes[0] + '+' + aliasLimpio + '@' + partes[1];
-    const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: rolFinal, admin_id: admin_id, nombre: nombre } });
-    if (errAuth) return res.status(400).json({ error: errAuth.message });
-    const authId = created && created.user ? created.user.id : null;
-    const { data: nuevoAse, error: errIns } = await supabase.from('asesores').insert(Object.assign({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : 'Asesor', rol: rolFinal, estado: 'activo', activo: true }, _nuevos)).select('id').single();
+    // PARTE A (punto 9): un usuario IA sin clave NO necesita usuario de Auth (no inicia sesion). Solo se
+    // crea el Auth user si hay clave (humanos siempre; IA solo si el dueno le dio una clave opcional).
+    let authId = null;
+    if (clave) {
+      const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: rolFinal, admin_id: admin_id, nombre: nombre } });
+      if (errAuth) return res.status(400).json({ error: errAuth.message });
+      authId = created && created.user ? created.user.id : null;
+    }
+    const { data: nuevoAse, error: errIns } = await supabase.from('asesores').insert(Object.assign({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : (esIa ? 'Agente IA' : 'Asesor'), rol: rolFinal, estado: 'activo', activo: true }, _nuevos)).select('id').single();
     if (errIns) { if (authId) { try { await supabase.auth.admin.deleteUser(authId); } catch (e) {} } return res.status(400).json({ error: errIns.message }); }
     try { if (nuevoAse && nuevoAse.id) await _setDepartamentosUsuario(nuevoAse.id, admin_id, req.body.departamentos); } catch (eDep) { console.error('membresia depto al crear:', eDep && eDep.message); }
     return res.json({ ok: true, email: email, id: nuevoAse && nuevoAse.id });
@@ -3233,10 +3307,21 @@ app.get('/api/asesores/membresias', async (req, res) => {
     if (ase && ase.admin_id) ownerId = ase.admin_id;
     const { data: ases } = await supabase.from('asesores').select('id').eq('admin_id', ownerId);
     const idsAse = (ases || []).map(function(a){ return a.id; });
+    // PARTE A (punto 9): devolver tambien el `modo` por depto para precargar el sub-segmented Recibe/Visualiza.
+    // Formato nuevo: { asesor_id: [{departamento_id, modo}] }. El front acepta tambien el legacy (string[]).
+    // DEFENSIVO: si la columna `modo` no existe todavia, reintentar sin ella (modo=null -> el front asume 'recibe').
     const mapa = {};
     if (idsAse.length) {
-      const { data: rows } = await supabase.from('usuario_departamento').select('asesor_id, departamento_id').in('asesor_id', idsAse);
-      (rows || []).forEach(function(r){ if (!mapa[r.asesor_id]) mapa[r.asesor_id] = []; mapa[r.asesor_id].push(r.departamento_id); });
+      let rows = null;
+      try {
+        const rr = await supabase.from('usuario_departamento').select('asesor_id, departamento_id, modo').in('asesor_id', idsAse);
+        if (rr.error) throw rr.error;
+        rows = rr.data;
+      } catch (eModo) {
+        const rr2 = await supabase.from('usuario_departamento').select('asesor_id, departamento_id').in('asesor_id', idsAse);
+        rows = (rr2.data || []).map(function(r){ return { asesor_id: r.asesor_id, departamento_id: r.departamento_id, modo: null }; });
+      }
+      (rows || []).forEach(function(r){ if (!mapa[r.asesor_id]) mapa[r.asesor_id] = []; mapa[r.asesor_id].push({ departamento_id: r.departamento_id, modo: r.modo || 'recibe' }); });
     }
     return res.json({ ok: true, membresias: mapa });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
@@ -3253,7 +3338,16 @@ app.post('/api/asesores/activar', async (req, res) => {
     // 1. Poner el asesor activo
     await supabase.from('asesores').update({ activo: true, estado: 'activo' }).eq('id', asesor_id);
     // 2. Buscar asesores activos de la inmobiliaria (excluyendo administradores: no reciben leads)
-    const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+    // PARTE A (punto 10): con reparto_v2 ON, ademas se excluye a los que tienen disponibilidad='no_recibe'
+    // (que es como se mapean ahora Administrador/Empleado). Con flag OFF, queda igual que antes.
+    let activos = null;
+    {
+      const { data: act0 } = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+      activos = act0;
+      let v2act = false;
+      try { v2act = await repartoV2Activo(admin_id, null); } catch (eV2a) { v2act = false; }
+      if (v2act && Array.isArray(activos)) activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe'; });
+    }
     if (!activos || activos.length === 0) return res.json({ ok: true, asignados: 0 });
     // 3. Buscar leads EN COLA: listos para humano, sin asignar y no tomados por el admin.
     //    Filtramos por status='listo_humano' para NO repartir conversaciones que aun maneja la IA.
@@ -3329,12 +3423,10 @@ app.post('/api/asesores/eliminar', async (req, res) => {
 // Las tablas tienen RLS service-key-only, por eso el frontend SIEMPRE pasa por estos endpoints.
 const PLANTILLAS_DEPTOS = {
   inmobiliaria: [
-    { nombre: 'Recepción', criterio: 'Saludos y consultas generales que todavia no tienen un area clara.', def: true },
-    { nombre: 'Ventas', criterio: 'Comprar una propiedad, ver propiedades en venta, precios de venta.' },
-    { nombre: 'Alquileres', criterio: 'Alquilar (anual o temporal), requisitos, garantias, precios de alquiler, permuta.' },
-    { nombre: 'Tasaciones', criterio: 'Cuanto vale mi propiedad, tasar o cotizar para vender o alquilar.' },
-    { nombre: 'Administración', criterio: 'Pagos, recibos, contratos, expensas, cobranzas.', fallback: true },
-    { nombre: 'Gerencia', criterio: 'Reclamos serios, quejas o decisiones que requieren al responsable.' }
+    { nombre: 'Venta', criterio: 'Comprar una propiedad, ver propiedades en venta, precios de venta.', def: true, sistema: true },
+    { nombre: 'Alquiler', criterio: 'Alquilar (anual o temporal), requisitos, garantias, precios de alquiler, permuta.', sistema: true },
+    { nombre: 'Administración', criterio: 'Pagos, recibos, contratos, expensas, cobranzas.', fallback: true, sistema: true },
+    { nombre: 'Gerencia', criterio: 'Reclamos serios, quejas o decisiones que requieren al responsable.', sistema: true }
   ],
   hoteleria: [
     { nombre: 'Reservas', criterio: 'Disponibilidad, precios, reservar una estadia.', def: true },
@@ -3423,6 +3515,17 @@ app.post('/api/departamentos/eliminar', async function(req, res) {
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!b.admin_id || !b.departamento_id) return res.status(400).json({ error: 'Faltan datos' });
+    // GUARDA (a): no borrar un depto con usuarios asociados (hay que reasignarlos primero).
+    try {
+      const { count } = await supabase.from('usuario_departamento').select('asesor_id', { count: 'exact', head: true }).eq('departamento_id', b.departamento_id);
+      if ((count || 0) > 0) return res.status(400).json({ error: 'Hay usuarios asociados, reasignalos primero' });
+    } catch (eMemb) { /* DEFENSIVO: si la consulta falla, no bloquear el borrado por este motivo */ }
+    // GUARDA (b): no borrar un departamento del sistema (es_sistema=true).
+    // DEFENSIVO: si la columna es_sistema no existe, el select da error -> tratar como NO-sistema (no bloquear).
+    try {
+      const { data: depRow, error: eSist } = await supabase.from('departamentos').select('es_sistema').eq('id', b.departamento_id).eq('user_id', b.admin_id).maybeSingle();
+      if (!eSist && depRow && depRow.es_sistema === true) return res.status(400).json({ error: 'Departamento del sistema, no se puede eliminar' });
+    } catch (eSis) { /* columna ausente u otro error: tratar como no-sistema */ }
     // SOFT delete: desactivar (no rompe conversaciones/membresias que apunten al depto). El front muestra solo activos.
     const { error } = await supabase.from('departamentos').update({ activo: false }).eq('id', b.departamento_id).eq('user_id', b.admin_id);
     if (error) return res.status(500).json({ error: error.message });
@@ -3441,9 +3544,15 @@ app.post('/api/departamentos/seed-rubro', async function(req, res) {
     const { data: existentes } = await supabase.from('departamentos').select('id').eq('user_id', b.admin_id).eq('activo', true).limit(1);
     if (existentes && existentes.length > 0) return res.status(400).json({ error: 'La cuenta ya tiene departamentos cargados' }); // solo cuenta ACTIVOS -> permite re-sembrar si se borraron todos
     const plantilla = PLANTILLAS_DEPTOS[b.rubro] || PLANTILLAS_DEPTOS['inmobiliaria'];
-    const filas = plantilla.map(function(d){ return { user_id: b.admin_id, nombre: d.nombre, criterio_derivacion: d.criterio, modo_reparto: d.modo || 'equitativo', recibe_fallback: !!d.fallback, es_default: !!d.def }; });
-    const { error } = await supabase.from('departamentos').insert(filas);
-    if (error) return res.status(500).json({ error: error.message });
+    const filas = plantilla.map(function(d){ return { user_id: b.admin_id, nombre: d.nombre, criterio_derivacion: d.criterio, modo_reparto: d.modo || 'equitativo', recibe_fallback: !!d.fallback, es_default: !!d.def, es_sistema: !!d.sistema }; });
+    // DEFENSIVO: la columna es_sistema puede no existir todavia. Si el insert falla por eso,
+    // reintentar sin esa columna (no rompe el sembrado de la plantilla).
+    let { error } = await supabase.from('departamentos').insert(filas);
+    if (error) {
+      const filasSinSistema = filas.map(function(f){ const c = Object.assign({}, f); delete c.es_sistema; return c; });
+      const r2 = await supabase.from('departamentos').insert(filasSinSistema);
+      if (r2.error) return res.status(500).json({ error: r2.error.message });
+    }
     return res.json({ ok: true, creados: filas.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -5569,8 +5678,8 @@ app.get('/api/citas', async function(req, res) {
     var userId = await verificarUsuario(req);
     if (!userId) return res.status(401).json({ error: 'No autorizado' });
     var ownerId = userId, soloAsesorId = null;
-    var ase = await supabase.from('asesores').select('id, admin_id, rol').eq('auth_user_id', userId).maybeSingle();
-    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (ase.data.rol !== 'administrador') soloAsesorId = ase.data.id; }
+    var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (!esAdministrador(ase.data)) soloAsesorId = ase.data.id; }
     var q = supabase.from('citas').select('*').eq('user_id', ownerId).order('fecha_hora', { ascending: true });
     if (soloAsesorId) q = q.eq('asesor_id', soloAsesorId);
     var r = await q;
@@ -5583,8 +5692,8 @@ app.post('/api/citas', async function(req, res) {
     var userId = await verificarUsuario(req);
     if (!userId) return res.status(401).json({ error: 'No autorizado' });
     var ownerId = userId, asesorIdProp = null, esAsesorComun = false;
-    var ase = await supabase.from('asesores').select('id, admin_id, rol').eq('auth_user_id', userId).maybeSingle();
-    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; asesorIdProp = ase.data.id; esAsesorComun = (ase.data.rol !== 'administrador'); }
+    var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; asesorIdProp = ase.data.id; esAsesorComun = !esAdministrador(ase.data); }
     var b = req.body || {};
     if (!b.fecha_hora) return res.status(400).json({ error: 'Falta fecha_hora' });
     var fh = new Date(b.fecha_hora);
@@ -5602,8 +5711,8 @@ app.post('/api/citas/actualizar', async function(req, res) {
     var userId = await verificarUsuario(req);
     if (!userId) return res.status(401).json({ error: 'No autorizado' });
     var ownerId = userId, soloAsesorId = null;
-    var ase = await supabase.from('asesores').select('id, admin_id, rol').eq('auth_user_id', userId).maybeSingle();
-    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (ase.data.rol !== 'administrador') soloAsesorId = ase.data.id; }
+    var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (!esAdministrador(ase.data)) soloAsesorId = ase.data.id; }
     var b = req.body || {};
     if (!b.id) return res.status(400).json({ error: 'Falta id' });
     var verq = supabase.from('citas').select('id').eq('id', b.id).eq('user_id', ownerId);

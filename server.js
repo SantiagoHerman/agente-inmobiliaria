@@ -3783,21 +3783,29 @@ const PLANTILLAS_DEPTOS = {
     { nombre: 'Administración', criterio: 'Pagos, recibos, contratos, expensas, cobranzas.', fallback: true, sistema: true },
     { nombre: 'Gerencia', criterio: 'Reclamos serios, quejas o decisiones que requieren al responsable.', sistema: true }
   ],
-  hoteleria: [
-    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, reservar una estadia.', def: true },
-    { nombre: 'Recepción', criterio: 'Check-in, llegada, traslados, consultas del huesped alojado.' },
-    { nombre: 'Eventos', criterio: 'Casamientos, grupos, eventos, salones.' },
-    { nombre: 'Mantenimiento', criterio: 'Problemas en la habitacion, fallas, limpieza.' },
-    { nombre: 'Administración', criterio: 'Facturas, pagos, cobranzas.', fallback: true },
-    { nombre: 'Gerencia', criterio: 'Quejas serias o huespedes VIP.' }
+  hotel: [
+    { nombre: 'Recepción', criterio: 'Consultas generales, llegada, check-in, información del alojamiento.', def: true, sistema: true },
+    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una estadía.', sistema: true },
+    { nombre: 'Administración', criterio: 'Facturas, pagos, seña, cobranzas, comprobantes.', fallback: true, sistema: true },
+    { nombre: 'Gerencia', criterio: 'Quejas serias, huéspedes VIP o decisiones que requieren al responsable.', sistema: true }
+  ],
+  cabanas: [
+    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una cabaña.', def: true, sistema: true },
+    { nombre: 'Consultas', criterio: 'Servicios, ubicación, qué incluye, mascotas, dudas generales.', sistema: true },
+    { nombre: 'Administración', criterio: 'Pagos, seña, cobranzas, comprobantes.', fallback: true, sistema: true },
+    { nombre: 'Gerencia', criterio: 'Reclamos o decisiones que requieren al responsable.', sistema: true }
   ],
   desarrolladora: [
-    { nombre: 'Ventas de pozo', criterio: 'Reservar o comprar unidades, tipologias, precios, planes de pago.', def: true },
-    { nombre: 'Proyectos', criterio: 'Consultas tecnicas, arquitecto, materiales, modificaciones de unidad.' },
-    { nombre: 'Avance de obra', criterio: 'En que etapa va la obra, fechas de entrega.' },
-    { nombre: 'Posventa', criterio: 'Ya compro: observaciones, entregas, garantia.' },
-    { nombre: 'Administración', criterio: 'Cuotas, pagos, planes de financiacion.', fallback: true },
-    { nombre: 'Gerencia', criterio: 'Reclamos o decisiones que requieren al responsable.' }
+    { nombre: 'Ventas', criterio: 'Comprar o reservar unidades, tipologías, precios, planes de pago.', def: true, sistema: true },
+    { nombre: 'Técnica', criterio: 'Planos, proyectos, especificaciones, avance de obra, modificaciones de unidad.', sistema: true },
+    { nombre: 'Administración', criterio: 'Cuotas, pagos, financiación, comprobantes.', fallback: true, sistema: true },
+    { nombre: 'Gerencia', criterio: 'Reclamos o decisiones que requieren al responsable.', sistema: true }
+  ],
+  hoteleria: [
+    { nombre: 'Recepción', criterio: 'Consultas generales, llegada, check-in, información del alojamiento.', def: true, sistema: true },
+    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una estadía.', sistema: true },
+    { nombre: 'Administración', criterio: 'Facturas, pagos, seña, cobranzas, comprobantes.', fallback: true, sistema: true },
+    { nombre: 'Gerencia', criterio: 'Quejas serias, huéspedes VIP o decisiones que requieren al responsable.', sistema: true }
   ]
 };
 

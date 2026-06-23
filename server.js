@@ -2607,32 +2607,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       if (_ofertaFH) {
         try { await manejarRespuestaFueraHorario(conv.id, user_id, texto, telefono, instanciaNombre); } catch (eFH) { console.error('Etapa9c respuesta lead:', eFH && eFH.message); }
       }
-      // FASE 2 (punto 2, sub-caso HUMANO): cuando atiende un HUMANO la conv tiene ai_enabled=false y el webhook
-      // RETORNA aca, ANTES de la clasificacion. Por eso el cambio-de-tema humano->re-derivar (que vive abajo en
-      // procesar()) nunca se disparaba. Lo replicamos aca, MUY acotado para no gastar tokens de mas:
-      //   - SOLO con reparto_v2 ON (flag OFF = comportamiento ACTUAL EXACTO: este bloque no corre y retorna como hoy).
-      //   - SOLO si un HUMANO realmente esta atendiendo (admin_tomo, o asesor_id asignado en listo_humano): asi NO
-      //     clasificamos cada mensaje de una conv simplemente pausada/en cola/agente_pausado (esos siguen sin gastar).
-      //   - SOLO si la conv YA tiene departamento_id (hay con que comparar) y el mensaje no es trivial (saludo/ok).
-      //   - Reusa clasificarEstado (sin prompt nuevo dedicado). NOTA DE GASTO: agrega 1 llamada Haiku (interna,
-      //     barata) por mensaje NO-trivial de un lead a una conv atendida por un humano, SOLO con reparto_v2 ON.
-      try {
-        let _repV2H = false; try { _repV2H = await repartoV2Activo(user_id); } catch (eRH) { _repV2H = false; }
-        if (_repV2H && !esMensajeTrivial(texto) && !_pideHumano(texto)) {
-          const { data: _cvH } = await supabase.from('conversations').select('departamento_id, asesor_id, admin_tomo, status').eq('id', conv.id).maybeSingle();
-          const _humanoAtiende = !!(_cvH && (_cvH.admin_tomo || (_cvH.asesor_id && _cvH.status === 'listo_humano')));
-          if (_humanoAtiende && _cvH.departamento_id) {
-            const _clasifH = await clasificarEstado(texto, user_id);
-            const _nuevoDeptoH = _clasifH && _clasifH.departamentoId;
-            // Re-derivar AUTOMATICO solo si la IA dedujo/el lead pidio OTRO depto distinto al guardado (cambio de tema
-            // real). admin_tomo se respeta como en el bloque de abajo: si el admin tomo la conv, NO re-derivamos sola.
-            if (_nuevoDeptoH && _nuevoDeptoH !== _cvH.departamento_id && !_cvH.admin_tomo) {
-              await supabase.from('conversations').update({ departamento_id: _nuevoDeptoH, asesor_id: null, updated_at: new Date().toISOString() }).eq('id', conv.id);
-              await derivarAHumano(conv.id, user_id, 'cambio_tema_rederivar_humano', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
-            }
-          }
-        }
-      } catch (eTemaH) { console.error('cambio de tema (humano):', eTemaH && eTemaH.message); }
+      // FASE 2 (correccion Diego): mientras un HUMANO atiende (ai_enabled=false), la IA NO se mete. El humano
+      // maneja la conversacion, incluida la re-derivacion MANUAL. El cambio-de-tema se reclasifica recien cuando
+      // el humano "devuelve la conversacion a la IA" (sale de listo_humano) -> ahi vuelve el flujo normal de
+      // clasificacion. NO clasificamos cada mensaje de una conv atendida por un humano => CERO gasto extra.
       return;
     }
     // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)

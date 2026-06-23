@@ -915,6 +915,157 @@ async function manejarRespuestaFueraHorario(convId, user_id, texto, telefono, in
   } catch (e) { console.error('manejarRespuestaFueraHorario:', e && e.message); return false; }
 }
 
+// ===== FASE 2 (PUNTOS 3+4): ESCALERA DE ESCALADO (solo con reparto_v2 ON) =====
+// Helpers DEFENSIVOS para la cascada de derivacion. Con flag OFF NADA de esto se invoca (lo gatea derivarAHumano).
+// Estado de un departamento de cara al reparto, SIN escribir nada y SIN tokens de IA:
+//   - 'asignable'    => hay AHORA un candidato disponible (humano o usuario IA). elegirAsesorParaDepartamento lo eligiria.
+//   - 'sin_miembros' => el depto NO tiene NINGUN miembro que reciba (membresia vacia o todos 'visualiza').
+//   - 'solo_no_recibe' => TODOS los miembros que reciben estan en disponibilidad='no_recibe' (ej. Gerencia que
+//       solo se AVISA, no se le deriva): NO esperar (no van a "volver" del no_recibe) -> solo avisar al gerente.
+//   - 'todos_pausa'  => tiene miembros que reciben (no todos no_recibe), pero AHORA ninguno disponible
+//       (pausa / fuera de horario): esperan en cola con tope (van a volver).
+// Reusa el picker (etapa 7) para 'asignable'; para los otros mira la membresia + disponibilidad de los miembros.
+async function estadoDeptoParaReparto(user_id, departamentoId) {
+  try {
+    if (!user_id || !departamentoId) return 'sin_miembros';
+    const _a = await elegirAsesorParaDepartamento(user_id, departamentoId);
+    if (_a) return 'asignable';
+    // No hay candidato disponible: distinguir estructural (sin miembros / solo no_recibe) vs transitorio (pausa/horario).
+    let membres = null;
+    try {
+      const rm = await supabase.from('usuario_departamento').select('asesor_id, modo').eq('departamento_id', departamentoId);
+      membres = rm.error ? null : rm.data;
+    } catch (eM) { membres = null; }
+    if (membres == null) {
+      // No pudimos leer la membresia (columna modo ausente u otro error): reintentar sin modo.
+      try { const rm2 = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId); membres = (rm2.data || []).map(function(m){ return { asesor_id: m.asesor_id, modo: null }; }); } catch (eM2) { membres = []; }
+    }
+    const idsReciben = (membres || []).filter(function(m){ return m.modo == null || m.modo === 'recibe'; }).map(function(m){ return m.asesor_id; });
+    if (!idsReciben.length) return 'sin_miembros';
+    // Hay miembros (por membresia) que reciben pero ninguno disponible. Ver si TODOS estan en 'no_recibe'
+    // (estructural, solo aviso) o si al menos uno esta solo en pausa/horario (transitorio, espera con tope).
+    let ases = null;
+    try {
+      const r = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', user_id).eq('activo', true).in('id', idsReciben);
+      ases = r.error ? null : r.data;
+    } catch (eA) { ases = null; }
+    if (ases == null) return 'todos_pausa'; // no se pudo leer disponibilidad: tratar como transitorio (conservador)
+    if (!ases.length) return 'sin_miembros'; // los miembros no estan activos en esta cuenta
+    const algunoNoEsNoRecibe = ases.some(function(a){ return a.disponibilidad !== 'no_recibe'; });
+    return algunoNoEsNoRecibe ? 'todos_pausa' : 'solo_no_recibe';
+  } catch (e) { return 'todos_pausa'; } // ante la duda, tratar como transitorio (espera con tope), no estructural
+}
+
+// Devuelve el id del departamento recibe_fallback (Administracion) de la cuenta, o null. Defensivo.
+async function deptoFallbackDe(user_id) {
+  try {
+    if (!user_id) return null;
+    const { data: dep } = await supabase.from('departamentos').select('id').eq('user_id', user_id).eq('recibe_fallback', true).eq('activo', true).maybeSingle();
+    return (dep && dep.id) ? dep.id : null;
+  } catch (e) { return null; }
+}
+
+// Aviso por WhatsApp al GERENTE/dueno. Dos usos (motivo):
+//   'gerencia_no_recibe' => el lead deberia ir a Gerencia pero esta en 'no_recibe' (no se le deriva, solo se le AVISA).
+//   'ultima_instancia'   => NINGUN paso logico resolvio la derivacion: se le pregunta al gerente como seguir / a quien derivar.
+// Plantilla FIJA (sin tokens de IA). Dedupe persistente best-effort por columna conversations.gerente_avisado + Set en memoria.
+const _gerenteAvisado = new Set();
+async function avisarGerenteWhatsApp(convId, user_id, motivo) {
+  try {
+    if (!convId || !user_id) return;
+    const _key = String(convId) + ':' + (motivo || '');
+    if (_gerenteAvisado.has(_key)) return;
+    // Dedupe persistente best-effort: gerente_avisado guarda un texto con los motivos ya avisados.
+    try {
+      const { data: _f } = await supabase.from('conversations').select('gerente_avisado').eq('id', convId).maybeSingle();
+      if (_f && typeof _f.gerente_avisado === 'string' && _f.gerente_avisado.indexOf(motivo || '') >= 0) { _gerenteAvisado.add(_key); return; }
+    } catch (eF) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
+    _gerenteAvisado.add(_key);
+    let _waContacto = null;
+    try {
+      const { data: _bs } = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', user_id).maybeSingle();
+      _waContacto = _bs && _bs.whatsapp_contacto ? String(_bs.whatsapp_contacto).trim() : null;
+    } catch (eBs) {}
+    const _texto = (motivo === 'gerencia_no_recibe')
+      ? 'Un lead necesita atencion de Gerencia y esa area esta configurada para NO recibir derivaciones automaticas. Te aviso para que decidas como seguir.'
+      : 'Hay un lead que no pude derivar por ningun camino automatico (sin asesores disponibles en su area ni en Administracion). Necesito que me indiques a quien derivarlo o que lo tomes a mano.';
+    if (_waContacto) { try { await enviarWhatsapp(nombreInstancia(user_id), _waContacto, _texto); } catch (eWa) { console.error('aviso gerente WhatsApp:', eWa && eWa.message); } }
+    try { await enviarPushAsesor(user_id, 'Lead sin derivacion', null, _texto); } catch (eP) {}
+    // Marca persistente best-effort: acumular el motivo en la columna (si existe).
+    try {
+      const { data: _cur } = await supabase.from('conversations').select('gerente_avisado').eq('id', convId).maybeSingle();
+      const _prev = (_cur && typeof _cur.gerente_avisado === 'string') ? _cur.gerente_avisado : '';
+      await supabase.from('conversations').update({ gerente_avisado: (_prev ? (_prev + ',') : '') + (motivo || '') }).eq('id', convId);
+    } catch (eMark) { /* columna ausente: el Set ya dedupea dentro del proceso */ }
+  } catch (e) { console.error('avisarGerenteWhatsApp:', e && e.message); }
+}
+
+// ===== FASE 2 (PUNTO 1): CONFIRMAR ANTES DE DERIVAR (solo con reparto_v2 ON) =====
+// Perilla por departamento departamentos.preguntar_antes_derivar: 'siempre' | 'nunca' | 'duda' (default).
+// DEFENSIVO: si la columna no existe o el valor es raro -> 'duda'. NO gasta tokens de IA (lee la DB).
+async function perillaPreguntarAntes(departamentoId) {
+  try {
+    if (!departamentoId) return 'duda';
+    const { data: dep } = await supabase.from('departamentos').select('preguntar_antes_derivar').eq('id', departamentoId).maybeSingle();
+    const v = dep && dep.preguntar_antes_derivar;
+    return (['siempre', 'nunca', 'duda'].indexOf(v) >= 0) ? v : 'duda';
+  } catch (e) { return 'duda'; }
+}
+
+// Decide si hay que CONFIRMAR con el lead antes de derivar. Entradas: la perilla del depto + si la IA DEDUJO
+// el depto (vs el lead lo pidio explicito). Regla (Diego): 'siempre'=>siempre confirma; 'nunca'=>nunca;
+// 'duda'=>confirma SOLO cuando la IA dedujo (o esta insegura). pidioExplicito=true => NUNCA confirmar (derivar directo).
+function debeConfirmarDerivacion(perilla, deducido, pidioExplicito) {
+  if (pidioExplicito) return false;        // el lead pidio el area/humano: derivar directo, sin re-preguntar
+  if (perilla === 'nunca') return false;
+  if (perilla === 'siempre') return true;
+  return deducido === true;                // 'duda' (default): confirmar cuando la IA dedujo
+}
+
+// Manda al lead "¿te derivo con [depto]?" y deja la conv en estado de CONFIRMACION PENDIENTE (sin asignar asesor).
+// Persiste el depto candidato en conversations.confirmacion_pendiente_depto (best-effort; defensivo si no existe).
+// Set en memoria como red dentro del proceso. NO gasta tokens de IA (plantilla fija). Devuelve true si pidio.
+const _confirmacionPendiente = new Map(); // convId -> departamentoId candidato (red dentro del proceso)
+async function pedirConfirmacionDerivacion(convId, user_id, departamentoId, telefono, instancia) {
+  try {
+    if (!convId || !user_id || !departamentoId) return false;
+    // Dedupe: si YA hay una confirmacion pendiente para el MISMO depto, no re-preguntar (no spamear al lead).
+    try { const _pend = await deptoConfirmacionPendiente(convId); if (_pend === departamentoId) return true; } catch (eP) {}
+    let _nombreDepto = 'el area correspondiente';
+    try { const { data: dep } = await supabase.from('departamentos').select('nombre').eq('id', departamentoId).maybeSingle(); if (dep && dep.nombre) _nombreDepto = dep.nombre; } catch (eN) {}
+    const _texto = 'Por lo que me contas, esto lo ve mejor el area de ' + _nombreDepto + '. ¿Queres que te derive con ' + _nombreDepto + '?';
+    if (telefono) { try { await enviarWhatsapp(instancia || nombreInstancia(user_id), telefono, _texto); } catch (eWa) { console.error('confirmacion derivacion WhatsApp:', eWa && eWa.message); } }
+    try { await supabase.from('messages').insert({ conversation_id: convId, user_id: user_id, role: 'ai', content: _texto, enviado_por: 'Agente IA' }); } catch (eMsg) {}
+    _confirmacionPendiente.set(convId, departamentoId);
+    // Persistir el candidato (best-effort): permite recuperar tras reinicio del proceso. Defensivo si la columna no existe.
+    try { await supabase.from('conversations').update({ confirmacion_pendiente_depto: departamentoId }).eq('id', convId); } catch (eMark) {}
+    return true;
+  } catch (e) { console.error('pedirConfirmacionDerivacion:', e && e.message); return false; }
+}
+
+// Hay una confirmacion de derivacion pendiente para esta conv? Devuelve el depto candidato o null.
+// 2 capas: Map en memoria (red dentro del proceso) + columna confirmacion_pendiente_depto (defensivo).
+async function deptoConfirmacionPendiente(convId) {
+  try {
+    if (!convId) return null;
+    if (_confirmacionPendiente.has(convId)) return _confirmacionPendiente.get(convId) || null;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('confirmacion_pendiente_depto').eq('id', convId).maybeSingle();
+      if (_cv && _cv.confirmacion_pendiente_depto) { _confirmacionPendiente.set(convId, _cv.confirmacion_pendiente_depto); return _cv.confirmacion_pendiente_depto; }
+    } catch (eF) { /* columna ausente: solo cuenta el Map en memoria */ }
+    return null;
+  } catch (e) { return null; }
+}
+
+// Limpia la confirmacion pendiente (consumida o cancelada): Map en memoria + columna.
+async function cerrarConfirmacionDerivacion(convId) {
+  try {
+    if (!convId) return;
+    _confirmacionPendiente.delete(convId);
+    try { await supabase.from('conversations').update({ confirmacion_pendiente_depto: null }).eq('id', convId); } catch (eMark) {}
+  } catch (e) {}
+}
+
 // ===== DERIVACION A HUMANO (unificada) =====
 // ETAPA 4 (refactor que PRESERVA EL COMPORTAMIENTO): la logica de pasar una conversacion a atencion
 // humana estaba triplicada (handoff por pedido explicito, clasificacion a listo_humano, y red de
@@ -946,6 +1097,9 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     // ETAPA 9c: recordar si entramos por el reparto v2 (para, al final, mandar el mensaje de fuera-de-horario
     // al lead cuando NO hubo NI humano NI usuario IA disponible). Con flag OFF queda false -> cero cambios.
     let _v2Activo = false;
+    // FASE 2 (puntos 3+4): true cuando la cascada YA resolvio la no-asignacion avisando al gerente
+    // (sin_miembros sin fallback / solo_no_recibe) -> NO hay que encolar a la espera ni ofrecer fuera-de-horario.
+    let _v2NoEsperar = false;
     if (_cv && !_cv.asesor_id && !_cv.admin_tomo) {
       const _ownerId = _cv.user_id || user_id;
       // ETAPA 7: reparto real por departamento SOLO si el flag por-tenant esta ON. Flag OFF (o ausente/
@@ -953,26 +1107,49 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
       const _v2 = await repartoV2Activo(_ownerId);
       _v2Activo = _v2; // ETAPA 9c: visible fuera de este bloque para la cascada de fuera-de-horario
       if (_v2) {
-        // (a) Si la conv tiene departamento_id (la IA dedujo), repartir DENTRO de ese depto.
-        if (_cv.departamento_id) {
-          _asesor = await elegirAsesorParaDepartamento(_ownerId, _cv.departamento_id);
-        } else {
-          // (b) Sin departamento_id: usar el departamento es_default del tenant si existe.
-          let _depDefault = null;
+        // ===== FASE 2 (PUNTOS 3+4): ESCALERA DE ESCALADO =====
+        // Resolver el departamento OBJETIVO: (a) el de la conv si la IA lo dedujo; (b) el es_default; (c) sin
+        // ninguno, pool general (conservador). Luego aplicar la cascada segun el estado del depto.
+        let _deptoObjetivo = _cv.departamento_id || null;
+        if (!_deptoObjetivo) {
           try {
             const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', _ownerId).eq('es_default', true).eq('activo', true).maybeSingle();
-            _depDefault = _dd && _dd.id ? _dd.id : null;
-          } catch (eDD) { _depDefault = null; }
-          if (_depDefault) {
-            _asesor = await elegirAsesorParaDepartamento(_ownerId, _depDefault);
+            _deptoObjetivo = _dd && _dd.id ? _dd.id : null;
+          } catch (eDD) { _deptoObjetivo = null; }
+        }
+        if (!_deptoObjetivo) {
+          // (c) Sin departamento ni default: caer al picker actual (pool general) — conservador.
+          _asesor = await elegirAsesorActivo(_ownerId);
+        } else {
+          const _estado = await estadoDeptoParaReparto(_ownerId, _deptoObjetivo);
+          if (_estado === 'asignable') {
+            _asesor = await elegirAsesorParaDepartamento(_ownerId, _deptoObjetivo);
+          } else if (_estado === 'sin_miembros') {
+            // (4a) Depto SIN miembros -> ir al depto recibe_fallback (Administracion) INMEDIATO (no esperar 30 min).
+            const _fbId = await deptoFallbackDe(_ownerId);
+            if (_fbId && _fbId !== _deptoObjetivo) {
+              const _estFb = await estadoDeptoParaReparto(_ownerId, _fbId);
+              if (_estFb === 'asignable') {
+                _asesor = await elegirAsesorParaDepartamento(_ownerId, _fbId);
+                if (_asesor) { try { await supabase.from('conversations').update({ departamento_id: _fbId }).eq('id', convId); } catch (eUpD) {} }
+              }
+            }
+            // (4d) Si el fallback tampoco resolvio (no hay fallback, o no esta disponible) -> ULTIMA INSTANCIA: avisar al gerente.
+            if (!_asesor) { _v2NoEsperar = true; try { await avisarGerenteWhatsApp(convId, _ownerId, 'ultima_instancia'); } catch (eUI) {} }
+          } else if (_estado === 'solo_no_recibe') {
+            // (4c) Depto (ej. Gerencia) con miembros que SOLO estan en 'no_recibe' -> NO derivar: solo AVISAR al gerente.
+            _v2NoEsperar = true;
+            try { await avisarGerenteWhatsApp(convId, _ownerId, 'gerencia_no_recibe'); } catch (eGR) {}
+            // _asesor queda null: NO encolar a la espera (no van a "volver" del no_recibe). Ya se aviso.
           } else {
-            // (c) Sin default: caer al picker actual (pool general) — conservador.
-            _asesor = await elegirAsesorActivo(_ownerId);
+            // (4b) 'todos_pausa': depto CON miembros pero todos en pausa/fuera de horario -> ESPERA en cola (van a
+            // volver) con TOPE: el cron escalarLeadsEnColaVencidos la escala al fallback al vencer. _asesor queda
+            // null y, mas abajo, se manda la oferta de fuera-de-horario + aviso al dueno (manejo de la espera).
           }
         }
-        // Nota: si el picker por depto no encontro candidato disponible, _asesor queda null y la conv
-        // queda EN COLA (mismo manejo de etapa 5 mas abajo). NO se cae al pool general en ese caso
-        // (decision de Diego: respetar el departamento; el aviso al dueno cubre la cola).
+        // Nota: si la cascada no encontro candidato, _asesor queda null. Segun el camino, ya se aviso al gerente
+        // (sin_miembros sin fallback / solo_no_recibe -> _v2NoEsperar=true) o queda EN ESPERA con tope (todos_pausa).
+        // El manejo de cola/fuera-de-horario de mas abajo solo aplica cuando corresponde esperar.
       } else {
         // Flag OFF: comportamiento ACTUAL EXACTO.
         _asesor = await elegirAsesorActivo(_ownerId);
@@ -998,12 +1175,16 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
     // (status='listo_humano' con asesor_id null, ya lo dejaron asi los sitios que llaman) y avisamos al dueno.
     // Dedupe interno: un solo aviso por conversacion encolada (no por cada mensaje). No gasta tokens de IA.
-    if (!_asesor && _cv && !_cv.admin_tomo) {
+    // FASE 2 (puntos 3+4): NO encolar a la espera cuando la cascada ya resolvio avisando al gerente
+    // (_v2NoEsperar: sin_miembros sin fallback disponible / solo_no_recibe). En esos casos no hay nadie que
+    // "vaya a volver", asi que ni ofrecemos fuera-de-horario ni avisamos al dueno por cola (ya se aviso al gerente).
+    if (!_asesor && _cv && !_cv.admin_tomo && !_v2NoEsperar) {
       // ETAPA 9c: con reparto_v2 ON, si NO hubo NI humano NI usuario IA disponible (picker por depto devolvio
-      // null), antes de solo encolar callado le mandamos al lead UN mensaje fijo (sin tokens) ofreciendo derivar
-      // a otra persona si es urgente. Dedupe interno: uno por conversacion. El LEAD decide; su respuesta la
-      // procesa el webhook reusando el flujo que ya tiene (sin llamada nueva a Claude). Igual avisamos al dueno
-      // (la conv queda en cola como hoy). Con flag OFF (_v2Activo=false) NO se ejecuta -> comportamiento ACTUAL.
+      // null) y corresponde ESPERAR (todos_pausa / pool general agotado), antes de solo encolar callado le mandamos
+      // al lead UN mensaje fijo (sin tokens) ofreciendo derivar a otra persona si es urgente. Dedupe interno: uno
+      // por conversacion. El LEAD decide; su respuesta la procesa el webhook reusando el flujo que ya tiene (sin
+      // llamada nueva a Claude). Igual avisamos al dueno (la conv queda en cola como hoy, el cron la escala al
+      // vencer el tope). Con flag OFF (_v2Activo=false) NO se ejecuta -> comportamiento ACTUAL.
       if (_v2Activo) {
         try { await enviarMensajeFueraHorario(convId, _cv.user_id || user_id); } catch (eFH) { console.error('Etapa9c fuera horario:', eFH && eFH.message); }
       }
@@ -1500,14 +1681,19 @@ async function clasificarEstado(mensajeCliente, user_id) {
     // ATAJO SIN IA: si el lead pide explicitamente un humano/asesor/persona -> listo_humano seguro (no falla
     // ni gasta token). Resuelve el caso "puedo hablar con una persona real?" que la IA a veces sub-clasificaba.
     // No deduce departamento (no hay IA en este atajo): departamentoId queda null (conservador).
-    if (_pideHumano(mensajeCliente)) return { estado: 'listo_humano', departamentoId: null };
+    if (_pideHumano(mensajeCliente)) return { estado: 'listo_humano', departamentoId: null, pidioArea: true, deducido: false, fueraAlcance: false };
     const _lineasDepto = _hayDeptos ? [
       'Ademas, deduci a que DEPARTAMENTO del negocio corresponde la consulta del cliente, eligiendo SOLO uno de esta lista (por su nombre EXACTO) o "ninguno" si no estas seguro:',
       _deptos.map(function(d){ return '- ' + d.nombre + (d.criterio_derivacion ? (': ' + String(d.criterio_derivacion).slice(0, 200)) : ''); }).join('\n'),
-      'REGLA DEPARTAMENTO: si no podes deducirlo con razonable seguridad del mensaje, responde "ninguno" (NO adivines).'
+      'REGLA DEPARTAMENTO: si no podes deducirlo con razonable seguridad del mensaje, responde "ninguno" (NO adivines).',
+      // FASE 2 (punto 1): distinguir si el cliente PIDIO un area explicitamente (la nombro / pidio esa atencion)
+      // o si vos la DEDUJISTE del tema. "pidio_area"=true SOLO si el cliente menciono/pidio el area el mismo.
+      'Indica ademas "pidio_area": true SOLO si el cliente PIDIO o NOMBRO explicitamente ese departamento/area el mismo (ej. "quiero hablar con administracion", "me pasas con ventas"); false si vos lo dedujiste del tema.',
+      // FASE 2 (punto 5): senal de que la IA NO puede resolver / el pedido esta fuera de alcance del negocio.
+      'Indica ademas "fuera_alcance": true SOLO si el cliente pide algo que claramente NO puede resolver un asistente automatico y excede informar/derivar (ej. un reclamo formal, una decision que requiere un responsable, un tema legal/contractual puntual); si no, false.'
     ] : [];
     const _formato = _hayDeptos
-      ? 'Responde UNICAMENTE un JSON sin markdown con esta forma EXACTA: {"estado":"<listo_humano|interesado|sin_cambio>","departamento":"<nombre exacto de la lista o ninguno>"}'
+      ? 'Responde UNICAMENTE un JSON sin markdown con esta forma EXACTA: {"estado":"<listo_humano|interesado|sin_cambio>","departamento":"<nombre exacto de la lista o ninguno>","pidio_area":<true|false>,"fuera_alcance":<true|false>}'
       : 'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.';
     const prompt = [
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
@@ -1520,11 +1706,11 @@ async function clasificarEstado(mensajeCliente, user_id) {
       _formato,
       'Mensaje del cliente: ' + mensajeCliente
     ]).join('\n');
-    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: _hayDeptos ? 60 : 20, messages: [{ role: 'user', content: prompt }] }); // Haiku: clasificacion INTERNA (regla de modelos: customer-facing=Sonnet, interno=Haiku). Logea cada decision en [CLASIFICADOR].
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: _hayDeptos ? 90 : 20, messages: [{ role: 'user', content: prompt }] }); // Haiku: clasificacion INTERNA (regla de modelos: customer-facing=Sonnet, interno=Haiku). FASE 2: el JSON ahora trae pidio_area/fuera_alcance, por eso 90 tokens (antes 60) en el caso con deptos. Logea cada decision en [CLASIFICADOR].
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_estado', PRECIO_HAIKU); } catch(e){}
     const rawOut = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
     // Parseo: con deptos esperamos JSON; sin deptos, una palabra suelta (compatibilidad).
-    let _estado = null; let _departamentoId = null;
+    let _estado = null; let _departamentoId = null; let _pidioArea = false; let _fueraAlcance = false;
     let _outLower = rawOut.toLowerCase();
     if (_hayDeptos) {
       try {
@@ -1533,14 +1719,18 @@ async function clasificarEstado(mensajeCliente, user_id) {
         if (parsed) {
           _outLower = String(parsed.estado || '').toLowerCase();
           _departamentoId = _resolverDeptoId(parsed.departamento);
+          _pidioArea = parsed.pidio_area === true;       // FASE 2 (punto 1): el cliente nombro/pidio el area
+          _fueraAlcance = parsed.fuera_alcance === true; // FASE 2 (punto 5): pedido fuera de alcance de la IA
         }
       } catch (eJson) { /* si el JSON falla, caemos al parseo por substring de abajo */ }
     }
     if (_outLower.includes('listo_humano')) _estado = 'listo_humano';
     else if (_outLower.includes('interesado')) _estado = 'interesado';
-    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> estado:', JSON.stringify(_estado), 'departamentoId:', JSON.stringify(_departamentoId));
-    return { estado: _estado, departamentoId: _departamentoId };
-  } catch (e) { console.error('Error clasificando estado:', e && e.message); return { estado: null, departamentoId: null }; }
+    // FASE 2 (punto 1): "deducido" = la IA infirio el depto del tema (hay depto y el cliente NO lo pidio explicito).
+    const _deducido = !!(_departamentoId && !_pidioArea);
+    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> estado:', JSON.stringify(_estado), 'departamentoId:', JSON.stringify(_departamentoId), 'pidioArea:', _pidioArea, 'fueraAlcance:', _fueraAlcance);
+    return { estado: _estado, departamentoId: _departamentoId, pidioArea: _pidioArea, deducido: _deducido, fueraAlcance: _fueraAlcance };
+  } catch (e) { console.error('Error clasificando estado:', e && e.message); return { estado: null, departamentoId: null, pidioArea: false, deducido: false, fueraAlcance: false }; }
 }
 
 // Extrae datos que el LEAD menciona (nombre, origen, interes, presupuesto) para tener MEMORIA y no re-preguntar.
@@ -2417,6 +2607,32 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       if (_ofertaFH) {
         try { await manejarRespuestaFueraHorario(conv.id, user_id, texto, telefono, instanciaNombre); } catch (eFH) { console.error('Etapa9c respuesta lead:', eFH && eFH.message); }
       }
+      // FASE 2 (punto 2, sub-caso HUMANO): cuando atiende un HUMANO la conv tiene ai_enabled=false y el webhook
+      // RETORNA aca, ANTES de la clasificacion. Por eso el cambio-de-tema humano->re-derivar (que vive abajo en
+      // procesar()) nunca se disparaba. Lo replicamos aca, MUY acotado para no gastar tokens de mas:
+      //   - SOLO con reparto_v2 ON (flag OFF = comportamiento ACTUAL EXACTO: este bloque no corre y retorna como hoy).
+      //   - SOLO si un HUMANO realmente esta atendiendo (admin_tomo, o asesor_id asignado en listo_humano): asi NO
+      //     clasificamos cada mensaje de una conv simplemente pausada/en cola/agente_pausado (esos siguen sin gastar).
+      //   - SOLO si la conv YA tiene departamento_id (hay con que comparar) y el mensaje no es trivial (saludo/ok).
+      //   - Reusa clasificarEstado (sin prompt nuevo dedicado). NOTA DE GASTO: agrega 1 llamada Haiku (interna,
+      //     barata) por mensaje NO-trivial de un lead a una conv atendida por un humano, SOLO con reparto_v2 ON.
+      try {
+        let _repV2H = false; try { _repV2H = await repartoV2Activo(user_id); } catch (eRH) { _repV2H = false; }
+        if (_repV2H && !esMensajeTrivial(texto) && !_pideHumano(texto)) {
+          const { data: _cvH } = await supabase.from('conversations').select('departamento_id, asesor_id, admin_tomo, status').eq('id', conv.id).maybeSingle();
+          const _humanoAtiende = !!(_cvH && (_cvH.admin_tomo || (_cvH.asesor_id && _cvH.status === 'listo_humano')));
+          if (_humanoAtiende && _cvH.departamento_id) {
+            const _clasifH = await clasificarEstado(texto, user_id);
+            const _nuevoDeptoH = _clasifH && _clasifH.departamentoId;
+            // Re-derivar AUTOMATICO solo si la IA dedujo/el lead pidio OTRO depto distinto al guardado (cambio de tema
+            // real). admin_tomo se respeta como en el bloque de abajo: si el admin tomo la conv, NO re-derivamos sola.
+            if (_nuevoDeptoH && _nuevoDeptoH !== _cvH.departamento_id && !_cvH.admin_tomo) {
+              await supabase.from('conversations').update({ departamento_id: _nuevoDeptoH, asesor_id: null, updated_at: new Date().toISOString() }).eq('id', conv.id);
+              await derivarAHumano(conv.id, user_id, 'cambio_tema_rederivar_humano', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
+            }
+          }
+        }
+      } catch (eTemaH) { console.error('cambio de tema (humano):', eTemaH && eTemaH.message); }
       return;
     }
     // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)
@@ -2497,6 +2713,32 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             } catch (eHand) { console.error('handoff humano:', eHand && eHand.message); }
             return; // saltea la generacion de la IA; el finally libera _genEnCurso
           }
+          // FASE 2 (punto 1): si hay una CONFIRMACION de derivacion pendiente para esta conv (solo con reparto_v2 ON:
+          // la sembro la clasificacion mas abajo), interpretamos la respuesta del lead SIN una llamada nueva a Claude:
+          // regex (_esAfirmacionLead). Si dice que SI -> derivar al depto candidato (y NO generar respuesta de IA).
+          // Si dice un NO claro -> cerrar la confirmacion y seguir con la IA normal. Si es AMBIGUO -> NO consumimos
+          // aca: dejamos que el flujo normal corra y la clasificacion que YA corre mas abajo resuelva el si/no (fallback
+          // a la clasificacion existente, sin llamada extra dedicada). Gate barato: Map en memoria primero (cero queries).
+          let _deptoConfPend = _confirmacionPendiente.get(_convId) || null;
+          if (!_deptoConfPend) {
+            try { if (await repartoV2Activo(user_id)) _deptoConfPend = await deptoConfirmacionPendiente(_convId); } catch (eRV) {}
+          }
+          if (_deptoConfPend) {
+            if (_esAfirmacionLead(texto)) {
+              await cerrarConfirmacionDerivacion(_convId);
+              try { await supabase.from('conversations').update({ departamento_id: _deptoConfPend }).eq('id', _convId); } catch (eUp) {}
+              try {
+                await derivarAHumano(_convId, user_id, 'confirmacion_derivar', { setStatus: true, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
+              } catch (eDer) { console.error('confirmacion derivar:', eDer && eDer.message); }
+              return; // consumido: no generar respuesta de IA
+            }
+            const _sNeg = String(texto || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+            if (/^no\b|^mejor\s+no\b|\bno\s+gracias\b|\bdejalo\b|\bdespues\b|\bmas\s+tarde\b/.test(_sNeg)) {
+              // NO claro: cerrar la confirmacion y dejar que la IA siga atendiendo normalmente.
+              await cerrarConfirmacionDerivacion(_convId);
+            }
+            // Ambiguo: no consumir; el flujo normal + la clasificacion de abajo deciden (fallback sin llamada extra).
+          }
           const resultado = await generarRespuestaAgente(user_id, _convId, texto);
           if (resultado && resultado.reply) {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
@@ -2525,50 +2767,147 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const estadoActual = (convActual && convActual.status) || 'en_conversacion';
           // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
           if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
-            // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId } (depto INERTE).
+            // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId, pidioArea, deducido, fueraAlcance }.
             const _clasif = await clasificarEstado(texto, user_id);
             const nuevoEstado = _clasif && _clasif.estado;
             const _departamentoId = _clasif && _clasif.departamentoId;
-            // DEPARTAMENTO INERTE (Etapa 3): guardar el depto deducido en conversations.departamento_id
-            // SIN usarlo todavia para rutear ni cambiar el reparto. Conservador: solo se escribe si la IA
-            // dedujo uno (si quedo null, no se toca) y solo si la conversacion AUN no tiene departamento_id
-            // (no piso una deduccion previa). Independiente del estado: aplica aunque siga interesado/sin_cambio.
-            if (_departamentoId) {
+            // FASE 2: senales nuevas (solo se USAN con reparto_v2 ON; con flag OFF se ignoran -> comportamiento ACTUAL).
+            const _pidioArea = !!(_clasif && _clasif.pidioArea);     // el lead nombro/pidio el area (punto 1)
+            const _deducido = !!(_clasif && _clasif.deducido);       // la IA dedujo el depto (punto 1)
+            const _fueraAlcance = !!(_clasif && _clasif.fueraAlcance);// pedido fuera de alcance de la IA (punto 5)
+            // _repV2Cls: gate por-tenant del comportamiento nuevo de derivacion/confirmacion/cambio-de-tema.
+            let _repV2Cls = false; try { _repV2Cls = await repartoV2Activo(user_id); } catch (eRG) { _repV2Cls = false; }
+            // FASE 2 (punto 6a): evitar que la RED DE SEGURIDAD re-invoque derivarAHumano si ya derivamos en ESTE mensaje.
+            let _yaDerivoEnEsteMensaje = false;
+
+            // FASE 2 (punto 1, fallback sin llamada extra): si quedo una CONFIRMACION pendiente y la respuesta del lead
+            // no se resolvio por regex arriba, usamos ESTA clasificacion (la que ya corrio) como fallback: si el lead
+            // clasifica listo_humano (acepta avanzar), lo tomamos como un "si" y derivamos al depto que estaba pendiente.
+            if (_repV2Cls) {
+              try {
+                const _deptoPend = await deptoConfirmacionPendiente(_convId);
+                if (_deptoPend && nuevoEstado === 'listo_humano') {
+                  await cerrarConfirmacionDerivacion(_convId);
+                  await supabase.from('conversations').update({ departamento_id: _deptoPend, status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', _convId);
+                  await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
+                  _yaDerivoEnEsteMensaje = true;
+                }
+              } catch (ePendFb) { console.error('confirmacion fallback:', ePendFb && ePendFb.message); }
+            }
+
+            // FASE 2 (punto 2): CAMBIO DE TEMA -> permitir RE-DERIVAR. Hoy el departamento_id se "congela" (solo se
+            // setea si esta null). Con reparto_v2 ON, si la IA dedujo/el lead pidio OTRO depto distinto al guardado:
+            //   - atiende un HUMANO (ai_enabled=false): re-derivar AUTOMATICO al depto correcto.
+            //   - atiende un USUARIO IA (es_ia, ai_enabled=true): si pertenece a AMBOS deptos -> sigue (no re-deriva);
+            //     si pertenece a uno solo -> deriva por logica al correcto.
+            // Con flag OFF: comportamiento ACTUAL EXACTO (solo se setea departamento_id si estaba null; nunca re-deriva).
+            let _cambioTemaManejado = false;
+            // FASE 2 (punto 6a): si YA derivamos en este mismo mensaje (p.ej. por el fallback de confirmacion
+            // pendiente que dedujo el depto y derivo), NO volver a re-derivar por cambio de tema: evita un SEGUNDO
+            // derivarAHumano/push en el mismo mensaje. Guard explicito ademas de gatear con reparto_v2 + depto.
+            if (_repV2Cls && _departamentoId && !_yaDerivoEnEsteMensaje) {
+              try {
+                const { data: _cvTema } = await supabase.from('conversations').select('departamento_id, ai_enabled, asesor_id, admin_tomo, status, user_id').eq('id', _convId).maybeSingle();
+                const _deptoPrevio = _cvTema && _cvTema.departamento_id;
+                if (_deptoPrevio && _deptoPrevio !== _departamentoId && !(_cvTema && _cvTema.admin_tomo)) {
+                  // Cambio de tema real (ya habia un depto y ahora es otro). Decidir segun quien atiende.
+                  const _atiendeIA = !!(_cvTema && _cvTema.ai_enabled === true);
+                  let _reDerivar = false;
+                  if (!_atiendeIA) {
+                    // Atiende un HUMANO (o esta en cola con IA off): re-derivar AUTOMATICO al depto correcto.
+                    _reDerivar = true;
+                  } else {
+                    // Atiende un USUARIO IA: re-derivar SOLO si el usuario IA asignado NO pertenece al nuevo depto.
+                    // Si pertenece a ambos (al previo y al nuevo) sigue atendiendo. Defensivo: ante duda, NO re-derivar.
+                    if (_cvTema.asesor_id) {
+                      try {
+                        const { data: _mem } = await supabase.from('usuario_departamento').select('departamento_id').eq('asesor_id', _cvTema.asesor_id);
+                        const _ids = (_mem || []).map(function(m){ return m.departamento_id; });
+                        if (_ids.indexOf(_departamentoId) < 0) _reDerivar = true; // el IA no cubre el nuevo depto
+                      } catch (eMem) { _reDerivar = false; }
+                    } else {
+                      _reDerivar = true; // IA activa sin asesor asignado: derivar por logica al nuevo depto
+                    }
+                  }
+                  if (_reDerivar) {
+                    await supabase.from('conversations').update({ departamento_id: _departamentoId, asesor_id: null, updated_at: new Date().toISOString() }).eq('id', _convId);
+                    await derivarAHumano(_convId, user_id, 'cambio_tema_rederivar', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
+                    _yaDerivoEnEsteMensaje = true;
+                  }
+                  _cambioTemaManejado = true;
+                }
+              } catch (eTema) { console.error('cambio de tema:', eTema && eTema.message); }
+            }
+
+            // DEPARTAMENTO (Etapa 3 + FASE 2): guardar el depto deducido en conversations.departamento_id.
+            // Conservador: solo se escribe si la IA dedujo/pidio uno y la conv AUN no tiene departamento_id (no piso
+            // una deduccion previa; el cambio de tema de arriba ya manejo el caso "tenia otro"). Aplica con flag ON u OFF.
+            if (_departamentoId && !_cambioTemaManejado) {
               try {
                 const { data: _cvDep } = await supabase.from('conversations').select('departamento_id').eq('id', _convId).maybeSingle();
                 if (_cvDep && !_cvDep.departamento_id) {
                   await supabase.from('conversations').update({ departamento_id: _departamentoId }).eq('id', _convId);
                 }
-              } catch (eDepW) { console.error('Error guardando departamento_id (inerte):', eDepW && eDepW.message); }
+              } catch (eDepW) { console.error('Error guardando departamento_id:', eDepW && eDepW.message); }
             }
-            if (nuevoEstado) {
+
+            // FASE 2 (punto 5): IA NO PUEDE AVANZAR. Si el pedido esta fuera de alcance de la IA, disparar la ESCALERA
+            // de derivacion (intenta SIEMPRE derivar por los pasos logicos; el WhatsApp al gerente es la ultima instancia
+            // dentro de derivarAHumano). Solo con reparto_v2 ON. Si no se manejo por cambio de tema y aun no derivamos.
+            if (_repV2Cls && _fueraAlcance && !_yaDerivoEnEsteMensaje && estadoActual !== 'listo_humano') {
+              await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', _convId);
+              await derivarAHumano(_convId, user_id, 'ia_fuera_alcance', { setStatus: false, push: true, pushTitulo: 'Lead fuera de alcance de la IA', pushTexto: (data.pushName || telefono), resumen: true });
+              _yaDerivoEnEsteMensaje = true;
+            }
+
+            if (nuevoEstado && !_yaDerivoEnEsteMensaje) {
               // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
               const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
               if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
-                const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
-                // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
-                if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
-                await supabase.from('conversations').update(update).eq('id', _convId);
-                // Si paso a listo_humano: asignar asesor (si no tiene) + generar resumen.
-                if (nuevoEstado === 'listo_humano') {
-                  // ETAPA 4: la asignacion de asesor y el resumen al transicionar a listo_humano ahora viven
-                  // en derivarAHumano (mismo comportamiento). El status/ai_enabled ya se escribieron arriba
-                  // (setStatus:false), y este flujo NO avisa por push (igual que antes, push:false).
-                  await derivarAHumano(_convId, user_id, 'clasificacion_listo_humano', { setStatus: false, push: false, resumen: true });
-                  // CITAS: si el lead acordo una cita concreta (fecha+hora) en este handoff, agendarla + avisar al asesor.
-                  // Fire-and-forget: no bloquea ni rompe la respuesta. Solo corre en el momento del handoff (raro).
-                  detectarYAgendarCita(user_id, _convId).catch(function(){});
+                // FASE 2 (punto 1): si pasa a listo_humano y hay que CONFIRMAR antes de derivar (perilla del depto +
+                // la IA DEDUJO, no lo pidio explicito), NO asignamos asesor: preguntamos "¿te derivo con [depto]?" y
+                // dejamos la conv en confirmacion pendiente (status NO sube a listo_humano todavia; la IA sigue activa
+                // para tomar el si/no). Solo con reparto_v2 ON. Con flag OFF: comportamiento ACTUAL EXACTO.
+                let _confirmar = false;
+                if (_repV2Cls && nuevoEstado === 'listo_humano' && _departamentoId) {
+                  try {
+                    const _perilla = await perillaPreguntarAntes(_departamentoId);
+                    _confirmar = debeConfirmarDerivacion(_perilla, _deducido, _pidioArea);
+                  } catch (ePer) { _confirmar = false; }
+                }
+                if (_confirmar) {
+                  // Pedir confirmacion: NO subir status ni asignar asesor. La conv sigue en su estado actual con IA ON.
+                  await pedirConfirmacionDerivacion(_convId, user_id, _departamentoId, telefono, instanciaNombre);
+                } else {
+                  const update = { status: nuevoEstado, updated_at: new Date().toISOString() };
+                  // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
+                  if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
+                  await supabase.from('conversations').update(update).eq('id', _convId);
+                  // Si paso a listo_humano: asignar asesor (si no tiene) + generar resumen.
+                  if (nuevoEstado === 'listo_humano') {
+                    // ETAPA 4: la asignacion de asesor y el resumen al transicionar a listo_humano ahora viven
+                    // en derivarAHumano (mismo comportamiento). El status/ai_enabled ya se escribieron arriba
+                    // (setStatus:false), y este flujo NO avisa por push (igual que antes, push:false).
+                    await derivarAHumano(_convId, user_id, 'clasificacion_listo_humano', { setStatus: false, push: false, resumen: true });
+                    _yaDerivoEnEsteMensaje = true;
+                    // CITAS: si el lead acordo una cita concreta (fecha+hora) en este handoff, agendarla + avisar al asesor.
+                    // Fire-and-forget: no bloquea ni rompe la respuesta. Solo corre en el momento del handoff (raro).
+                    detectarYAgendarCita(user_id, _convId).catch(function(){});
+                  }
                 }
               }
             }
-            // RED DE SEGURIDAD: si la conversacion esta en listo_humano sin asesor (quedo huerfana), derivar ahora
+            // RED DE SEGURIDAD: si la conversacion esta en listo_humano sin asesor (quedo huerfana), derivar ahora.
+            // FASE 2 (punto 6a): NO re-invocar derivarAHumano si YA derivamos en este mismo mensaje (evita doble aviso).
             try {
-              const { data: cvSeg } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, user_id').eq('id', _convId).single();
-              // Se mantiene el guard de status='listo_humano' (la red de seguridad SOLO actua si ya esta en
-              // atencion humana). El criterio "sin asesor && !admin_tomo" lo reaplica derivarAHumano por dentro.
-              if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
-                // ETAPA 4: solo asignar asesor (sin tocar status, sin push, sin resumen) — igual que antes.
-                await derivarAHumano(_convId, cvSeg.user_id, 'red_seguridad', { setStatus: false, push: false, resumen: false });
+              if (!_yaDerivoEnEsteMensaje) {
+                const { data: cvSeg } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, user_id').eq('id', _convId).single();
+                // Se mantiene el guard de status='listo_humano' (la red de seguridad SOLO actua si ya esta en
+                // atencion humana). El criterio "sin asesor && !admin_tomo" lo reaplica derivarAHumano por dentro.
+                if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
+                  // ETAPA 4: solo asignar asesor (sin tocar status, sin push, sin resumen) — igual que antes.
+                  await derivarAHumano(_convId, cvSeg.user_id, 'red_seguridad', { setStatus: false, push: false, resumen: false });
+                }
               }
             } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
             // MEMORIA VIVA: actualizar el resumen-de-avance (THROTTLED) para que el agente retome sin releer todo
@@ -2989,7 +3328,7 @@ async function escalarLeadsEnColaVencidos() {
   if (_escalarEnCurso) return; // evitar solapamiento entre ticks
   _escalarEnCurso = true;
   try {
-    const TREINTA_MIN_MS = 30 * 60 * 1000; // D5=A: umbral FIJO (luego configurable)
+    const TOPE_DEFAULT_MS = 30 * 60 * 1000; // FASE 2 (punto 4): tope de espera por defecto (30 min); configurable por cuenta.
     const ahoraMs = Date.now();
     // Conversaciones EN COLA: en atencion humana, sin asesor y no tomadas por el admin.
     // Traemos los tenants distintos para chequear el flag UNA vez por cuenta (no por conversacion).
@@ -3002,6 +3341,7 @@ async function escalarLeadsEnColaVencidos() {
     if (!enCola || enCola.length === 0) return;
     // Cache del flag reparto_v2 por tenant (una query chica por cuenta como mucho).
     const _flagCache = {};
+    const _topeCache = {}; // FASE 2 (punto 4): cache del tope de espera por tenant.
     for (const conv of enCola) {
       if (_escaladoFallback.has(conv.id)) continue; // ya escalado en este proceso
       const ownerId = conv.user_id;
@@ -3009,6 +3349,14 @@ async function escalarLeadsEnColaVencidos() {
       // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO escalar (comportamiento actual).
       if (!(ownerId in _flagCache)) _flagCache[ownerId] = await repartoV2Activo(ownerId);
       if (_flagCache[ownerId] !== true) continue;
+      // FASE 2 (punto 4): tope de espera configurable por cuenta (business_settings.cola_tope_min, en minutos).
+      // DEFENSIVO: si la columna no existe o el valor es raro -> 30 min. Cache por tenant (una query chica como mucho).
+      if (!(ownerId in _topeCache)) {
+        let _topeMs = TOPE_DEFAULT_MS;
+        try { const { data: _bsT } = await supabase.from('business_settings').select('cola_tope_min').eq('user_id', ownerId).maybeSingle(); const _m = _bsT && Number(_bsT.cola_tope_min); if (_m && _m > 0 && _m <= 240) _topeMs = _m * 60 * 1000; } catch (eT) {}
+        _topeCache[ownerId] = _topeMs;
+      }
+      const TOPE_MS = _topeCache[ownerId];
       // Dedupe persistente (best-effort): si ya se marco escalado_fallback, saltar. Defensivo si la columna no existe.
       try {
         const { data: _f } = await supabase.from('conversations').select('escalado_fallback').eq('id', conv.id).maybeSingle();
@@ -3020,7 +3368,7 @@ async function escalarLeadsEnColaVencidos() {
         const { data: ult } = await supabase.from('messages').select('created_at').eq('conversation_id', conv.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
         if (ult && ult.created_at) anchorMs = new Date(ult.created_at).getTime();
       } catch (eMsg) {}
-      if (!anchorMs || (ahoraMs - anchorMs) < TREINTA_MIN_MS) continue; // todavia no cumplio 30 min en cola
+      if (!anchorMs || (ahoraMs - anchorMs) < TOPE_MS) continue; // todavia no cumplio el tope de espera en cola
       // Marcar en memoria YA (antes de los pasos) para que ticks concurrentes no re-escalen.
       _escaladoFallback.add(conv.id);
       // PASO 1: intentar asignar a un asesor del departamento con recibe_fallback=true (picker etapa 7).
@@ -3036,12 +3384,21 @@ async function escalarLeadsEnColaVencidos() {
         }
       } catch (eP1) { console.error('Etapa8 paso1:', eP1 && eP1.message); }
       // PASO 2: si no hubo asesor en el depto fallback -> avisar al DUENO (plantilla fija, sin tokens de IA).
+      // FASE 2 (punto 4d): ademas, ULTIMA INSTANCIA: WhatsApp al GERENTE preguntando como seguir / a quien derivar
+      // (distinto del aviso de cola). Tras el tope vencido y sin fallback disponible, no queda paso logico: se le
+      // pregunta al gerente. Dedupe propio en avisarGerenteWhatsApp (no spamea). Sin tokens de IA.
       if (!_asignado) {
         try { await avisarDuenoColaSinAsesor(conv.id, ownerId); } catch (eP2) { console.error('Etapa8 paso2:', eP2 && eP2.message); }
-        console.log('Etapa8 fallback: lead ' + conv.id + ' sin asesor en depto fallback -> avisado al dueno');
+        try { await avisarGerenteWhatsApp(conv.id, ownerId, 'ultima_instancia'); } catch (eP2b) { console.error('Etapa8 paso2 gerente:', eP2b && eP2b.message); }
+        console.log('Etapa8 fallback: lead ' + conv.id + ' sin asesor en depto fallback -> avisado al dueno + gerente');
       }
       // Marca persistente best-effort para no re-escalar en proximos ticks (defensivo si la columna no existe).
       try { await supabase.from('conversations').update({ escalado_fallback: true }).eq('id', conv.id); } catch (eMark) { /* columna ausente: el Set ya dedupea */ }
+      // FASE 2 (punto 6b): al vencer el tope, la oferta de fuera-de-horario quedo sin respuesta sí/no del lead.
+      // No lo dejamos "en visto": cerramos la oferta (ya se escalo por el camino logico). Igual la confirmacion
+      // pendiente, si la hubiera, deja de tener sentido una vez escalado. Best-effort, no rompe el escalado.
+      try { await cerrarOfertaFueraHorario(conv.id); } catch (eCF) {}
+      try { await cerrarConfirmacionDerivacion(conv.id); } catch (eCC) {}
     }
   } catch (e) { console.error('Error en escalarLeadsEnColaVencidos:', e && e.message); }
   finally { _escalarEnCurso = false; }

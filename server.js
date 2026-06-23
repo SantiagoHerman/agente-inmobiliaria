@@ -2546,9 +2546,32 @@ setTimeout(hacerBackup, 90 * 1000);
 
 // ===== ASESORES (gestionados por el admin) =====
 // Crear un asesor: crea el usuario en Auth (con la service key) y la fila en asesores.
+// Helpers Fase 1: validan y aplican los campos nuevos del usuario (aditivo, todo opcional).
+function _camposUsuarioNuevos(b) {
+  const out = {};
+  if (['conectado', 'pausa', 'no_recibe'].indexOf(b.disponibilidad) >= 0) out.disponibilidad = b.disponibilidad;
+  if (Array.isArray(b.visibilidad)) out.visibilidad = b.visibilidad.filter(function(v){ return ['propias', 'departamento', 'generales'].indexOf(v) >= 0; });
+  if (['oficina', 'personalizado'].indexOf(b.horario_modo) >= 0) out.horario_modo = b.horario_modo;
+  if (b.horario_json && typeof b.horario_json === 'object') out.horario_json = b.horario_json;
+  if (typeof b.es_ia === 'boolean') out.es_ia = b.es_ia;
+  return out;
+}
+// Reemplaza la membresia de departamentos de un usuario (valida que los deptos sean de la cuenta).
+async function _setDepartamentosUsuario(asesorId, adminId, departamentos) {
+  if (!Array.isArray(departamentos)) return;
+  let ids = [];
+  if (departamentos.length) {
+    const { data: validos } = await supabase.from('departamentos').select('id').eq('user_id', adminId).in('id', departamentos);
+    ids = (validos || []).map(function(d){ return d.id; });
+  }
+  await supabase.from('usuario_departamento').delete().eq('asesor_id', asesorId);
+  if (ids.length) await supabase.from('usuario_departamento').insert(ids.map(function(did){ return { asesor_id: asesorId, departamento_id: did }; }));
+}
+
 app.post('/api/asesores/crear', async (req, res) => {
   try {
     const { admin_id, nombre, usuario, clave, cargo, rol } = req.body || {};
+    const _nuevos = _camposUsuarioNuevos(req.body);
     // SEGURIDAD: validar identidad por token
     const _uidToken = await verificarUsuario(req);
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
@@ -2574,13 +2597,50 @@ app.post('/api/asesores/crear', async (req, res) => {
     const { data: created, error: errAuth } = await supabase.auth.admin.createUser({ email: email, password: clave, email_confirm: true, user_metadata: { rol: rolFinal, admin_id: admin_id, nombre: nombre } });
     if (errAuth) return res.status(400).json({ error: errAuth.message });
     const authId = created && created.user ? created.user.id : null;
-    const { error: errIns } = await supabase.from('asesores').insert({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : 'Asesor', rol: rolFinal, estado: 'activo', activo: true });
+    const { data: nuevoAse, error: errIns } = await supabase.from('asesores').insert(Object.assign({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : 'Asesor', rol: rolFinal, estado: 'activo', activo: true }, _nuevos)).select('id').single();
     if (errIns) { if (authId) { try { await supabase.auth.admin.deleteUser(authId); } catch (e) {} } return res.status(400).json({ error: errIns.message }); }
-    return res.json({ ok: true, email: email });
+    try { if (nuevoAse && nuevoAse.id) await _setDepartamentosUsuario(nuevoAse.id, admin_id, req.body.departamentos); } catch (eDep) { console.error('membresia depto al crear:', eDep && eDep.message); }
+    return res.json({ ok: true, email: email, id: nuevoAse && nuevoAse.id });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
 // Eliminar un asesor: borra el usuario de Auth y la fila. Los mensajes conservan enviado_por.
+// Actualiza los campos NUEVOS de un usuario (disponibilidad/visibilidad/horario/es_ia) + su membresia de departamentos. ADITIVO.
+app.post('/api/asesores/config', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!b.admin_id || !b.asesor_id) return res.status(400).json({ error: 'Faltan datos' });
+    const { data: ase } = await supabase.from('asesores').select('id').eq('id', b.asesor_id).eq('admin_id', b.admin_id).maybeSingle();
+    if (!ase) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const nuevos = _camposUsuarioNuevos(b);
+    if (Object.keys(nuevos).length) { const { error } = await supabase.from('asesores').update(nuevos).eq('id', b.asesor_id).eq('admin_id', b.admin_id); if (error) return res.status(500).json({ error: error.message }); }
+    if (Array.isArray(b.departamentos)) await _setDepartamentosUsuario(b.asesor_id, b.admin_id, b.departamentos);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Membresias de departamentos de todos los usuarios de la cuenta: { asesor_id: [departamento_id, ...] }. La tabla tiene RLS service-key, por eso pasa por aca.
+app.get('/api/asesores/membresias', async (req, res) => {
+  try {
+    const userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    let ownerId = userId;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+    const { data: ases } = await supabase.from('asesores').select('id').eq('admin_id', ownerId);
+    const idsAse = (ases || []).map(function(a){ return a.id; });
+    const mapa = {};
+    if (idsAse.length) {
+      const { data: rows } = await supabase.from('usuario_departamento').select('asesor_id, departamento_id').in('asesor_id', idsAse);
+      (rows || []).forEach(function(r){ if (!mapa[r.asesor_id]) mapa[r.asesor_id] = []; mapa[r.asesor_id].push(r.departamento_id); });
+    }
+    return res.json({ ok: true, membresias: mapa });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/asesores/activar', async (req, res) => {
   try {
     const { admin_id, asesor_id } = req.body || {};

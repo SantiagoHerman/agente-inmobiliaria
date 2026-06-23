@@ -624,7 +624,7 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId) {
         .select('id, disponibilidad, horario_modo, horario_json, es_ia')
         .eq('admin_id', user_id)
         .eq('activo', true)
-        .eq('rol', 'asesor') // D4=B: solo 'asesor' (excluye 'empleado', null y 'administrador')
+        .or('rol.eq.asesor,es_ia.eq.true') // D4=B + Usuario IA: elegible si rol='asesor' O es_ia=true (excluye 'empleado'/'administrador'/null que no sean IA)
         .in('id', idsMiembros);
       if (r.error) throw r.error;
       ases = r.data;
@@ -3180,8 +3180,8 @@ app.post('/api/asesores/crear', async (req, res) => {
     if (!admin_id || !nombre || !usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
     // Rol del usuario: 'asesor' (default) o 'administrador'. Los administradores quedan excluidos
     // de la auto-asignacion/rotacion de leads y de las notificaciones push automaticas de la IA.
-    const rolFinal = (rol === 'administrador') ? 'administrador' : 'asesor';
-    if (rol && rol !== 'asesor' && rol !== 'administrador') return res.status(400).json({ error: 'Rol invalido (debe ser asesor o administrador)' });
+    const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : 'asesor');
+    if (rol && rol !== 'asesor' && rol !== 'administrador' && rol !== 'empleado') return res.status(400).json({ error: 'Rol invalido (debe ser asesor, administrador o empleado)' });
     // Limite de usuarios por admin: por defecto 5, salvo override por cliente (limits_override.asesores, seteable desde el Maestro).
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
     let topeAsesores = 5;

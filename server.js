@@ -614,6 +614,160 @@ async function repartoV2Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== PARTE B (PUNTO 1): RUNTIME DEL USUARIO IA — leer la persona/config del asesor IA que cubre =====
+// Cuando elegirAsesorParaDepartamento eligio un usuario es_ia como COBERTURA (no habia humano), la conv queda con
+// ai_enabled=true + asesor_id = ese usuario IA. generarRespuestaAgente debe responder COMO ese usuario (su
+// agente_config: nombre, tono, objetivo, conocimiento, no_hacer, datos_que_usa) en vez de la persona genERICA de
+// la cuenta. Esta funcion devuelve la config SANEADA del usuario IA que cubre ESTA conv, o null si no aplica.
+//
+// REGLAS DURAS (gating): SOLO devuelve algo con reparto_v2 ON y si el asesor asignado es_ia=true. Con flag OFF,
+// columna ausente, asesor no-IA, o cualquier error -> null => generarRespuestaAgente usa la config genérica de la
+// cuenta (comportamiento ACTUAL EXACTO). DEFENSIVO: agente_config se lee con fallback total (jsonb sin forma fija;
+// el dueno pudo guardar {} o claves distintas). AISLAMIENTO (cruce de datos): el asesor se lee SIEMPRE con
+// .eq('admin_id', ownerId) — un usuario IA de otro tenant NO puede ser tomado. Los DATOS del negocio
+// (inventario/precios/fechas) los sigue resolviendo generarRespuestaAgente por el user_id del TENANT, nunca por el asesor.
+async function configUsuarioIACobertura(ownerId, conversation_id) {
+  try {
+    if (!ownerId || !conversation_id) return null;
+    if (!(await repartoV2Activo(ownerId))) return null; // flag OFF -> comportamiento actual
+    const { data: cv } = await supabase.from('conversations').select('asesor_id, ai_enabled').eq('id', conversation_id).maybeSingle();
+    // Solo cobertura IA: la IA esta activa (ai_enabled !== false) y hay un asesor asignado. Si no hay asesor o la IA
+    // esta pausada por-conv, NO es cobertura es_ia -> persona genérica (el caller ni siquiera llega con ai_enabled=false).
+    if (!cv || !cv.asesor_id || cv.ai_enabled === false) return null;
+    // Leer el asesor SOLO de este tenant (admin_id=ownerId) -> aislamiento. Defensivo si es_ia/agente_config no existen.
+    let ase = null;
+    try {
+      const r = await supabase.from('asesores').select('id, es_ia, agente_config, nombre').eq('id', cv.asesor_id).eq('admin_id', ownerId).maybeSingle();
+      if (r.error) throw r.error;
+      ase = r.data;
+    } catch (eCol) {
+      try { const r2 = await supabase.from('asesores').select('id, es_ia, agente_config').eq('id', cv.asesor_id).eq('admin_id', ownerId).maybeSingle(); ase = r2.data; } catch (eCol2) { ase = null; }
+    }
+    if (!ase || ase.es_ia !== true) return null; // no es un usuario IA -> persona genérica
+    return sanearAgenteConfig(ase.agente_config, (ase.nombre || null));
+  } catch (e) { return null; } // ante cualquier fallo: persona genérica (nunca romper)
+}
+
+// Sanea agente_config (jsonb libre) a una forma conocida con fallbacks. NUNCA tira: si viene null/{}/raro, devuelve
+// un objeto con campos vacios y persona=false (=> generarRespuestaAgente usa la persona genérica). nombreFallback:
+// el campo asesores.nombre como respaldo del nombre humano si agente_config no trae uno.
+function sanearAgenteConfig(cfg, nombreFallback) {
+  const _s = function(v){ return (v != null && String(v).trim()) ? String(v).trim() : ''; };
+  const c = (cfg && typeof cfg === 'object') ? cfg : {};
+  // 'forma_hablar' o 'tono' (el form v4 puede usar cualquiera de los dos nombres).
+  const formaHablar = _s(c.forma_hablar) || _s(c.tono);
+  const out = {
+    nombre: _s(c.nombre) || _s(nombreFallback),
+    formaHablar: formaHablar,
+    objetivo: _s(c.objetivo),
+    conocimiento: _s(c.conocimiento),
+    noHacer: _s(c.no_hacer) || _s(c.noHacer),
+    datosQueUsa: _s(c.datos_que_usa) || _s(c.datosQueUsa)
+  };
+  // 'persona': hay config util? (al menos un nombre o algun campo con contenido). Si no, el caller cae a genérico.
+  out.persona = !!(out.nombre || out.formaHablar || out.objetivo || out.conocimiento || out.noHacer || out.datosQueUsa);
+  return out;
+}
+
+// ===== PARTE B (PUNTO 6 / REGLA 19): APRENDIZAJE DE LA IA — preguntar al dueno y aprender =====
+// Ciclo (TODO gated por reparto_v2 ON; con flag OFF NADA de esto corre -> comportamiento ACTUAL EXACTO):
+//   1) La IA, mientras atiende, detecta que NO sabe resolver algo -> usa la tool consultar_al_dueno (NO inventa).
+//   2) registrarConsultaAprendizaje guarda la duda (tabla aprendizaje_ia, best-effort) y manda WhatsApp al dueno
+//      (business_settings.whatsapp_contacto) con la pregunta. Plantilla fija (sin tokens de IA en este paso).
+//   3) Cuando el dueno responde por su canal de WhatsApp, procesarRespuestaAprendizaje toma su respuesta y hace
+//      UNA llamada de IA (Haiku, barata) que VALIDA: ¿es logico y aplicable como regla general, o cruza/afecta
+//      datos? (AVISO ROJO: 1 llamada de IA PUNTUAL por respuesta del dueno, NO por mensaje de lead.)
+//   4) Si es aplicable -> se guarda como REGLA GENERAL en knowledge_base del TENANT (toda la cuenta) y queda
+//      estado='aplicada'. Si cruza datos / no tiene logica -> estado='no_aplicable', NO se aplica, se le avisa al
+//      dueno el motivo / se le dan opciones. Todo queda GUARDADO y con flag de estado (visible/editable).
+// AISLAMIENTO (cruce de datos): la consulta y el knowledge_base se escriben SIEMPRE con el user_id del TENANT
+// dueno de la conversacion (validado), NUNCA global ni de otro tenant.
+//
+// Tabla aprendizaje_ia (best-effort; si no existe, los insert/select fallan en silencio y el ciclo se degrada sin
+// romper nada): { id, user_id, conversation_id, pregunta, respuesta_dueno, estado, motivo, kb_id, created_at }.
+//   estado: 'pendiente' (preguntado, esperando al dueno) | 'aplicada' (guardada en KB) | 'no_aplicable' (rechazada).
+
+// Dedupe en memoria: no re-preguntar lo mismo en la misma conv dentro del proceso (clave conv).
+const _aprendizajePreguntado = new Set();
+
+// PASO 2: registrar la duda + avisar al dueno. user_id = TENANT dueno de la conv (aislamiento). Best-effort.
+async function registrarConsultaAprendizaje(user_id, conversation_id, pregunta) {
+  try {
+    if (!user_id || !pregunta || !String(pregunta).trim()) return false;
+    if (!(await repartoV2Activo(user_id))) return false; // GATING: flag OFF -> no corre (ACTUAL EXACTO)
+    const _key = String(conversation_id || '') + '::' + String(pregunta).trim().slice(0, 60).toLowerCase();
+    if (_aprendizajePreguntado.has(_key)) return true; // ya preguntado en este proceso
+    // Anti-spam persistente: si ya hay una consulta PENDIENTE identica para esta conv, no reabrir.
+    try {
+      const { data: _ya } = await supabase.from('aprendizaje_ia').select('id').eq('user_id', user_id).eq('conversation_id', conversation_id || null).eq('estado', 'pendiente').limit(1);
+      if (_ya && _ya.length > 0) { _aprendizajePreguntado.add(_key); return true; }
+    } catch (eYa) { /* tabla ausente: el Set en memoria cubre dentro del proceso */ }
+    _aprendizajePreguntado.add(_key);
+    // Guardar la consulta (best-effort: si la tabla no existe, no rompe).
+    try { await supabase.from('aprendizaje_ia').insert({ user_id: user_id, conversation_id: conversation_id || null, pregunta: String(pregunta).trim().slice(0, 1000), estado: 'pendiente' }); } catch (eIns) {}
+    // Avisar al dueno por WhatsApp (plantilla fija, sin tokens de IA). Si no hay whatsapp_contacto, solo queda guardada.
+    let _wa = null;
+    try { const { data: _bs } = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', user_id).maybeSingle(); _wa = _bs && _bs.whatsapp_contacto ? String(_bs.whatsapp_contacto).trim() : null; } catch (eBs) {}
+    const _texto = 'El asistente tuvo una consulta que no supo resolver y necesita tu ayuda:\n\n"' + String(pregunta).trim().slice(0, 500) + '"\n\nRespondeme aca como deberia contestarse y, si tiene logica, lo guardo como regla para toda la cuenta.';
+    if (_wa) { try { await enviarWhatsapp(nombreInstancia(user_id), _wa, _texto); } catch (eWa) { console.error('aprendizaje aviso dueno:', eWa && eWa.message); } }
+    try { await enviarPushAsesor(user_id, 'El asistente necesita tu ayuda', null, String(pregunta).trim().slice(0, 180)); } catch (eP) {}
+    return true;
+  } catch (e) { console.error('registrarConsultaAprendizaje:', e && e.message); return false; }
+}
+
+// Hay una consulta de aprendizaje PENDIENTE para este tenant? Devuelve la fila mas reciente o null. Best-effort.
+async function consultaAprendizajePendiente(user_id) {
+  try {
+    if (!user_id) return null;
+    const { data } = await supabase.from('aprendizaje_ia').select('id, pregunta, conversation_id').eq('user_id', user_id).eq('estado', 'pendiente').order('created_at', { ascending: false }).limit(1);
+    return (data && data.length > 0) ? data[0] : null;
+  } catch (e) { return null; } // tabla ausente u otro error: no hay aprendizaje pendiente
+}
+
+// PASO 3+4: el dueno respondio. VALIDA con 1 llamada de IA (Haiku) si la respuesta es logica/aplicable como regla
+// general o si cruza/afecta datos; segun eso, GUARDA en knowledge_base (estado 'aplicada') o marca 'no_aplicable'.
+// AVISO ROJO: esta es la UNICA llamada de IA del ciclo, y es PUNTUAL (1 por respuesta del dueno, no por mensaje del
+// lead). user_id = TENANT (aislamiento: el knowledge_base se escribe con ESTE user_id). Devuelve true si consumio.
+async function procesarRespuestaAprendizaje(user_id, respuestaDueno, instancia, telefono) {
+  try {
+    if (!user_id || !respuestaDueno || !String(respuestaDueno).trim()) return false;
+    if (!(await repartoV2Activo(user_id))) return false; // GATING
+    const pend = await consultaAprendizajePendiente(user_id);
+    if (!pend) return false; // no hay nada pendiente -> el caller sigue con el flujo normal (reportes)
+    // VALIDACION (1 llamada de IA puntual, Haiku barato): ¿es una regla general logica y aplicable, o cruza datos?
+    const sys = 'Sos el validador de aprendizaje de un CRM. Te paso una DUDA que el asistente no supo resolver y la RESPUESTA que dio el dueno del negocio. Decidi si la respuesta del dueno se puede guardar como REGLA GENERAL de la cuenta (una respuesta estandar que el asistente podra reutilizar con cualquier cliente). Devolve SOLO un JSON valido sin markdown: {"aplicable": true|false, "pregunta_regla": "la pregunta/tema en forma corta", "respuesta_regla": "la respuesta lista para reutilizar, redactada de forma general", "motivo": "si aplicable=false, por que (ej: depende del caso/cliente puntual, cruza datos especificos, no es logico, falta info)"}. aplicable=false SI: la respuesta depende de datos puntuales de UN cliente o propiedad especifica, contradice algo, no tiene logica, o es ambigua. aplicable=true SOLO si sirve como regla estable para toda la cuenta.';
+    const usr = 'DUDA del asistente: ' + String(pend.pregunta || '').slice(0, 800) + '\n\nRESPUESTA del dueno: ' + String(respuestaDueno).slice(0, 800);
+    let obj = null;
+    try {
+      const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 320, system: sys, messages: [{ role: 'user', content: usr }] });
+      try { if (r && r.usage) await registrarUsoTokens(user_id, r.usage, 'aprendizaje_validar', PRECIO_HAIKU); } catch (eU) {}
+      let txt = ((r && r.content && r.content[0] && r.content[0].text) || '').trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+      obj = JSON.parse(txt);
+    } catch (eIA) { obj = null; }
+    if (!obj) {
+      // No se pudo validar: NO aplicar (conservador). Dejar pendiente y avisar al dueno (best-effort, sin reintentar IA).
+      try { if (instancia && telefono) await enviarWhatsapp(instancia, telefono, 'No pude interpretar bien la respuesta. ¿Me la pasas mas concreta? Asi la guardo como regla.'); } catch (eW) {}
+      return true; // consumido (era el canal de aprendizaje), pero sin aplicar
+    }
+    if (obj.aplicable === true && obj.respuesta_regla && String(obj.respuesta_regla).trim()) {
+      // GUARDAR como regla general en knowledge_base del TENANT (aislamiento por user_id). Best-effort.
+      let _kbId = null;
+      try {
+        const { data: _kb } = await supabase.from('knowledge_base').insert({ user_id: user_id, category: 'aprendido', question: String(obj.pregunta_regla || pend.pregunta || '').slice(0, 300), answer: String(obj.respuesta_regla).slice(0, 2000) }).select('id').maybeSingle();
+        _kbId = _kb && _kb.id ? _kb.id : null;
+      } catch (eKb) { console.error('aprendizaje guardar KB:', eKb && eKb.message); }
+      try { await supabase.from('aprendizaje_ia').update({ respuesta_dueno: String(respuestaDueno).slice(0, 1000), estado: 'aplicada', motivo: null, kb_id: _kbId }).eq('id', pend.id); } catch (eUp) {}
+      try { if (instancia && telefono) await enviarWhatsapp(instancia, telefono, 'Listo, lo guarde como regla para toda la cuenta. El asistente ya lo va a usar. Lo podes ver y editar en la base de conocimiento.'); } catch (eW) {}
+    } else {
+      // NO aplicable: marcar y avisar el motivo / dar opciones (NO se escribe en knowledge_base).
+      const _motivo = String(obj.motivo || 'depende del caso puntual, no sirve como regla general').slice(0, 500);
+      try { await supabase.from('aprendizaje_ia').update({ respuesta_dueno: String(respuestaDueno).slice(0, 1000), estado: 'no_aplicable', motivo: _motivo }).eq('id', pend.id); } catch (eUp) {}
+      try { if (instancia && telefono) await enviarWhatsapp(instancia, telefono, 'Gracias. Eso NO lo guarde como regla general porque ' + _motivo + '. Si queres, pasamelo de una forma que sirva para cualquier cliente, o lo resolves vos a mano en este caso.'); } catch (eW) {}
+    }
+    return true; // consumido: era una respuesta al canal de aprendizaje
+  } catch (e) { console.error('procesarRespuestaAprendizaje:', e && e.message); return false; }
+}
+
 // ===== ETAPA 7: REPARTO REAL POR DEPARTAMENTO (solo con reparto_v2 ON) =====
 // Picker nuevo, usado DENTRO de derivarAHumano SOLO cuando reparto_v2 esta ON. Elige el asesor del
 // departamento indicado segun el modo_reparto del depto. Candidatos (todos a la vez):
@@ -1092,8 +1246,12 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     }
     // 2) Elegir/asignar asesor (solo si no tiene y no lo tomo el admin) — criterio identico al actual.
     // ETAPA 7: con reparto_v2 ON tambien necesitamos departamento_id para el picker por departamento.
-    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, user_id, departamento_id').eq('id', convId).maybeSingle();
+    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, user_id, departamento_id, status').eq('id', convId).maybeSingle();
     let _asesor = _cv && _cv.asesor_id;
+    // PARTE B: true si el asesor que termina asignado es un USUARIO IA (cobertura). Se usa para (a) bajar el status
+    // de la cola y mantener ai_enabled=true, y (b) NO mandar push a un "asesor" que es un bot (no hay humano). Con
+    // flag OFF nunca se elige un usuario IA por aca -> queda false -> comportamiento ACTUAL EXACTO.
+    let _asesorEsIA = false;
     // ETAPA 9c: recordar si entramos por el reparto v2 (para, al final, mandar el mensaje de fuera-de-horario
     // al lead cuando NO hubo NI humano NI usuario IA disponible). Con flag OFF queda false -> cero cambios.
     let _v2Activo = false;
@@ -1162,12 +1320,21 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         // flag OFF este bloque no se ejecuta (elegirAsesorActivo no devuelve usuarios IA por depto) y el
         // handoff a humano es el ACTUAL EXACTO. DEFENSIVO: si la columna es_ia no existe, _esIa queda false.
         if (_v2) {
-          let _esIa = false;
           try {
             const { data: _aseIa } = await supabase.from('asesores').select('es_ia').eq('id', _asesor).maybeSingle();
-            _esIa = !!(_aseIa && _aseIa.es_ia === true);
-          } catch (eIa) { _esIa = false; }
-          if (_esIa) { _updAsesor.ai_enabled = true; }
+            _asesorEsIA = !!(_aseIa && _aseIa.es_ia === true);
+          } catch (eIa) { _asesorEsIA = false; }
+          if (_asesorEsIA) {
+            // PARTE B (fix race/estado, hallazgo auditoria): la cobertura es un USUARIO IA. La IA debe SEGUIR
+            // respondiendo (ai_enabled=true) y la conv NO debe quedar en la COLA humana ('listo_humano'): si
+            // quedara en listo_humano, (a) la reclasificacion se bloquearia (no podria cambiar de tema/avanzar),
+            // (b) el drenaje /api/asesores/activar la robaria para un humano, y (c) el cron la escalaria. Por eso,
+            // si algun caller la dejo en 'listo_humano' antes de derivar, la BAJAMOS a 'en_conversacion' (la IA la
+            // sigue atendiendo con su persona). Solo con reparto_v2 ON + asesor es_ia: con flag OFF este bloque no
+            // corre y el handoff a humano es el ACTUAL EXACTO.
+            _updAsesor.ai_enabled = true;
+            if (_cv && _cv.status === 'listo_humano') { _updAsesor.status = 'en_conversacion'; }
+          }
         }
         await supabase.from('conversations').update(_updAsesor).eq('id', convId);
       }
@@ -1191,7 +1358,9 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
       await avisarDuenoColaSinAsesor(convId, _cv.user_id || user_id);
     }
     // 3) Push al asesor (opcional: hoy solo lo hace el handoff por pedido explicito).
-    if (opts.push && _asesor) {
+    // PARTE B: si la cobertura es un USUARIO IA (_asesorEsIA), NO mandamos push: es un bot, no hay humano que
+    // atienda; la propia IA sigue respondiendo. Con flag OFF/asesor humano: push igual que hoy (ACTUAL EXACTO).
+    if (opts.push && _asesor && !_asesorEsIA) {
       try {
         const { data: _aseRow } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesor).maybeSingle();
         if (_aseRow && _aseRow.auth_user_id) await enviarPushAsesor(_aseRow.auth_user_id, opts.pushTitulo || 'Atencion humana', opts.pushTexto || '');
@@ -1309,6 +1478,15 @@ app.post('/api/enviar-media', async (req, res) => {
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;
   const historialManual = (opciones && opciones.historialManual) || null;
+  // PARTE B (punto 1): persona del USUARIO IA que cubre (o null => persona genérica de la cuenta, ACTUAL EXACTO).
+  // Saneado/gateado por el caller (configUsuarioIACobertura): aca solo se USA si trae persona=true. Reusa TODO el
+  // motor (mismo Sonnet, mismas tools, misma KB/inventario por user_id del tenant): solo cambia la voz/objetivo.
+  const agenteConfig = (opciones && opciones.agenteConfig && opciones.agenteConfig.persona) ? opciones.agenteConfig : null;
+  // PARTE B (punto 6 / regla 19): aprendizaje SOLO con reparto_v2 ON. Habilita la tool consultar_al_dueno para que
+  // la IA, en vez de inventar cuando NO sabe, pregunte al dueno. Con flag OFF -> false => la tool NO se ofrece y el
+  // comportamiento es el ACTUAL EXACTO. En modoPrueba no aplica (no hay conv real ni dueno a quien preguntar).
+  let aprendizajeActivo = false;
+  if (conversation_id && !modoPrueba) { try { aprendizajeActivo = await repartoV2Activo(user_id); } catch (eAp) { aprendizajeActivo = false; } }
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, images').eq('user_id', user_id).eq('activa', true);
@@ -1330,11 +1508,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } catch (eDL) { console.error('lectura datos lead:', eDL && eDL.message); }
   }
 
-  const agentName = (settings && settings.agent_name) || 'Asistente';
+  // PARTE B (punto 1 + punto 4 anti-delate): si cubre un USUARIO IA con persona, su NOMBRE HUMANO manda (nunca
+  // "asistente/bot"); su forma_hablar reemplaza el tono fijo y su objetivo describe hasta donde avanza. Si no hay
+  // config (o flag OFF) -> persona genérica de la cuenta (ACTUAL EXACTO).
+  const agentName = (agenteConfig && agenteConfig.nombre) || (settings && settings.agent_name) || 'Asistente';
   const agentCargo = (settings && settings.agent_cargo && String(settings.agent_cargo).trim()) ? String(settings.agent_cargo).trim() : '';
-  const tono = TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano;
+  const tono = (agenteConfig && agenteConfig.formaHablar)
+    ? ('FORMA DE HABLAR (tu estilo personal, respetalo): ' + agenteConfig.formaHablar)
+    : (TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano);
   const autonomia = AUTONOMIA[(settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
-  const objetivo = OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar;
+  const objetivo = (agenteConfig && agenteConfig.objetivo)
+    ? ('TU OBJETIVO (hasta donde avanzas vos antes de derivar a un compañero): ' + agenteConfig.objetivo)
+    : (OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar);
   const largo = LARGO[(settings && settings.response_length) || 'corto'] || LARGO.corto;
   const usaEmojis = settings && settings.use_emojis === true;
   const rubro = (settings && settings.rubro) || 'inmobiliaria';
@@ -1407,7 +1592,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     const MAX_HISTORIAL = 16;
     const { data: prev } = await supabase.from('messages').select('role, content, content_original').eq('conversation_id', conversation_id).order('created_at', { ascending: false }).limit(MAX_HISTORIAL);
     if (prev && prev.length > 0) {
-      historial = prev.slice().reverse().map(function(m){ var textoBase = (m.role === 'ai') ? (m.content_original || m.content) : m.content; return { role: (m.role === 'contact' ? 'user' : 'assistant'), content: textoBase }; });
+      // PARTE B (punto 5 / hallazgo auditoria): el lead = 'user'; lo que dijo la IA o un asesor HUMANO = 'assistant'
+      // (es lo que vio el lead en el hilo). Para que la persona IA no confunda los mensajes de un humano como
+      // suyos al RETOMAR, marcamos los de role='human' con un prefijo claro [Compañero del equipo]. Anthropic no
+      // permite anotar metadatos por mensaje, asi que el prefijo es la senal mas robusta y barata (sin tokens extra
+      // de IA). Con persona genérica el prefijo igual ayuda (continuidad) y NO cambia el comportamiento de respuesta.
+      historial = prev.slice().reverse().map(function(m){
+        if (m.role === 'contact') return { role: 'user', content: m.content };
+        var textoBase = (m.role === 'ai') ? (m.content_original || m.content) : m.content;
+        // role 'human' = lo escribio un asesor humano desde el CRM: marcarlo para no atribuirselo la persona IA.
+        if (m.role === 'human') textoBase = '[Compañero del equipo] ' + textoBase;
+        return { role: 'assistant', content: textoBase };
+      });
     }
   }
 
@@ -1455,11 +1651,22 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   }
 
+  // PARTE B (punto 1): bloques EXTRA de la persona del usuario IA que cubre (conocimiento propio, que NO hacer,
+  // que datos puede usar). Solo se agregan cuando hay agenteConfig con persona; con persona genérica quedan vacios
+  // (=> .filter(Boolean) los descarta y el prompt es el ACTUAL EXACTO). El nombre/tono/objetivo ya se aplicaron
+  // arriba (agentName/tono/objetivo). Los DATOS del negocio (inventario/precios/fechas) SIEMPRE salen del user_id
+  // del tenant (ya cargados arriba); 'datos_que_usa' solo MODULA cuales de esos datos puede ofrecer este usuario IA.
+  const _ic = agenteConfig || {};
+  const bloqueIAConocimiento = _ic.conocimiento ? ('LO QUE SABES Y MANEJAS VOS (tu conocimiento propio como parte del equipo): ' + _ic.conocimiento) : '';
+  const bloqueIANoHacer = _ic.noHacer ? ('LO QUE NO DEBES HACER (limites estrictos, respetalos siempre): ' + _ic.noHacer) : '';
+  const bloqueIADatos = _ic.datosQueUsa ? ('QUE DATOS PODES USAR (de los datos del negocio cargados mas abajo, usa SOLO los que correspondan a esto): ' + _ic.datosQueUsa) : '';
+
   // Parte ESTATICA del system: identica para el tenant entre mensajes y leads -> se CACHEA con cache_control
   // (prompt caching de Anthropic, ~-90% en relecturas). Los datos del lead (dinamicos) van en un bloque aparte.
   const systemStatic = [
     'Sos ' + agentName + (agentCargo ? (', ' + agentCargo) : ', asesor/a') + ' de ' + company + ' (rubro: ' + rubro + ').',
         'IDENTIDAD: Sos una persona del equipo. NUNCA digas que sos una inteligencia artificial, un bot, un asistente virtual ni un programa. Si te preguntan que cargo ocupas, si sos una IA, o quien sos, responde con tu nombre (' + agentName + ')' + (agentCargo ? (" y tu cargo (" + agentCargo + ")") : '') + ' de forma natural, sin admitir que sos un sistema.',
+        bloqueIAConocimiento, bloqueIANoHacer, bloqueIADatos,
         'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
     'LINKS DE PROPIEDADES: Cuando menciones o recomiendes una propiedad que en el inventario tenga un campo link, inclui ese link en tu respuesta para que el lead pueda ver mas informacion y fotos. Compartilo de forma natural, por ejemplo: Te paso el link para que veas las fotos y los detalles. Si la propiedad no tiene link en el inventario, no inventes ninguno ni menciones que falta.',
     'FOTOS DE PROPIEDADES: Cuando el lead te PIDA ver una foto de una propiedad (por ejemplo: mandame una del dormitorio, mostrame la pileta, tenes fotos de la cocina), usa la herramienta enviar_foto_propiedad indicando el numero de la propiedad (campo numero del inventario, ej: 12) y la categoria pedida. Solo podes mandar fotos de propiedades que en el inventario digan fotos disponibles. Las categorias validas son: dormitorio, bano, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Si no tenes claro de que propiedad habla, primero preguntale cual antes de usar la herramienta. No inventes fotos que no existan.',
@@ -1471,6 +1678,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
     instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
+    // PARTE B (punto 6 / regla 19): cuando NO sabes resolver algo, NO inventes. Si es info que el dueno podria
+    // aclararte (una politica, un dato del negocio que no tenes), usa la herramienta consultar_al_dueno para
+    // preguntarle, y mientras tanto decile al lead con naturalidad que lo averiguas y le confirmas. NO la uses para
+    // cosas que ya se derivan a un humano ni para datos puntuales de un solo cliente.
+    aprendizajeActivo ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes: usa la herramienta consultar_al_dueno con la pregunta concreta, y decile al lead con naturalidad que lo consultas y le confirmas enseguida.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
     'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:', inventario, '',
@@ -1494,6 +1706,15 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       required: ['numero', 'categoria']
     }
   }];
+  // PARTE B (punto 6 / regla 19): tool consultar_al_dueno, SOLO con reparto_v2 ON (aprendizajeActivo). ADITIVO: si
+  // no se ofrece (flag OFF) el flujo es EXACTO al actual. Si la IA no la usa, tampoco cambia nada.
+  if (aprendizajeActivo) {
+    toolsAgente.push({
+      name: 'consultar_al_dueno',
+      description: 'Usala SOLO cuando NO sabes resolver una consulta del lead porque te falta info que solo el dueno del negocio puede aclararte (una politica, un dato del negocio que no figura en tu conocimiento ni en la base). NO la uses para datos puntuales de un solo cliente/propiedad ni para cosas que ya se derivan a un humano. Indica la pregunta concreta para el dueno.',
+      input_schema: { type: 'object', properties: { pregunta: { type: 'string', description: 'La pregunta concreta y autocontenida para el dueno (que necesitas saber para poder responderle al lead).' } }, required: ['pregunta'] }
+    });
+  }
 
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
@@ -1515,8 +1736,45 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // mediaAEnviar: fotos que el webhook debera mandar DESPUES del texto. Vacio si la IA no pidio foto.
   let mediaAEnviar = [];
   let reply;
-  // ¿La IA pidio usar la tool de foto?
+  // PARTE B (punto 6 / regla 19): ¿la IA pidio consultar_al_dueno? Lo manejamos ANTES de la tool de foto. Registra
+  // la duda + avisa al dueno (registrarConsultaAprendizaje, sin tokens de IA en ese paso) y hace un SEGUNDO turno
+  // para que la IA cierre con un mensaje natural al lead ("lo consulto y te confirmo"). Gateado: la tool solo existe
+  // con reparto_v2 ON, asi que esta rama nunca se entra con flag OFF (ACTUAL EXACTO).
   if (completion && completion.stop_reason === 'tool_use') {
+    const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
+    if (_toolDueno) {
+      try {
+        const _pregunta = (_toolDueno.input && _toolDueno.input.pregunta) ? String(_toolDueno.input.pregunta).trim() : '';
+        // Registrar + avisar al dueno en segundo plano (no bloquea la respuesta al lead). user_id = TENANT (aislamiento).
+        if (_pregunta) { registrarConsultaAprendizaje(user_id, conversation_id, _pregunta).catch(function(){}); }
+        let _textoCierre = '';
+        try {
+          const _msgsT2 = mensajesParaIA.concat([
+            { role: 'assistant', content: completion.content },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolDueno.id, content: 'Consulta registrada y enviada al dueno. Decile al lead con naturalidad que estas averiguando ese dato y le confirmas enseguida; segui la conversacion normal con lo que si podes responder.' }] }
+          ]);
+          const _c2 = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsT2 });
+          const _b2 = (_c2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
+          if (_b2 && _b2.text) _textoCierre = _b2.text;
+          if (_c2 && _c2.usage && completion && completion.usage) {
+            completion.usage = {
+              input_tokens: (completion.usage.input_tokens || 0) + (_c2.usage.input_tokens || 0),
+              output_tokens: (completion.usage.output_tokens || 0) + (_c2.usage.output_tokens || 0),
+              cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (_c2.usage.cache_read_input_tokens || 0),
+              cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (_c2.usage.cache_creation_input_tokens || 0)
+            };
+          }
+        } catch (eT2) { console.error('segundo turno consultar_al_dueno:', eT2 && eT2.message); }
+        const _textoPrevioD = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+        reply = _textoCierre || _textoPrevioD || 'Dejame que lo averiguo con el equipo y te confirmo enseguida.';
+        if (!usaEmojis) { const _l = quitarEmojis(reply); if (_l) reply = _l; }
+        // Guardado/traduccion/persistencia: cae al bloque comun de mas abajo (reusa replyCliente/insert). Saltamos
+        // toda la logica de foto. Marcamos que ya tenemos reply para no re-entrar al else.
+      } catch (eDueno) {
+        console.error('flujo consultar_al_dueno:', eDueno && eDueno.message);
+        reply = 'Dejame que lo averiguo con el equipo y te confirmo enseguida.';
+      }
+    } else {
     try {
       const toolUse = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'enviar_foto_propiedad'; });
       const textoPrevio = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
@@ -1596,6 +1854,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       const _txt = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       reply = _txt || 'Disculpa, ahora mismo no puedo mandarte la foto, pero seguimos por aca.';
     }
+    } // cierra el else de _toolDueno (rama tool de foto / otras tools)
   } else {
     const block = (completion && completion.content) ? completion.content[0] : null;
     reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
@@ -1616,8 +1875,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       }
     } catch (e) { console.error('trad saliente IA:', e && e.message); /* si falla, se envia el original en idioma base */ }
     // content = lo que recibe el cliente (idioma del lead); content_original = version en idioma base para el asesor
+    // PARTE B (punto 4 anti-delate): si cubre un usuario IA, firmamos el mensaje con SU NOMBRE HUMANO en enviado_por
+    // (lo que ve el equipo en el CRM), nunca "Agente IA". role sigue siendo 'ai' (no cambia pausa ni contador).
+    const _enviadoPor = (agenteConfig && agenteConfig.nombre) ? agenteConfig.nombre : 'Agente IA';
     await supabase.from('messages').insert([
-      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: 'Agente IA' }
+      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: _enviadoPor }
     ]);
     await supabase.from('conversations').update({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }
@@ -2399,6 +2661,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             await enviarWhatsapp(instanciaNombre, telefono, 'Listo, guarde esto en la configuracion de tu negocio (lo ves y editas en Configuracion -> Sobre tu negocio). El agente lo va a tener en cuenta al atender:\n\n"' + _resumen + '"');
             return;
           }
+          // PARTE B (punto 6 / regla 19): si hay una consulta de APRENDIZAJE pendiente para este tenant, la respuesta
+          // del dueno es la ACLARACION. La procesamos (valida con 1 llamada de IA puntual y guarda en KB si aplica).
+          // Si consume el mensaje, cortamos aca (no lo tratamos como pedido de reporte). Gateado por reparto_v2 dentro
+          // de la funcion: con flag OFF devuelve false y el flujo de reportes sigue EXACTO al actual.
+          try {
+            if (await procesarRespuestaAprendizaje(user_id, textoAdmin, instanciaNombre, telefono)) return;
+          } catch (eApr) { console.error('aprendizaje respuesta dueno:', eApr && eApr.message); }
           const respuestaAdmin = await responderConsultaAdmin(user_id, textoAdmin);
           await enviarWhatsapp(instanciaNombre, telefono, respuestaAdmin);
           return; // el numero del dueno es canal de reportes/config; no se procesa como lead
@@ -2717,7 +2986,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             }
             // Ambiguo: no consumir; el flujo normal + la clasificacion de abajo deciden (fallback sin llamada extra).
           }
-          const resultado = await generarRespuestaAgente(user_id, _convId, texto);
+          // PARTE B (punto 1): si ESTA conv la cubre un USUARIO IA (es_ia + ai_enabled + reparto_v2 ON), responder
+          // COMO ese usuario (su agente_config). configUsuarioIACobertura ya gatea/sanea/aisla por tenant; devuelve
+          // null en el camino genérico => generarRespuestaAgente responde con la persona de la cuenta (ACTUAL EXACTO).
+          let _agenteConfigIA = null;
+          try { _agenteConfigIA = await configUsuarioIACobertura(user_id, _convId); } catch (eCfgIA) { _agenteConfigIA = null; }
+          const resultado = await generarRespuestaAgente(user_id, _convId, texto, _agenteConfigIA ? { agenteConfig: _agenteConfigIA } : undefined);
           if (resultado && resultado.reply) {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
             try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
@@ -3697,11 +3971,25 @@ app.post('/api/asesores/activar', async (req, res) => {
     // (que es como se mapean ahora Administrador/Empleado). Con flag OFF, queda igual que antes.
     let activos = null;
     {
-      const { data: act0 } = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+      // PARTE B (fix hueco auditoria): traemos tambien es_ia para EXCLUIR usuarios IA del drenaje de la COLA humana.
+      // La cola 'listo_humano' son leads que esperan un HUMANO; si se los asignaramos a un usuario IA quedarian con
+      // ai_enabled=false (cola humana) y un asesor IA -> NADIE responde. DEFENSIVO: si es_ia no existe, reintentamos
+      // sin esa columna (set legacy) y no se filtra (comportamiento ACTUAL EXACTO).
+      let act0 = null;
+      try {
+        const r = await supabase.from('asesores').select('id, disponibilidad, es_ia').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+        if (r.error) throw r.error; act0 = r.data;
+      } catch (eIaCol) {
+        const r2 = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+        act0 = r2.data;
+      }
       activos = act0;
       let v2act = false;
       try { v2act = await repartoV2Activo(admin_id, null); } catch (eV2a) { v2act = false; }
-      if (v2act && Array.isArray(activos)) activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe'; });
+      if (v2act && Array.isArray(activos)) {
+        activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe'; });
+        activos = activos.filter(function(a){ return a.es_ia !== true; }); // la cola humana NO se reparte a usuarios IA
+      }
     }
     if (!activos || activos.length === 0) return res.json({ ok: true, asignados: 0 });
     // 3. Buscar leads EN COLA: listos para humano, sin asignar y no tomados por el admin.

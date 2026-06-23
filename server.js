@@ -566,12 +566,108 @@ async function elegirAsesorActivo(admin_id) {
     // contar leads asignados a cada asesor activo
     let mejor = null; let menos = Infinity;
     for (const a of activos) {
-      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', a.id);
+      // D1=B: la "carga" cuenta SOLO las conversaciones que el asesor atiende de verdad
+      // (asignadas a el y en atencion humana = status 'listo_humano'). Se excluyen las
+      // cerradas y las que todavia maneja la IA (en_conversacion / interesado / recontacto).
+      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', a.id).eq('status', 'listo_humano');
       const n = count || 0;
       if (n < menos) { menos = n; mejor = a.id; }
     }
     return mejor;
   } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
+}
+
+// ===== ETAPA 5: COLA + AVISO AL DUENO =====
+// Cuando una conversacion pasa a atencion humana pero NO hay asesor disponible (elegirAsesorActivo
+// devuelve null), queda EN COLA (status='listo_humano' con asesor_id null) y hay que avisarle al dueno.
+// D2=C: el aviso va por WhatsApp (business_settings.whatsapp_contacto) Y por push (device_tokens del admin).
+// El aviso es una PLANTILLA FIJA (no gasta tokens de IA). Dedupe: un solo aviso por conversacion encolada
+// (no por cada mensaje). El drenaje de la cola al activarse un asesor lo hace /api/asesores/activar (etapa 2).
+//
+// Dedupe en 2 capas (conservador): (a) flag persistente conversations.cola_avisada (si la columna existe);
+// (b) Set en memoria como red de seguridad dentro del proceso. Si la columna NO existe todavia en la base,
+// el update falla en silencio y el Set evita el spam dentro de este proceso.
+const _colaAvisada = new Set();
+async function avisarDuenoColaSinAsesor(convId, user_id) {
+  try {
+    if (!convId || !user_id) return;
+    if (_colaAvisada.has(convId)) return; // ya avisado en este proceso
+    // Dedupe persistente: si la conv ya tiene cola_avisada=true, no reavisar. Si la columna no existe,
+    // la consulta puede fallar; en ese caso seguimos (el Set en memoria nos cubre dentro del proceso).
+    try {
+      const { data: _flag } = await supabase.from('conversations').select('cola_avisada').eq('id', convId).maybeSingle();
+      if (_flag && _flag.cola_avisada === true) { _colaAvisada.add(convId); return; }
+    } catch (eFlag) { /* columna ausente u otro error: no bloquea el aviso */ }
+    // Marcar en memoria YA (antes de los envios) para que mensajes concurrentes no disparen otro aviso.
+    _colaAvisada.add(convId);
+    // Datos del dueno: business_settings (whatsapp_contacto) de esta cuenta.
+    let _waContacto = null;
+    try {
+      const { data: _bs } = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', user_id).maybeSingle();
+      _waContacto = _bs && _bs.whatsapp_contacto ? String(_bs.whatsapp_contacto).trim() : null;
+    } catch (eBs) {}
+    const _texto = 'Tenes un lead esperando atencion y no hay ningun asesor disponible para tomarlo. Activa o conecta un asesor para que se le asigne.';
+    // 1) WhatsApp al dueno (si configuro whatsapp_contacto). Usa la instancia de la cuenta.
+    if (_waContacto) {
+      try { await enviarWhatsapp(nombreInstancia(user_id), _waContacto, _texto); } catch (eWa) { console.error('aviso cola WhatsApp:', eWa && eWa.message); }
+    }
+    // 2) Push al dueno (sus device_tokens estan keyed por su propio auth user_id = user_id del admin).
+    try { await enviarPushAsesor(user_id, 'Lead en espera', null, _texto); } catch (ePush) { console.error('aviso cola push:', ePush && ePush.message); }
+    // 3) Marcar el flag persistente (best-effort: si la columna no existe, falla en silencio).
+    try { await supabase.from('conversations').update({ cola_avisada: true }).eq('id', convId); } catch (eMark) { /* columna ausente: el Set en memoria ya dedupea */ }
+  } catch (e) { console.error('avisarDuenoColaSinAsesor:', e && e.message); }
+}
+
+// ===== DERIVACION A HUMANO (unificada) =====
+// ETAPA 4 (refactor que PRESERVA EL COMPORTAMIENTO): la logica de pasar una conversacion a atencion
+// humana estaba triplicada (handoff por pedido explicito, clasificacion a listo_humano, y red de
+// seguridad). Esta funcion la centraliza SIN cambiar lo que hace hoy. El reparto por departamento y
+// la cola se engancharan aca en etapas posteriores; por ahora usa elegirAsesorActivo IGUAL que antes.
+//
+// Hace, en este orden y solo si corresponde:
+//   1) (opts.setStatus) status='listo_humano' + ai_enabled=false (+ last_message/last_role si vienen).
+//   2) Elegir/asignar asesor con elegirAsesorActivo SOLO si la conv no tiene asesor_id ni admin_tomo
+//      (mismo criterio que hoy); escribe asesor_id + ultimo_asesor_id. Devuelve el asesor resultante.
+//   3) (opts.push) avisar al asesor por push (titulo/cuerpo segun el caso).
+//   4) (opts.resumen) generar y guardar el resumen de la conversacion.
+// Las partes que NO comparten los 3 sitios (mandar WhatsApp del handoff, insertar el mensaje, agendar
+// cita) quedan FUERA: las sigue manejando cada sitio para no alterar el comportamiento.
+// Devuelve el asesor_id vigente (el ya asignado o el recien elegido) o null.
+async function derivarAHumano(convId, user_id, motivo, opts) {
+  opts = opts || {};
+  try {
+    // 1) Pasar a atencion humana (status + IA off). Algunos sitios ya lo hicieron antes; por eso es opcional.
+    if (opts.setStatus) {
+      const _upd = { status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() };
+      if (typeof opts.lastMessage === 'string') { _upd.last_message = opts.lastMessage; _upd.last_role = opts.lastRole || 'ai'; }
+      await supabase.from('conversations').update(_upd).eq('id', convId);
+    }
+    // 2) Elegir/asignar asesor (solo si no tiene y no lo tomo el admin) — criterio identico al actual.
+    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, user_id').eq('id', convId).maybeSingle();
+    let _asesor = _cv && _cv.asesor_id;
+    if (_cv && !_cv.asesor_id && !_cv.admin_tomo) {
+      _asesor = await elegirAsesorActivo(_cv.user_id || user_id);
+      if (_asesor) await supabase.from('conversations').update({ asesor_id: _asesor, ultimo_asesor_id: _asesor }).eq('id', convId);
+    }
+    // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
+    // (status='listo_humano' con asesor_id null, ya lo dejaron asi los sitios que llaman) y avisamos al dueno.
+    // Dedupe interno: un solo aviso por conversacion encolada (no por cada mensaje). No gasta tokens de IA.
+    if (!_asesor && _cv && !_cv.admin_tomo) {
+      await avisarDuenoColaSinAsesor(convId, _cv.user_id || user_id);
+    }
+    // 3) Push al asesor (opcional: hoy solo lo hace el handoff por pedido explicito).
+    if (opts.push && _asesor) {
+      try {
+        const { data: _aseRow } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesor).maybeSingle();
+        if (_aseRow && _aseRow.auth_user_id) await enviarPushAsesor(_aseRow.auth_user_id, opts.pushTitulo || 'Atencion humana', opts.pushTexto || '');
+      } catch (eP) {}
+    }
+    // 4) Resumen (opcional) para que el asesor se ponga al dia.
+    if (opts.resumen) {
+      try { const _res = await generarResumenConversacion(convId, user_id); if (_res) await supabase.from('conversations').update({ summary: _res }).eq('id', convId); } catch (eR) {}
+    }
+    return _asesor || null;
+  } catch (e) { console.error('Error derivarAHumano (' + (motivo || '') + '):', e && e.message); return null; }
 }
 
 // ===== TRANSCRIPCION DE AUDIO con Groq Whisper (multilenguaje, autodetect) =====
@@ -1015,29 +1111,82 @@ function _pideHumano(texto) {
 
 // Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
 // Conservador: solo devuelve un estado nuevo cuando la senal es clara; si no, devuelve null.
+//
+// FASE 2 / ETAPA 3 (departamento INERTE): ademas del estado, esta MISMA llamada a Haiku deduce
+// el DEPARTAMENTO del lead (D8=C hibrido: lo deduce de la charla; D3=A: lo mapea a uno de los
+// departamentos del tenant). NO se agrega ninguna llamada extra a Claude: se reusa la unica
+// llamada que ya existia, solo se amplia el prompt para que devuelva tambien el depto. Si la IA
+// no esta segura, departamentoId queda null (preguntar al lead es de una etapa posterior).
+//
+// Devuelve un objeto { estado, departamentoId }:
+//   - estado: 'listo_humano' | 'interesado' | null  (igual que antes; null = sin cambio)
+//   - departamentoId: id (uuid) de un departamento del tenant, o null si no se pudo deducir.
+// El departamento es INERTE en esta etapa: solo se guarda en conversations.departamento_id; NO se
+// usa todavia para rutear ni cambia el reparto.
 async function clasificarEstado(mensajeCliente, user_id) {
   try {
+    // Cargar los departamentos ACTIVOS del tenant (DB, sin IA). Si no hay, el depto queda inerte/null.
+    let _deptos = [];
+    try {
+      if (user_id) {
+        const { data: _dd } = await supabase.from('departamentos').select('id, nombre, criterio_derivacion').eq('user_id', user_id).eq('activo', true);
+        _deptos = _dd || [];
+      }
+    } catch (eDep) { _deptos = []; }
+    const _hayDeptos = _deptos.length > 0;
+    // Mapea el nombre que devuelve la IA -> id de departamento del tenant (match exacto, sin acentos/case).
+    const _norm = function(s){ return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
+    const _resolverDeptoId = function(nombre){
+      const n = _norm(nombre);
+      if (!n || n === 'ninguno' || n === 'null' || n === 'none') return null;
+      const hit = _deptos.find(function(d){ return _norm(d.nombre) === n; });
+      return hit ? hit.id : null;
+    };
+
     // ATAJO SIN IA: si el lead pide explicitamente un humano/asesor/persona -> listo_humano seguro (no falla
     // ni gasta token). Resuelve el caso "puedo hablar con una persona real?" que la IA a veces sub-clasificaba.
-    if (_pideHumano(mensajeCliente)) return 'listo_humano';
+    // No deduce departamento (no hay IA en este atajo): departamentoId queda null (conservador).
+    if (_pideHumano(mensajeCliente)) return { estado: 'listo_humano', departamentoId: null };
+    const _lineasDepto = _hayDeptos ? [
+      'Ademas, deduci a que DEPARTAMENTO del negocio corresponde la consulta del cliente, eligiendo SOLO uno de esta lista (por su nombre EXACTO) o "ninguno" si no estas seguro:',
+      _deptos.map(function(d){ return '- ' + d.nombre + (d.criterio_derivacion ? (': ' + String(d.criterio_derivacion).slice(0, 200)) : ''); }).join('\n'),
+      'REGLA DEPARTAMENTO: si no podes deducirlo con razonable seguridad del mensaje, responde "ninguno" (NO adivines).'
+    ] : [];
+    const _formato = _hayDeptos
+      ? 'Responde UNICAMENTE un JSON sin markdown con esta forma EXACTA: {"estado":"<listo_humano|interesado|sin_cambio>","departamento":"<nombre exacto de la lista o ninguno>"}'
+      : 'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.';
     const prompt = [
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
-      'Segun el mensaje del cliente, responde UNA sola palabra exacta:',
+      'Segun el mensaje del cliente, clasifica el ESTADO en una de estas opciones exactas:',
       '- listo_humano  => si pide hablar con / ser atendido por una persona, asesor, humano, agente o alguien real EN CUALQUIER FORMA, incluso como PREGUNTA (ej: "puedo hablar con una persona real?", "que me atienda un asesor") => SIEMPRE listo_humano, sin importar si pregunto o no por una propiedad. TAMBIEN si CONFIRMA o ACUERDA un paso concreto: ACEPTA o COORDINA una VISITA o cita (da fecha/dia/horario o dice que si a ir a verla), una reserva, sena, compra o alquiler; o quiere AVANZAR la operacion; o pide que lo contacten/llamen.',
       '- interesado    => todavia esta CONSULTANDO sin confirmar: pregunta por una propiedad, precio, disponibilidad, o (en hotel) alojamiento/fechas; pide datos para decidir; pregunta si puede visitar o cuando (SIN acordar todavia una fecha/horario concreto); o dice que le interesa. Basta con que pregunte por algo concreto del negocio.',
       '- sin_cambio    => SOLO si es un saludo inicial sin consulta (hola, buenas) o algo no relacionado al negocio. Si ya pregunto algo concreto, NO es sin_cambio.',
-      'CLAVE: la diferencia entre listo_humano e interesado es el COMPROMISO. Si SOLO consulta o muestra interes => interesado. Si ACEPTA/COORDINA una visita, reserva o avanzar la operacion => listo_humano (hay que derivar a un humano). Ante la duda entre interesado y sin_cambio, elegi interesado.',
-      'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.',
+      'CLAVE: la diferencia entre listo_humano e interesado es el COMPROMISO. Si SOLO consulta o muestra interes => interesado. Si ACEPTA/COORDINA una visita, reserva o avanzar la operacion => listo_humano (hay que derivar a un humano). Ante la duda entre interesado y sin_cambio, elegi interesado.'
+    ].concat(_lineasDepto).concat([
+      _formato,
       'Mensaje del cliente: ' + mensajeCliente
-    ].join('\n');
-    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 20, messages: [{ role: 'user', content: prompt }] }); // Haiku: clasificacion INTERNA (regla de modelos: customer-facing=Sonnet, interno=Haiku). Logea cada decision en [CLASIFICADOR].
+    ]).join('\n');
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: _hayDeptos ? 60 : 20, messages: [{ role: 'user', content: prompt }] }); // Haiku: clasificacion INTERNA (regla de modelos: customer-facing=Sonnet, interno=Haiku). Logea cada decision en [CLASIFICADOR].
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_estado', PRECIO_HAIKU); } catch(e){}
-    const out = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim().toLowerCase() : '';
-    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> respuesta IA:', JSON.stringify(out));
-    if (out.includes('listo_humano')) return 'listo_humano';
-    if (out.includes('interesado')) return 'interesado';
-    return null;
-  } catch (e) { console.error('Error clasificando estado:', e && e.message); return null; }
+    const rawOut = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
+    // Parseo: con deptos esperamos JSON; sin deptos, una palabra suelta (compatibilidad).
+    let _estado = null; let _departamentoId = null;
+    let _outLower = rawOut.toLowerCase();
+    if (_hayDeptos) {
+      try {
+        const m = rawOut.match(/\{[\s\S]*\}/);
+        const parsed = m ? JSON.parse(m[0]) : null;
+        if (parsed) {
+          _outLower = String(parsed.estado || '').toLowerCase();
+          _departamentoId = _resolverDeptoId(parsed.departamento);
+        }
+      } catch (eJson) { /* si el JSON falla, caemos al parseo por substring de abajo */ }
+    }
+    if (_outLower.includes('listo_humano')) _estado = 'listo_humano';
+    else if (_outLower.includes('interesado')) _estado = 'interesado';
+    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> estado:', JSON.stringify(_estado), 'departamentoId:', JSON.stringify(_departamentoId));
+    return { estado: _estado, departamentoId: _departamentoId };
+  } catch (e) { console.error('Error clasificando estado:', e && e.message); return { estado: null, departamentoId: null }; }
 }
 
 // Extrae datos que el LEAD menciona (nombre, origen, interes, presupuesto) para tener MEMORIA y no re-preguntar.
@@ -1959,16 +2108,19 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             try {
               await enviarWhatsapp(instanciaNombre, telefono, _msgHandoff);
               await supabase.from('messages').insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: _msgHandoff, enviado_por: 'Agente IA' });
-              await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, last_message: _msgHandoff, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', _convId);
-              // asignar asesor si no tiene + avisarle por push + resumen para que se ponga al dia (mismo criterio que la derivacion normal)
-              const { data: _cvH } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', _convId).maybeSingle();
-              let _aseH = _cvH && _cvH.asesor_id;
-              if (_cvH && !_cvH.asesor_id && !_cvH.admin_tomo) {
-                _aseH = await elegirAsesorActivo(user_id);
-                if (_aseH) await supabase.from('conversations').update({ asesor_id: _aseH, ultimo_asesor_id: _aseH }).eq('id', _convId);
-              }
-              if (_aseH) { try { const { data: _aseRow } = await supabase.from('asesores').select('auth_user_id').eq('id', _aseH).maybeSingle(); if (_aseRow && _aseRow.auth_user_id) await enviarPushAsesor(_aseRow.auth_user_id, 'Un lead pide un asesor', (data.pushName || telefono)); } catch (eP) {} }
-              try { const _resH = await generarResumenConversacion(_convId, user_id); if (_resH) await supabase.from('conversations').update({ summary: _resH }).eq('id', _convId); } catch (eR) {}
+              // ETAPA 4: pasar a listo_humano + IA off, asignar asesor (si no tiene), push y resumen
+              // ahora viven en derivarAHumano (mismo comportamiento que antes). El handoff conserva el
+              // estado last_message/last_role del mensaje de derivacion y avisa por push (caso explicito).
+              await derivarAHumano(_convId, user_id, 'handoff_pedido_humano', {
+                setStatus: true, lastMessage: _msgHandoff, lastRole: 'ai',
+                push: true, pushTitulo: 'Un lead pide un asesor', pushTexto: (data.pushName || telefono),
+                resumen: true
+              });
+              // ETAPA 3 (departamento INERTE): en este handoff NO se deduce departamento_id. Este atajo evita a
+              // proposito toda llamada a Claude (ahorra tokens) y se dispara por un pedido explicito de humano,
+              // donde el rubro/departamento suele no estar claro. Decision CONSERVADORA (regla D8=C / "si no esta
+              // segura, dejar null"): queda departamento_id en null y se deducira en un mensaje posterior por la
+              // clasificacion normal. No agregamos una llamada de IA solo para esto (regla de gasto en rojo).
             } catch (eHand) { console.error('handoff humano:', eHand && eHand.message); }
             return; // saltea la generacion de la IA; el finally libera _genEnCurso
           }
@@ -2000,7 +2152,22 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const estadoActual = (convActual && convActual.status) || 'en_conversacion';
           // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
           if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
-            const nuevoEstado = await clasificarEstado(texto, user_id);
+            // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId } (depto INERTE).
+            const _clasif = await clasificarEstado(texto, user_id);
+            const nuevoEstado = _clasif && _clasif.estado;
+            const _departamentoId = _clasif && _clasif.departamentoId;
+            // DEPARTAMENTO INERTE (Etapa 3): guardar el depto deducido en conversations.departamento_id
+            // SIN usarlo todavia para rutear ni cambiar el reparto. Conservador: solo se escribe si la IA
+            // dedujo uno (si quedo null, no se toca) y solo si la conversacion AUN no tiene departamento_id
+            // (no piso una deduccion previa). Independiente del estado: aplica aunque siga interesado/sin_cambio.
+            if (_departamentoId) {
+              try {
+                const { data: _cvDep } = await supabase.from('conversations').select('departamento_id').eq('id', _convId).maybeSingle();
+                if (_cvDep && !_cvDep.departamento_id) {
+                  await supabase.from('conversations').update({ departamento_id: _departamentoId }).eq('id', _convId);
+                }
+              } catch (eDepW) { console.error('Error guardando departamento_id (inerte):', eDepW && eDepW.message); }
+            }
             if (nuevoEstado) {
               // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
               const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
@@ -2009,20 +2176,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
                 if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
                 await supabase.from('conversations').update(update).eq('id', _convId);
-                // Si paso a listo_humano y no tiene asesor ni fue tomado por el admin, asignar automaticamente
+                // Si paso a listo_humano: asignar asesor (si no tiene) + generar resumen.
                 if (nuevoEstado === 'listo_humano') {
-                  const { data: cv } = await supabase.from('conversations').select('asesor_id, admin_tomo').eq('id', _convId).single();
-                  if (cv && !cv.asesor_id && !cv.admin_tomo) {
-                    const asesorAuto = await elegirAsesorActivo(user_id);
-                    if (asesorAuto) {
-                      await supabase.from('conversations').update({ asesor_id: asesorAuto, ultimo_asesor_id: asesorAuto }).eq('id', _convId);
-                    }
-                  }
-                  // Al TRANSICIONAR a listo_humano, generar el RESUMEN IA y guardarlo (no bloquea ni rompe la respuesta)
-                  try {
-                    var _res = await generarResumenConversacion(_convId, user_id);
-                    if (_res) await supabase.from('conversations').update({ summary: _res, updated_at: new Date().toISOString() }).eq('id', _convId);
-                  } catch (eResumen) { console.error('Error resumen auto listo_humano:', eResumen && eResumen.message); }
+                  // ETAPA 4: la asignacion de asesor y el resumen al transicionar a listo_humano ahora viven
+                  // en derivarAHumano (mismo comportamiento). El status/ai_enabled ya se escribieron arriba
+                  // (setStatus:false), y este flujo NO avisa por push (igual que antes, push:false).
+                  await derivarAHumano(_convId, user_id, 'clasificacion_listo_humano', { setStatus: false, push: false, resumen: true });
                   // CITAS: si el lead acordo una cita concreta (fecha+hora) en este handoff, agendarla + avisar al asesor.
                   // Fire-and-forget: no bloquea ni rompe la respuesta. Solo corre en el momento del handoff (raro).
                   detectarYAgendarCita(user_id, _convId).catch(function(){});
@@ -2032,11 +2191,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             // RED DE SEGURIDAD: si la conversacion esta en listo_humano sin asesor (quedo huerfana), derivar ahora
             try {
               const { data: cvSeg } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, user_id').eq('id', _convId).single();
+              // Se mantiene el guard de status='listo_humano' (la red de seguridad SOLO actua si ya esta en
+              // atencion humana). El criterio "sin asesor && !admin_tomo" lo reaplica derivarAHumano por dentro.
               if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
-                const asesorSeg = await elegirAsesorActivo(cvSeg.user_id);
-                if (asesorSeg) {
-                  await supabase.from('conversations').update({ asesor_id: asesorSeg, ultimo_asesor_id: asesorSeg }).eq('id', _convId);
-                }
+                // ETAPA 4: solo asignar asesor (sin tocar status, sin push, sin resumen) — igual que antes.
+                await derivarAHumano(_convId, cvSeg.user_id, 'red_seguridad', { setStatus: false, push: false, resumen: false });
               }
             } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
             // MEMORIA VIVA: actualizar el resumen-de-avance (THROTTLED) para que el agente retome sin releer todo
@@ -2654,13 +2813,16 @@ app.post('/api/asesores/activar', async (req, res) => {
     // 2. Buscar asesores activos de la inmobiliaria (excluyendo administradores: no reciben leads)
     const { data: activos } = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
     if (!activos || activos.length === 0) return res.json({ ok: true, asignados: 0 });
-    // 3. Buscar leads en espera, sin asignar y no tomados por el admin
-    const { data: enEspera } = await supabase.from('conversations').select('id').eq('user_id', admin_id).is('asesor_id', null).eq('admin_tomo', false);
+    // 3. Buscar leads EN COLA: listos para humano, sin asignar y no tomados por el admin.
+    //    Filtramos por status='listo_humano' para NO repartir conversaciones que aun maneja la IA.
+    const { data: enEspera } = await supabase.from('conversations').select('id').eq('user_id', admin_id).eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
     if (!enEspera || enEspera.length === 0) return res.json({ ok: true, asignados: 0 });
     // 4. Contar carga actual de cada activo para repartir equitativo
     const carga = {};
     for (const a of activos) {
-      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', a.id);
+      // D1=B: la carga cuenta SOLO conversaciones asignadas y en atencion humana ('listo_humano').
+      // Se excluyen cerradas y las que aun maneja la IA (en_conversacion / interesado / recontacto).
+      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', a.id).eq('status', 'listo_humano');
       carga[a.id] = count || 0;
     }
     // 5. Repartir cada lead en espera al activo con menos carga
@@ -2668,7 +2830,13 @@ app.post('/api/asesores/activar', async (req, res) => {
     for (const lead of enEspera) {
       let mejor = activos[0].id; let menos = carga[mejor];
       for (const a of activos) { if (carga[a.id] < menos) { menos = carga[a.id]; mejor = a.id; } }
+      // La asignacion va PRIMERO y sola, para no depender de columnas nuevas (si cola_avisada no existe,
+      // Supabase devuelve error en vez de tirar excepcion y NO se escribiria la asignacion). Mantiene el drenaje intacto.
       await supabase.from('conversations').update({ asesor_id: mejor, ultimo_asesor_id: mejor }).eq('id', lead.id);
+      // ETAPA 5 (best-effort): limpiar la marca de aviso para que, si en el futuro vuelve a quedar sin asesor,
+      // se pueda volver a avisar al dueno. Si la columna cola_avisada no existe, esto no afecta la asignacion.
+      try { await supabase.from('conversations').update({ cola_avisada: false }).eq('id', lead.id); } catch (eFlag) {}
+      try { _colaAvisada.delete(lead.id); } catch (eDel) {}
       carga[mejor] = (carga[mejor] || 0) + 1;
       asignados++;
     }

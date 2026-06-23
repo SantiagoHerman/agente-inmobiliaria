@@ -1030,8 +1030,8 @@ async function clasificarEstado(mensajeCliente, user_id) {
       'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.',
       'Mensaje del cliente: ' + mensajeCliente
     ].join('\n');
-    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 20, messages: [{ role: 'user', content: prompt }] });
-    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_estado'); } catch(e){}
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 20, messages: [{ role: 'user', content: prompt }] }); // Haiku: clasificacion INTERNA (regla de modelos: customer-facing=Sonnet, interno=Haiku). Logea cada decision en [CLASIFICADOR].
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_estado', PRECIO_HAIKU); } catch(e){}
     const out = (r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim().toLowerCase() : '';
     console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> respuesta IA:', JSON.stringify(out));
     if (out.includes('listo_humano')) return 'listo_humano';
@@ -1061,8 +1061,8 @@ async function extraerDatosLead(texto, datosPrevios, user_id) {
       (prev.nombre || prev.interes || prev.presupuesto) ? ('Datos ya conocidos (no hace falta repetirlos, solo agrega lo nuevo): ' + JSON.stringify({ nombre: prev.nombre || '', interes: prev.interes || '', presupuesto: prev.presupuesto || '' })) : '',
       'Mensaje del cliente: ' + JSON.stringify(texto)
     ].filter(Boolean).join('\n');
-    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 150, messages: [{ role: 'user', content: prompt }] });
-    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'extraer_datos'); } catch(e){}
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 150, messages: [{ role: 'user', content: prompt }] }); // Haiku: extraccion INTERNA de datos (regla de modelos). Errar a vacio es seguro.
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'extraer_datos', PRECIO_HAIKU); } catch(e){}
     let out = (r && r.content && r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
     // por si la IA envuelve en ```json ... ```
     const m = out.match(/\{[\s\S]*\}/);

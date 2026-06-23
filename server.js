@@ -2654,6 +2654,130 @@ app.post('/api/asesores/eliminar', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== DEPARTAMENTOS (Fase 1 - equipo configurable). ADITIVO: tablas nuevas, NO toca el reparto actual. =====
+// Scope por cuenta: el dueno (token === admin_id) gestiona los departamentos de su inmobiliaria.
+// Las tablas tienen RLS service-key-only, por eso el frontend SIEMPRE pasa por estos endpoints.
+const PLANTILLAS_DEPTOS = {
+  inmobiliaria: [
+    { nombre: 'Recepción', criterio: 'Saludos y consultas generales que todavia no tienen un area clara.', def: true },
+    { nombre: 'Ventas', criterio: 'Comprar una propiedad, ver propiedades en venta, precios de venta.' },
+    { nombre: 'Alquileres', criterio: 'Alquilar (anual o temporal), requisitos, garantias, precios de alquiler, permuta.' },
+    { nombre: 'Tasaciones', criterio: 'Cuanto vale mi propiedad, tasar o cotizar para vender o alquilar.' },
+    { nombre: 'Administración', criterio: 'Pagos, recibos, contratos, expensas, cobranzas.', fallback: true },
+    { nombre: 'Gerencia', criterio: 'Reclamos serios, quejas o decisiones que requieren al responsable.' }
+  ],
+  hoteleria: [
+    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, reservar una estadia.', def: true },
+    { nombre: 'Recepción', criterio: 'Check-in, llegada, traslados, consultas del huesped alojado.' },
+    { nombre: 'Eventos', criterio: 'Casamientos, grupos, eventos, salones.' },
+    { nombre: 'Mantenimiento', criterio: 'Problemas en la habitacion, fallas, limpieza.' },
+    { nombre: 'Administración', criterio: 'Facturas, pagos, cobranzas.', fallback: true },
+    { nombre: 'Gerencia', criterio: 'Quejas serias o huespedes VIP.' }
+  ],
+  desarrolladora: [
+    { nombre: 'Ventas de pozo', criterio: 'Reservar o comprar unidades, tipologias, precios, planes de pago.', def: true },
+    { nombre: 'Proyectos', criterio: 'Consultas tecnicas, arquitecto, materiales, modificaciones de unidad.' },
+    { nombre: 'Avance de obra', criterio: 'En que etapa va la obra, fechas de entrega.' },
+    { nombre: 'Posventa', criterio: 'Ya compro: observaciones, entregas, garantia.' },
+    { nombre: 'Administración', criterio: 'Cuotas, pagos, planes de financiacion.', fallback: true },
+    { nombre: 'Gerencia', criterio: 'Reclamos o decisiones que requieren al responsable.' }
+  ]
+};
+
+app.get('/api/departamentos', async function(req, res) {
+  try {
+    const userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    let ownerId = userId;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+    const { data, error } = await supabase.from('departamentos').select('*').eq('user_id', ownerId).order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true, departamentos: data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/departamentos/crear', async function(req, res) {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!b.admin_id || !b.nombre || !String(b.nombre).trim()) return res.status(400).json({ error: 'Falta el nombre del departamento' });
+    const fila = {
+      user_id: b.admin_id,
+      nombre: String(b.nombre).trim().slice(0, 60),
+      criterio_derivacion: b.criterio_derivacion ? String(b.criterio_derivacion).slice(0, 1000) : null,
+      modo_reparto: (['equitativo', 'responsable_fijo'].indexOf(b.modo_reparto) >= 0) ? b.modo_reparto : 'equitativo',
+      preguntar_antes_derivar: (['siempre', 'duda', 'nunca'].indexOf(b.preguntar_antes_derivar) >= 0) ? b.preguntar_antes_derivar : 'duda',
+      recibe_fallback: b.recibe_fallback === true,
+      es_default: b.es_default === true
+    };
+    const { data: nuevo, error } = await supabase.from('departamentos').insert(fila).select('id').single();
+    if (error) return res.status(500).json({ error: error.message });
+    // un solo default y un solo recibe_fallback por cuenta
+    if (fila.es_default) await supabase.from('departamentos').update({ es_default: false }).eq('user_id', b.admin_id).neq('id', nuevo.id);
+    if (fila.recibe_fallback) await supabase.from('departamentos').update({ recibe_fallback: false }).eq('user_id', b.admin_id).neq('id', nuevo.id);
+    return res.json({ ok: true, id: nuevo && nuevo.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/departamentos/actualizar', async function(req, res) {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!b.admin_id || !b.departamento_id) return res.status(400).json({ error: 'Faltan datos' });
+    const cambios = {};
+    if (typeof b.nombre === 'string' && b.nombre.trim()) cambios.nombre = b.nombre.trim().slice(0, 60);
+    if (typeof b.criterio_derivacion === 'string') cambios.criterio_derivacion = b.criterio_derivacion.slice(0, 1000);
+    if (['equitativo', 'responsable_fijo'].indexOf(b.modo_reparto) >= 0) cambios.modo_reparto = b.modo_reparto;
+    if (['siempre', 'duda', 'nunca'].indexOf(b.preguntar_antes_derivar) >= 0) cambios.preguntar_antes_derivar = b.preguntar_antes_derivar;
+    if (typeof b.recibe_fallback === 'boolean') cambios.recibe_fallback = b.recibe_fallback;
+    if (typeof b.es_default === 'boolean') cambios.es_default = b.es_default;
+    if (typeof b.activo === 'boolean') cambios.activo = b.activo;
+    if (Object.keys(cambios).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
+    const { error } = await supabase.from('departamentos').update(cambios).eq('id', b.departamento_id).eq('user_id', b.admin_id);
+    if (error) return res.status(500).json({ error: error.message });
+    if (cambios.es_default === true) await supabase.from('departamentos').update({ es_default: false }).eq('user_id', b.admin_id).neq('id', b.departamento_id);
+    if (cambios.recibe_fallback === true) await supabase.from('departamentos').update({ recibe_fallback: false }).eq('user_id', b.admin_id).neq('id', b.departamento_id);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/departamentos/eliminar', async function(req, res) {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!b.admin_id || !b.departamento_id) return res.status(400).json({ error: 'Faltan datos' });
+    // SOFT delete: desactivar (no rompe conversaciones/membresias que apunten al depto). El front muestra solo activos.
+    const { error } = await supabase.from('departamentos').update({ activo: false }).eq('id', b.departamento_id).eq('user_id', b.admin_id);
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Sembrar la plantilla de un rubro: crea los departamentos base SOLO si la cuenta no tiene ninguno.
+app.post('/api/departamentos/seed-rubro', async function(req, res) {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!b.admin_id) return res.status(400).json({ error: 'Falta admin_id' });
+    const { data: existentes } = await supabase.from('departamentos').select('id').eq('user_id', b.admin_id).limit(1);
+    if (existentes && existentes.length > 0) return res.status(400).json({ error: 'La cuenta ya tiene departamentos cargados' });
+    const plantilla = PLANTILLAS_DEPTOS[b.rubro] || PLANTILLAS_DEPTOS['inmobiliaria'];
+    const filas = plantilla.map(function(d){ return { user_id: b.admin_id, nombre: d.nombre, criterio_derivacion: d.criterio, modo_reparto: d.modo || 'equitativo', recibe_fallback: !!d.fallback, es_default: !!d.def }; });
+    const { error } = await supabase.from('departamentos').insert(filas);
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true, creados: filas.length });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // ===== SCRAPER MULTIPLATAFORMA: HELPERS (aditivo, no rompe el camino WordPress) =====
 // Estrategia: el flujo de import sigue siendo lista -> detalle. Para WordPress/Houzez
 // se usa el sitemap (como siempre). Para Tokko Broker (sin sitemap ni wp-json) se

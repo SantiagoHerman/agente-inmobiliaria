@@ -2768,8 +2768,8 @@ app.post('/api/departamentos/seed-rubro', async function(req, res) {
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!b.admin_id) return res.status(400).json({ error: 'Falta admin_id' });
-    const { data: existentes } = await supabase.from('departamentos').select('id').eq('user_id', b.admin_id).limit(1);
-    if (existentes && existentes.length > 0) return res.status(400).json({ error: 'La cuenta ya tiene departamentos cargados' });
+    const { data: existentes } = await supabase.from('departamentos').select('id').eq('user_id', b.admin_id).eq('activo', true).limit(1);
+    if (existentes && existentes.length > 0) return res.status(400).json({ error: 'La cuenta ya tiene departamentos cargados' }); // solo cuenta ACTIVOS -> permite re-sembrar si se borraron todos
     const plantilla = PLANTILLAS_DEPTOS[b.rubro] || PLANTILLAS_DEPTOS['inmobiliaria'];
     const filas = plantilla.map(function(d){ return { user_id: b.admin_id, nombre: d.nombre, criterio_derivacion: d.criterio, modo_reparto: d.modo || 'equitativo', recibe_fallback: !!d.fallback, es_default: !!d.def }; });
     const { error } = await supabase.from('departamentos').insert(filas);

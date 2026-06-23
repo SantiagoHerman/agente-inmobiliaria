@@ -2829,13 +2829,23 @@ function dentroHorarioOficina(horario) {
     const dias = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
     const nombreDia = dias[arg.getDay()];
     const cfg = horario[nombreDia];
-    if (!cfg || cfg.cerrado) return false;
+    // Dia explicitamente marcado como atiende=false tambien cuenta como cerrado (formato nuevo del editor).
+    if (!cfg || cfg.cerrado || cfg.atiende === false) return false;
     const minutosAhora = arg.getHours() * 60 + arg.getMinutes();
-    const [hDesde, mDesde] = (cfg.desde || '09:00').split(':').map(Number);
-    const [hHasta, mHasta] = (cfg.hasta || '18:00').split(':').map(Number);
-    const desde = hDesde * 60 + mDesde;
-    const hasta = hHasta * 60 + mHasta;
-    return minutosAhora >= desde && minutosAhora <= hasta;
+    const enFranja = function(desdeStr, hastaStr) {
+      const [hDesde, mDesde] = String(desdeStr || '09:00').split(':').map(Number);
+      const [hHasta, mHasta] = String(hastaStr || '18:00').split(':').map(Number);
+      const desde = hDesde * 60 + mDesde;
+      const hasta = hHasta * 60 + mHasta;
+      return minutosAhora >= desde && minutosAhora <= hasta;
+    };
+    // PARTE A (correccion 8): TURNO CORTADO. Si el dia tiene `franjas` (array), estar DENTRO de CUALQUIERA
+    // de las franjas (ej. manana 09-13 y tarde 16-20) => disponible. Si no hay franjas, formato legacy desde/hasta.
+    if (Array.isArray(cfg.franjas)) {
+      if (cfg.franjas.length === 0) return false; // dia abierto pero sin franjas cargadas => cerrado
+      return cfg.franjas.some(function(f){ return f && enFranja(f.desde, f.hasta); });
+    }
+    return enFranja(cfg.desde, cfg.hasta);
   } catch (e) { return false; }
 }
 
@@ -3186,7 +3196,8 @@ function _camposUsuarioNuevos(b) {
   const out = {};
   if (['conectado', 'pausa', 'no_recibe'].indexOf(b.disponibilidad) >= 0) out.disponibilidad = b.disponibilidad;
   if (Array.isArray(b.visibilidad)) out.visibilidad = b.visibilidad.filter(function(v){ return ['propias', 'departamento', 'generales'].indexOf(v) >= 0; });
-  if (['oficina', 'personalizado'].indexOf(b.horario_modo) >= 0) out.horario_modo = b.horario_modo;
+  // PARTE A (correccion 8): aceptar tambien el modo '24-7' (siempre disponible) ademas de oficina/personalizado.
+  if (['oficina', 'personalizado', '24-7'].indexOf(b.horario_modo) >= 0) out.horario_modo = b.horario_modo;
   if (b.horario_json && typeof b.horario_json === 'object') out.horario_json = b.horario_json;
   if (typeof b.es_ia === 'boolean') out.es_ia = b.es_ia;
   // PARTE A (punto 9): config del agente IA (jsonb). Acepta objeto (config) o null (limpiar al pasar a Humano).
@@ -3203,16 +3214,18 @@ function _camposUsuarioNuevos(b) {
 async function _setDepartamentosUsuario(asesorId, adminId, departamentos) {
   if (!Array.isArray(departamentos)) return;
   // Normalizar entradas a { id, modo }.
+  // PARTE A (correccion 3 y 7): un departamento TILDADO = el usuario RECIBE de ese depto. La "solo
+  // visualizacion" ya NO se maneja por departamento (se maneja con "Visibilidad de leads"), por lo que la
+  // membresia SIEMPRE se guarda con modo='recibe', ignorando cualquier 'visualiza' que pudiera llegar.
   const pedidos = [];
   departamentos.forEach(function(d){
-    let id = null, modo = 'recibe';
+    let id = null;
     if (d && typeof d === 'object') {
       id = d.departamento_id || d.id || null;
-      if (d.modo === 'visualiza' || d.modo === 'recibe') modo = d.modo;
     } else {
       id = d; // legacy: string id
     }
-    if (id) pedidos.push({ id: id, modo: modo });
+    if (id) pedidos.push({ id: id, modo: 'recibe' });
   });
   let filas = [];
   if (pedidos.length) {
@@ -3236,16 +3249,23 @@ async function _setDepartamentosUsuario(asesorId, adminId, departamentos) {
 
 app.post('/api/asesores/crear', async (req, res) => {
   try {
-    const { admin_id, nombre, usuario, clave, cargo, rol } = req.body || {};
+    let { admin_id, nombre, usuario, clave, cargo, rol } = req.body || {};
     const _nuevos = _camposUsuarioNuevos(req.body);
     const esIa = req.body && req.body.es_ia === true;
     // SEGURIDAD: validar identidad por token
     const _uidToken = await verificarUsuario(req);
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
-    // PARTE A (punto 9): la CLAVE es OPCIONAL si es un usuario IA (no necesita acceso/login). Para humanos sigue siendo obligatoria.
-    if (!admin_id || !nombre || !usuario) return res.status(400).json({ error: 'Faltan datos' });
-    if (!esIa && !clave) return res.status(400).json({ error: 'Faltan datos' });
+    // PARTE A (puntos 4/9 + correccion 7): un usuario IA NO inicia sesion, por lo que NO necesita usuario(alias)
+    // ni clave. Para humanos AMBOS siguen siendo obligatorios. Si es IA y no llega usuario/clave, generamos
+    // valores internos (el esquema requiere `usuario` NOT NULL; la clave queda sin Auth user => sin login).
+    if (!admin_id || !nombre) return res.status(400).json({ error: 'Faltan datos' });
+    if (esIa) {
+      if (!usuario || !String(usuario).trim()) usuario = 'ia_' + Math.random().toString(36).slice(2, 10);
+      // clave de IA: se ignora para login (no se crea Auth user); no se exige.
+    } else {
+      if (!usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
+    }
     // PARTE A (punto 10 - migracion rol-administrador, defensivo): el front YA NO envia `rol`. Si llega
     // (retrocompat) se respeta y valida; si NO llega, `rol` queda en null y la "capacidad administrador"
     // se deriva de la visibilidad ('generales' = ver-todo). El rol queda como columna legacy de solo-lectura.

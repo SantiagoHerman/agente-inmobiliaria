@@ -616,18 +616,50 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId) {
     const idsMiembros = (membres || []).map(function(m){ return m.asesor_id; });
     if (!idsMiembros.length) return null;
     // 2) Filtrar a asesores de ESTA cuenta, activos, rol='asesor' (excluye empleado/null/admin), que reciben.
-    const { data: ases } = await supabase.from('asesores')
-      .select('id, disponibilidad')
-      .eq('admin_id', user_id)
-      .eq('activo', true)
-      .eq('rol', 'asesor') // D4=B: solo 'asesor' (excluye 'empleado', null y 'administrador')
-      .in('id', idsMiembros);
+    // ETAPA 9a: ademas traemos horario_modo/horario_json (DEFENSIVO: si las columnas no existen, reintentamos sin ellas).
+    // ETAPA 9b: ademas traemos es_ia (DEFENSIVO: si la columna no existe, reintentamos sin ella).
+    let ases = null;
+    try {
+      const r = await supabase.from('asesores')
+        .select('id, disponibilidad, horario_modo, horario_json, es_ia')
+        .eq('admin_id', user_id)
+        .eq('activo', true)
+        .eq('rol', 'asesor') // D4=B: solo 'asesor' (excluye 'empleado', null y 'administrador')
+        .in('id', idsMiembros);
+      if (r.error) throw r.error;
+      ases = r.data;
+    } catch (eHor) {
+      // columnas horario_*/es_ia ausentes u otro error: reintentar con el set minimo (comportamiento previo a 9a/9b)
+      const r2 = await supabase.from('asesores')
+        .select('id, disponibilidad')
+        .eq('admin_id', user_id)
+        .eq('activo', true)
+        .eq('rol', 'asesor')
+        .in('id', idsMiembros);
+      ases = r2.data;
+    }
+    // ETAPA 9a: horario de oficina de la cuenta (para los asesores en modo 'oficina'). Una sola query, DEFENSIVO.
+    let bsCuenta = null;
+    try {
+      const { data: bsd } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', user_id).maybeSingle();
+      bsCuenta = bsd || null;
+    } catch (eBs) { bsCuenta = null; }
     const candidatos = (ases || []).filter(function(a){
       // recibe si disponibilidad es 'conectado' o si nunca se configuro (null/''/undefined = legacy)
-      return a.disponibilidad === 'conectado' || a.disponibilidad == null || a.disponibilidad === '';
+      const recibe = a.disponibilidad === 'conectado' || a.disponibilidad == null || a.disponibilidad === '';
+      if (!recibe) return false;
+      // ETAPA 9a: ademas debe estar DENTRO de su horario AHORA (24-7 siempre; oficina usa la cuenta; custom usa su json).
+      return asesorDisponibleAhora(a, bsCuenta);
     });
     if (!candidatos.length) return null;
-    const idsCand = candidatos.map(function(a){ return a.id; });
+    // ETAPA 9b: PREFERENCIA HUMANO sobre usuario IA. Un asesor con es_ia=true es candidato IGUAL que un
+    // humano (ya paso disponibilidad + horario 9a). Pero los HUMANOS disponibles tienen prioridad: solo si
+    // NO hay ningun humano disponible (todos pausados/fuera de horario) y hay un usuario IA disponible, se
+    // elige el usuario IA (cobertura 24/7 / fuera de horario). Si hay al menos un humano disponible, el
+    // pool de seleccion (responsable_fijo + equitativo) se restringe a humanos y los IA se ignoran.
+    const humanos = candidatos.filter(function(a){ return a.es_ia !== true; });
+    const efectivos = humanos.length ? humanos : candidatos; // si no hay humanos, quedan los IA disponibles
+    const idsCand = efectivos.map(function(a){ return a.id; });
     // 3) modo_reparto del depto + (opcional) responsable_id. DEFENSIVO ante columna inexistente.
     let modoReparto = 'equitativo';
     let responsableId = null;
@@ -694,6 +726,161 @@ async function avisarDuenoColaSinAsesor(convId, user_id) {
   } catch (e) { console.error('avisarDuenoColaSinAsesor:', e && e.message); }
 }
 
+// ===== ETAPA 9c: MENSAJE FUERA DE HORARIO (solo con reparto_v2 ON) =====
+// GATED por el flag por-tenant reparto_v2. Con el flag OFF (o ausente/columna inexistente) NADA de esto corre
+// (lo gatea derivarAHumano antes de llamar aca). Cuando se deriva a un depto y NO hay NI humano NI usuario IA
+// disponible (elegirAsesorParaDepartamento devolvio null), en vez de encolar callado se le manda al lead UN
+// mensaje automatico (PLANTILLA FIJA, sin tokens de IA) avisando que estan fuera del horario de atencion y
+// ofreciendo derivarlo a otra persona/departamento disponible si es urgente. El LEAD decide: si responde que si,
+// se deriva a otro depto con gente disponible (lo maneja el webhook reusando el flujo que YA procesa el mensaje,
+// sin una llamada nueva a Claude); si no, queda en cola + aviso al dueno como hoy.
+// Dedupe: UN solo mensaje de fuera-de-horario por conversacion (no en cada mensaje). 2 capas (conservador):
+//   (a) flag persistente conversations.fuera_horario_avisada (si la columna existe);
+//   (b) Set en memoria como red dentro del proceso.
+const _fueraHorarioAvisada = new Set();
+
+// Detector SOLO-REGEX (CERO tokens de IA) de una respuesta afirmativa/urgente del lead a la oferta de derivacion.
+// Conservador: ante la duda devuelve false (queda en cola como hoy). NO se agrega ninguna llamada a Claude.
+function _esAfirmacionLead(texto) {
+  const s = String(texto || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+  if (!s) return false;
+  if (/\bno\b/.test(s) && !/\bno\s+(importa|hay\s+problema|te\s+preocupes)\b/.test(s)) {
+    // un "no" claro al principio = el lead NO quiere derivar (salvo frases tipo "no hay problema")
+    if (/^no\b/.test(s)) return false;
+  }
+  // afirmaciones / urgencia tipicas
+  if (/^(si|sii+|sip|dale|ok|oka|okey|okay|bueno|claro|obvio|perfecto|listo|de una|porfa|por favor|porfavor)\b/.test(s)) return true;
+  if (/\b(si|claro|dale|obvio|porfa|por favor|porfavor)\b/.test(s) && s.length <= 40) return true;
+  if (/\b(urgente|urgencia|es urgente|necesito|me urge|cuanto antes|ya mismo|ahora|si por favor|si gracias|deriva(me)?|pasa(me)?|quiero hablar)\b/.test(s)) return true;
+  return false;
+}
+
+// Devuelve true si el departamento tiene AHORA al menos un candidato disponible (humano o usuario IA).
+// Reusa el picker de la etapa 7 (NO escribe nada, NO gasta tokens de IA): si devuelve un asesor, hay disponibilidad.
+async function hayDisponibilidadEnDepto(user_id, departamentoId) {
+  try {
+    if (!user_id || !departamentoId) return false;
+    const _a = await elegirAsesorParaDepartamento(user_id, departamentoId);
+    return !!_a;
+  } catch (e) { return false; }
+}
+
+// Busca el PRIMER departamento del tenant (distinto del excluido) que tenga gente disponible AHORA.
+// Devuelve { id } o null. Defensivo: ante cualquier error devuelve null (se queda en cola como hoy).
+async function buscarDeptoConDisponibilidad(user_id, excluirDeptoId) {
+  try {
+    if (!user_id) return null;
+    const { data: deps } = await supabase.from('departamentos').select('id').eq('user_id', user_id).eq('activo', true);
+    for (const d of (deps || [])) {
+      if (!d || !d.id) continue;
+      if (excluirDeptoId && d.id === excluirDeptoId) continue;
+      if (await hayDisponibilidadEnDepto(user_id, d.id)) return { id: d.id };
+    }
+    return null;
+  } catch (e) { console.error('buscarDeptoConDisponibilidad:', e && e.message); return null; }
+}
+
+// Manda al lead el mensaje FIJO de fuera-de-horario (sin tokens) ofreciendo derivar a otra persona si es urgente.
+// Dedupe: un solo mensaje por conversacion. Lo llama derivarAHumano cuando NO hubo NI humano NI IA en el depto.
+// Resuelve telefono (contacts.phone via la conv) e instancia (nombreInstancia) por dentro. Solo con reparto_v2 ON
+// (el caller ya lo gatea). Devuelve true si mando el mensaje (o ya estaba avisada), false si no pudo.
+async function enviarMensajeFueraHorario(convId, user_id) {
+  try {
+    if (!convId || !user_id) return false;
+    if (_fueraHorarioAvisada.has(convId)) return true; // ya avisado en este proceso
+    // Dedupe persistente (best-effort): si la columna existe y ya esta en true, no reavisar.
+    try {
+      const { data: _flag } = await supabase.from('conversations').select('fuera_horario_avisada').eq('id', convId).maybeSingle();
+      if (_flag && _flag.fuera_horario_avisada === true) { _fueraHorarioAvisada.add(convId); return true; }
+    } catch (eFlag) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
+    // Telefono del lead via la conversacion -> contacto.
+    let _telefono = null;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('contact_id').eq('id', convId).maybeSingle();
+      if (_cv && _cv.contact_id) {
+        const { data: _ct } = await supabase.from('contacts').select('phone').eq('id', _cv.contact_id).maybeSingle();
+        _telefono = _ct && _ct.phone ? String(_ct.phone).trim() : null;
+      }
+    } catch (eTel) {}
+    if (!_telefono) return false; // sin telefono no podemos avisar al lead (queda solo el aviso al dueno)
+    // Marcar en memoria YA (antes del envio) para que mensajes concurrentes no manden dos.
+    _fueraHorarioAvisada.add(convId);
+    const _texto = 'En este momento estamos fuera del horario de atencion y no hay nadie disponible para atenderte. Si es urgente, decime "si" y te derivo con otra persona de otro area que pueda ayudarte; si no, apenas se conecte alguien te respondemos por aca.';
+    try { await enviarWhatsapp(nombreInstancia(user_id), _telefono, _texto); } catch (eWa) { console.error('fuera horario WhatsApp:', eWa && eWa.message); }
+    // Guardar el mensaje en el chat (sin tokens) para que se vea en la app igual que en WhatsApp.
+    try { await supabase.from('messages').insert({ conversation_id: convId, user_id: user_id, role: 'ai', content: _texto, enviado_por: 'Sistema' }); } catch (eMsg) {}
+    // Marca persistente best-effort (defensivo si la columna no existe).
+    try { await supabase.from('conversations').update({ fuera_horario_avisada: true }).eq('id', convId); } catch (eMark) {}
+    return true;
+  } catch (e) { console.error('enviarMensajeFueraHorario:', e && e.message); return false; }
+}
+
+// ETAPA 9c: hay un ofrecimiento de fuera-de-horario pendiente para esta conversacion?
+// 2 capas: Set en memoria (red dentro del proceso) + flag persistente fuera_horario_avisada (defensivo).
+async function tieneOfertaFueraHorarioPendiente(convId) {
+  try {
+    if (!convId) return false;
+    if (_fueraHorarioAvisada.has(convId)) return true;
+    try {
+      const { data: _flag } = await supabase.from('conversations').select('fuera_horario_avisada').eq('id', convId).maybeSingle();
+      if (_flag && _flag.fuera_horario_avisada === true) { _fueraHorarioAvisada.add(convId); return true; }
+    } catch (eFlag) { /* columna ausente: solo cuenta el Set en memoria */ }
+    return false;
+  } catch (e) { return false; }
+}
+
+// Cierra el ofrecimiento (consumido): limpia el Set y el flag persistente para no re-disparar.
+async function cerrarOfertaFueraHorario(convId) {
+  try {
+    if (!convId) return;
+    _fueraHorarioAvisada.delete(convId);
+    try { await supabase.from('conversations').update({ fuera_horario_avisada: false }).eq('id', convId); } catch (eMark) {}
+  } catch (e) {}
+}
+
+// El lead respondio a la oferta de fuera-de-horario. SOLO con reparto_v2 ON (lo gatea el caller). Reusa el flujo
+// que YA proceso el mensaje del lead (NO agrega una llamada nueva a Claude): la respuesta se interpreta con un
+// detector solo-regex (_esAfirmacionLead). Si el lead dice que SI, se busca otro depto con gente disponible y se
+// re-deriva ahi (derivarAHumano asigna al asesor/usuario IA disponible). Si dice que no (o no hay otro depto con
+// gente), se cierra la oferta y la conv queda en cola + aviso al dueno como hoy. Devuelve true si CONSUMIO el
+// mensaje (no debe seguir el flujo normal de IA), false si no aplicaba.
+async function manejarRespuestaFueraHorario(convId, user_id, texto, telefono, instancia) {
+  try {
+    if (!convId || !user_id) return false;
+    if (!(await tieneOfertaFueraHorarioPendiente(convId))) return false; // no hay oferta pendiente
+    // Solo nos metemos si la conv sigue EN COLA (listo_humano, sin asesor, no la tomo el admin). Si ya la tomaron
+    // o se asigno alguien, la oferta quedo obsoleta -> la cerramos y dejamos seguir el flujo normal.
+    const { data: _cv } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, departamento_id, user_id').eq('id', convId).maybeSingle();
+    if (!_cv || _cv.status !== 'listo_humano' || _cv.asesor_id || _cv.admin_tomo === true) { await cerrarOfertaFueraHorario(convId); return false; }
+    const _ownerId = _cv.user_id || user_id;
+    if (!_esAfirmacionLead(texto)) {
+      // El lead NO quiere derivar (o no se entiende como un si claro): no consumimos el mensaje, queda en cola.
+      // No cerramos la oferta: si el lead luego dice "si", la tomamos. (Dedupe del mensaje ya evita reenviarlo.)
+      return false;
+    }
+    // El lead dijo que SI: buscar otro depto con gente disponible AHORA (excluyendo el actual) y derivar ahi.
+    const _otro = await buscarDeptoConDisponibilidad(_ownerId, _cv.departamento_id || null);
+    if (!_otro || !_otro.id) {
+      // No hay ningun otro depto con gente disponible: avisamos al lead (sin tokens) y queda en cola + aviso dueno.
+      try { await enviarWhatsapp(instancia || nombreInstancia(_ownerId), telefono, 'Por ahora no tengo a nadie disponible en otra area tampoco. En cuanto se conecte alguien te respondemos por aca, gracias por la paciencia.'); } catch (eWa) {}
+      try { await supabase.from('messages').insert({ conversation_id: convId, user_id: _ownerId, role: 'ai', content: 'Por ahora no tengo a nadie disponible en otra area tampoco. En cuanto se conecte alguien te respondemos por aca, gracias por la paciencia.', enviado_por: 'Sistema' }); } catch (eMsg) {}
+      await cerrarOfertaFueraHorario(convId);
+      try { await avisarDuenoColaSinAsesor(convId, _ownerId); } catch (eAv) {}
+      return true; // consumido (no seguir el flujo de IA)
+    }
+    // Reapuntar la conv al otro depto y derivar (derivarAHumano elige el asesor/usuario IA disponible del depto).
+    await supabase.from('conversations').update({ departamento_id: _otro.id }).eq('id', convId);
+    await cerrarOfertaFueraHorario(convId);
+    const _asesor = await derivarAHumano(convId, _ownerId, 'fuera_horario_derivar', { setStatus: false, push: true, pushTitulo: 'Lead derivado de otra area', pushTexto: telefono || '', resumen: true });
+    // Avisar al lead que lo estamos derivando (plantilla fija, sin tokens de IA).
+    if (_asesor) {
+      try { await enviarWhatsapp(instancia || nombreInstancia(_ownerId), telefono, 'Listo, te derivo con alguien de otra area que esta disponible y te va a estar respondiendo. Gracias por avisar.'); } catch (eWa) {}
+      try { await supabase.from('messages').insert({ conversation_id: convId, user_id: _ownerId, role: 'ai', content: 'Listo, te derivo con alguien de otra area que esta disponible y te va a estar respondiendo. Gracias por avisar.', enviado_por: 'Sistema' }); } catch (eMsg) {}
+    }
+    return true; // consumido
+  } catch (e) { console.error('manejarRespuestaFueraHorario:', e && e.message); return false; }
+}
+
 // ===== DERIVACION A HUMANO (unificada) =====
 // ETAPA 4 (refactor que PRESERVA EL COMPORTAMIENTO): la logica de pasar una conversacion a atencion
 // humana estaba triplicada (handoff por pedido explicito, clasificacion a listo_humano, y red de
@@ -722,11 +909,15 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     // ETAPA 7: con reparto_v2 ON tambien necesitamos departamento_id para el picker por departamento.
     const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, user_id, departamento_id').eq('id', convId).maybeSingle();
     let _asesor = _cv && _cv.asesor_id;
+    // ETAPA 9c: recordar si entramos por el reparto v2 (para, al final, mandar el mensaje de fuera-de-horario
+    // al lead cuando NO hubo NI humano NI usuario IA disponible). Con flag OFF queda false -> cero cambios.
+    let _v2Activo = false;
     if (_cv && !_cv.asesor_id && !_cv.admin_tomo) {
       const _ownerId = _cv.user_id || user_id;
       // ETAPA 7: reparto real por departamento SOLO si el flag por-tenant esta ON. Flag OFF (o ausente/
       // columna inexistente) => comportamiento ACTUAL EXACTO (elegirAsesorActivo, pool general).
       const _v2 = await repartoV2Activo(_ownerId);
+      _v2Activo = _v2; // ETAPA 9c: visible fuera de este bloque para la cascada de fuera-de-horario
       if (_v2) {
         // (a) Si la conv tiene departamento_id (la IA dedujo), repartir DENTRO de ese depto.
         if (_cv.departamento_id) {
@@ -752,12 +943,36 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         // Flag OFF: comportamiento ACTUAL EXACTO.
         _asesor = await elegirAsesorActivo(_ownerId);
       }
-      if (_asesor) await supabase.from('conversations').update({ asesor_id: _asesor, ultimo_asesor_id: _asesor }).eq('id', convId);
+      if (_asesor) {
+        const _updAsesor = { asesor_id: _asesor, ultimo_asesor_id: _asesor };
+        // ETAPA 9b: si el asesor elegido es un usuario IA (es_ia=true), NO hacemos handoff a humano:
+        // se mantiene ai_enabled=true para que generarRespuestaAgente (Sonnet) siga respondiendo al lead.
+        // Guardamos igual asesor_id (tracking del usuario IA del depto). Solo aplica con reparto_v2 ON; con
+        // flag OFF este bloque no se ejecuta (elegirAsesorActivo no devuelve usuarios IA por depto) y el
+        // handoff a humano es el ACTUAL EXACTO. DEFENSIVO: si la columna es_ia no existe, _esIa queda false.
+        if (_v2) {
+          let _esIa = false;
+          try {
+            const { data: _aseIa } = await supabase.from('asesores').select('es_ia').eq('id', _asesor).maybeSingle();
+            _esIa = !!(_aseIa && _aseIa.es_ia === true);
+          } catch (eIa) { _esIa = false; }
+          if (_esIa) { _updAsesor.ai_enabled = true; }
+        }
+        await supabase.from('conversations').update(_updAsesor).eq('id', convId);
+      }
     }
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
     // (status='listo_humano' con asesor_id null, ya lo dejaron asi los sitios que llaman) y avisamos al dueno.
     // Dedupe interno: un solo aviso por conversacion encolada (no por cada mensaje). No gasta tokens de IA.
     if (!_asesor && _cv && !_cv.admin_tomo) {
+      // ETAPA 9c: con reparto_v2 ON, si NO hubo NI humano NI usuario IA disponible (picker por depto devolvio
+      // null), antes de solo encolar callado le mandamos al lead UN mensaje fijo (sin tokens) ofreciendo derivar
+      // a otra persona si es urgente. Dedupe interno: uno por conversacion. El LEAD decide; su respuesta la
+      // procesa el webhook reusando el flujo que ya tiene (sin llamada nueva a Claude). Igual avisamos al dueno
+      // (la conv queda en cola como hoy). Con flag OFF (_v2Activo=false) NO se ejecuta -> comportamiento ACTUAL.
+      if (_v2Activo) {
+        try { await enviarMensajeFueraHorario(convId, _cv.user_id || user_id); } catch (eFH) { console.error('Etapa9c fuera horario:', eFH && eFH.message); }
+      }
       await avisarDuenoColaSinAsesor(convId, _cv.user_id || user_id);
     }
     // 3) Push al asesor (opcional: hoy solo lo hace el handoff por pedido explicito).
@@ -2153,7 +2368,23 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     //  ya se transcribio/tradujo para que lo tome un humano. Esta es tu distincion: app vs Maestro.)
     // Pausa por-conversacion (ai_enabled) O pausa de IA por-cliente del Maestro (agente_pausado = "solo atencion":
     // el agente NO contesta para ESTE cliente, pero ya se transcribio/tradujo para que lo atienda un humano).
-    if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) return;
+    if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) {
+      // ETAPA 9c: la conv esta pausada (en cola tras el mensaje de fuera-de-horario). Si HAY una oferta pendiente
+      // para ESTA conv (solo puede existir con reparto_v2 ON: la sembro enviarMensajeFueraHorario), interpretamos
+      // la respuesta del lead REUSANDO este mismo flujo (sin una llamada nueva a Claude) y, si dijo que si, lo
+      // derivamos a otro depto con gente disponible. Gate barato: primero el Set en memoria (ZERO queries). Con
+      // flag OFF el Set nunca se siembra; ademas exigimos reparto_v2 ON antes de mirar el flag persistente, asi
+      // el camino con flag OFF es comportamiento ACTUAL EXACTO. El flag persistente cubre el caso de reinicio del
+      // proceso (el Set se pierde pero la oferta sigue marcada en la conv).
+      let _ofertaFH = _fueraHorarioAvisada.has(conv.id);
+      if (!_ofertaFH) {
+        try { if (await repartoV2Activo(user_id)) _ofertaFH = await tieneOfertaFueraHorarioPendiente(conv.id); } catch (eRV) {}
+      }
+      if (_ofertaFH) {
+        try { await manejarRespuestaFueraHorario(conv.id, user_id, texto, telefono, instanciaNombre); } catch (eFH) { console.error('Etapa9c respuesta lead:', eFH && eFH.message); }
+      }
+      return;
+    }
     // Enforcement de suscripcion (inerte salvo SUBSCRIPTIONS_ENABLED=true; fail-open ante errores para no cortar el servicio)
     if (SUBSCRIPTIONS_ENABLED) {
       try {
@@ -2572,6 +2803,30 @@ function dentroHorarioOficina(horario) {
     const hasta = hHasta * 60 + mHasta;
     return minutosAhora >= desde && minutosAhora <= hasta;
   } catch (e) { return false; }
+}
+
+// ===== ETAPA 9a: HORARIO POR USUARIO (solo se consulta con reparto_v2 ON) =====
+// Devuelve true si el asesor esta DENTRO de su horario AHORA. DEFENSIVO: ante cualquier dato faltante o raro
+// devuelve true (no bloquear el reparto por un horario mal cargado). Modos (asesores.horario_modo):
+//   - '24-7' / '24_7' / '24/7'  -> SIEMPRE disponible (cubre 24/7, util para usuarios IA).
+//   - 'personalizado' / 'custom' -> usa el horario propio del asesor (asesores.horario_json); si no hay json, true.
+//   - 'oficina' (default / null / cualquier otro) -> usa el horario de oficina de la cuenta (bs.horario_oficina);
+//     si la cuenta no tiene horario de oficina cargado, true (no asumimos cerrado).
+// Esta funcion NO consulta la base (recibe asesor y bs ya cargados) y NUNCA tira: ante error -> true.
+function asesorDisponibleAhora(asesor, bs) {
+  try {
+    if (!asesor) return false;
+    const modo = asesor.horario_modo || 'oficina';
+    if (modo === '24-7' || modo === '24_7' || modo === '24/7') return true;
+    if (modo === 'personalizado' || modo === 'custom') {
+      if (asesor.horario_json && typeof asesor.horario_json === 'object') return dentroHorarioOficina(asesor.horario_json);
+      return true; // modo custom sin json cargado: no bloquear
+    }
+    // 'oficina' (y cualquier valor desconocido): seguir el horario de oficina de la cuenta
+    const ho = bs && bs.horario_oficina;
+    if (!ho) return true; // la cuenta no configuro horario de oficina: no asumir cerrado
+    return dentroHorarioOficina(ho);
+  } catch (e) { return true; }
 }
 
 // Plantillas variadas de primer recontacto (anti-baneo: nunca el mismo texto).

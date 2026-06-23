@@ -577,6 +577,82 @@ async function elegirAsesorActivo(admin_id) {
   } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
 }
 
+// ===== FASE 2 (ETAPAS 6-7-8): FLAG POR-CUENTA reparto_v2 =====
+// Red de seguridad: TODO el comportamiento nuevo del reparto por departamento/cola va GATED detras de este
+// flag por-tenant (business_settings.reparto_v2). FALSE / ausente / null / columna inexistente -> comportamiento
+// ACTUAL EXACTO. TRUE -> comportamiento nuevo. DEFENSIVO: si la columna todavia no existe, el .select devuelve
+// error en el objeto (no throw) -> lo tratamos como FALSE. Lee eficiente: si ya hay un business_settings cargado
+// del tenant y trae la propiedad reparto_v2, se reusa (sin query); si no, una query chica .select('reparto_v2').
+async function repartoV2Activo(user_id, bs) {
+  try {
+    // Reusar un business_settings ya cargado si trae la propiedad (evita una query extra por mensaje).
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'reparto_v2')) return bs.reparto_v2 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('reparto_v2').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.reparto_v2 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// ===== ETAPA 7: REPARTO REAL POR DEPARTAMENTO (solo con reparto_v2 ON) =====
+// Picker nuevo, usado DENTRO de derivarAHumano SOLO cuando reparto_v2 esta ON. Elige el asesor del
+// departamento indicado segun el modo_reparto del depto. Candidatos (todos a la vez):
+//   (a) pertenecen al departamentoId (tabla usuario_departamento),
+//   (b) asesores.activo = true,
+//   (c) reciben: disponibilidad = 'conectado' (o null/ausente = legacy nunca configurado -> recibe;
+//       se EXCLUYE solo 'pausa' y 'no_recibe'),
+//   (d) rol = 'asesor' (se EXCLUYE rol 'empleado', rol null y rol 'administrador' - D4=B),
+//   (e) menor carga = count de conversations con status='listo_humano' asignadas (D1=B).
+// modo_reparto: 'equitativo' (default) => el de menor carga; 'responsable_fijo' => el responsable del
+//   depto si esta disponible, con fallback al equitativo si no lo esta. El responsable se lee de una
+//   columna OPCIONAL departamentos.responsable_id (DEFENSIVO: si la columna no existe o no hay
+//   responsable disponible, cae al equitativo). Si no hay ningun candidato disponible -> null
+//   (derivarAHumano ya encola + avisa al dueno). Esta funcion NO escribe nada, solo elige.
+async function elegirAsesorParaDepartamento(user_id, departamentoId) {
+  try {
+    if (!user_id || !departamentoId) return null;
+    // 1) Miembros del departamento.
+    const { data: membres } = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId);
+    const idsMiembros = (membres || []).map(function(m){ return m.asesor_id; });
+    if (!idsMiembros.length) return null;
+    // 2) Filtrar a asesores de ESTA cuenta, activos, rol='asesor' (excluye empleado/null/admin), que reciben.
+    const { data: ases } = await supabase.from('asesores')
+      .select('id, disponibilidad')
+      .eq('admin_id', user_id)
+      .eq('activo', true)
+      .eq('rol', 'asesor') // D4=B: solo 'asesor' (excluye 'empleado', null y 'administrador')
+      .in('id', idsMiembros);
+    const candidatos = (ases || []).filter(function(a){
+      // recibe si disponibilidad es 'conectado' o si nunca se configuro (null/''/undefined = legacy)
+      return a.disponibilidad === 'conectado' || a.disponibilidad == null || a.disponibilidad === '';
+    });
+    if (!candidatos.length) return null;
+    const idsCand = candidatos.map(function(a){ return a.id; });
+    // 3) modo_reparto del depto + (opcional) responsable_id. DEFENSIVO ante columna inexistente.
+    let modoReparto = 'equitativo';
+    let responsableId = null;
+    try {
+      const { data: dep, error: eDep } = await supabase.from('departamentos').select('modo_reparto, responsable_id').eq('id', departamentoId).maybeSingle();
+      if (!eDep && dep) { modoReparto = dep.modo_reparto || 'equitativo'; responsableId = dep.responsable_id || null; }
+    } catch (eD1) {
+      // columna responsable_id ausente u otro error: reintentar sin esa columna (solo modo_reparto)
+      try { const { data: dep2 } = await supabase.from('departamentos').select('modo_reparto').eq('id', departamentoId).maybeSingle(); if (dep2) modoReparto = dep2.modo_reparto || 'equitativo'; } catch (eD2) {}
+    }
+    // 4) responsable_fijo: si el responsable es candidato disponible, devolverlo; si no, fallback al equitativo.
+    if (modoReparto === 'responsable_fijo' && responsableId && idsCand.indexOf(responsableId) >= 0) {
+      return responsableId;
+    }
+    // 5) Equitativo (default y fallback): el candidato con menor carga (status='listo_humano', D1=B).
+    let mejor = null; let menos = Infinity;
+    for (const id of idsCand) {
+      const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', id).eq('status', 'listo_humano');
+      const n = count || 0;
+      if (n < menos) { menos = n; mejor = id; }
+    }
+    return mejor;
+  } catch (e) { console.error('Error elegirAsesorParaDepartamento:', e && e.message); return null; }
+}
+
 // ===== ETAPA 5: COLA + AVISO AL DUENO =====
 // Cuando una conversacion pasa a atencion humana pero NO hay asesor disponible (elegirAsesorActivo
 // devuelve null), queda EN COLA (status='listo_humano' con asesor_id null) y hay que avisarle al dueno.
@@ -643,10 +719,39 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
       await supabase.from('conversations').update(_upd).eq('id', convId);
     }
     // 2) Elegir/asignar asesor (solo si no tiene y no lo tomo el admin) — criterio identico al actual.
-    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, user_id').eq('id', convId).maybeSingle();
+    // ETAPA 7: con reparto_v2 ON tambien necesitamos departamento_id para el picker por departamento.
+    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, user_id, departamento_id').eq('id', convId).maybeSingle();
     let _asesor = _cv && _cv.asesor_id;
     if (_cv && !_cv.asesor_id && !_cv.admin_tomo) {
-      _asesor = await elegirAsesorActivo(_cv.user_id || user_id);
+      const _ownerId = _cv.user_id || user_id;
+      // ETAPA 7: reparto real por departamento SOLO si el flag por-tenant esta ON. Flag OFF (o ausente/
+      // columna inexistente) => comportamiento ACTUAL EXACTO (elegirAsesorActivo, pool general).
+      const _v2 = await repartoV2Activo(_ownerId);
+      if (_v2) {
+        // (a) Si la conv tiene departamento_id (la IA dedujo), repartir DENTRO de ese depto.
+        if (_cv.departamento_id) {
+          _asesor = await elegirAsesorParaDepartamento(_ownerId, _cv.departamento_id);
+        } else {
+          // (b) Sin departamento_id: usar el departamento es_default del tenant si existe.
+          let _depDefault = null;
+          try {
+            const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', _ownerId).eq('es_default', true).eq('activo', true).maybeSingle();
+            _depDefault = _dd && _dd.id ? _dd.id : null;
+          } catch (eDD) { _depDefault = null; }
+          if (_depDefault) {
+            _asesor = await elegirAsesorParaDepartamento(_ownerId, _depDefault);
+          } else {
+            // (c) Sin default: caer al picker actual (pool general) — conservador.
+            _asesor = await elegirAsesorActivo(_ownerId);
+          }
+        }
+        // Nota: si el picker por depto no encontro candidato disponible, _asesor queda null y la conv
+        // queda EN COLA (mismo manejo de etapa 5 mas abajo). NO se cae al pool general en ese caso
+        // (decision de Diego: respetar el departamento; el aviso al dueno cubre la cola).
+      } else {
+        // Flag OFF: comportamiento ACTUAL EXACTO.
+        _asesor = await elegirAsesorActivo(_ownerId);
+      }
       if (_asesor) await supabase.from('conversations').update({ asesor_id: _asesor, ultimo_asesor_id: _asesor }).eq('id', convId);
     }
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
@@ -1893,7 +1998,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, estado_previo, idioma_lead, asesor_id').eq('user_id', user_id).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
-      const asesorAsignado = await elegirAsesorActivo(user_id);
+      // ETAPA 6: con reparto_v2 ON, NO se asigna asesor al crear (la asignacion pasa a la derivacion via
+      // derivarAHumano). Con el flag OFF (o columna ausente) -> asignacion EAGER actual EXACTA.
+      const _repV2 = await repartoV2Activo(user_id);
+      const asesorAsignado = _repV2 ? null : await elegirAsesorActivo(user_id);
       const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contacto.id, channel: 'whatsapp', status: 'en_conversacion', ai_enabled: true, asesor_id: asesorAsignado, ultimo_asesor_id: asesorAsignado }).select('id, ai_enabled, asesor_id').single();
       conv = convNueva;
     }
@@ -2564,6 +2672,82 @@ async function revisarInactividad() {
   } catch (e) { console.error('Error en revisarInactividad:', e && e.message); }
 }
 
+// ===== ETAPA 8: FALLBACK ESCALONADO (solo con reparto_v2 ON) =====
+// GATED por el flag por-tenant reparto_v2. Con el flag OFF (o ausente/columna inexistente) NADA de esto corre.
+// Cuando una conversacion quedo EN COLA (status='listo_humano', asesor_id null, admin_tomo false) hace mas de
+// 30 MINUTOS (umbral FIJO, D5=A) sin que nadie la tome, se ESCALA en dos pasos:
+//   Paso 1: intentar asignarla a un asesor del departamento con recibe_fallback=true (ej. Administracion),
+//           usando el picker de la etapa 7 (elegirAsesorParaDepartamento). Si asigna -> listo, NO se avisa.
+//   Paso 2: si tampoco hay candidato disponible -> avisar al DUENO (admin del tenant) con la MISMA plantilla
+//           fija de la etapa 5 (sin tokens de IA) para que lo tome a mano (reusa avisarDuenoColaSinAsesor).
+// Anti doble-escalamiento: marca la conversacion con la columna OPCIONAL escalado_fallback=true (best-effort,
+// defensivo si la columna no existe) + un Set en memoria como red dentro del proceso. Asi NO re-escala en cada tick.
+// "Tiempo en cola" se mide con el timestamp del ULTIMO mensaje de la conversacion (no hay columna dedicada): si
+// el lead escribio recien, la conv esta activa y NO se escala todavia; recien al quedar 30 min quieta se escala.
+const _escaladoFallback = new Set();
+var _escalarEnCurso = false;
+async function escalarLeadsEnColaVencidos() {
+  if (_escalarEnCurso) return; // evitar solapamiento entre ticks
+  _escalarEnCurso = true;
+  try {
+    const TREINTA_MIN_MS = 30 * 60 * 1000; // D5=A: umbral FIJO (luego configurable)
+    const ahoraMs = Date.now();
+    // Conversaciones EN COLA: en atencion humana, sin asesor y no tomadas por el admin.
+    // Traemos los tenants distintos para chequear el flag UNA vez por cuenta (no por conversacion).
+    const { data: enCola } = await supabase
+      .from('conversations')
+      .select('id, user_id, departamento_id, updated_at')
+      .eq('status', 'listo_humano')
+      .is('asesor_id', null)
+      .eq('admin_tomo', false);
+    if (!enCola || enCola.length === 0) return;
+    // Cache del flag reparto_v2 por tenant (una query chica por cuenta como mucho).
+    const _flagCache = {};
+    for (const conv of enCola) {
+      if (_escaladoFallback.has(conv.id)) continue; // ya escalado en este proceso
+      const ownerId = conv.user_id;
+      if (!ownerId) continue;
+      // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO escalar (comportamiento actual).
+      if (!(ownerId in _flagCache)) _flagCache[ownerId] = await repartoV2Activo(ownerId);
+      if (_flagCache[ownerId] !== true) continue;
+      // Dedupe persistente (best-effort): si ya se marco escalado_fallback, saltar. Defensivo si la columna no existe.
+      try {
+        const { data: _f } = await supabase.from('conversations').select('escalado_fallback').eq('id', conv.id).maybeSingle();
+        if (_f && _f.escalado_fallback === true) { _escaladoFallback.add(conv.id); continue; }
+      } catch (eF) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
+      // Tiempo en cola: usar el timestamp del ULTIMO mensaje (si no hay, caer a updated_at de la conv).
+      let anchorMs = conv.updated_at ? new Date(conv.updated_at).getTime() : 0;
+      try {
+        const { data: ult } = await supabase.from('messages').select('created_at').eq('conversation_id', conv.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if (ult && ult.created_at) anchorMs = new Date(ult.created_at).getTime();
+      } catch (eMsg) {}
+      if (!anchorMs || (ahoraMs - anchorMs) < TREINTA_MIN_MS) continue; // todavia no cumplio 30 min en cola
+      // Marcar en memoria YA (antes de los pasos) para que ticks concurrentes no re-escalen.
+      _escaladoFallback.add(conv.id);
+      // PASO 1: intentar asignar a un asesor del departamento con recibe_fallback=true (picker etapa 7).
+      let _asignado = null;
+      try {
+        const { data: depFb } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('recibe_fallback', true).eq('activo', true).maybeSingle();
+        if (depFb && depFb.id) {
+          _asignado = await elegirAsesorParaDepartamento(ownerId, depFb.id);
+          if (_asignado) {
+            await supabase.from('conversations').update({ asesor_id: _asignado, ultimo_asesor_id: _asignado, updated_at: new Date().toISOString() }).eq('id', conv.id);
+            console.log('Etapa8 fallback: lead ' + conv.id + ' escalado al depto fallback -> asesor ' + _asignado);
+          }
+        }
+      } catch (eP1) { console.error('Etapa8 paso1:', eP1 && eP1.message); }
+      // PASO 2: si no hubo asesor en el depto fallback -> avisar al DUENO (plantilla fija, sin tokens de IA).
+      if (!_asignado) {
+        try { await avisarDuenoColaSinAsesor(conv.id, ownerId); } catch (eP2) { console.error('Etapa8 paso2:', eP2 && eP2.message); }
+        console.log('Etapa8 fallback: lead ' + conv.id + ' sin asesor en depto fallback -> avisado al dueno');
+      }
+      // Marca persistente best-effort para no re-escalar en proximos ticks (defensivo si la columna no existe).
+      try { await supabase.from('conversations').update({ escalado_fallback: true }).eq('id', conv.id); } catch (eMark) { /* columna ausente: el Set ya dedupea */ }
+    }
+  } catch (e) { console.error('Error en escalarLeadsEnColaVencidos:', e && e.message); }
+  finally { _escalarEnCurso = false; }
+}
+
 // ---- Envio del primer recontacto, solo en horario de oficina, con salvaguardas ----
 var _recontactoEnCurso = false;
 async function enviarRecontactosPendientes() {
@@ -2688,6 +2872,9 @@ async function reintentarFallidos() {
 // Revisar fallidos cada 60 segundos (reenvia apenas WhatsApp vuelve a estar conectado)
 setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
+// ETAPA 8 (gated por reparto_v2 por-tenant): escalar leads en cola >30 min. Con flag OFF NO hace nada por cuenta.
+setInterval(escalarLeadsEnColaVencidos, 5 * 60 * 1000); // cada 5 min: granularidad para el umbral fijo de 30 min
+setTimeout(escalarLeadsEnColaVencidos, 80 * 1000); // primera corrida ~80s tras arrancar (cuando ya esta estable)
 setInterval(enviarReportesProgramados, 60 * 60 * 1000); // reportes programados: chequear cada hora
 setInterval(guardarSnapshotDiario, 60 * 60 * 1000); // snapshot de metricas: actualizar cada hora
 setTimeout(guardarSnapshotDiario, 50 * 1000); // primer snapshot al arrancar
@@ -6428,8 +6615,12 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     const { data: convExistente } = await supabase.from('conversations').select('id, ai_enabled, status, asesor_id').eq('user_id', tenantUserId).eq('contact_id', contacto.id).maybeSingle();
     if (convExistente) { conv = convExistente; }
     else {
+      // ETAPA 6: con reparto_v2 ON, NO se asigna asesor al crear (la asignacion pasa a la derivacion via
+      // derivarAHumano). Con el flag OFF (o columna ausente) -> asignacion EAGER actual EXACTA.
       let asesorAsignado = null;
-      try { asesorAsignado = await elegirAsesorActivo(tenantUserId); } catch (e) {}
+      let _repV2 = false;
+      try { _repV2 = await repartoV2Activo(tenantUserId); } catch (e) {}
+      if (!_repV2) { try { asesorAsignado = await elegirAsesorActivo(tenantUserId); } catch (e) {} }
       const { data: convNueva } = await supabase.from('conversations').insert({ user_id: tenantUserId, contact_id: contacto.id, channel: canal, status: 'en_conversacion', ai_enabled: true, asesor_id: asesorAsignado, ultimo_asesor_id: asesorAsignado }).select('id, ai_enabled, asesor_id').single();
       conv = convNueva;
     }

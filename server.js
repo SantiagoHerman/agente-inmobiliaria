@@ -4110,6 +4110,326 @@ app.get('/api/departamentos', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// CHAT INTERNO DEL EQUIPO (humano-a-humano). ADITIVO y AISLADO:
+//   - NO toca messages/conversations ni dispara Evolution/WhatsApp.
+//   - Aislamiento estricto por admin_id (tenant) + el auth user debe ser participante.
+//   - Costo de IA = CERO (solo Postgres + push FCM ya existente).
+// Identidad canonica = auth_user_id (lo que devuelve verificarUsuario y lo que usa el push).
+// participantes[] / leido_por[] guardan auth_user_id (NO asesores.id).
+// ============================================================================
+
+// Resuelve la identidad del que llama para el chat de equipo.
+// Devuelve { authUserId, ownerId, asesorId|null, esDueno } o null si no hay token.
+async function _equipoIdentidad(req) {
+  const authUserId = await verificarUsuario(req);
+  if (!authUserId) return null;
+  let ownerId = authUserId, asesorId = null, esDueno = true;
+  const { data: ase } = await supabase.from('asesores').select('id, admin_id').eq('auth_user_id', authUserId).maybeSingle();
+  if (ase && ase.admin_id) { ownerId = ase.admin_id; asesorId = ase.id; esDueno = false; }
+  return { authUserId: authUserId, ownerId: ownerId, asesorId: asesorId, esDueno: esDueno };
+}
+
+// IDs de departamentos a los que pertenece el usuario (dentro de su tenant).
+// El DUENO pertenece a TODOS los departamentos activos de su cuenta; el asesor solo
+// a los de su membresia (usuario_departamento). Devuelve array de departamento_id.
+async function _equipoDepartamentosDe(ident) {
+  if (ident.esDueno) {
+    const { data: deps } = await supabase.from('departamentos').select('id').eq('user_id', ident.ownerId).eq('activo', true);
+    return (deps || []).map(function(d){ return d.id; });
+  }
+  if (!ident.asesorId) return [];
+  const { data: mem } = await supabase.from('usuario_departamento').select('departamento_id').eq('asesor_id', ident.asesorId);
+  let ids = (mem || []).map(function(m){ return m.departamento_id; }).filter(Boolean);
+  if (!ids.length) return [];
+  // Solo departamentos activos de ESTE tenant (aislamiento).
+  const { data: deps } = await supabase.from('departamentos').select('id').eq('user_id', ident.ownerId).eq('activo', true).in('id', ids);
+  return (deps || []).map(function(d){ return d.id; });
+}
+
+// auth_user_id de TODOS los miembros de un departamento (asesores miembros + el dueno).
+// Aislado por tenant: solo asesores con admin_id=ownerId. Excluye nulls.
+async function _equipoParticipantesDepto(ownerId, departamentoId) {
+  const set = {};
+  set[ownerId] = true; // el dueno siempre participa de los canales de su cuenta
+  const { data: mem } = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId);
+  const idsAse = (mem || []).map(function(m){ return m.asesor_id; }).filter(Boolean);
+  if (idsAse.length) {
+    const { data: ases } = await supabase.from('asesores').select('auth_user_id').eq('admin_id', ownerId).in('id', idsAse);
+    (ases || []).forEach(function(a){ if (a && a.auth_user_id) set[a.auth_user_id] = true; });
+  }
+  return Object.keys(set);
+}
+
+// Obtiene (o crea) el canal grupal de un departamento. Devuelve el thread o null.
+async function _equipoThreadDepto(ownerId, departamentoId) {
+  const { data: ex } = await supabase.from('team_threads').select('*')
+    .eq('admin_id', ownerId).eq('tipo', 'departamento').eq('departamento_id', departamentoId).maybeSingle();
+  if (ex) return ex;
+  const { data: nuevo, error } = await supabase.from('team_threads')
+    .insert({ admin_id: ownerId, tipo: 'departamento', departamento_id: departamentoId, participantes: null })
+    .select('*').single();
+  if (error) return null;
+  return nuevo;
+}
+
+// Obtiene (o crea) el DM 1-a-1 entre dos auth_user_id del mismo tenant. Par ordenado para deduplicar.
+async function _equipoThreadDm(ownerId, authA, authB) {
+  const par = [authA, authB].sort();
+  const { data: cands } = await supabase.from('team_threads').select('*')
+    .eq('admin_id', ownerId).eq('tipo', 'dm').contains('participantes', par);
+  const found = (cands || []).find(function(t){
+    const p = (t.participantes || []).slice().sort();
+    return p.length === 2 && p[0] === par[0] && p[1] === par[1];
+  });
+  if (found) return found;
+  const { data: nuevo, error } = await supabase.from('team_threads')
+    .insert({ admin_id: ownerId, tipo: 'dm', departamento_id: null, participantes: par })
+    .select('*').single();
+  if (error) return null;
+  return nuevo;
+}
+
+// Verifica que `authUserId` participe del thread (autorizacion por mensaje). Devuelve bool.
+async function _equipoEsParticipante(ident, thread) {
+  if (!thread || thread.admin_id !== ident.ownerId) return false; // aislamiento de tenant
+  if (thread.tipo === 'dm') return (thread.participantes || []).indexOf(ident.authUserId) >= 0;
+  if (thread.tipo === 'departamento') {
+    if (ident.esDueno) return true;
+    const deptos = await _equipoDepartamentosDe(ident);
+    return deptos.indexOf(thread.departamento_id) >= 0;
+  }
+  return false;
+}
+
+// GET /api/equipo/threads -> lista de canales (departamentos del usuario) + sus DMs, con
+// ultimo mensaje, no-leidos y metadatos para el panel izquierdo.
+app.get('/api/equipo/threads', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+
+    // 1) Asegurar/obtener los canales de departamento del usuario.
+    const deptoIds = await _equipoDepartamentosDe(ident);
+    const canales = [];
+    let nombresDepto = {};
+    if (deptoIds.length) {
+      const { data: deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ident.ownerId).in('id', deptoIds);
+      (deps || []).forEach(function(d){ nombresDepto[d.id] = d.nombre; });
+      for (let i = 0; i < deptoIds.length; i++) {
+        const th = await _equipoThreadDepto(ident.ownerId, deptoIds[i]);
+        if (th) canales.push(th);
+      }
+    }
+
+    // 2) DMs donde el usuario es participante (de su tenant).
+    const { data: dms } = await supabase.from('team_threads').select('*')
+      .eq('admin_id', ident.ownerId).eq('tipo', 'dm').contains('participantes', [ident.authUserId]);
+
+    const threads = canales.concat(dms || []);
+    if (!threads.length) return res.json({ ok: true, threads: [], esDueno: ident.esDueno });
+
+    // 3) Resolver nombres de los "otros" en DMs (mapa auth_user_id -> nombre).
+    const otrosIds = {};
+    (dms || []).forEach(function(t){ (t.participantes || []).forEach(function(p){ if (p !== ident.authUserId) otrosIds[p] = true; }); });
+    const nombrePorAuth = {};
+    const otrosArr = Object.keys(otrosIds);
+    if (otrosArr.length) {
+      const { data: ases } = await supabase.from('asesores').select('auth_user_id, nombre').eq('admin_id', ident.ownerId).in('auth_user_id', otrosArr);
+      (ases || []).forEach(function(a){ if (a.auth_user_id) nombrePorAuth[a.auth_user_id] = a.nombre; });
+    }
+
+    // 4) Para cada thread: ultimo mensaje + conteo de no-leidos (no contiene mi auth_user_id en leido_por).
+    const out = [];
+    for (let i = 0; i < threads.length; i++) {
+      const t = threads[i];
+      const { data: ult } = await supabase.from('team_messages').select('content, media_url, created_at, sender_auth_user_id')
+        .eq('thread_id', t.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      const { count: noLeidos } = await supabase.from('team_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('thread_id', t.id)
+        .neq('sender_auth_user_id', ident.authUserId)
+        .not('leido_por', 'cs', '{' + ident.authUserId + '}');
+      let nombre = '', otroAuth = null;
+      if (t.tipo === 'departamento') {
+        nombre = nombresDepto[t.departamento_id] || 'Departamento';
+      } else {
+        otroAuth = (t.participantes || []).find(function(p){ return p !== ident.authUserId; }) || null;
+        nombre = (otroAuth && (nombrePorAuth[otroAuth] || (otroAuth === ident.ownerId ? 'Dueño' : null))) || 'Compañero';
+      }
+      out.push({
+        id: t.id,
+        tipo: t.tipo,
+        departamento_id: t.departamento_id || null,
+        otro_auth_user_id: otroAuth,
+        nombre: nombre,
+        ultimo: ult ? { content: ult.content, media_url: ult.media_url || null, created_at: ult.created_at, mio: ult.sender_auth_user_id === ident.authUserId } : null,
+        no_leidos: noLeidos || 0
+      });
+    }
+    // Ordenar por actividad reciente (ultimo mensaje primero; los vacios al final).
+    out.sort(function(a, b){
+      const ta = a.ultimo ? new Date(a.ultimo.created_at).getTime() : 0;
+      const tb = b.ultimo ? new Date(b.ultimo.created_at).getTime() : 0;
+      return tb - ta;
+    });
+    return res.json({ ok: true, threads: out, esDueno: ident.esDueno });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/equipo/mensajes?thread_id=... -> mensajes de un hilo (solo si el usuario participa).
+app.get('/api/equipo/mensajes', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const threadId = req.query && req.query.thread_id;
+    if (!threadId) return res.status(400).json({ error: 'Falta thread_id' });
+    const { data: thread } = await supabase.from('team_threads').select('*').eq('id', threadId).maybeSingle();
+    if (!thread) return res.status(404).json({ error: 'Hilo no encontrado' });
+    if (!(await _equipoEsParticipante(ident, thread))) return res.status(403).json({ error: 'No participas de este hilo' });
+
+    const { data: msgs } = await supabase.from('team_messages')
+      .select('id, sender_auth_user_id, content, media_url, leido_por, created_at')
+      .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
+      .order('created_at', { ascending: true }).limit(500);
+
+    // Nombres de los remitentes (asesores del tenant). El dueno no tiene fila -> "Dueño".
+    const remitentes = {};
+    (msgs || []).forEach(function(m){ remitentes[m.sender_auth_user_id] = true; });
+    const nombrePorAuth = {};
+    const arr = Object.keys(remitentes);
+    if (arr.length) {
+      const { data: ases } = await supabase.from('asesores').select('auth_user_id, nombre').eq('admin_id', ident.ownerId).in('auth_user_id', arr);
+      (ases || []).forEach(function(a){ if (a.auth_user_id) nombrePorAuth[a.auth_user_id] = a.nombre; });
+    }
+    const out = (msgs || []).map(function(m){
+      return {
+        id: m.id,
+        content: m.content,
+        media_url: m.media_url || null,
+        created_at: m.created_at,
+        mio: m.sender_auth_user_id === ident.authUserId,
+        sender_nombre: nombrePorAuth[m.sender_auth_user_id] || (m.sender_auth_user_id === ident.ownerId ? 'Dueño' : 'Compañero')
+      };
+    });
+    return res.json({ ok: true, mensajes: out, tipo: thread.tipo });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/equipo/enviar { thread_id | destino, content, media_url? }
+//   - thread_id: enviar a un hilo existente (canal o dm) del que el usuario participa.
+//   - destino:   { tipo:'dm', auth_user_id } o { tipo:'departamento', departamento_id }
+//                resuelve/crea el hilo y luego envia.
+// Envia push a los destinatarios (humano-a-humano, 0 tokens IA). NUNCA toca al lead.
+app.post('/api/equipo/enviar', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const b = req.body || {};
+    const content = (b.content == null ? '' : String(b.content)).trim();
+    const mediaUrl = b.media_url ? String(b.media_url).slice(0, 2000) : null;
+    if (!content && !mediaUrl) return res.status(400).json({ error: 'Mensaje vacio' });
+
+    // Resolver el thread (existente por thread_id, o crear/obtener via destino).
+    let thread = null;
+    if (b.thread_id) {
+      const { data: th } = await supabase.from('team_threads').select('*').eq('id', b.thread_id).maybeSingle();
+      thread = th || null;
+    } else if (b.destino && typeof b.destino === 'object') {
+      const d = b.destino;
+      if (d.tipo === 'dm' && d.auth_user_id) {
+        const otro = String(d.auth_user_id);
+        if (otro === ident.authUserId) return res.status(400).json({ error: 'No podes enviarte un DM a vos mismo' });
+        // El destino debe pertenecer al MISMO tenant: o es el dueno, o es un asesor con admin_id=ownerId.
+        let valido = (otro === ident.ownerId);
+        if (!valido) {
+          const { data: aseDest } = await supabase.from('asesores').select('id').eq('auth_user_id', otro).eq('admin_id', ident.ownerId).maybeSingle();
+          valido = !!aseDest;
+        }
+        if (!valido) return res.status(403).json({ error: 'Destino fuera de tu equipo' });
+        thread = await _equipoThreadDm(ident.ownerId, ident.authUserId, otro);
+      } else if (d.tipo === 'departamento' && d.departamento_id) {
+        // Validar que el depto sea del tenant y que el usuario pertenezca.
+        const deptos = await _equipoDepartamentosDe(ident);
+        if (deptos.indexOf(d.departamento_id) < 0) return res.status(403).json({ error: 'No pertenecas a ese departamento' });
+        thread = await _equipoThreadDepto(ident.ownerId, d.departamento_id);
+      } else {
+        return res.status(400).json({ error: 'Destino invalido' });
+      }
+    } else {
+      return res.status(400).json({ error: 'Falta thread_id o destino' });
+    }
+    if (!thread) return res.status(404).json({ error: 'Hilo no encontrado' });
+    if (!(await _equipoEsParticipante(ident, thread))) return res.status(403).json({ error: 'No participas de este hilo' });
+
+    // Insertar el mensaje. leido_por arranca con el remitente (ya lo "leyo").
+    const { data: msg, error: errMsg } = await supabase.from('team_messages').insert({
+      thread_id: thread.id,
+      admin_id: ident.ownerId,
+      sender_auth_user_id: ident.authUserId,
+      content: content || '',
+      media_url: mediaUrl,
+      leido_por: [ident.authUserId]
+    }).select('id, created_at').single();
+    if (errMsg) return res.status(500).json({ error: errMsg.message });
+
+    // Resolver destinatarios (auth_user_id) y enviarles push. Excluye al remitente. Dedupe.
+    let destinatarios = [];
+    if (thread.tipo === 'dm') {
+      destinatarios = (thread.participantes || []).filter(function(p){ return p && p !== ident.authUserId; });
+    } else if (thread.tipo === 'departamento') {
+      destinatarios = await _equipoParticipantesDepto(ident.ownerId, thread.departamento_id);
+      destinatarios = destinatarios.filter(function(p){ return p && p !== ident.authUserId; });
+    }
+    // Dedupe
+    const vistos = {}; const finales = [];
+    destinatarios.forEach(function(p){ if (!vistos[p]) { vistos[p] = true; finales.push(p); } });
+    // Nombre del remitente para el titulo del push.
+    let nombreRemitente = ident.esDueno ? 'Tu equipo' : 'Tu equipo';
+    try {
+      if (!ident.esDueno) {
+        const { data: yo } = await supabase.from('asesores').select('nombre').eq('auth_user_id', ident.authUserId).eq('admin_id', ident.ownerId).maybeSingle();
+        if (yo && yo.nombre) nombreRemitente = yo.nombre;
+      }
+    } catch (eN) {}
+    const cuerpo = content ? content.slice(0, 140) : 'Te envio un archivo';
+    for (let i = 0; i < finales.length; i++) {
+      // Reusa el push FCM existente (0 tokens IA). bodyLiteral fuerza el texto del chat interno.
+      try { await enviarPushAsesor(finales[i], nombreRemitente, '', 'Chat interno: ' + cuerpo); } catch (eP) {}
+    }
+    return res.json({ ok: true, id: msg && msg.id, thread_id: thread.id, created_at: msg && msg.created_at });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/equipo/leido { thread_id } -> marca como leidos por el usuario todos los mensajes del hilo.
+app.post('/api/equipo/leido', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const b = req.body || {};
+    if (!b.thread_id) return res.status(400).json({ error: 'Falta thread_id' });
+    const { data: thread } = await supabase.from('team_threads').select('*').eq('id', b.thread_id).maybeSingle();
+    if (!thread) return res.status(404).json({ error: 'Hilo no encontrado' });
+    if (!(await _equipoEsParticipante(ident, thread))) return res.status(403).json({ error: 'No participas de este hilo' });
+
+    // Mensajes del hilo (de este tenant) que aun NO me tienen en leido_por y que no envie yo.
+    const { data: pend } = await supabase.from('team_messages')
+      .select('id, leido_por')
+      .eq('thread_id', b.thread_id).eq('admin_id', ident.ownerId)
+      .neq('sender_auth_user_id', ident.authUserId)
+      .not('leido_por', 'cs', '{' + ident.authUserId + '}');
+    let marcados = 0;
+    for (let i = 0; i < (pend || []).length; i++) {
+      const m = pend[i];
+      const nuevo = Array.isArray(m.leido_por) ? m.leido_por.slice() : [];
+      if (nuevo.indexOf(ident.authUserId) < 0) nuevo.push(ident.authUserId);
+      const { error } = await supabase.from('team_messages').update({ leido_por: nuevo }).eq('id', m.id).eq('admin_id', ident.ownerId);
+      if (!error) marcados++;
+    }
+    return res.json({ ok: true, marcados: marcados });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/departamentos/crear', async function(req, res) {
   try {
     const b = req.body || {};

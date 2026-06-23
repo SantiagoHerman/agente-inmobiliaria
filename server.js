@@ -6412,4 +6412,99 @@ app.post('/api/webhook/meta', function(req, res) {
   } catch (e) { console.error('POST /api/webhook/meta error:', e && e.message); }
 });
 
+// ============================================================================
+// CREDENCIALES META (Messenger + Instagram) - guardar/cargar para la pantalla
+// de Integraciones. ADITIVO: NO toca el webhook ni la logica de envio de arriba;
+// solo alimenta la tabla messenger_credentials que esos endpoints ya consumen.
+// Auth identica a /api/departamentos: verificarUsuario + admin_id-en-body + 403.
+// REGLA token: el page_access_token y el app_secret NUNCA se loguean ni se
+// devuelven completos. El GET enmascara el token a los ultimos 4 y solo informa
+// un booleano de si hay app_secret cargado.
+// ============================================================================
+
+// --- POST /api/meta/credenciales : GUARDAR / ACTIVAR / DESACTIVAR una credencial. ---
+app.post('/api/meta/credenciales', async function(req, res) {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!b.admin_id) return res.status(400).json({ error: 'Falta admin_id' });
+    const canal = (b.canal === 'instagram') ? 'instagram' : (b.canal === 'page' ? 'page' : null);
+    if (!canal) return res.status(400).json({ error: 'Canal invalido' });
+
+    // Validacion de campos minimos por canal (los opcionales no bloquean).
+    if (canal === 'page') {
+      if (!b.page_id || !String(b.page_id).trim()) return res.status(400).json({ error: 'Falta el ID de la Pagina de Facebook' });
+    } else {
+      if (!b.ig_user_id || !String(b.ig_user_id).trim()) return res.status(400).json({ error: 'Falta el ID de la cuenta de Instagram' });
+    }
+
+    // Construir fila SOLO con columnas reales de la tabla.
+    const fila = { user_id: b.admin_id, canal, activo: (b.activo === false ? false : true) };
+    if (canal === 'page') { fila.page_id = String(b.page_id || '').trim(); fila.ig_user_id = null; }
+    else                  { fila.ig_user_id = String(b.ig_user_id || '').trim(); fila.page_id = null; }
+    fila.page_access_token = String(b.page_access_token || '').trim();
+    fila.verify_token = b.verify_token ? String(b.verify_token).trim() : null;
+    fila.app_secret = b.app_secret ? String(b.app_secret).trim() : null;
+
+    // Upsert manual por (user_id, canal). El token/app_secret SOLO se pisan si el
+    // usuario los reescribio (string no vacio); si vienen vacios en un registro
+    // existente, se conserva el valor previo (no se sobreescribe con null).
+    const { data: existe } = await supabase
+      .from('messenger_credentials')
+      .select('id')
+      .eq('user_id', b.admin_id)
+      .eq('canal', canal)
+      .maybeSingle();
+    if (existe) {
+      if (!fila.page_access_token) delete fila.page_access_token; // conservar token previo
+      if (fila.app_secret === null && !b.app_secret) delete fila.app_secret; // conservar app_secret previo
+      const { error } = await supabase.from('messenger_credentials').update(fila).eq('id', existe.id);
+      if (error) return res.status(500).json({ error: error.message });
+    } else {
+      if (!fila.page_access_token) return res.status(400).json({ error: 'Falta el token de la pagina' });
+      const { error } = await supabase.from('messenger_credentials').insert(fila);
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    // NUNCA devolver el token. Solo confirmacion.
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// --- GET /api/meta/credenciales : CARGAR credenciales con el token ENMASCARADO. ---
+app.get('/api/meta/credenciales', async function(req, res) {
+  try {
+    const userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    let ownerId = userId;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+
+    const { data, error } = await supabase
+      .from('messenger_credentials')
+      .select('canal, page_id, ig_user_id, verify_token, app_secret, page_access_token, activo')
+      .eq('user_id', ownerId);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const mask = function(s) { if (!s) return ''; const v = String(s); return v.length <= 4 ? '****' : ('****' + v.slice(-4)); };
+    const armar = function(fila) {
+      if (!fila) return null;
+      return {
+        canal: fila.canal,
+        page_id: fila.page_id || '',
+        ig_user_id: fila.ig_user_id || '',
+        verify_token: fila.verify_token || '',
+        activo: fila.activo === true,
+        page_access_token_mask: mask(fila.page_access_token),
+        app_secret_set: !!fila.app_secret
+      };
+    };
+    const filas = data || [];
+    const fPage = filas.find(function(f){ return f.canal === 'page'; }) || null;
+    const fIg = filas.find(function(f){ return f.canal === 'instagram'; }) || null;
+    return res.json({ ok: true, page: armar(fPage), instagram: armar(fIg) });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

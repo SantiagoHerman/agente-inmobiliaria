@@ -4937,6 +4937,19 @@ app.get('/api/equipo/avisos-config', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// GET /api/etiquetas -> { ok, etiquetas:[{id,nombre,color}] }. Catalogo de etiquetas del tenant. Lo leen DUEÑO y ASESOR
+// (ambos las muestran/asignan en la lista de leads). Defensivo: si la columna no existe todavia, devuelve [].
+app.get('/api/etiquetas', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    let etiquetas = [];
+    const r = await supabase.from('business_settings').select('etiquetas').eq('user_id', ident.ownerId).maybeSingle();
+    if (!r.error && r.data && Array.isArray(r.data.etiquetas)) etiquetas = r.data.etiquetas;
+    return res.json({ ok: true, etiquetas: etiquetas });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/equipo/avisos-config', async function(req, res) {
   try {
     const ident = await _equipoIdentidad(req);

@@ -7211,28 +7211,28 @@ async function clasificarFotoBase64(url, user_id) {
   if (['image/jpeg', 'image/png', 'image/gif', 'image/webp'].indexOf(mediaType) < 0) mediaType = 'image/jpeg';
   const buf = Buffer.from(await resp.arrayBuffer());
   const r = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-haiku-4-5',
     max_tokens: 10,
     messages: [{ role: 'user', content: [
       { type: 'image', source: { type: 'base64', media_type: mediaType, data: buf.toString('base64') } },
       { type: 'text', text: PROMPT_CLASIFICAR_FOTO }
     ] }]
   });
-  try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'vision_foto'); } catch(e){}
+  try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'vision_foto', PRECIO_HAIKU); } catch(e){}
   return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
 }
 // Clasifica una sola foto: primero intenta source.type:'url' (soportado por el SDK 0.91), y si falla cae a base64.
 async function clasificarFotoUna(url, user_id) {
   try {
     const r = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5',
       max_tokens: 10,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'url', url: url } },
         { type: 'text', text: PROMPT_CLASIFICAR_FOTO }
       ] }]
     });
-    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'vision_foto'); } catch(e){}
+    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'vision_foto', PRECIO_HAIKU); } catch(e){}
     const t = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
     return matchearCategoriaFoto(t);
   } catch (eUrl) {

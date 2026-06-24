@@ -8,7 +8,39 @@ const app = express();
 // Solo se usa para validar la firma X-Hub-Signature-256 de los webhooks de Meta (HMAC sobre
 // los bytes exactos recibidos). NO afecta a WhatsApp ni a ningun otro endpoint: solo agrega
 // la propiedad req.rawBody. El parseo a req.body sigue identico a antes.
-app.use(express.json({ limit: '2mb', verify: function(req, res, buf){ try { req.rawBody = buf; } catch(e){} } }));
+// LIMITE DEL BODY JSON: subido de 2mb -> 12mb. Motivo (bug A1 SOPORTE imagen): el adjunto del ticket viaja
+// como data URL base64 dentro del JSON, y el base64 pesa ~33% MAS que los bytes reales. Con el limite viejo de
+// 2mb, una captura/foto de ~1.5MB ya superaba el limite y Express devolvia 413 (PayloadTooLargeError) ANTES de
+// entrar al handler -> el front lo veia como "error de conexion". Con 12mb entra comodo una imagen de ~8MB reales
+// (~11MB en base64), que es el tope que valida subirImagenSoporte. No habilita uploads sin control: el tope duro
+// de tamano de imagen sigue en subirImagenSoporte (8MB) y subirMediaEquipo (25MB). NO afecta el gasto de IA.
+app.use(express.json({ limit: '12mb', verify: function(req, res, buf){ try { req.rawBody = buf; } catch(e){} } }));
+
+// MANEJADOR DE BODY DEMASIADO GRANDE (bug A1 SOPORTE imagen): si el JSON supera el limite (12mb), express.json
+// lanza un error 413 'entity.too.large' que, sin este handler, se devolvia como un 500/413 crudo SIN cabeceras
+// CORS -> el navegador lo mostraba como "error de conexion" generico. Aca lo capturamos y devolvemos un 413 con
+// CORS y un mensaje claro para que el front pueda explicar "la imagen es demasiado grande". Cualquier otro error
+// de parseo (JSON malformado) -> 400 claro. Va ANTES del middleware de CORS, asi que setea las cabeceras el mismo.
+app.use(function(err, req, res, next){
+  if (!err) return next();
+  try {
+    var origin = req.headers && req.headers.origin;
+    var permitidos = ['https://raices-crm.vercel.app','https://www.raicescrm.com','https://raicescrm.com','http://localhost:3000'];
+    if (origin && permitidos.indexOf(origin) !== -1) res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Headers', 'Content-Type, apikey, Authorization');
+  } catch (eCors) {}
+  var tipo = err.type || '';
+  var status = err.status || err.statusCode;
+  if (tipo === 'entity.too.large' || status === 413) {
+    return res.status(413).json({ error: 'El archivo adjunto es demasiado grande. Probá con una imagen más liviana (hasta ~8MB).' });
+  }
+  if (tipo === 'entity.parse.failed' || status === 400) {
+    return res.status(400).json({ error: 'No se pudo leer la solicitud (formato inválido).' });
+  }
+  // Cualquier otro error de middleware temprano: 500 controlado (no rompe el proceso).
+  console.error('error middleware temprano:', err && err.message);
+  return res.status(500).json({ error: 'Error procesando la solicitud' });
+});
 
 app.use((req, res, next) => {
   // Lista blanca de origenes permitidos (solo la app de Raices CRM)
@@ -169,9 +201,17 @@ const EVOLUTION_KEY = process.env.EVOLUTION_KEY || '';
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
 
 const TONO = {
-  formal: 'Usa un tono formal y profesional, tratando de usted.',
-  cercano: 'Usa un tono cercano, amable y profesional. Equilibrado.',
-  relajado: 'Usa un tono relajado y cotidiano, con voseo argentino (vos, tenes, queres). Natural y cercano.'
+  // TONOS FIJOS (formal/cercano/relajado): cada uno se aplica DESDE EL PRIMER mensaje (incluido el saludo) y se
+  // mantiene EXACTAMENTE IGUAL toda la charla. Van enfaticos y explicitos porque el resto del prompt esta escrito en
+  // voseo argentino (Sos, deci, fijate) y el modelo tiende a copiar ese registro, a espejar como escribe el lead y a
+  // RELAJARSE a medida que crece la confianza (warm-up). Estas instrucciones MANDAN sobre ese registro y prohiben el
+  // drift. El UNICO tono que puede variar es 'adaptativo'.
+  formal: 'TONO FORMAL — TRATO DE USTED OBLIGATORIO Y CONSTANTE: Dirigite al cliente SIEMPRE de USTED, nunca de "vos" ni de "tu". Conjuga TODOS los verbos en tercera persona de cortesia (usted): deci "¿en que puedo ayudarlo?", "cuenteme", "si usted prefiere", "le envio", "aguarde un momento" — y NUNCA "¿en que te ayudo?", "contame", "si queres", "te mando", "espera". Usa un registro profesional, cortes y respetuoso (Sr./Sra. + apellido si lo sabes). APLICA este registro DESDE EL PRIMER mensaje (incluido el saludo) y mantenelo EXACTAMENTE IGUAL durante TODA la conversacion. NO te relajes ni te ablandes aunque el cliente te tutee, te vosee, escriba informal o crezca la confianza con el correr de la charla: vos seguis SIEMPRE de usted, igual al final que al principio. Este tono tiene PRIORIDAD sobre cualquier otra instruccion de estilo y sobre el registro (voseo) del resto del prompt.',
+  cercano: 'TONO CERCANO — AMABLE PERO ESTABLE: Usa un tono cercano, amable, calido y profesional, equilibrado: ni acartonado ni informal de mas. Podes tutear/vosear con naturalidad pero SIN volverte coloquial, sin modismos de jerga y sin chistes. APLICA este registro DESDE EL PRIMER mensaje (incluido el saludo) y mantenelo EXACTAMENTE IGUAL durante TODA la conversacion. NO te endurezcas ni te relajes mas de la cuenta aunque el cliente escriba muy formal, muy informal, te tutee o crezca la confianza con el correr de la charla: el registro queda igual de cercano-profesional al final que al principio. Este tono tiene PRIORIDAD sobre cualquier otra instruccion de estilo y sobre el registro del resto del prompt.',
+  relajado: 'TONO RELAJADO — VOSEO ARGENTINO PERO ESTABLE: Usa un tono relajado, cotidiano y cercano, con voseo argentino (vos, tenes, queres, fijate, dale). Natural, como un chat de WhatsApp entre conocidos, pero sin pasarte de informal (sin malas palabras ni exceso de jerga). APLICA este registro DESDE EL PRIMER mensaje (incluido el saludo) y mantenelo EXACTAMENTE IGUAL durante TODA la conversacion. NO te pongas formal ni cambies el registro aunque el cliente te trate de usted o escriba acartonado, ni aunque crezca la confianza: el voseo relajado queda igual al final que al principio, ni mas formal ni mas informal. Este tono tiene PRIORIDAD sobre cualquier otra instruccion de estilo.',
+  // ADAPTATIVO = el UNICO tono donde la IA puede variar el registro a proposito. No fija un registro: lee como escribe
+  // el lead y lo acompana, pudiendo ajustarse a medida que avanza la charla.
+  adaptativo: 'TONO ADAPTATIVO — VOS DECIDIS EL REGISTRO: Lee el registro del lead (como te escribe: formal, informal, voseo, tuteo, mas seco o mas calido) y adapta el tuyo de forma natural para acompanarlo y generar confianza. Podes ajustar el tono a medida que avanza la conversacion si cambia el clima de la charla. Sea cual sea el registro, manteniendote siempre profesional, respetuoso y claro. Este es el unico modo en el que podes variar el tono libremente.'
 };
 const AUTONOMIA = {
   conservador: 'Solo responde con informacion confirmada en la base de conocimiento. Si no sabes algo, deci que lo vas a consultar. Nunca inventes datos.',
@@ -210,7 +250,7 @@ const PRECIOS_MP = { basico: 55000, pro: 130000, premium: 330000, enterprise: 55
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
-  trial:      { ai_messages: 200,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  trial:      { ai_messages: 100,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   basico:     { ai_messages: 500,   asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
   pro:        { ai_messages: 1800,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   premium:    { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
@@ -290,6 +330,10 @@ async function dentroDelTopeIA(user_id) {
   }
   const plan = await planActual(user_id);
   let tope = topeMensajesPlan(plan, sub); // grandfathering: clientes viejos conservan el tope legacy
+  // B1: durante el TRIAL con tarjeta (status 'trial' + trial_con_tarjeta) el cupo es FIJO = PLAN_LIMITS.trial (100),
+  // sin importar que plan eligio ni grandfathering. Recien tras el 1er pago real (webhook -> status 'active') se
+  // libera el cupo del plan elegido. Un override del Maestro (si existe) sigue mandando sobre este cap.
+  if (sub && sub.status === 'trial' && sub.trial_con_tarjeta === true) tope = PLAN_LIMITS.trial.ai_messages;
   if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages; // override por cliente (panel maestro)
   else if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // compat override viejo
   if (tope === Infinity) return true;
@@ -334,14 +378,16 @@ async function debeBloquearAcceso(user_id) {
     // webhook ~1285). NO se bloquea past_due: el agente sigue atendiendo durante la gracia de 1 dia, y el
     // cron revisarSuscripciones pasa past_due -> suspended tras esa gracia (recien ahi se bloquea aca).
     if (est === 'cancelled' || est === 'suspended') return true;
-    // TRIAL = SIN ACCESO. MercadoPago NUNCA usa el estado "trial": una suscripcion autorizada (aun en su
+    // TRIAL: por defecto SIN ACCESO. MercadoPago NUNCA usa el estado "trial": una suscripcion autorizada (aun en su
     // periodo de prueba con tarjeta) queda 'authorized' -> la mapeamos a 'active'. Por eso status 'trial' en
-    // nuestra base SOLO puede venir de: (a) el trial automatico del registro (sin tarjeta), o (b) una preapproval
+    // nuestra base puede venir de: (a) el trial automatico del registro (sin tarjeta), (b) una preapproval
     // 'pending'/abandonada (el webhook mapea todo lo no-authorized/paused/cancelled a 'trial', y le pone
-    // mp_preapproval_id aunque NO este autorizada). Ninguno es un suscriptor real -> se bloquea SIEMPRE.
-    // Asi un usuario recien registrado queda bloqueado (solo Suscripcion/Ayuda/Soporte/Salir) hasta que MP
-    // confirme la suscripcion (authorized -> active). Tambien mata el bypass del boton Dashboard al volver atras.
-    if (est === 'trial') return true;
+    // mp_preapproval_id aunque NO este autorizada), o (c) B1: el trial CON TARJETA upfront (start_date = ahora+4d),
+    // marcado con trial_con_tarjeta=true. Solo (c) es un suscriptor "real" en prueba -> NO se bloquea (la IA
+    // responde, capeada a 100 por dentroDelTopeIA). (a) y (b) NO son suscriptores reales -> se bloquean SIEMPRE.
+    // Asi un usuario que solo se registro (o abandono el checkout) queda bloqueado (solo Suscripcion/Ayuda/
+    // Soporte/Salir) hasta que cargue tarjeta; y se mata el bypass del boton Dashboard al volver atras.
+    if (est === 'trial') return (sub && sub.trial_con_tarjeta === true) ? false : true;
     return false; // active, past_due (en gracia), o estado desconocido -> no bloquear
   } catch (e) { return false; } // ante cualquier error -> fail-open (no cortar el servicio)
 }
@@ -493,7 +539,7 @@ async function mpCrearPlan(nombre, montoARS, backUrl) {
 // creamos la preapproval SIN plan, con status:'pending'. El MONTO sale HARDCODE de PRECIOS_MP[nivel]
 // (NO del GET del plan en MP: ese GET a veces falla -> transaction_amount undefined -> MP 500). Tampoco
 // mandamos free_trial: el preapproval DIRECTO (sin plan) no lo soporta y tira 500. Conserva external_reference.
-async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nivel) {
+async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nivel, startDateISO) {
   var monto = PRECIOS_MP[nivel];
   // Sin precio configurado para este nivel => transaction_amount undefined => MP 500. Cortamos con un error claro ANTES.
   if (typeof monto === 'undefined' || monto === null) {
@@ -509,6 +555,11 @@ async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nive
     transaction_amount: monto,
     currency_id: 'ARS'
   };
+  // B1 (TRIAL con tarjeta): si llega startDateISO, lo ponemos en auto_recurring.start_date para diferir el PRIMER
+  // cobro (ej. ahora + 4 dias). El cliente carga la tarjeta YA (autoriza), pero MP no cobra hasta esa fecha -> es el
+  // periodo de prueba. NO usamos free_trial: en el preapproval DIRECTO (sin plan) MP lo rechaza con 500. Defensivo:
+  // solo lo agregamos si vino un valor; sin start_date el comportamiento es el de siempre (cobra al autorizar).
+  if (startDateISO) autoRecurring.start_date = startDateISO;
   var body = {
     reason: (plan && plan.reason) ? plan.reason : 'Suscripcion Raices CRM',
     external_reference: externalRef,
@@ -1522,8 +1573,9 @@ async function subirImagenSoporte(dataUrl, carpeta) {
     if (mime.indexOf('image/') !== 0) return null; // SOLO imagenes (captura/foto)
     var base64 = m[2];
     var buffer = Buffer.from(base64, 'base64');
-    // Tope defensivo de tamano (~6MB de bytes reales) para no abusar del Storage.
-    if (buffer.length > 6 * 1024 * 1024) { console.error('subirImagenSoporte: imagen demasiado grande'); return null; }
+    // Tope defensivo de tamano (~8MB de bytes reales) para no abusar del Storage. Coherente con el limite del
+    // body JSON (12mb): una imagen de 8MB reales pesa ~11MB en base64, que entra dentro de los 12mb del body.
+    if (buffer.length > 8 * 1024 * 1024) { console.error('subirImagenSoporte: imagen demasiado grande (' + buffer.length + ' bytes, tope 8MB)'); return null; }
     var ext = (mime.indexOf('png') >= 0) ? 'png' : (mime.indexOf('webp') >= 0) ? 'webp' : (mime.indexOf('gif') >= 0) ? 'gif' : 'jpg';
     var sub = (carpeta === 'maestro') ? 'maestro' : 'cliente';
     var nombre = 'soporte/' + sub + '/' + Date.now() + '_' + Math.random().toString(36).substring(2, 8) + '.' + ext;
@@ -1824,7 +1876,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     'QUIEN SOS: Sos una combinacion de tres roles en una sola persona. (1) SECRETARIA: ordenada, recordas datos del cliente, coordinas y no dejas cabos sueltos. (2) ATENCION AL PUBLICO: calida, paciente, clara, das una excelente primera impresion y resolves dudas con amabilidad. (3) SETTER: detectas que mueve al cliente, generas interes y avanzas la conversacion hacia el cierre. Combinas los tres roles de forma natural, no robotica.',
     'COMO TRABAJAS: No te limites a responder y esperar. Llevas la conversacion hacia adelante con calidez y naturalidad, paso a paso.',
     'REGITE SIEMPRE Y A RAJATABLA POR LA CONFIGURACION (es OBLIGATORIA, no opcional): respeta el IDIOMA configurado, el uso o no de EMOJIS, el TONO indicado, el nivel de AUTONOMIA (cuanto podes afirmar vs cuando derivar), el OBJETIVO (hasta donde atender antes de pasar a un humano), el LARGO de respuesta y las instrucciones internas; usa la base de conocimiento como tu UNICA fuente de verdad. Si la configuracion y tu instinto comercial chocan, SIEMPRE gana la configuracion.',
-    'PRIMERO conecta: mostrate humano, calido y con interes genuino. Adapta el trato al lead segun como te escribe.',
+    'PRIMERO conecta: mostrate humano, calido y con interes genuino. (El REGISTRO/TONO con que hablas lo define la configuracion de TONO de mas abajo: respetalo SIEMPRE y no lo cambies para espejar al lead, salvo que el tono configurado sea Adaptativo.)',
     'DETECTA que motiva a este lead a avanzar: puede ser inversion, una mejor calidad de vida, disfrutar en pareja, vision a futuro, un proyecto para la familia, o seguridad. No lo interrogues ni preguntes el dolor de forma directa: descubrilo con preguntas naturales y escuchando lo que dice.',
     'CONECTA la oferta con eso que lo mueve: cuando presentes una opcion, relacionala con su motivacion (ejemplo: si busca invertir, resalta valor y proyeccion; si es para la familia, resalta espacio y comodidad). Siempre con datos reales.',
     'PENSA COMO EL DUENO DEL NEGOCIO: tu meta no es empujar cualquier cosa, sino que el cliente encuentre la MEJOR opcion para EL. Recomendar lo que de verdad le conviene genera confianza y es lo que mas cierra. Razona que le sirve segun lo que busca, su presupuesto y su situacion, con criterio del negocio.',
@@ -1878,7 +1930,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     comportamientoSetter,
     instruccionIdioma,
     'Respondes consultas de clientes por WhatsApp.',
-    'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si es informal; Sr./Sra. y apellido si es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
+    'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Ese saludo y presentacion YA tienen que estar escritos en el TONO configurado (ver mas abajo), desde la primera palabra. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si el tono es cercano/relajado; Sr./Sra. y apellido si el tono es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
     instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
@@ -3127,8 +3179,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           }
         }
         // cancelled/suspended = lapso de pago; trial = suscripcion no autorizada todavia (pending/abandonada o
-        // trial automatico del registro, ver debeBloquearAcceso). En todos esos casos la IA no atiende.
-        if (!_cortesia && (_est === 'cancelled' || _est === 'suspended' || _est === 'trial')) {
+        // trial automatico del registro, ver debeBloquearAcceso). En esos casos la IA no atiende. EXCEPCION (B1):
+        // el trial CON TARJETA upfront (trial_con_tarjeta=true) SI atiende, capeado a 100 por dentroDelTopeIA.
+        var _trialConTarjeta = !!(_sub && _sub.trial_con_tarjeta === true);
+        if (!_cortesia && (_est === 'cancelled' || _est === 'suspended' || (_est === 'trial' && !_trialConTarjeta))) {
           await enviarWhatsapp(instanciaNombre, telefono, 'El servicio no esta activo. El administrador debe completar o regularizar la suscripcion para continuar.');
           return;
         }
@@ -3652,20 +3706,42 @@ function dentroHorarioOficina(horario) {
     // Dia explicitamente marcado como atiende=false tambien cuenta como cerrado (formato nuevo del editor).
     if (!cfg || cfg.cerrado || cfg.atiende === false) return false;
     const minutosAhora = arg.getHours() * 60 + arg.getMinutes();
-    const enFranja = function(desdeStr, hastaStr) {
-      const [hDesde, mDesde] = String(desdeStr || '09:00').split(':').map(Number);
-      const [hHasta, mHasta] = String(hastaStr || '18:00').split(':').map(Number);
-      const desde = hDesde * 60 + mDesde;
-      const hasta = hHasta * 60 + mHasta;
+    // Convierte 'HH:MM' a minutos del dia. Devuelve null si el valor no es un horario valido (asi una franja
+    // mal cargada NO se trata como abierta). `fallback` solo se usa en el formato legacy desde/hasta (compat).
+    const aMinutos = function(str, fallback) {
+      const s = String(str == null ? '' : str).trim();
+      if (!s) return (fallback == null) ? null : fallback;
+      const partes = s.split(':');
+      const h = Number(partes[0]);
+      const m = (partes.length > 1) ? Number(partes[1]) : 0;
+      if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) {
+        return (fallback == null) ? null : fallback;
+      }
+      return h * 60 + m;
+    };
+    // Legacy desde/hasta: mantiene los defaults historicos (09:00 / 18:00) para no cambiar el comportamiento actual.
+    const enFranjaLegacy = function(desdeStr, hastaStr) {
+      const desde = aMinutos(desdeStr, 9 * 60);
+      const hasta = aMinutos(hastaStr, 18 * 60);
       return minutosAhora >= desde && minutosAhora <= hasta;
     };
-    // PARTE A (correccion 8): TURNO CORTADO. Si el dia tiene `franjas` (array), estar DENTRO de CUALQUIERA
-    // de las franjas (ej. manana 09-13 y tarde 16-20) => disponible. Si no hay franjas, formato legacy desde/hasta.
+    // Franja explicita (turno cortado): EXIGE desde/hasta validos. Una franja sin horarios validos o degenerada
+    // (hasta <= desde) NO cuenta como abierta (no se asume el rango 09-18 que usa el formato legacy).
+    const enFranjaEstricta = function(f) {
+      if (!f || typeof f !== 'object') return false;
+      const desde = aMinutos(f.desde, null);
+      const hasta = aMinutos(f.hasta, null);
+      if (desde == null || hasta == null || hasta <= desde) return false;
+      return minutosAhora >= desde && minutosAhora <= hasta;
+    };
+    // PARTE A (correccion 8) + C1 (horario cortado): si el dia tiene `franjas` (array), estar DENTRO de CUALQUIERA
+    // de ellas (ej. manana 09-13 y tarde 16-20) => disponible. Soporta 1 o 2 (o mas) franjas por dia.
+    // Si NO hay franjas, se usa el formato legacy desde/hasta (compat con la franja unica existente).
     if (Array.isArray(cfg.franjas)) {
       if (cfg.franjas.length === 0) return false; // dia abierto pero sin franjas cargadas => cerrado
-      return cfg.franjas.some(function(f){ return f && enFranja(f.desde, f.hasta); });
+      return cfg.franjas.some(enFranjaEstricta);
     }
-    return enFranja(cfg.desde, cfg.hasta);
+    return enFranjaLegacy(cfg.desde, cfg.hasta);
   } catch (e) { return false; }
 }
 
@@ -5331,6 +5407,49 @@ app.post('/api/departamentos/seed-rubro', async function(req, res) {
       if (r2.error) return res.status(500).json({ error: r2.error.message });
     }
     return res.json({ ok: true, creados: filas.length });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// B3: SUGERIR CRITERIO de derivacion para un departamento (1 sola llamada a Haiku, on-demand).
+// Input: { admin_id, nombre, rubro }. Output: { ok, criterio } -> un criterio corto, editable, que el front
+// precarga al crear un depto cuando el usuario aprieta "Sugerir con IA". COSTO IA: Haiku (claude-haiku-4-5, barato),
+// prompt corto + max_tokens chico. Se contabiliza con PRECIO_HAIKU para no inflar el panel. NO corre por mensaje:
+// solo al apretar el boton. Defensivo: si no hay key o la IA falla, devuelve un fallback de la plantilla del rubro.
+app.post('/api/departamentos/sugerir-criterio', async function(req, res) {
+  try {
+    const b = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (b.admin_id && _uidToken !== b.admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    const nombre = (b.nombre ? String(b.nombre) : '').trim().slice(0, 60);
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre del departamento' });
+    const rubro = normalizarRubro((b.rubro ? String(b.rubro) : '').trim() || 'inmobiliaria');
+    // Fallback determinista (CERO IA): si la plantilla del rubro ya trae un depto con ese nombre, usamos su criterio.
+    var fallback = '';
+    try {
+      var plant = PLANTILLAS_DEPTOS[rubro] || PLANTILLAS_DEPTOS['inmobiliaria'];
+      var nrm = function(s){ return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
+      var hit = plant.find(function(d){ return nrm(d.nombre) === nrm(nombre); });
+      if (hit) fallback = hit.criterio;
+    } catch (eF) {}
+    // Sin API key de Anthropic: devolvemos el fallback (o vacio) sin intentar IA -> no rompe ni gasta.
+    if (!anthropic || !process.env.ANTHROPIC_KEY) {
+      return res.json({ ok: true, criterio: fallback, fuente: 'fallback' });
+    }
+    const sys = 'Sos un asistente que ayuda a configurar un CRM de atencion al cliente. Dado el NOMBRE de un departamento y el RUBRO del negocio, escribi UN criterio breve (1 sola frase, maximo 18 palabras) que describa que tipo de consultas o mensajes deberian derivarse a ese departamento. Sin preambulos, sin comillas, sin punto final opcional. Escribi en espanol rioplatense, claro y concreto.';
+    const usr = 'Rubro: ' + rubro + '. Departamento: "' + nombre + '". Devolve solo el criterio.';
+    let criterio = fallback;
+    let fuente = 'fallback';
+    try {
+      const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 120, system: sys, messages: [{ role: 'user', content: usr }] });
+      // Contabilizar el uso a precio HAIKU (no Sonnet) para no inflar el costo del panel.
+      try { if (r && r.usage) await registrarUsoTokens(_uidToken, r.usage, 'sugerir_criterio_depto', PRECIO_HAIKU); } catch (eU) {}
+      const txt = (r && r.content && r.content[0] && r.content[0].text) ? String(r.content[0].text).trim() : '';
+      if (txt) { criterio = txt.replace(/^["'\s]+|["'\s]+$/g, '').slice(0, 1000); fuente = 'ia'; }
+    } catch (eIA) {
+      console.error('sugerir-criterio IA (se usa fallback):', eIA && eIA.message);
+    }
+    return res.json({ ok: true, criterio: criterio, fuente: fuente });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -7751,8 +7870,13 @@ app.get('/api/suscripcion', async function(req, res) {
     var ov = (sub && sub.limits_override) || {};
     var hayOvMsgs = (typeof ov.ai_messages === 'number');
     var esCortesia = !!(sub && sub.cortesia === true);
+    // B1: es_prueba = el tenant esta en el periodo de prueba con tarjeta (status 'trial' + trial_con_tarjeta). El front
+    // muestra "X / 100 - de prueba" + boton "Aceptar el plan". (El trial sin tarjeta / pending NO es es_prueba: ese
+    // esta bloqueado por el paywall, no tiene cupo de uso.)
+    var esPrueba = !!(sub && sub.status === 'trial' && sub.trial_con_tarjeta === true);
     // El cliente ve su tope de mensajes EFECTIVO (grandfathered o nuevo; y si tiene override del Maestro, ese manda).
     var topeEfectivo = topeMensajesPlan(plan, sub);
+    if (esPrueba) topeEfectivo = PLAN_LIMITS.trial.ai_messages; // durante el trial el cupo visible es 100, no el del plan elegido
     if (hayOvMsgs) topeEfectivo = ov.ai_messages;
     // Cortesia = saldo ILIMITADO -> tope null (el dashboard no muestra contador en reversa). SALVO que el Maestro
     // le haya puesto un override de mensajes: ESE manda aun bajo cortesia (override > cortesia-ilimitado).
@@ -7788,7 +7912,7 @@ app.get('/api/suscripcion', async function(req, res) {
     }
     // puede_cancelar: solo si hay un preapproval real cobrable.
     var puede_cancelar = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar });
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -7806,18 +7930,111 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     var planId = PLANES_MP[nivel] || null;
     if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
-    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel);
+    // B1: TRIAL de 4 dias con tarjeta upfront. Solo para una cuenta NUEVA que arranca su suscripcion (no para un
+    // upgrade desde active/cortesia: ese cobra ya). Diferimos el 1er cobro con start_date = ahora + 4 dias.
+    var subPrev = await getSubscription(user_id);
+    var yaActivo = !!(subPrev && (subPrev.status === 'active' || subPrev.status === 'past_due' || subPrev.cortesia === true));
+    var startDateISO = null;
+    if (!yaActivo) {
+      var d4 = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000);
+      startDateISO = d4.toISOString();
+    }
+    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, startDateISO);
     // Guardar el plan ELEGIDO en la fila para que se apliquen sus limites al activarse (el webhook NO incluye
     // 'plan' en su upsert -> se preserva). Asi un Enterprise queda con 20.000 y no cae al default. Si el tenant
-    // NO esta active/cortesia, lo dejamos en 'trial' (bloqueado por el candado) hasta que MP confirme el pago;
-    // si YA esta active (upgrade de plan), NO tocamos el status para no cortarle el acceso durante el cambio.
+    // NO esta active/cortesia, lo dejamos en 'trial' y marcamos trial_con_tarjeta=true: durante esos 4 dias la IA
+    // SI atiende (capeada a 100; ver dentroDelTopeIA/debeBloquearAcceso). Tras el 1er pago real el webhook lo pasa
+    // a 'active' (cupo del plan). Si YA esta active (upgrade), NO tocamos status ni el flag (no cortar el acceso).
     try {
-      var subPrev = await getSubscription(user_id);
       var filaPlan = { user_id: user_id, plan: nivel };
-      if (!(subPrev && (subPrev.status === 'active' || subPrev.cortesia === true))) filaPlan.status = 'trial';
-      await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
+      if (!yaActivo) { filaPlan.status = 'trial'; filaPlan.trial_con_tarjeta = true; }
+      // DEFENSIVO: la columna trial_con_tarjeta puede no existir aun (migracion pendiente). Si el upsert falla por
+      // eso, reintentamos sin ese campo: el cliente queda en 'trial' (bloqueado hasta el pago, como antes) en vez
+      // de romper el checkout. Una vez corrida la migracion, el trial atiende capeado a 100 normalmente.
+      var upT = await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
+      if (upT && upT.error && !yaActivo) {
+        var filaSinFlag = { user_id: user_id, plan: nivel, status: 'trial' };
+        await supabase.from('subscriptions').upsert(filaSinFlag, { onConflict: 'user_id' });
+      }
     } catch (eP) { console.error('checkout guardar plan:', eP && eP.message); }
     return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// B1: ACEPTAR EL PLAN durante el trial -> cobrar YA (sin esperar los 4 dias). El trial se monto con un preapproval
+// con start_date = ahora+4d (1er cobro diferido). MP no permite "adelantar" ese start_date de forma confiable una
+// vez autorizado, asi que el patron (acordado en el contrato) es: CANCELAR el preapproval del trial y CREAR uno
+// nuevo con start_date = ahora (cobra al autorizar). Devuelve un init_point nuevo para que el cliente confirme la
+// tarjeta; al autorizarse, el webhook lo pasa a 'active' (y limpia trial_con_tarjeta -> rige el cupo del plan).
+app.post('/api/suscripcion/aceptar-plan', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
+    var sub = await getSubscription(user_id);
+    if (!sub) return res.status(400).json({ error: 'No tenes una prueba activa' });
+    // Solo aplica a un trial con tarjeta (el unico que tiene preapproval del trial para reemplazar).
+    if (!(sub.status === 'trial' && sub.trial_con_tarjeta === true)) {
+      return res.status(400).json({ error: 'No estas en periodo de prueba' });
+    }
+    // El plan elegido ya quedo guardado en el checkout del trial. Si por algun motivo no esta, error claro.
+    var nivel = sub.plan && PRECIOS_MP[sub.plan] ? sub.plan : null;
+    if (!nivel) return res.status(400).json({ error: 'No hay un plan elegido para aceptar' });
+    var planId = PLANES_MP[nivel] || null;
+    if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
+    var email = (req.body && req.body.email) ? String(req.body.email) : '';
+    if (!email) return res.status(400).json({ error: 'Falta email del pagador' });
+    // 1) Cancelar el preapproval del trial en MP (best-effort: si falla, seguimos creando el nuevo; el viejo, al
+    //    quedar sin cobrar/duplicado, no genera un 2do cobro porque su start_date era a futuro y lo reemplazamos).
+    if (sub.mp_preapproval_id) {
+      try { await mpCancelarSuscripcion(sub.mp_preapproval_id); }
+      catch (eC) { console.error('aceptar-plan cancelar trial MP:', eC && eC.message); }
+    }
+    // 2) Crear un preapproval nuevo SIN start_date (cobra al autorizar -> YA).
+    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, null);
+    // Dejamos la fila en 'trial' + trial_con_tarjeta=true hasta que el webhook confirme el pago (authorized->active):
+    // asi la IA sigue atendiendo (capeada a 100) durante el breve intervalo de re-autorizacion, sin cortar nada.
+    return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// B2: CAMBIAR DE PLAN sin crear una 2da suscripcion. Si el tenant YA tiene un preapproval cobrable
+// (mp_preapproval_id + status active/past_due) hacemos PUT /preapproval/{id} con el transaction_amount nuevo de
+// PRECIOS_MP y actualizamos el plan en la DB (el cupo de mensajes lo toma de PLAN_LIMITS via planActual). NO se
+// crea una nueva preapproval (evita doble cobro). Si NO tiene un preapproval activo, no es un "cambio": el front
+// debe mandar al checkout normal (devolvemos un error claro que el front interpreta).
+app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
+    var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
+    if (['basico','pro','premium','enterprise'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
+    var monto = PRECIOS_MP[nivel];
+    if (typeof monto === 'undefined' || monto === null) return res.status(400).json({ error: 'Plan sin precio configurado: ' + nivel });
+    var sub = await getSubscription(user_id);
+    var tieneMPactivo = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
+    if (!tieneMPactivo) {
+      // Sin suscripcion activa -> no hay nada que "cambiar". El front debe usar /checkout (alta nueva con trial).
+      return res.status(409).json({ error: 'No tenes una suscripcion activa para cambiar', usar_checkout: true });
+    }
+    if (sub.plan === nivel) return res.status(400).json({ error: 'Ya tenes ese plan' });
+    var prevPlan = sub.plan || null;
+    // PUT al preapproval existente: solo cambia el monto recurrente (mismo id, misma tarjeta -> sin doble cobro).
+    // MP exige el bloque auto_recurring completo en el update del monto.
+    try {
+      await mpFetch('/preapproval/' + sub.mp_preapproval_id, 'PUT', {
+        auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: monto, currency_id: 'ARS' }
+      });
+    } catch (eMP) {
+      return res.status(502).json({ error: 'No se pudo actualizar la suscripcion en MercadoPago: ' + (eMP && eMP.message) });
+    }
+    // Actualizar el plan en la DB (el webhook puede llegar despues; lo dejamos consistente ya). status intacto.
+    await supabase.from('subscriptions').update({ plan: nivel }).eq('user_id', user_id);
+    // NOTIF MAESTRO (best-effort): cambio de plan iniciado por el cliente.
+    crearNotifMaestro('suscripcion_cambio', 'Cambio de plan', 'Un cliente cambio de plan' + (prevPlan ? ': ' + prevPlan + ' -> ' + nivel : ' a ' + nivel) + '.', { ref_user_id: user_id, ref_id: sub.mp_preapproval_id, severidad: 'info' }).catch(function(){});
+    return res.json({ ok: true, plan: nivel });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -7844,7 +8061,22 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
     try { var ps = await supabase.from('subscriptions').select('status, plan').eq('user_id', user_id).maybeSingle(); prevSub = ps && ps.data ? ps.data : null; } catch (ePrev) {}
     var fila = { user_id: user_id, status: estado, mp_preapproval_id: sus.id, current_period_end: sus.next_payment_date || null };
     if (planNivel) fila.plan = planNivel;
-    await supabase.from('subscriptions').upsert(fila, { onConflict: 'user_id' });
+    // B1: el 1er pago real (trial -> active) cierra el periodo de prueba. Limpiamos trial_con_tarjeta (deja de
+    // capear a 100 -> rige el cupo del plan) y arrancamos el periodo del plan en limpio (los mensajes gastados en
+    // el trial NO se descuentan del 1er mes pago). Solo en ESA transicion (no en renovaciones: las maneja el cron).
+    if (estado === 'active' && prevSub && prevSub.status === 'trial') {
+      fila.trial_con_tarjeta = false;
+      fila.ai_messages_this_period = 0;
+      fila.period_start = new Date().toISOString();
+    }
+    // DEFENSIVO: si la columna trial_con_tarjeta aun no existe, el upsert con ese campo falla. Reintentamos sin el
+    // (ni period_start, que es de la misma migracion-suite) para no perder el cambio de status del webhook.
+    var upW = await supabase.from('subscriptions').upsert(fila, { onConflict: 'user_id' });
+    if (upW && upW.error) {
+      var filaCompat = { user_id: user_id, status: estado, mp_preapproval_id: sus.id, current_period_end: sus.next_payment_date || null };
+      if (planNivel) filaCompat.plan = planNivel;
+      await supabase.from('subscriptions').upsert(filaCompat, { onConflict: 'user_id' });
+    }
     // NOTIF MAESTRO (best-effort, nunca rompe el webhook). Criterio:
     //  - cancelled            -> 'suscripcion_cancelada'
     //  - active 1ra vez       -> 'suscripcion_nueva' (antes NO estaba 'active')
@@ -9194,15 +9426,17 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     // Gate de suscripcion (mismo criterio que WA ~1668-1686): cuenta NUEVA sin suscripcion, o cuenta no al dia
     // (cancelled/suspended/trial), la IA no responde. La cortesia siempre pasa. En Meta retornamos sin enviar
     // mensaje (multicanal minimo). Asi el congelamiento por falta de pago corta tambien Messenger/Instagram.
+    // EXCEPCION (B1): el trial CON TARJETA (trial_con_tarjeta=true) SI responde, capeado a 100 por dentroDelTopeIA (abajo).
     if (SUBSCRIPTIONS_ENABLED) {
       try {
         const _subM = await getSubscription(tenantUserId);
         const _corM = _subM && _subM.cortesia === true;
         const _estM = _subM ? _subM.status : null;
+        const _trialTarjetaM = !!(_subM && _subM.trial_con_tarjeta === true);
         if (!_subM && TRIAL_DESDE) {
           try { const _uM = await supabase.auth.admin.getUserById(tenantUserId); const _caM = _uM && _uM.data && _uM.data.user && _uM.data.user.created_at; if (_caM && new Date(_caM).getTime() >= new Date(TRIAL_DESDE).getTime()) return; } catch (eC) {}
         }
-        if (!_corM && (_estM === 'cancelled' || _estM === 'suspended' || _estM === 'trial')) return;
+        if (!_corM && (_estM === 'cancelled' || _estM === 'suspended' || (_estM === 'trial' && !_trialTarjetaM))) return;
       } catch (e) {}
     }
 

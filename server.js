@@ -204,14 +204,17 @@ const MP_BASE = 'https://api.mercadopago.com';
 // IDs globales de los planes en MercadoPago (creados 2026-06-16). Son del SaaS, compartidos por todos los tenants.
 // enterprise: su id se carga en la env MP_PLAN_ENTERPRISE de Railway (mismo patron; se crea una vez via /api/maestro/mp-crear-plan-enterprise).
 const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7', enterprise: process.env.MP_PLAN_ENTERPRISE || '' };
+// Precios mensuales en ARS por nivel (HARDCODE). El preapproval directo (mpCrearSuscripcion) usa ESTE monto en
+// auto_recurring.transaction_amount: asi el checkout NO depende del GET del plan en MP (que a veces falla -> MP 500).
+const PRECIOS_MP = { basico: 55000, pro: 130000, premium: 330000, enterprise: 550000 };
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
   trial:      { ai_messages: 200,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  basico:     { ai_messages: 700,   asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
-  pro:        { ai_messages: 1700,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  basico:     { ai_messages: 500,   asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
+  pro:        { ai_messages: 1800,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   premium:    { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
-  enterprise: { ai_messages: 7000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+  enterprise: { ai_messages: 8000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
 };
 // TOPES VIEJOS (grandfathering). Los clientes creados ANTES de PLANES_NUEVOS_DESDE conservan estos topes de mensajes
 // (no se les recorta a mitad de camino); los clientes NUEVOS arrancan con los topes nuevos de arriba (mas bajos, para
@@ -274,7 +277,17 @@ async function usoMensajesIA(user_id) {
 async function dentroDelTopeIA(user_id) {
   if (!SUBSCRIPTIONS_ENABLED) return true;
   const sub = await getSubscription(user_id);
-  if (sub && sub.cortesia === true) return true; // cortesia: saldo ILIMITADO (sin tope) hasta que se le saca la cortesia
+  if (sub && sub.cortesia === true) {
+    // Cortesia: por defecto ILIMITADO. PERO si el Maestro le puso un override de mensajes (limits_override.ai_messages),
+    // ESE tope manda aun bajo cortesia (override > cortesia-ilimitado). Enforzamos igual que a un plan normal.
+    if (sub.limits_override && typeof sub.limits_override.ai_messages === 'number') {
+      const topeC = sub.limits_override.ai_messages;
+      if (topeC === Infinity) return true;
+      const usadoC = (typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
+      return usadoC < topeC;
+    }
+    return true; // sin override -> saldo ILIMITADO hasta que se le saque la cortesia
+  }
   const plan = await planActual(user_id);
   let tope = topeMensajesPlan(plan, sub); // grandfathering: clientes viejos conservan el tope legacy
   if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages; // override por cliente (panel maestro)
@@ -477,23 +490,27 @@ async function mpCrearPlan(nombre, montoARS, backUrl) {
 // Crea una suscripcion (preapproval). Devuelve el objeto con init_point (checkout de MP).
 // IMPORTANTE: el flujo "con preapproval_plan_id + payer_email" via API exige card_token_id (MP400).
 // Para obtener el init_point (checkout donde el cliente carga la tarjeta en MP) SIN exigir tarjeta,
-// creamos la preapproval SIN plan, con status:'pending', copiando precio/frecuencia/prueba del plan
-// (que leemos de MP, donde viven los precios). Conserva external_reference para mapear al usuario.
-async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl) {
-  var ar = {};
-  try {
-    var plan = await mpFetch('/preapproval_plan/' + planId, 'GET', null);
-    ar = (plan && plan.auto_recurring) ? plan.auto_recurring : {};
-  } catch (e) { ar = {}; }
+// creamos la preapproval SIN plan, con status:'pending'. El MONTO sale HARDCODE de PRECIOS_MP[nivel]
+// (NO del GET del plan en MP: ese GET a veces falla -> transaction_amount undefined -> MP 500). Tampoco
+// mandamos free_trial: el preapproval DIRECTO (sin plan) no lo soporta y tira 500. Conserva external_reference.
+async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nivel) {
+  var monto = PRECIOS_MP[nivel];
+  // Sin precio configurado para este nivel => transaction_amount undefined => MP 500. Cortamos con un error claro ANTES.
+  if (typeof monto === 'undefined' || monto === null) {
+    throw new Error('Plan sin precio configurado: ' + nivel);
+  }
+  // El GET del plan es SOLO para el "reason" (texto). NO para el precio. Si falla, seguimos con un reason por defecto.
+  var plan = null;
+  try { plan = await mpFetch('/preapproval_plan/' + planId, 'GET', null); }
+  catch (e) { console.error('mpCrearSuscripcion GET plan (no critico, se usa precio hardcode):', e && e.message); }
   var autoRecurring = {
-    frequency: ar.frequency || 1,
-    frequency_type: ar.frequency_type || 'months',
-    transaction_amount: ar.transaction_amount,
-    currency_id: ar.currency_id || 'ARS'
+    frequency: 1,
+    frequency_type: 'months',
+    transaction_amount: monto,
+    currency_id: 'ARS'
   };
-  if (ar.free_trial) autoRecurring.free_trial = ar.free_trial;
   var body = {
-    reason: (typeof plan !== 'undefined' && plan && plan.reason) ? plan.reason : 'Suscripcion Raices CRM',
+    reason: (plan && plan.reason) ? plan.reason : 'Suscripcion Raices CRM',
     external_reference: externalRef,
     payer_email: payerEmail,
     back_url: backUrl,
@@ -501,6 +518,12 @@ async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl) {
     auto_recurring: autoRecurring
   };
   return await mpFetch('/preapproval', 'POST', body);
+}
+
+// Cancela un preapproval en MercadoPago (corta el cobro de la tarjeta). mpFetch tira en no-2xx:
+// el que llama debe envolver en try/catch (best-effort) y seguir cancelando localmente igual.
+async function mpCancelarSuscripcion(preapprovalId) {
+  return await mpFetch('/preapproval/' + preapprovalId, 'PUT', { status: 'cancelled' });
 }
 
 // Consulta el estado de una suscripcion por id.
@@ -1485,6 +1508,155 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
   } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
 }
 
+// ===== SOPORTE: subir una imagen (data URL base64) al bucket 'media', carpeta soporte/ =====
+// Reusa el patron de subirMediaAStorage (buffer -> supabase.storage 'media' -> publicUrl), pero la
+// fuente es una data URL que manda el cliente o el Maestro (no Evolution). Defensivo: si algo falla,
+// devuelve null y el endpoint sigue (la consulta/respuesta se guarda igual, sin imagen). carpeta:
+// 'cliente' (lo sube el dueno) | 'maestro' (lo sube el dev al responder).
+async function subirImagenSoporte(dataUrl, carpeta) {
+  try {
+    if (!dataUrl || typeof dataUrl !== 'string') return null;
+    var m = /^data:([^;,]+);base64,(.+)$/.exec(dataUrl);
+    if (!m) return null; // solo aceptamos data URLs base64; cualquier otra cosa se ignora
+    var mime = m[1] || 'application/octet-stream';
+    if (mime.indexOf('image/') !== 0) return null; // SOLO imagenes (captura/foto)
+    var base64 = m[2];
+    var buffer = Buffer.from(base64, 'base64');
+    // Tope defensivo de tamano (~6MB de bytes reales) para no abusar del Storage.
+    if (buffer.length > 6 * 1024 * 1024) { console.error('subirImagenSoporte: imagen demasiado grande'); return null; }
+    var ext = (mime.indexOf('png') >= 0) ? 'png' : (mime.indexOf('webp') >= 0) ? 'webp' : (mime.indexOf('gif') >= 0) ? 'gif' : 'jpg';
+    var sub = (carpeta === 'maestro') ? 'maestro' : 'cliente';
+    var nombre = 'soporte/' + sub + '/' + Date.now() + '_' + Math.random().toString(36).substring(2, 8) + '.' + ext;
+    var up = await supabase.storage.from('media').upload(nombre, buffer, { contentType: mime, upsert: false });
+    if (up.error) { console.error('subirImagenSoporte upload:', up.error.message); return null; }
+    var pub = supabase.storage.from('media').getPublicUrl(nombre);
+    return (pub && pub.data) ? pub.data.publicUrl : null;
+  } catch (e) { console.error('subirImagenSoporte error:', e && e.message); return null; }
+}
+
+// ===== CHAT INTERNO DEL EQUIPO: subir media (data URL base64) al bucket 'media', carpeta equipo/<user_id>/ =====
+// Reusa el patron de subirImagenSoporte (data URL base64 -> buffer -> supabase.storage 'media' -> publicUrl).
+// SOPORTA: imagenes, videos, audios y documentos comunes. La fuente es una data URL que manda el front del equipo.
+//
+// COSTO DE IA = CERO (REGLA CRITICA): este flujo SOLO guarda el archivo. NUNCA transcribe ni traduce: NO llama a
+// transcribirAudioGroq (el path de audio de WhatsApp del cliente que SI transcribe), NI a Claude, NI a traduccion.
+// El audio del equipo se guarda y se reproduce tal cual (reproductor). Esta funcion esta TOTALMENTE separada del
+// path de audio customer-facing (subirMediaAStorage).
+//
+// Validaciones: tipo permitido (image/* | video/* | audio/* | documentos comunes) y tamano (<=25MB de bytes reales).
+// Defensivo: si algo falla devuelve null y el caller decide (no rompe el server). Devuelve { url, tipo, nombre } o null.
+async function subirMediaEquipo(dataUrl, userId, nombreOriginal) {
+  try {
+    if (!dataUrl || typeof dataUrl !== 'string') return null;
+    var m = /^data:([^;,]+);base64,(.+)$/.exec(dataUrl);
+    if (!m) return null; // solo data URLs base64
+    var mime = (m[1] || 'application/octet-stream').toLowerCase();
+    var base64 = m[2];
+    var buffer = Buffer.from(base64, 'base64');
+    if (!buffer.length) return null;
+    // Tope de tamano: 25MB de bytes reales.
+    if (buffer.length > 25 * 1024 * 1024) { console.error('subirMediaEquipo: archivo demasiado grande'); return null; }
+
+    // Clasificar tipo + extension. NO se transcribe ni traduce ningun audio aca.
+    var tipo = null, ext = 'bin';
+    if (mime.indexOf('image/') === 0) {
+      tipo = 'image';
+      ext = (mime.indexOf('png') >= 0) ? 'png' : (mime.indexOf('webp') >= 0) ? 'webp' : (mime.indexOf('gif') >= 0) ? 'gif' : (mime.indexOf('svg') >= 0) ? 'svg' : 'jpg';
+    } else if (mime.indexOf('video/') === 0) {
+      tipo = 'video';
+      ext = (mime.indexOf('webm') >= 0) ? 'webm' : (mime.indexOf('quicktime') >= 0 || mime.indexOf('mov') >= 0) ? 'mov' : (mime.indexOf('ogg') >= 0) ? 'ogv' : 'mp4';
+    } else if (mime.indexOf('audio/') === 0) {
+      tipo = 'audio';
+      ext = (mime.indexOf('mpeg') >= 0 || mime.indexOf('mp3') >= 0) ? 'mp3' : (mime.indexOf('wav') >= 0) ? 'wav' : (mime.indexOf('webm') >= 0) ? 'webm' : (mime.indexOf('mp4') >= 0 || mime.indexOf('m4a') >= 0 || mime.indexOf('aac') >= 0) ? 'm4a' : 'ogg';
+    } else {
+      // Documentos comunes (whitelist por MIME). Cualquier otra cosa => rechazar.
+      var docExt = {
+        'application/pdf': 'pdf',
+        'application/msword': 'doc',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+        'application/vnd.ms-excel': 'xls',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+        'application/vnd.ms-powerpoint': 'ppt',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+        'text/plain': 'txt',
+        'text/csv': 'csv',
+        'application/rtf': 'rtf',
+        'application/zip': 'zip',
+        'application/x-zip-compressed': 'zip'
+      };
+      if (!docExt[mime]) { console.error('subirMediaEquipo: tipo no permitido', mime); return null; }
+      tipo = 'document';
+      ext = docExt[mime];
+    }
+
+    // Si el nombre original trae una extension razonable, preservarla para los documentos (descarga).
+    var nombreLimpio = '';
+    if (nombreOriginal && typeof nombreOriginal === 'string') {
+      nombreLimpio = nombreOriginal.replace(/[^\w.\- ]+/g, '').trim().slice(0, 180);
+    }
+
+    var safeUser = (userId ? String(userId) : 'anon').replace(/[^\w-]+/g, '');
+    var nombre = 'equipo/' + safeUser + '/' + Date.now() + '_' + Math.random().toString(36).substring(2, 8) + '.' + ext;
+    var up = await supabase.storage.from('media').upload(nombre, buffer, { contentType: mime, upsert: false });
+    if (up.error) { console.error('subirMediaEquipo upload:', up.error.message); return null; }
+    var pub = supabase.storage.from('media').getPublicUrl(nombre);
+    var url = (pub && pub.data) ? pub.data.publicUrl : null;
+    if (!url) return null;
+    return { url: url, tipo: tipo, nombre: (nombreLimpio || ('archivo.' + ext)) };
+  } catch (e) { console.error('subirMediaEquipo error:', e && e.message); return null; }
+}
+
+// ===== SOPORTE: avisar al cliente que el Maestro respondio su ticket =====
+// Camino 1 (preferido): WhatsApp desde una instancia de SOPORTE de Raices.
+//   - SOPORTE_WA_INSTANCE: nombre de la instancia de Evolution dedicada a soporte (recomendado).
+//     Si no se setea, se puede apuntar a la instancia de la cuenta Raices (190b9a5c...).
+// Camino 2 (degradacion): si NO hay instancia configurada / no esta conectada / falla, cae a push FCM
+//   al auth_user_id del cliente (dueno del tenant) + el hilo in-app (que ya queda guardado en la DB).
+// SIEMPRE try/catch y nunca rompe la respuesta del endpoint (se llama best-effort, sin await critico).
+var SOPORTE_WA_INSTANCE = process.env.SOPORTE_WA_INSTANCE || '';
+async function enviarSoporteWhatsapp(opts) {
+  // opts: { telefono, user_id (auth del dueno), numero (ticket), cuerpo, imagen_url }
+  var telefono = opts && opts.telefono ? String(opts.telefono).replace(/[^0-9]/g, '') : '';
+  var cuerpo = (opts && opts.cuerpo) ? String(opts.cuerpo) : '';
+  var numero = (opts && (opts.numero || opts.numero === 0)) ? opts.numero : null;
+  var encabezado = 'Respuesta a tu soporte' + (numero != null ? ' #' + numero : '') + ':';
+  var texto = encabezado + '\n\n' + cuerpo;
+  var canal = 'ninguno';
+  // --- Camino 1: WhatsApp via instancia de soporte ---
+  try {
+    if (SOPORTE_WA_INSTANCE && EVOLUTION_URL && EVOLUTION_KEY && telefono) {
+      var conectada = false;
+      try { conectada = await instanciaConectada(SOPORTE_WA_INSTANCE); } catch (eC) { conectada = false; }
+      if (conectada) {
+        if (opts && opts.imagen_url) {
+          var okMedia = await enviarWhatsappMedia(SOPORTE_WA_INSTANCE, telefono, opts.imagen_url, 'imagen', texto);
+          if (okMedia) return 'whatsapp';
+        }
+        var resp = await fetch(EVOLUTION_URL + '/message/sendText/' + SOPORTE_WA_INSTANCE, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+          body: JSON.stringify({ number: telefono, text: texto })
+        });
+        var bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eT) {}
+        var body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJ) {}
+        var aceptado = !!(body && body.key && body.key.id);
+        if (resp.ok || aceptado) return 'whatsapp';
+        console.error('enviarSoporteWhatsapp sendText no aceptado:', resp.status, (bodyTxt || '').slice(0, 200));
+      } else {
+        console.error('enviarSoporteWhatsapp: instancia de soporte no conectada (' + SOPORTE_WA_INSTANCE + ')');
+      }
+    }
+  } catch (eWA) { console.error('enviarSoporteWhatsapp WA:', eWA && eWA.message); }
+  // --- Camino 2: degradar a push FCM al dueno del tenant (no rompe nada) ---
+  try {
+    if (opts && opts.user_id) {
+      await enviarPushAsesor(opts.user_id, 'Respuesta de soporte' + (numero != null ? ' #' + numero : ''), '', cuerpo.slice(0, 180));
+      canal = 'push';
+    }
+  } catch (eP) { console.error('enviarSoporteWhatsapp push:', eP && eP.message); }
+  return canal; // 'push' o 'ninguno' (el hilo in-app ya quedo guardado de todas formas)
+}
+
 app.post('/api/enviar-media', async (req, res) => {
   try {
     const _uid = await verificarUsuario(req);
@@ -2172,7 +2344,7 @@ async function detectarIdioma(texto, user_id) {
   try {
     if (!texto || texto.trim().length < 2) return 'es';
     const comp = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5',
       max_tokens: 10,
       system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Mira la ORACION completa, no palabras aisladas. Si el mensaje entero es un saludo o frase corta (ej. hi, hello, bonjour, hallo), ESE es el idioma. Solo si dentro de una oracion larga hay una palabra prestada de otro idioma, ignora esa palabra y usa el idioma dominante de la oracion. Responde SOLO con el codigo de dos letras del idioma (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl, u otro codigo ISO 639-1 si corresponde). Nada mas.',
       messages: [ { role: 'user', content: texto } ]
@@ -4261,6 +4433,19 @@ app.post('/api/asesores/eliminar', async (req, res) => {
 // ===== DEPARTAMENTOS (Fase 1 - equipo configurable). ADITIVO: tablas nuevas, NO toca el reparto actual. =====
 // Scope por cuenta: el dueno (token === admin_id) gestiona los departamentos de su inmobiliaria.
 // Las tablas tienen RLS service-key-only, por eso el frontend SIEMPRE pasa por estos endpoints.
+// Normaliza un rubro (incluye valores legacy) a uno de los 3 valores CANONICOS:
+// 'inmobiliaria' | 'hotel_cabanas' | 'desarrolladora'. Backwards-compatible: los rubros
+// viejos guardados en clientes existentes (hotel, cabanas, cabañas, temporario, hoteleria)
+// se mapean a 'hotel_cabanas' sin necesidad de migrar la DB. Default defensivo: inmobiliaria.
+function normalizarRubro(r) {
+  var v = String(r || '').trim().toLowerCase();
+  if (v === 'desarrolladora') return 'desarrolladora';
+  if (v === 'hotel' || v === 'cabanas' || v === 'cabañas' || v === 'temporario' || v === 'hoteleria' || v === 'hotel_cabanas') return 'hotel_cabanas';
+  return 'inmobiliaria';
+}
+
+// Plantillas de departamentos por rubro CANONICO (3). hotel_cabanas combina Hotel/Apart/Cabañas.
+// El lookup SIEMPRE pasa por normalizarRubro(), asi que las claves legacy se resuelven solas.
 const PLANTILLAS_DEPTOS = {
   inmobiliaria: [
     { nombre: 'Venta', criterio: 'Comprar una propiedad, ver propiedades en venta, precios de venta.', def: true, sistema: true },
@@ -4268,29 +4453,17 @@ const PLANTILLAS_DEPTOS = {
     { nombre: 'Administración', criterio: 'Pagos, recibos, contratos, expensas, cobranzas.', fallback: true, sistema: true },
     { nombre: 'Gerencia', criterio: 'Reclamos serios, quejas o decisiones que requieren al responsable.', sistema: true }
   ],
-  hotel: [
+  hotel_cabanas: [
     { nombre: 'Recepción', criterio: 'Consultas generales, llegada, check-in, información del alojamiento.', def: true, sistema: true },
-    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una estadía.', sistema: true },
+    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una estadía o cabaña.', sistema: true },
     { nombre: 'Administración', criterio: 'Facturas, pagos, seña, cobranzas, comprobantes.', fallback: true, sistema: true },
     { nombre: 'Gerencia', criterio: 'Quejas serias, huéspedes VIP o decisiones que requieren al responsable.', sistema: true }
-  ],
-  cabanas: [
-    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una cabaña.', def: true, sistema: true },
-    { nombre: 'Consultas', criterio: 'Servicios, ubicación, qué incluye, mascotas, dudas generales.', sistema: true },
-    { nombre: 'Administración', criterio: 'Pagos, seña, cobranzas, comprobantes.', fallback: true, sistema: true },
-    { nombre: 'Gerencia', criterio: 'Reclamos o decisiones que requieren al responsable.', sistema: true }
   ],
   desarrolladora: [
     { nombre: 'Ventas', criterio: 'Comprar o reservar unidades, tipologías, precios, planes de pago.', def: true, sistema: true },
     { nombre: 'Técnica', criterio: 'Planos, proyectos, especificaciones, avance de obra, modificaciones de unidad.', sistema: true },
     { nombre: 'Administración', criterio: 'Cuotas, pagos, financiación, comprobantes.', fallback: true, sistema: true },
     { nombre: 'Gerencia', criterio: 'Reclamos o decisiones que requieren al responsable.', sistema: true }
-  ],
-  hoteleria: [
-    { nombre: 'Recepción', criterio: 'Consultas generales, llegada, check-in, información del alojamiento.', def: true, sistema: true },
-    { nombre: 'Reservas', criterio: 'Disponibilidad, precios, fechas, reservar una estadía.', sistema: true },
-    { nombre: 'Administración', criterio: 'Facturas, pagos, seña, cobranzas, comprobantes.', fallback: true, sistema: true },
-    { nombre: 'Gerencia', criterio: 'Quejas serias, huéspedes VIP o decisiones que requieren al responsable.', sistema: true }
   ]
 };
 
@@ -4458,6 +4631,14 @@ app.get('/api/equipo/threads', async function(req, res) {
       const { data: ases } = await supabase.from('asesores').select('auth_user_id, nombre').eq('admin_id', ident.ownerId).in('auth_user_id', otrosArr);
       (ases || []).forEach(function(a){ if (a.auth_user_id) nombrePorAuth[a.auth_user_id] = a.nombre; });
     }
+    // Si el "otro" de algun DM es el DUENO del tenant (no tiene fila en asesores), su nombre = company_name si existe;
+    // si no, queda el fallback "Administrador" mas abajo. (Consistente con el roster /personas.)
+    if (otrosIds[ident.ownerId] && !nombrePorAuth[ident.ownerId]) {
+      try {
+        const { data: bs } = await supabase.from('business_settings').select('company_name').eq('user_id', ident.ownerId).maybeSingle();
+        if (bs && bs.company_name && String(bs.company_name).trim()) nombrePorAuth[ident.ownerId] = String(bs.company_name).trim();
+      } catch (eBs) {}
+    }
 
     // 4) Para cada thread: ultimo mensaje + conteo de no-leidos (no contiene mi auth_user_id en leido_por).
     const out = [];
@@ -4475,7 +4656,8 @@ app.get('/api/equipo/threads', async function(req, res) {
         nombre = nombresDepto[t.departamento_id] || 'Departamento';
       } else {
         otroAuth = (t.participantes || []).find(function(p){ return p !== ident.authUserId; }) || null;
-        nombre = (otroAuth && (nombrePorAuth[otroAuth] || (otroAuth === ident.ownerId ? 'Dueño' : null))) || 'Compañero';
+        // LABEL: el dueno es el ADMINISTRADOR inherente de la cuenta (consistente con el roster /personas).
+        nombre = (otroAuth && (nombrePorAuth[otroAuth] || (otroAuth === ident.ownerId ? 'Administrador' : null))) || 'Compañero';
       }
       out.push({
         id: t.id,
@@ -4515,7 +4697,7 @@ app.get('/api/equipo/personas', async function(req, res) {
     const personas = [];
     // (a) El DUEÑO del tenant (no es fila en asesores). Se omite si el que pregunta ES el dueño (no DM a si mismo).
     if (ident.ownerId !== ident.authUserId) {
-      let nombreDueno = 'Dueño';
+      let nombreDueno = 'Administrador'; // LABEL: el dueno es el ADMINISTRADOR inherente de la cuenta.
       try {
         const { data: bs } = await supabase.from('business_settings').select('company_name').eq('user_id', ident.ownerId).maybeSingle();
         if (bs && bs.company_name && String(bs.company_name).trim()) nombreDueno = String(bs.company_name).trim();
@@ -4608,10 +4790,24 @@ app.get('/api/equipo/mensajes', async function(req, res) {
     if (!thread) return res.status(404).json({ error: 'Hilo no encontrado' });
     if (!(await _equipoEsParticipante(ident, thread))) return res.status(403).json({ error: 'No participas de este hilo' });
 
-    const { data: msgs } = await supabase.from('team_messages')
-      .select('id, sender_auth_user_id, content, media_url, leido_por, created_at')
-      .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
-      .order('created_at', { ascending: true }).limit(500);
+    // DEFENSIVO: intentar leer las columnas de media (media_url/media_tipo/media_nombre). Si alguna no existe en el
+    // esquema todavia, reintentar el select sin ellas para que el chat de TEXTO siga funcionando.
+    let msgs = null;
+    {
+      const r1 = await supabase.from('team_messages')
+        .select('id, sender_auth_user_id, content, media_url, media_tipo, media_nombre, leido_por, created_at')
+        .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
+        .order('created_at', { ascending: true }).limit(500);
+      if (r1.error && /column|media_tipo|media_nombre|media_url|schema cache/i.test(r1.error.message || '')) {
+        const r2 = await supabase.from('team_messages')
+          .select('id, sender_auth_user_id, content, leido_por, created_at')
+          .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
+          .order('created_at', { ascending: true }).limit(500);
+        msgs = r2.data;
+      } else {
+        msgs = r1.data;
+      }
+    }
 
     // Nombres de los remitentes (asesores del tenant). El dueno no tiene fila -> "Dueño".
     const remitentes = {};
@@ -4627,9 +4823,12 @@ app.get('/api/equipo/mensajes', async function(req, res) {
         id: m.id,
         content: m.content,
         media_url: m.media_url || null,
+        media_tipo: m.media_tipo || null,
+        media_nombre: m.media_nombre || null,
         created_at: m.created_at,
         mio: m.sender_auth_user_id === ident.authUserId,
-        sender_nombre: nombrePorAuth[m.sender_auth_user_id] || (m.sender_auth_user_id === ident.ownerId ? 'Dueño' : 'Compañero')
+        // LABEL: el dueno es el ADMINISTRADOR inherente de la cuenta.
+        sender_nombre: nombrePorAuth[m.sender_auth_user_id] || (m.sender_auth_user_id === ident.ownerId ? 'Administrador' : 'Compañero')
       };
     });
     return res.json({ ok: true, mensajes: out, tipo: thread.tipo });
@@ -4882,7 +5081,20 @@ app.post('/api/equipo/enviar', async function(req, res) {
     if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     const b = req.body || {};
     const content = (b.content == null ? '' : String(b.content)).trim();
-    const mediaUrl = b.media_url ? String(b.media_url).slice(0, 2000) : null;
+    // MEDIA OPCIONAL del chat interno. Se puede mandar:
+    //   - b.media: data URL base64 (image/video/audio/document) -> se sube al bucket 'media' (equipo/<user_id>/).
+    //     COSTO IA = 0: subirMediaEquipo SOLO guarda; NUNCA transcribe ni traduce (no toca transcribirAudioGroq/Claude).
+    //   - b.media_url: URL ya subida (compat / avisos internos) -> se guarda tal cual.
+    let mediaUrl = b.media_url ? String(b.media_url).slice(0, 2000) : null;
+    let mediaTipo = (b.media_tipo && ['image', 'video', 'audio', 'document'].indexOf(String(b.media_tipo)) >= 0) ? String(b.media_tipo) : null;
+    let mediaNombre = b.media_nombre ? String(b.media_nombre).slice(0, 200) : null;
+    if (b.media && typeof b.media === 'string') {
+      const subido = await subirMediaEquipo(b.media, ident.authUserId, b.media_nombre);
+      if (!subido) return res.status(400).json({ error: 'No se pudo subir el archivo (tipo no permitido o supera 25MB)' });
+      mediaUrl = subido.url;
+      mediaTipo = subido.tipo;
+      mediaNombre = subido.nombre;
+    }
     if (!content && !mediaUrl) return res.status(400).json({ error: 'Mensaje vacio' });
 
     // Resolver el thread (existente por thread_id, o crear/obtener via destino).
@@ -4925,14 +5137,27 @@ app.post('/api/equipo/enviar', async function(req, res) {
     if (!(await _equipoEsParticipante(ident, thread))) return res.status(403).json({ error: 'No participas de este hilo' });
 
     // Insertar el mensaje. leido_por arranca con el remitente (ya lo "leyo").
-    const { data: msg, error: errMsg } = await supabase.from('team_messages').insert({
+    // DEFENSIVO: si las columnas de media (media_url/media_tipo/media_nombre) no existen, se reintenta el insert
+    // sin esas keys para que el envio de TEXTO siga funcionando (lectura/escritura defensiva del contrato).
+    const baseRow = {
       thread_id: thread.id,
       admin_id: ident.ownerId,
       sender_auth_user_id: ident.authUserId,
       content: content || '',
-      media_url: mediaUrl,
       leido_por: [ident.authUserId]
-    }).select('id, created_at').single();
+    };
+    const rowConMedia = Object.assign({}, baseRow, { media_url: mediaUrl, media_tipo: mediaTipo, media_nombre: mediaNombre });
+    let msg = null, errMsg = null;
+    {
+      const r1 = await supabase.from('team_messages').insert(rowConMedia).select('id, created_at').single();
+      if (r1.error && /column|media_tipo|media_nombre|media_url|schema cache/i.test(r1.error.message || '')) {
+        // Columna(s) de media ausente(s): reintentar solo con texto (sin perder el mensaje de texto).
+        const r2 = await supabase.from('team_messages').insert(baseRow).select('id, created_at').single();
+        msg = r2.data; errMsg = r2.error;
+      } else {
+        msg = r1.data; errMsg = r1.error;
+      }
+    }
     if (errMsg) return res.status(500).json({ error: errMsg.message });
 
     // Resolver destinatarios (auth_user_id) y enviarles push. Excluye al remitente. Dedupe.
@@ -4954,7 +5179,13 @@ app.post('/api/equipo/enviar', async function(req, res) {
         if (yo && yo.nombre) nombreRemitente = yo.nombre;
       }
     } catch (eN) {}
-    const cuerpo = content ? content.slice(0, 140) : 'Te envio un archivo';
+    let cuerpo;
+    if (content) cuerpo = content.slice(0, 140);
+    else if (mediaTipo === 'image') cuerpo = 'Te envio una imagen';
+    else if (mediaTipo === 'video') cuerpo = 'Te envio un video';
+    else if (mediaTipo === 'audio') cuerpo = 'Te envio un audio';
+    else if (mediaTipo === 'document') cuerpo = 'Te envio un documento';
+    else cuerpo = 'Te envio un archivo';
     for (let i = 0; i < finales.length; i++) {
       // Reusa el push FCM existente (0 tokens IA). bodyLiteral fuerza el texto del chat interno.
       try { await enviarPushAsesor(finales[i], nombreRemitente, '', 'Chat interno: ' + cuerpo); } catch (eP) {}
@@ -4972,7 +5203,7 @@ app.post('/api/equipo/enviar', async function(req, res) {
       }
     }
 
-    return res.json({ ok: true, id: msg && msg.id, thread_id: thread.id, created_at: msg && msg.created_at });
+    return res.json({ ok: true, id: msg && msg.id, thread_id: thread.id, created_at: msg && msg.created_at, media_url: mediaUrl, media_tipo: mediaTipo, media_nombre: mediaNombre });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -5089,7 +5320,7 @@ app.post('/api/departamentos/seed-rubro', async function(req, res) {
     if (!b.admin_id) return res.status(400).json({ error: 'Falta admin_id' });
     const { data: existentes } = await supabase.from('departamentos').select('id').eq('user_id', b.admin_id).eq('activo', true).limit(1);
     if (existentes && existentes.length > 0) return res.status(400).json({ error: 'La cuenta ya tiene departamentos cargados' }); // solo cuenta ACTIVOS -> permite re-sembrar si se borraron todos
-    const plantilla = PLANTILLAS_DEPTOS[b.rubro] || PLANTILLAS_DEPTOS['inmobiliaria'];
+    const plantilla = PLANTILLAS_DEPTOS[normalizarRubro(b.rubro)] || PLANTILLAS_DEPTOS['inmobiliaria'];
     const filas = plantilla.map(function(d){ return { user_id: b.admin_id, nombre: d.nombre, criterio_derivacion: d.criterio, modo_reparto: d.modo || 'equitativo', recibe_fallback: !!d.fallback, es_default: !!d.def, es_sistema: !!d.sistema }; });
     // DEFENSIVO: la columna es_sistema puede no existir todavia. Si el insert falla por eso,
     // reintentar sin esa columna (no rompe el sembrado de la plantilla).
@@ -6615,7 +6846,7 @@ async function clasificarTemperatura(textoUsuario, user_id) {
       'caliente (muestra interes concreto en ver, visitar, precio, o avanzar con una propiedad), ' +
       'tibio (responde pero sin interes claro), frio (no hay interes). ' +
       'Responde SOLO con: caliente, tibio o frio. Mensaje: ' + JSON.stringify(textoUsuario);
-    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
+    const r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_temperatura'); } catch(e){}
     const t = (r && r.content && r.content[0] && r.content[0].text ? r.content[0].text : '').toLowerCase().trim();
     if (t.indexOf('caliente') >= 0) return 'caliente';
@@ -7517,20 +7748,47 @@ app.get('/api/suscripcion', async function(req, res) {
     var sub = await getSubscription(user_id);
     var plan = await planActual(user_id);
     var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+    var ov = (sub && sub.limits_override) || {};
+    var hayOvMsgs = (typeof ov.ai_messages === 'number');
+    var esCortesia = !!(sub && sub.cortesia === true);
     // El cliente ve su tope de mensajes EFECTIVO (grandfathered o nuevo; y si tiene override del Maestro, ese manda).
     var topeEfectivo = topeMensajesPlan(plan, sub);
-    if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') topeEfectivo = sub.limits_override.ai_messages;
-    // Cortesia = saldo ILIMITADO: tope null -> el dashboard NO muestra contador en reversa (no hay tope que contar).
-    var esCortesia = !!(sub && sub.cortesia === true);
-    if (esCortesia) topeEfectivo = null;
+    if (hayOvMsgs) topeEfectivo = ov.ai_messages;
+    // Cortesia = saldo ILIMITADO -> tope null (el dashboard no muestra contador en reversa). SALVO que el Maestro
+    // le haya puesto un override de mensajes: ESE manda aun bajo cortesia (override > cortesia-ilimitado).
+    if (esCortesia && !hayOvMsgs) topeEfectivo = null;
     lim = Object.assign({}, lim, { ai_messages: topeEfectivo });
-    // Tope de asesores EFECTIVO: si hay override por cliente (Maestro), ese manda (misma logica que /api/asesores/crear).
-    if (sub && sub.limits_override && typeof sub.limits_override.asesores === 'number' && sub.limits_override.asesores > 0) lim = Object.assign({}, lim, { asesores: sub.limits_override.asesores });
+    // Tope de asesores/contactos/propiedades EFECTIVO: si hay override por cliente (Maestro), ESE manda — tambien
+    // bajo cortesia (el override aplica siempre que exista, incluso con la cuenta en cortesia).
+    if (typeof ov.asesores === 'number' && ov.asesores > 0) lim = Object.assign({}, lim, { asesores: ov.asesores });
+    if (typeof ov.contactos === 'number' && ov.contactos > 0) lim = Object.assign({}, lim, { contactos: ov.contactos });
+    if (typeof ov.propiedades === 'number' && ov.propiedades > 0) lim = Object.assign({}, lim, { propiedades: ov.propiedades });
     var usado = await usoMensajesIA(user_id);
     // Senal AUTORITATIVA para el frontend: congelar el acceso si el tenant debe pagar y no lo hizo.
     // Misma logica EXACTA con la que el agente corta el servicio (debeBloquearAcceso). FAIL-OPEN.
     var bloqueado = await debeBloquearAcceso(user_id);
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado });
+    // ===== Campos de DISPLAY "Mi plan" (no rompen los de arriba) =====
+    // snapshot_cortesia: columna jsonb opcional (migracion nueva). DEFENSIVO: si no existe, getSubscription
+    // ya devuelve la fila sin esa key -> snap = null y no rompe.
+    var snap = (sub && sub.snapshot_cortesia && typeof sub.snapshot_cortesia === 'object') ? sub.snapshot_cortesia : null;
+    var tieneMPactivo = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
+    // sin_suscripcion: la cuenta esta bloqueada, NO es cortesia y NO tiene MP activo -> el front muestra "elegi un plan".
+    var sin_suscripcion = !!(bloqueado === true && !esCortesia && !tieneMPactivo);
+    // plan_label: que mostrar como "Plan actual".
+    var plan_label = null;
+    var snapPlanReal = !!(snap && (snap.mp_preapproval_id || snap.status === 'active'));
+    if (esCortesia) {
+      plan_label = (snapPlanReal && snap.plan) ? snap.plan : 'Cortesia'; // cortesia con plan previo real -> ese plan; si no -> "Cortesia"
+    } else if (tieneMPactivo) {
+      plan_label = (sub && sub.plan) ? sub.plan : null; // MP activo -> nombre del plan
+    } else if (sin_suscripcion) {
+      plan_label = null; // sin suscripcion -> el front muestra "elegi un plan"
+    } else {
+      plan_label = (sub && sub.plan && PLAN_LIMITS[sub.plan]) ? sub.plan : null; // estado intermedio (trial/etc): no forzar "basico"
+    }
+    // puede_cancelar: solo si hay un preapproval real cobrable.
+    var puede_cancelar = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -7548,7 +7806,7 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     var planId = PLANES_MP[nivel] || null;
     if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
-    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl);
+    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel);
     // Guardar el plan ELEGIDO en la fila para que se apliquen sus limites al activarse (el webhook NO incluye
     // 'plan' en su upsert -> se preserva). Asi un Enterprise queda con 20.000 y no cae al default. Si el tenant
     // NO esta active/cortesia, lo dejamos en 'trial' (bloqueado por el candado) hasta que MP confirme el pago;
@@ -7632,15 +7890,56 @@ app.post('/api/soporte', async function(req, res) {
     var mensaje = (req.body && req.body.mensaje) ? String(req.body.mensaje).slice(0, 4000) : '';
     var telefono = (req.body && req.body.telefono) ? String(req.body.telefono).replace(/[^0-9+ ]/g, '').slice(0, 30) : '';
     if (!mensaje.trim()) return res.status(400).json({ error: 'El mensaje esta vacio' });
-    // DEFENSIVO: intentar con telefono; si la columna aun no existe (migracion pendiente), reintentar sin el. Soporte nunca se rompe.
-    var ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto', telefono: telefono });
-    if (ins.error && /telefono|column|does not exist|schema cache/i.test(String(ins.error.message || ''))) {
-      ins = await supabase.from('support_messages').insert({ user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto' });
+    // Adjunto opcional: el cliente puede mandar una imagen/captura como data URL base64. Se sube a
+    // Storage 'media' (carpeta soporte/cliente/). Si falla, seguimos sin imagen (no rompe el ticket).
+    var imagen_url = null;
+    try { if (req.body && req.body.imagen) imagen_url = await subirImagenSoporte(req.body.imagen, 'cliente'); } catch (eImg) {}
+    // DEFENSIVO en CASCADA: intentamos con todas las columnas nuevas; si alguna no existe aun
+    // (migracion pendiente), reintentamos quitando las que sobran. Soporte nunca se rompe.
+    // Importante: NO seteamos `numero` en el insert -> lo da el DEFAULT nextval() de la secuencia.
+    var base = { user_id: user_id, categoria: categoria, mensaje: mensaje, estado: 'abierto' };
+    var intentos = [
+      Object.assign({}, base, { telefono: telefono, imagen_url: imagen_url }),
+      Object.assign({}, base, { telefono: telefono }),
+      base
+    ];
+    var ins = null;
+    for (var i = 0; i < intentos.length; i++) {
+      ins = await supabase.from('support_messages').insert(intentos[i]).select('numero').maybeSingle();
+      if (!ins.error) break;
+      if (!/column|does not exist|schema cache|imagen_url|telefono|numero/i.test(String(ins.error.message || ''))) break;
     }
     if (ins.error) { console.error('soporte insert:', ins.error.message); return res.status(503).json({ error: 'El soporte se esta habilitando, intenta mas tarde' }); }
+    var numero = (ins.data && ins.data.numero != null) ? ins.data.numero : null;
     // NOTIF MAESTRO (best-effort, nunca rompe el soporte)
-    crearNotifMaestro('soporte', 'Nuevo ticket de soporte', '[' + categoria + '] ' + mensaje.slice(0, 280), { ref_user_id: user_id, severidad: 'info' }).catch(function(){});
-    return res.json({ ok: true });
+    crearNotifMaestro('soporte', 'Nuevo ticket de soporte' + (numero != null ? ' #' + numero : ''), '[' + categoria + '] ' + mensaje.slice(0, 280), { ref_user_id: user_id, severidad: 'info' }).catch(function(){});
+    return res.json({ ok: true, numero: numero, imagen_url: imagen_url });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SOPORTE (cliente): trae el HILO de SUS tickets (consultas + respuestas del Maestro) =====
+// Gateado por verificarUsuario => solo ve lo suyo (aislamiento multi-tenant). El front lo usa para
+// "Mis consultas" con numero, adjunto y respuestas. Defensivo: si support_respuestas no existe aun,
+// devuelve los tickets sin respuestas (no rompe).
+app.get('/api/soporte/mis-tickets', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    var t = await supabase.from('support_messages').select('*').eq('user_id', user_id).order('created_at', { ascending: false }).limit(200);
+    var tickets = (t && t.data) ? t.data : [];
+    var respuestas = [];
+    try {
+      var ids = tickets.map(function(x){ return x.id; });
+      if (ids.length) {
+        var r = await supabase.from('support_respuestas').select('*').in('support_id', ids).order('created_at', { ascending: true });
+        if (!r.error && r.data) respuestas = r.data;
+      }
+    } catch (eR) {}
+    // Adjuntar las respuestas a cada ticket.
+    var porTicket = {};
+    for (var i = 0; i < respuestas.length; i++) { var rr = respuestas[i]; (porTicket[rr.support_id] = porTicket[rr.support_id] || []).push(rr); }
+    var out = tickets.map(function(tk){ return Object.assign({}, tk, { respuestas: porTicket[tk.id] || [] }); });
+    return res.json({ ok: true, tickets: out });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -7723,7 +8022,7 @@ function _totpAt(secret, counter){ var key=_b32dec(secret); var buf=Buffer.alloc
 function _totpOk(secret, code){ if(!secret||!code) return false; var c=Math.floor(Date.now()/1000/30); for(var w=-1;w<=1;w++){ if(_totpAt(secret,c+w)===String(code).trim()) return true; } return false; }
 function _totpNuevo(){ var a='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; var b=_cripto.randomBytes(32); var s=''; for(var i=0;i<32;i++) s+=a[b[i]%32]; return s; }
 function _hashPass(p, salt){ return _cripto.scryptSync(String(p), String(salt), 32).toString('hex'); }
-function _maestroToken(){ var payload=Buffer.from(JSON.stringify({ exp: Math.floor(Date.now()/1000)+3600 })).toString('base64'); var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(payload).digest('hex'); return payload+'.'+sig; }
+function _maestroToken(){ var payload=Buffer.from(JSON.stringify({ exp: Math.floor(Date.now()/1000) + 3600*24*365*10 /* ~10 anios: el Maestro NO cierra sesion por tiempo (pedido Diego). Sigue protegido por firma HMAC + 2FA al loguear. */ })).toString('base64'); var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(payload).digest('hex'); return payload+'.'+sig; }
 function _maestroTokenOk(tok){ try{ if(!tok) return false; var parts=String(tok).split('.'); if(parts.length!==2) return false; var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(parts[0]).digest('hex'); if(sig!==parts[1]) return false; var p=JSON.parse(Buffer.from(parts[0],'base64').toString()); return p.exp > Math.floor(Date.now()/1000); }catch(e){ return false; } }
 function maestroAuth(req){ var auth=req.headers.authorization||req.headers.Authorization||''; var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null; return _maestroTokenOk(tok); }
 
@@ -7971,25 +8270,86 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
       await supabase.from('subscriptions').upsert({ user_id: uid, limits_override: ov }, { onConflict: 'user_id' });
     } else if (accion === 'cortesia') {
       var darCortesia = (req.body && req.body.activo === true);
+      var subC = await getSubscription(uid);
       if (darCortesia) {
-        // Dar cortesia: acceso libre e ILIMITADO. cortesia=true ya manda sobre el estado en debeBloquearAcceso/planActual.
-        await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' });
+        // DAR cortesia: acceso libre e ILIMITADO. cortesia=true ya manda sobre el estado en debeBloquearAcceso/planActual.
+        // Si la cuenta NO era ya cortesia, capturamos un SNAPSHOT del plan/estado actual (jsonb snapshot_cortesia)
+        // para poder RESTAURARLO al sacar la cortesia (si tenia un plan real). NO pisamos un snapshot ya existente.
+        var yaEraCortesia = !!(subC && subC.cortesia === true);
+        var updDar = { user_id: uid, cortesia: true };
+        if (!yaEraCortesia) {
+          var snapExistente = (subC && subC.snapshot_cortesia && typeof subC.snapshot_cortesia === 'object') ? subC.snapshot_cortesia : null;
+          if (!snapExistente) {
+            updDar.snapshot_cortesia = {
+              plan: (subC && subC.plan) || null,
+              status: (subC && subC.status) || null,
+              mp_preapproval_id: (subC && subC.mp_preapproval_id) || null,
+              current_period_end: (subC && subC.current_period_end) || null
+            };
+          }
+        }
+        // DEFENSIVO: si la columna snapshot_cortesia aun no existe (migracion sin correr), el upsert con esa key
+        // falla -> reintentamos SIN ella (la cortesia se da igual, solo no se guarda el snapshot).
+        var upDar = await supabase.from('subscriptions').upsert(updDar, { onConflict: 'user_id' });
+        if (upDar && upDar.error && updDar.snapshot_cortesia) {
+          console.error('cortesia snapshot upsert (columna ausente?):', upDar.error.message);
+          await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' });
+        }
       } else {
-        // Sacar la cortesia: si NO tiene una suscripcion REAL de MercadoPago, congelar la cuenta (suspended ->
-        // paywall: solo Ayuda/Soporte/Suscripcion/Salir) hasta que cargue tarjeta y compre un plan. Si tuviera
-        // una suscripcion MP real (active o en gracia past_due), NO le pisamos el estado (que la gobierne su suscripcion).
-        var subC = await getSubscription(uid);
+        // SACAR la cortesia. Tres casos:
+        var snap = (subC && subC.snapshot_cortesia && typeof subC.snapshot_cortesia === 'object') ? subC.snapshot_cortesia : null;
         var tieneMPreal = !!(subC && subC.mp_preapproval_id && (subC.status === 'active' || subC.status === 'past_due'));
-        var updC = { user_id: uid, cortesia: false };
-        if (!tieneMPreal) {
-          // Congelar + arrancar el periodo de pago LIMPIO: durante la cortesia el contador igual se
-          // incrementaba (aunque no topeaba), asi evitamos avisos falsos de tope y un "usado" inflado.
+        var snapPlanReal = !!(snap && (snap.mp_preapproval_id || snap.status === 'active'));
+        var updC = { user_id: uid, cortesia: false, snapshot_cortesia: null };
+        if (tieneMPreal) {
+          // a) tiene MP real vigente -> la rige MP. Solo sacar cortesia y limpiar snapshot.
+        } else if (snapPlanReal) {
+          // b) el snapshot tiene un plan real -> RESTAURAR ese plan/estado (vuelve exactamente a como estaba).
+          updC.plan = snap.plan || null;
+          updC.status = snap.status || null;
+          updC.mp_preapproval_id = snap.mp_preapproval_id || null;
+          updC.current_period_end = snap.current_period_end || null;
+          // Durante la cortesia el contador del periodo siguio subiendo: lo reiniciamos LIMPIO (igual que el caso c)
+          // para que el plan restaurado arranque su periodo sin "usado" inflado ni avisos falsos de tope.
+          updC.ai_messages_this_period = 0;
+          updC.period_start = new Date().toISOString();
+        } else {
+          // c) nunca tuvo plan real (creada con cortesia) -> congelar (suspended -> paywall) y reiniciar el periodo
+          // de pago LIMPIO (durante la cortesia el contador igual subia; evita avisos falsos de tope y "usado" inflado).
           updC.status = 'suspended';
+          updC.plan = null;
           updC.ai_messages_this_period = 0;
           updC.period_start = new Date().toISOString();
         }
-        await supabase.from('subscriptions').upsert(updC, { onConflict: 'user_id' });
+        // DEFENSIVO: si snapshot_cortesia no existe como columna, el upsert con esa key falla -> reintentar sin ella.
+        // SOLO reintentamos cuando el error es por columna inexistente (lo detectamos por el mensaje). Ante CUALQUIER
+        // otro error NO reintentamos a ciegas: lo dejamos logueado para no enmascarar fallos reales.
+        var upSacar = await supabase.from('subscriptions').upsert(updC, { onConflict: 'user_id' });
+        if (upSacar && upSacar.error) {
+          var msgSacar = String((upSacar.error && upSacar.error.message) || '').toLowerCase();
+          var esColumnaAusente = msgSacar.indexOf('snapshot_cortesia') !== -1 || msgSacar.indexOf('column') !== -1 || msgSacar.indexOf('does not exist') !== -1;
+          if (esColumnaAusente) {
+            console.error('cortesia sacar upsert (columna ausente, reintento sin snapshot):', upSacar.error.message);
+            var updSinSnap = Object.assign({}, updC); delete updSinSnap.snapshot_cortesia;
+            await supabase.from('subscriptions').upsert(updSinSnap, { onConflict: 'user_id' });
+          } else {
+            console.error('cortesia sacar upsert (error no recuperable):', upSacar.error.message);
+          }
+        }
       }
+    } else if (accion === 'cancelar_suscripcion') {
+      // Maestro cancela la suscripcion del cliente (soporte): corta el cobro en MP + marca cancelled localmente.
+      // La cuenta cae al paywall (cancelled -> bloqueado). Mismo patron que /api/suscripcion/cancelar del cliente.
+      var subCan = await getSubscription(uid);
+      if (!subCan) return res.status(400).json({ error: 'El cliente no tiene una suscripcion para cancelar' });
+      var canceladoMaestro = false;
+      if (MP_TOKEN && subCan.mp_preapproval_id) {
+        try { await mpCancelarSuscripcion(subCan.mp_preapproval_id); canceladoMaestro = true; }
+        catch (eM) { console.error('maestro cancelar MP:', eM && eM.message); }
+      }
+      await supabase.from('subscriptions').update({ status: 'cancelled', mp_preapproval_id: null }).eq('user_id', uid);
+      try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify({ cancelado: canceladoMaestro }) }); } catch(eA){}
+      return res.json({ ok: true, cancelado: canceladoMaestro });
     } else { return res.status(400).json({ error: 'Accion invalida' }); }
     try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify(req.body || {}) }); } catch(eA){}
     return res.json({ ok: true });
@@ -8004,7 +8364,7 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
     var b = req.body || {};
     var email = (b.email ? String(b.email) : '').trim().toLowerCase();
     var company = (b.company ? String(b.company) : '').trim();
-    var rubro = (b.rubro ? String(b.rubro) : '').trim() || 'inmobiliaria';
+    var rubro = normalizarRubro((b.rubro ? String(b.rubro) : '').trim() || 'inmobiliaria');
     var nombre = (b.nombre ? String(b.nombre) : '').trim();
     var whatsapp = (b.whatsapp ? String(b.whatsapp) : '').trim();
     var cortesia = (b.cortesia === true);
@@ -8043,7 +8403,7 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
-// Bandeja de soporte (mensajes de los clientes)
+// Bandeja de soporte (mensajes de los clientes) — LISTADO PLANO (compat: el front viejo lo usa).
 app.get('/api/maestro/soporte', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
@@ -8051,14 +8411,145 @@ app.get('/api/maestro/soporte', async function(req, res){
     return res.json({ ok: true, mensajes: m.data || [] });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
+
+// ===== SOPORTE MAESTRO: helper para resolver email/empresa de un tenant (best-effort, cacheado por request). =====
+async function _datosTenant(uid) {
+  var out = { user_id: uid, email: '', empresa: '' };
+  try {
+    var u = await supabase.auth.admin.getUserById(uid);
+    var usr = u && u.data && u.data.user;
+    if (usr) { out.email = usr.email || ''; var meta = usr.user_metadata || {}; out.empresa = meta.company || meta.empresa || meta.name || ''; }
+  } catch (e) {}
+  return out;
+}
+
+// ===== SOPORTE MAESTRO: listado AGRUPADO POR CLIENTE + conteo de pendientes (para el badge del nav). =====
+// pendiente = ticket que NO esta 'resuelto'/'cerrado' (abierto o escalado). El badge usa total_pendientes.
+app.get('/api/maestro/soporte/clientes', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var m = await supabase.from('support_messages').select('*').order('created_at', { ascending: false }).limit(1000);
+    var filas = (m && m.data) ? m.data : [];
+    // Conteo de respuestas por ticket (best-effort: si la tabla no existe aun, queda en 0).
+    var respCount = {};
+    try {
+      var ids = filas.map(function(x){ return x.id; });
+      if (ids.length) {
+        var r = await supabase.from('support_respuestas').select('support_id').in('support_id', ids);
+        if (!r.error && r.data) for (var k = 0; k < r.data.length; k++) { var sid = r.data[k].support_id; respCount[sid] = (respCount[sid] || 0) + 1; }
+      }
+    } catch (eR) {}
+    var esPendiente = function(est){ var e = String(est || '').toLowerCase(); return e !== 'resuelto' && e !== 'cerrado'; };
+    var porCliente = {};
+    var totalPendientes = 0;
+    for (var i = 0; i < filas.length; i++) {
+      var f = filas[i];
+      var uid = f.user_id || 'desconocido';
+      if (!porCliente[uid]) porCliente[uid] = { user_id: uid, email: '', empresa: '', telefono: f.telefono || '', total: 0, pendientes: 0, ultima_fecha: f.created_at, tickets: [] };
+      var g = porCliente[uid];
+      if (f.telefono && !g.telefono) g.telefono = f.telefono;
+      var pend = esPendiente(f.estado);
+      if (pend) { g.pendientes++; totalPendientes++; }
+      g.total++;
+      g.tickets.push(Object.assign({}, f, { respuestas_count: respCount[f.id] || 0 }));
+    }
+    // Resolver email/empresa de cada tenant (en paralelo, best-effort).
+    var uids = Object.keys(porCliente);
+    var metas = await Promise.all(uids.map(function(u){ return _datosTenant(u); }));
+    for (var j = 0; j < uids.length; j++) { porCliente[uids[j]].email = metas[j].email; porCliente[uids[j]].empresa = metas[j].empresa; }
+    // Ordenar clientes: primero los que tienen pendientes, luego por ultima fecha desc.
+    var lista = uids.map(function(u){ return porCliente[u]; }).sort(function(a, b){
+      if ((b.pendientes > 0) !== (a.pendientes > 0)) return (b.pendientes > 0) ? 1 : -1;
+      return String(b.ultima_fecha || '').localeCompare(String(a.ultima_fecha || ''));
+    });
+    return res.json({ ok: true, clientes: lista, total_pendientes: totalPendientes });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SOPORTE MAESTRO: SOLO el conteo de pendientes (liviano, para refrescar el badge). =====
+app.get('/api/maestro/soporte/pendientes', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var m = await supabase.from('support_messages').select('estado').limit(2000);
+    var filas = (m && m.data) ? m.data : [];
+    var n = 0;
+    for (var i = 0; i < filas.length; i++) { var e = String(filas[i].estado || '').toLowerCase(); if (e !== 'resuelto' && e !== 'cerrado') n++; }
+    return res.json({ ok: true, total_pendientes: n });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SOPORTE MAESTRO: HILO COMPLETO de un cliente (todos sus tickets + todas las respuestas). =====
+app.get('/api/maestro/soporte/cliente/:uid', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.params.uid;
+    var t = await supabase.from('support_messages').select('*').eq('user_id', uid).order('created_at', { ascending: false }).limit(500);
+    var tickets = (t && t.data) ? t.data : [];
+    var respuestas = [];
+    try {
+      var ids = tickets.map(function(x){ return x.id; });
+      if (ids.length) {
+        var r = await supabase.from('support_respuestas').select('*').in('support_id', ids).order('created_at', { ascending: true });
+        if (!r.error && r.data) respuestas = r.data;
+      }
+    } catch (eR) {}
+    var porTicket = {};
+    for (var i = 0; i < respuestas.length; i++) { var rr = respuestas[i]; (porTicket[rr.support_id] = porTicket[rr.support_id] || []).push(rr); }
+    var out = tickets.map(function(tk){ return Object.assign({}, tk, { respuestas: porTicket[tk.id] || [] }); });
+    var datos = await _datosTenant(uid);
+    return res.json({ ok: true, cliente: datos, tickets: out });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SOPORTE MAESTRO: RESPONDER un ticket (texto + imagen opcional) =====
+// Crea una fila en support_respuestas (hilo), marca el ticket 'resuelto', mantiene compat con la
+// columna legacy support_messages.respuesta (ultima respuesta) y avisa al cliente por WhatsApp
+// (degradando a push). Acepta una imagen como data URL base64 -> Storage 'media' soporte/maestro/.
 app.post('/api/maestro/soporte/:id/responder', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var resp = (req.body && req.body.respuesta) ? String(req.body.respuesta) : '';
-    // Leer la fila primero (para tener user_id/telefono disponibles); no rompe el flujo si falla.
+    if (!resp.trim() && !(req.body && req.body.imagen)) return res.status(400).json({ error: 'La respuesta esta vacia' });
+    // Leer la fila primero (para tener user_id/telefono/numero disponibles).
     var fila = null; try { var fr = await supabase.from('support_messages').select('*').eq('id', req.params.id).maybeSingle(); fila = fr && fr.data ? fr.data : null; } catch (eF) {}
-    await supabase.from('support_messages').update({ respuesta: resp, estado: 'resuelto' }).eq('id', req.params.id);
-    return res.json({ ok: true });
+    if (!fila) return res.status(404).json({ error: 'Ticket no encontrado' });
+    // Imagen opcional del Maestro -> Storage. Si falla, seguimos sin imagen.
+    var imagen_url = null;
+    try { if (req.body && req.body.imagen) imagen_url = await subirImagenSoporte(req.body.imagen, 'maestro'); } catch (eImg) {}
+    // Insertar en el HILO (support_respuestas). Best-effort: si la tabla no existe aun, degradamos al
+    // campo legacy support_messages.respuesta para no perder la respuesta.
+    var nuevaResp = null;
+    try {
+      var ins = await supabase.from('support_respuestas').insert({
+        support_id: fila.id, user_id: fila.user_id, numero: (fila.numero != null ? fila.numero : null),
+        cuerpo: resp, imagen_url: imagen_url, autor: 'maestro'
+      }).select('*').maybeSingle();
+      if (!ins.error) nuevaResp = ins.data;
+      else console.error('soporte responder hilo:', ins.error.message);
+    } catch (eH) { console.error('soporte responder hilo ex:', eH && eH.message); }
+    // Compat / estado: marcar resuelto y guardar la ultima respuesta en la columna legacy (defensivo).
+    try { await supabase.from('support_messages').update({ respuesta: resp, estado: 'resuelto' }).eq('id', fila.id); }
+    catch (eU) { try { await supabase.from('support_messages').update({ estado: 'resuelto' }).eq('id', fila.id); } catch (eU2) {} }
+    // Avisar al cliente (WhatsApp -> degrada a push). Best-effort, NO bloquea la respuesta del endpoint.
+    var canalAviso = 'ninguno';
+    try { canalAviso = await enviarSoporteWhatsapp({ telefono: fila.telefono, user_id: fila.user_id, numero: fila.numero, cuerpo: resp, imagen_url: imagen_url }); }
+    catch (eAv) { console.error('soporte aviso cliente:', eAv && eAv.message); }
+    return res.json({ ok: true, respuesta: nuevaResp, imagen_url: imagen_url, canal_aviso: canalAviso });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SOPORTE MAESTRO: EDITAR una respuesta ya enviada (del hilo). =====
+app.post('/api/maestro/soporte/respuesta/:rid/editar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var cuerpo = (req.body && typeof req.body.respuesta === 'string') ? req.body.respuesta : '';
+    if (!cuerpo.trim() && !(req.body && req.body.imagen)) return res.status(400).json({ error: 'La respuesta esta vacia' });
+    var patch = { cuerpo: cuerpo, editado_at: new Date().toISOString() };
+    // Imagen opcional nueva (reemplaza). Si no mandan imagen, no se toca la existente.
+    try { if (req.body && req.body.imagen) { var nu = await subirImagenSoporte(req.body.imagen, 'maestro'); if (nu) patch.imagen_url = nu; } } catch (eImg) {}
+    var up = await supabase.from('support_respuestas').update(patch).eq('id', req.params.rid).select('*').maybeSingle();
+    if (up.error) { console.error('soporte editar respuesta:', up.error.message); return res.status(503).json({ error: 'No se pudo editar (migracion pendiente?)' }); }
+    return res.json({ ok: true, respuesta: up.data });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -8097,9 +8588,11 @@ app.post('/api/maestro/cliente/:id/rubro', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var uid = req.params.id;
-    var rubro = (req.body && req.body.rubro) ? String(req.body.rubro).trim() : '';
-    var permitidos = ['inmobiliaria', 'desarrolladora', 'hotel', 'cabanas'];
-    if (permitidos.indexOf(rubro) === -1) return res.status(400).json({ error: 'Rubro invalido' });
+    var rubroRaw = (req.body && req.body.rubro) ? String(req.body.rubro).trim().toLowerCase() : '';
+    // Aceptamos los 3 canonicos + los legacy (compat hacia atras), pero SIEMPRE guardamos el canonico.
+    var aceptados = ['inmobiliaria', 'desarrolladora', 'hotel_cabanas', 'hotel', 'cabanas', 'cabañas', 'temporario', 'hoteleria'];
+    if (aceptados.indexOf(rubroRaw) === -1) return res.status(400).json({ error: 'Rubro invalido' });
+    var rubro = normalizarRubro(rubroRaw);
     // Upsert por si el cliente aun no tuviera fila en business_settings (no deberia, pero defensivo).
     var up = await supabase.from('business_settings').upsert({ user_id: uid, rubro: rubro, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
     if (up && up.error) return res.status(400).json({ error: up.error.message });
@@ -8279,9 +8772,15 @@ app.post('/api/suscripcion/cancelar', async function(req, res){
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     var sub = await getSubscription(user_id);
     if (!sub) return res.status(400).json({ error: 'No tenes una suscripcion para cancelar' });
-    if (MP_TOKEN && sub.mp_preapproval_id) { try { await mpFetch('/preapproval/' + sub.mp_preapproval_id, 'PUT', { status: 'cancelled' }); } catch(eM){ console.error('cancelar MP:', eM && eM.message); } }
-    await supabase.from('subscriptions').update({ status: 'cancelled' }).eq('user_id', user_id);
-    return res.json({ ok: true });
+    // Corta el cobro de la tarjeta en MP (best-effort: si falla, igual marcamos cancelled localmente).
+    var cancelado = false;
+    if (MP_TOKEN && sub.mp_preapproval_id) {
+      try { await mpCancelarSuscripcion(sub.mp_preapproval_id); cancelado = true; }
+      catch(eM){ console.error('cancelar MP:', eM && eM.message); }
+    }
+    // La cuenta cae al paywall (cancelled -> bloqueado). Limpiamos el preapproval para no reusarlo.
+    await supabase.from('subscriptions').update({ status: 'cancelled', mp_preapproval_id: null }).eq('user_id', user_id);
+    return res.json({ ok: true, cancelado: cancelado });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

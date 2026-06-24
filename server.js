@@ -236,22 +236,23 @@ const LARGO = {
 // El COMPORTAMIENTO y el RUBRO estaban hardcodeados dentro de generarRespuestaAgente. Ahora viven aca como DEFAULTS y
 // el cliente los puede personalizar via business_settings.instrucciones_agente (jsonb: { items:[...] }).
 // REGLA DE ORO: con la columna en null/ausente, los builders devuelven EXACTAMENTE los mismos textos de antes (prompt
-// byte-identico). 'protegido' = critica: la UI no deja borrarla/apagarla y el backend la re-inyecta si falta o queda vacia.
+// byte-identico). Las de comportamiento + rubro son de SISTEMA (es_sistema): la UI deja EDITARLAS y DESACTIVARLAS, pero NO eliminarlas; el backend las re-inyecta si faltan, respetando su on/off.
 const DEFAULT_COMPORTAMIENTO = [
-  { id: 'cmp-quien-sos',       protegido: false, texto: 'QUIEN SOS: Sos una combinacion de tres roles en una sola persona. (1) SECRETARIA: ordenada, recordas datos del cliente, coordinas y no dejas cabos sueltos. (2) ATENCION AL PUBLICO: calida, paciente, clara, das una excelente primera impresion y resolves dudas con amabilidad. (3) SETTER: detectas que mueve al cliente, generas interes y avanzas la conversacion hacia el cierre. Combinas los tres roles de forma natural, no robotica.' },
-  { id: 'cmp-como-trabajas',   protegido: false, texto: 'COMO TRABAJAS: No te limites a responder y esperar. Llevas la conversacion hacia adelante con calidez y naturalidad, paso a paso.' },
-  { id: 'cmp-config',          protegido: true,  texto: 'REGITE SIEMPRE Y A RAJATABLA POR LA CONFIGURACION (es OBLIGATORIA, no opcional): respeta el IDIOMA configurado, el uso o no de EMOJIS, el TONO indicado, el nivel de AUTONOMIA (cuanto podes afirmar vs cuando derivar), el OBJETIVO (hasta donde atender antes de pasar a un humano), el LARGO de respuesta y las instrucciones internas; usa la base de conocimiento como tu UNICA fuente de verdad. Si la configuracion y tu instinto comercial chocan, SIEMPRE gana la configuracion.' },
-  { id: 'cmp-conecta',         protegido: false, texto: 'PRIMERO conecta: mostrate humano, calido y con interes genuino. (El REGISTRO/TONO con que hablas lo define la configuracion de TONO de mas abajo: respetalo SIEMPRE y no lo cambies para espejar al lead, salvo que el tono configurado sea Adaptativo.)' },
-  { id: 'cmp-motiva',          protegido: false, texto: 'DETECTA que motiva a este lead a avanzar: puede ser inversion, una mejor calidad de vida, disfrutar en pareja, vision a futuro, un proyecto para la familia, o seguridad. No lo interrogues ni preguntes el dolor de forma directa: descubrilo con preguntas naturales y escuchando lo que dice.' },
-  { id: 'cmp-oferta',          protegido: false, texto: 'CONECTA la oferta con eso que lo mueve: cuando presentes una opcion, relacionala con su motivacion (ejemplo: si busca invertir, resalta valor y proyeccion; si es para la familia, resalta espacio y comodidad). Siempre con datos reales.' },
-  { id: 'cmp-dueno',           protegido: false, texto: 'PENSA COMO EL DUENO DEL NEGOCIO: tu meta no es empujar cualquier cosa, sino que el cliente encuentre la MEJOR opcion para EL. Recomendar lo que de verdad le conviene genera confianza y es lo que mas cierra. Razona que le sirve segun lo que busca, su presupuesto y su situacion, con criterio del negocio.' },
-  { id: 'cmp-no-decidido',     protegido: false, texto: 'CUANDO EL LEAD NO ESTA DECIDIDO (lo mas comun): no lo dejes en el aire ni le tires todo el catalogo. Hace 1 o 2 preguntas clave para entender que necesita (uso, zona, presupuesto, prioridades) y propone la MEJOR o las 2 mejores opciones del inventario que encajan, explicando en criollo POR QUE le sirven a EL. Si dudas entre dos, ofrece ambas y ayudalo a elegir.' },
-  { id: 'cmp-persona-real',    protegido: false, texto: 'HABLA COMO UNA PERSONA REAL: natural, con calidez y criterio, nunca como un guion o un robot. Aprovecha el contexto del negocio que tengas cargado para sonar como alguien que conoce de verdad lo que vende.' },
-  { id: 'cmp-no-inventar',     protegido: true,  texto: 'NUNCA inventes datos, precios, caracteristicas ni beneficios. Si no tenes la info, decis que la consultas. Persuadir es conectar lo real con lo que el lead necesita, no exagerar ni presionar.' },
-  { id: 'cmp-progresa',        protegido: false, texto: 'PROGRESA la charla: en cada respuesta haces avanzar un paso (entender mejor su necesidad, mostrar una opcion que encaje, o proponer el siguiente paso). Evita respuestas que cierren la conversacion.' },
-  { id: 'cmp-cierre',          protegido: false, texto: 'AVANZA hacia el cierre SOLO hasta el limite que define tu objetivo configurado (ver arriba). Cuando el lead ACEPTA o COORDINA ese paso (por ejemplo acuerda una visita o cita, da fecha/horario, o quiere avanzar una reserva/sena), DERIVA de inmediato: decile de forma natural que lo pasas con un asesor del equipo para confirmarlo/coordinarlo, y NO sigas vos gestionando ese cierre. Nunca te pases del limite de tu objetivo configurado.' },
-  { id: 'cmp-empatico',        protegido: false, texto: 'Sos empatico y persuasivo, nunca insistente ni manipulador. Si el lead no quiere avanzar, respetalo y dejas la puerta abierta.' },
-  { id: 'cmp-primer-contacto', protegido: false, texto: 'SI NO HAY CONVERSACION PREVIA con este contacto (no hablaron antes), tratalo como un primer contacto: presentate, genera confianza desde cero y NO asumas que ya venian hablando de algo. No digas cosas como lo que veniamos viendo si nunca hubo charla.' }
+  { id: 'cmp-quien-sos',       texto: 'QUIEN SOS: Sos una combinacion de tres roles en una sola persona. (1) SECRETARIA: ordenada, recordas datos del cliente, coordinas y no dejas cabos sueltos. (2) ATENCION AL PUBLICO: calida, paciente, clara, das una excelente primera impresion y resolves dudas con amabilidad. (3) SETTER: detectas que mueve al cliente, generas interes y avanzas la conversacion hacia el cierre. Combinas los tres roles de forma natural, no robotica.' },
+  { id: 'cmp-como-trabajas',   texto: 'COMO TRABAJAS: No te limites a responder y esperar. Llevas la conversacion hacia adelante con calidez y naturalidad, paso a paso.' },
+  { id: 'cmp-config',          texto: 'REGITE SIEMPRE Y A RAJATABLA POR LA CONFIGURACION (es OBLIGATORIA, no opcional): respeta el IDIOMA configurado, el uso o no de EMOJIS, el TONO indicado, el nivel de AUTONOMIA (cuanto podes afirmar vs cuando derivar), el OBJETIVO (hasta donde atender antes de pasar a un humano), el LARGO de respuesta y las instrucciones internas; usa la base de conocimiento como tu UNICA fuente de verdad. Si la configuracion y tu instinto comercial chocan, SIEMPRE gana la configuracion.' },
+  { id: 'cmp-conecta',         texto: 'PRIMERO conecta: mostrate humano, calido y con interes genuino. (El REGISTRO/TONO con que hablas lo define la configuracion de TONO de mas abajo: respetalo SIEMPRE y no lo cambies para espejar al lead, salvo que el tono configurado sea Adaptativo.)' },
+  { id: 'cmp-motiva',          texto: 'DETECTA que motiva a este lead a avanzar: puede ser inversion, una mejor calidad de vida, disfrutar en pareja, vision a futuro, un proyecto para la familia, o seguridad. No lo interrogues ni preguntes el dolor de forma directa: descubrilo con preguntas naturales y escuchando lo que dice.' },
+  { id: 'cmp-oferta',          texto: 'CONECTA la oferta con eso que lo mueve: cuando presentes una opcion, relacionala con su motivacion (ejemplo: si busca invertir, resalta valor y proyeccion; si es para la familia, resalta espacio y comodidad). Siempre con datos reales.' },
+  { id: 'cmp-dueno',           texto: 'PENSA COMO EL DUENO DEL NEGOCIO: tu meta no es empujar cualquier cosa, sino que el cliente encuentre la MEJOR opcion para EL. Recomendar lo que de verdad le conviene genera confianza y es lo que mas cierra. Razona que le sirve segun lo que busca, su presupuesto y su situacion, con criterio del negocio.' },
+  { id: 'cmp-no-decidido',     texto: 'CUANDO EL LEAD NO ESTA DECIDIDO (lo mas comun): no lo dejes en el aire ni le tires todo el catalogo. Hace 1 o 2 preguntas clave para entender que necesita (uso, zona, presupuesto, prioridades) y propone la MEJOR o las 2 mejores opciones del inventario que encajan, explicando en criollo POR QUE le sirven a EL. Si dudas entre dos, ofrece ambas y ayudalo a elegir.' },
+  { id: 'cmp-persona-real',    texto: 'HABLA COMO UNA PERSONA REAL: natural, con calidez y criterio, nunca como un guion o un robot. Aprovecha el contexto del negocio que tengas cargado para sonar como alguien que conoce de verdad lo que vende.' },
+  { id: 'cmp-no-inventar',     texto: 'NUNCA inventes datos, precios, caracteristicas ni beneficios. Si no tenes la info, decis que la consultas. Persuadir es conectar lo real con lo que el lead necesita, no exagerar ni presionar.' },
+  { id: 'cmp-progresa',        texto: 'PROGRESA la charla: en cada respuesta haces avanzar un paso (entender mejor su necesidad, mostrar una opcion que encaje, o proponer el siguiente paso). Evita respuestas que cierren la conversacion.' },
+  { id: 'cmp-cierre',          texto: 'AVANZA hacia el cierre SOLO hasta el limite que define tu objetivo configurado (ver arriba). Cuando el lead ACEPTA o COORDINA ese paso (por ejemplo acuerda una visita o cita, da fecha/horario, o quiere avanzar una reserva/sena), DERIVA de inmediato: decile de forma natural que lo pasas con un asesor del equipo para confirmarlo/coordinarlo, y NO sigas vos gestionando ese cierre. Nunca te pases del limite de tu objetivo configurado.' },
+  { id: 'cmp-empatico',        texto: 'Sos empatico y persuasivo, nunca insistente ni manipulador. Si el lead no quiere avanzar, respetalo y dejas la puerta abierta.' },
+  { id: 'cmp-primer-contacto', texto: 'SI NO HAY CONVERSACION PREVIA con este contacto (no hablaron antes), tratalo como un primer contacto: presentate, genera confianza desde cero y NO asumas que ya venian hablando de algo. No digas cosas como lo que veniamos viendo si nunca hubo charla.' },
+  { id: 'cmp-no-repetir',      texto: 'NO REPITAS PREGUNTAS NI SEAS REDUNDANTE: no vuelvas a preguntar algo que el lead ya respondio, que ya figura en sus datos, o que podes deducir de lo que dijo. Si te falta un dato, fijate primero si lo podes inferir del contexto; si de verdad lo necesitas, pedilo una sola vez y formulandolo distinto (no repitas la misma pregunta tal cual). Si no lo conseguis, segui avanzando con lo que tenes; nunca inventes el dato.' }
 ];
 const DEFAULT_RUBRO = {
   hotel_cabanas: 'RUBRO HOTEL, CABANAS O COMPLEJO DE ALOJAMIENTO. Hablas de RESERVAS de alojamiento, no de venta ni alquiler de inmuebles. Vocabulario: noches, estadia, reserva, disponibilidad, check-in y check-out, capacidad de personas, temporada alta o baja, tarifa por noche, servicios incluidos como pileta, parrilla, wifi, cochera y ropa de cama. Preguntas clave al huesped ANTES de cotizar: fechas de entrada y salida (asi calculas cuantas noches) y cuantas personas se alojan. Con esas fechas cruza la DISPONIBILIDAD del inventario: si una unidad figura OCUPADA en esas fechas, no la ofrezcas para ese periodo y proponé fechas u opciones libres. Al presentar opciones, deci capacidad, servicios y precio por noche (y si podes, el total estimado por la cantidad de noches). Cuando el huesped quiere confirmar una reserva o seña, derivá a un asesor del equipo segun tu objetivo configurado. NUNCA hables de expensas, escrituras ni metros cuadrados.',
@@ -276,26 +277,30 @@ function instruccionesAgenteItems(settings, rubro) {
         categoria: (it && it.categoria) ? it.categoria : 'interna',
         texto: (it && typeof it.texto === 'string') ? it.texto : '',
         activo: !(it && it.activo === false),
-        protegido: !!(it && it.protegido === true),
+        es_sistema: !!(it && it.es_sistema === true),
         orden: (it && typeof it.orden === 'number') ? it.orden : i
       };
     });
-    // Red de seguridad: re-inyectar protegidas del comportamiento si faltan; forzar activas + texto no vacio.
+    // Red de seguridad: las de SISTEMA (14 de comportamiento + rubro) NO se eliminan -> re-inyectar si faltan.
+    // Se RESPETA el activo (el admin puede DESACTIVARLAS) y el texto editado; solo se garantiza que ESTEN presentes.
     DEFAULT_COMPORTAMIENTO.forEach(function(d) {
-      if (!d.protegido) return;
       const ex = items.find(function(x) { return x.id === d.id; });
-      if (!ex) items.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, protegido: true, orden: 0 });
-      else { ex.activo = true; ex.protegido = true; ex.categoria = 'comportamiento'; if (!ex.texto || !ex.texto.trim()) ex.texto = d.texto; }
+      if (!ex) items.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, es_sistema: true, orden: 0 });
+      else { ex.es_sistema = true; ex.categoria = 'comportamiento'; if (!ex.texto || !ex.texto.trim()) ex.texto = d.texto; }
     });
+    // El item de rubro tampoco se elimina: garantizar que haya al menos uno (re-inyectar el default si falta).
+    const k = _rubroKey(rubro);
+    if (!items.some(function(x) { return x.categoria === 'rubro'; })) items.push({ id: 'rub-' + k, categoria: 'rubro', texto: DEFAULT_RUBRO[k], activo: true, es_sistema: true, orden: 100 });
+    else items.forEach(function(x) { if (x.categoria === 'rubro') x.es_sistema = true; });
     return items;
   }
   // DEFAULTS (el cliente nunca personalizo) -> reproduce EXACTAMENTE el comportamiento anterior.
   const out = [];
-  DEFAULT_COMPORTAMIENTO.forEach(function(d, i) { out.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, protegido: d.protegido, orden: i }); });
+  DEFAULT_COMPORTAMIENTO.forEach(function(d, i) { out.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, es_sistema: true, orden: i }); });
   const k = _rubroKey(rubro);
-  out.push({ id: 'rub-' + k, categoria: 'rubro', texto: DEFAULT_RUBRO[k], activo: true, protegido: false, orden: 100 });
+  out.push({ id: 'rub-' + k, categoria: 'rubro', texto: DEFAULT_RUBRO[k], activo: true, es_sistema: true, orden: 100 });
   const instr = (settings && settings.instructions) || '';
-  if (instr) out.push({ id: 'int-legacy', categoria: 'interna', texto: String(instr), activo: true, protegido: false, orden: 200 });
+  if (instr) out.push({ id: 'int-legacy', categoria: 'interna', texto: String(instr), activo: true, es_sistema: false, orden: 200 });
   return out;
 }
 // Arma los 3 bloques de texto que van al system prompt, respetando orden y activo. Con la columna en null devuelve
@@ -4914,7 +4919,7 @@ app.post('/api/equipo/avisos-config', async function(req, res) {
 });
 
 // ============ INSTRUCCIONES DEL AGENTE (editor por cliente) ============
-// GET  /api/instrucciones-agente -> { ok, items:[{id,categoria,texto,activo,protegido,orden}], rubro }
+// GET  /api/instrucciones-agente -> { ok, items:[{id,categoria,texto,activo,es_sistema,orden}], rubro }
 //   Siembra los DEFAULTS si la columna esta en null (no los guarda; solo el POST persiste). Solo el dueño.
 // POST /api/instrucciones-agente { items:[...] }  -> guarda business_settings.instrucciones_agente (jsonb).
 //   POST { reset:true } -> vuelve a null (defaults). Garantiza protegidas presentes+activas. Defensivo si falta migrar.
@@ -4956,6 +4961,9 @@ app.post('/api/instrucciones-agente', async function(req, res) {
 
     const rawItems = (req.body && Array.isArray(req.body.items)) ? req.body.items : null;
     if (!rawItems) return res.status(400).json({ error: 'Falta items (array) o reset:true' });
+    // Rubro del tenant (para re-inyectar el item de rubro si faltara).
+    const { data: bsR } = await supabase.from('business_settings').select('rubro').eq('user_id', ident.ownerId).maybeSingle();
+    const kP = _rubroKey((bsR && bsR.rubro) || 'inmobiliaria');
     const CATS = { comportamiento: 1, rubro: 1, interna: 1 }; // 'sistema' no se persiste: cae a 'interna' (las reglas de sistema son fijas, no items).
     let items = rawItems.slice(0, 200).map(function(it, i) {
       return {
@@ -4963,17 +4971,19 @@ app.post('/api/instrucciones-agente', async function(req, res) {
         categoria: (it && CATS[it.categoria]) ? it.categoria : 'interna',
         texto: (it && typeof it.texto === 'string') ? it.texto.slice(0, 4000) : '',
         activo: !(it && it.activo === false),
-        protegido: !!(it && it.protegido === true),
+        es_sistema: !!(it && it.es_sistema === true),
         orden: (it && typeof it.orden === 'number') ? it.orden : i
       };
     }).filter(function(x) { return x.texto && x.texto.trim(); });
-    // Red de seguridad server-side: las protegidas del comportamiento SIEMPRE presentes + activas, aunque el front falle.
+    // Red de seguridad server-side: las de SISTEMA (14 de comportamiento + rubro) NO se eliminan -> re-inyectar si faltan,
+    // aunque el front falle o manipule. Se RESPETA el activo (el admin puede desactivarlas) y el texto editado.
     DEFAULT_COMPORTAMIENTO.forEach(function(d) {
-      if (!d.protegido) return;
       const ex = items.find(function(x) { return x.id === d.id; });
-      if (!ex) items.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, protegido: true, orden: 0 });
-      else { ex.activo = true; ex.protegido = true; ex.categoria = 'comportamiento'; if (!ex.texto || !ex.texto.trim()) ex.texto = d.texto; }
+      if (!ex) items.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, es_sistema: true, orden: 0 });
+      else { ex.es_sistema = true; ex.categoria = 'comportamiento'; if (!ex.texto || !ex.texto.trim()) ex.texto = d.texto; }
     });
+    if (!items.some(function(x) { return x.categoria === 'rubro'; })) items.push({ id: 'rub-' + kP, categoria: 'rubro', texto: DEFAULT_RUBRO[kP], activo: true, es_sistema: true, orden: 100 });
+    else items.forEach(function(x) { if (x.categoria === 'rubro') x.es_sistema = true; });
     const payload = { items: items, updated_at: new Date().toISOString() };
     const { error } = await supabase.from('business_settings').update({ instrucciones_agente: payload }).eq('user_id', ident.ownerId);
     if (error) return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar instrucciones_agente?): ' + (error.message || 'error de esquema') });

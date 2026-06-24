@@ -8089,6 +8089,32 @@ app.post('/api/maestro/cliente/:id/nota', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// Cambiar el TIPO DE COMERCIO (rubro) de un cliente. SOLO el Maestro (gateado por maestroAuth).
+// El cliente NO puede cambiarlo desde su /configuracion: cambia el inventario y la estructura de
+// departamentos, asi que solo se toca aca a pedido de soporte. Setea business_settings.rubro y, de
+// paso, el user_metadata.rubro (lo usa el fallback de la config cuando aun no hay business_settings).
+app.post('/api/maestro/cliente/:id/rubro', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.params.id;
+    var rubro = (req.body && req.body.rubro) ? String(req.body.rubro).trim() : '';
+    var permitidos = ['inmobiliaria', 'desarrolladora', 'hotel', 'cabanas'];
+    if (permitidos.indexOf(rubro) === -1) return res.status(400).json({ error: 'Rubro invalido' });
+    // Upsert por si el cliente aun no tuviera fila en business_settings (no deberia, pero defensivo).
+    var up = await supabase.from('business_settings').upsert({ user_id: uid, rubro: rubro, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    if (up && up.error) return res.status(400).json({ error: up.error.message });
+    // Espejar en user_metadata (best-effort: la config usa esto como fallback). Mergeamos sobre el
+    // metadata actual para NO pisar name/company. Nunca rompe la operacion.
+    try {
+      var cur = await supabase.auth.admin.getUserById(uid);
+      var meta = (cur && cur.data && cur.data.user && cur.data.user.user_metadata) ? cur.data.user.user_metadata : {};
+      await supabase.auth.admin.updateUserById(uid, { user_metadata: Object.assign({}, meta, { rubro: rubro }) });
+    } catch(eMeta){}
+    try { await supabase.from('admin_audit').insert({ accion: 'cambiar_rubro', target_user_id: uid, detalle: JSON.stringify({ rubro: rubro }) }); } catch(eA){}
+    return res.json({ ok: true, rubro: rubro });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // Ver conversaciones recientes del cliente (solo lectura)
 app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
   try{

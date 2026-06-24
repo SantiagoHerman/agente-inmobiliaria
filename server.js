@@ -1079,11 +1079,16 @@ async function manejarRespuestaFueraHorario(convId, user_id, texto, telefono, in
 //   - 'todos_pausa'  => tiene miembros que reciben (no todos no_recibe), pero AHORA ninguno disponible
 //       (pausa / fuera de horario): esperan en cola con tope (van a volver).
 // Reusa el picker (etapa 7) para 'asignable'; para los otros mira la membresia + disponibilidad de los miembros.
+// BUG 4 (race doble picker): devuelve { estado, asesor }. `asesor` es el id elegido por el ÚNICO
+// llamado a elegirAsesorParaDepartamento (cuando estado==='asignable'); en los demas estados es null.
+// El caller (derivarAHumano) REUSA este asesor en vez de volver a llamar al picker (cerraba una ventana
+// de carrera donde dos mensajes elegian al mismo o a distintos asesores). El UPDATE de asignacion que hace
+// el caller es CONDICIONAL (where asesor_id is null) para cerrar la ventana. Comportamiento gated por reparto_v2.
 async function estadoDeptoParaReparto(user_id, departamentoId) {
   try {
-    if (!user_id || !departamentoId) return 'sin_miembros';
+    if (!user_id || !departamentoId) return { estado: 'sin_miembros', asesor: null };
     const _a = await elegirAsesorParaDepartamento(user_id, departamentoId);
-    if (_a) return 'asignable';
+    if (_a) return { estado: 'asignable', asesor: _a };
     // No hay candidato disponible: distinguir estructural (sin miembros / solo no_recibe) vs transitorio (pausa/horario).
     let membres = null;
     try {
@@ -1095,7 +1100,7 @@ async function estadoDeptoParaReparto(user_id, departamentoId) {
       try { const rm2 = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId); membres = (rm2.data || []).map(function(m){ return { asesor_id: m.asesor_id, modo: null }; }); } catch (eM2) { membres = []; }
     }
     const idsReciben = (membres || []).filter(function(m){ return m.modo == null || m.modo === 'recibe'; }).map(function(m){ return m.asesor_id; });
-    if (!idsReciben.length) return 'sin_miembros';
+    if (!idsReciben.length) return { estado: 'sin_miembros', asesor: null };
     // Hay miembros (por membresia) que reciben pero ninguno disponible. Ver si TODOS estan en 'no_recibe'
     // (estructural, solo aviso) o si al menos uno esta solo en pausa/horario (transitorio, espera con tope).
     let ases = null;
@@ -1103,11 +1108,11 @@ async function estadoDeptoParaReparto(user_id, departamentoId) {
       const r = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', user_id).eq('activo', true).in('id', idsReciben);
       ases = r.error ? null : r.data;
     } catch (eA) { ases = null; }
-    if (ases == null) return 'todos_pausa'; // no se pudo leer disponibilidad: tratar como transitorio (conservador)
-    if (!ases.length) return 'sin_miembros'; // los miembros no estan activos en esta cuenta
+    if (ases == null) return { estado: 'todos_pausa', asesor: null }; // no se pudo leer disponibilidad: tratar como transitorio (conservador)
+    if (!ases.length) return { estado: 'sin_miembros', asesor: null }; // los miembros no estan activos en esta cuenta
     const algunoNoEsNoRecibe = ases.some(function(a){ return a.disponibilidad !== 'no_recibe'; });
-    return algunoNoEsNoRecibe ? 'todos_pausa' : 'solo_no_recibe';
-  } catch (e) { return 'todos_pausa'; } // ante la duda, tratar como transitorio (espera con tope), no estructural
+    return { estado: (algunoNoEsNoRecibe ? 'todos_pausa' : 'solo_no_recibe'), asesor: null };
+  } catch (e) { return { estado: 'todos_pausa', asesor: null }; } // ante la duda, tratar como transitorio (espera con tope), no estructural
 }
 
 // Devuelve el id del departamento recibe_fallback (Administracion) de la cuenta, o null. Defensivo.
@@ -1279,16 +1284,18 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
           // (c) Sin departamento ni default: caer al picker actual (pool general) — conservador.
           _asesor = await elegirAsesorActivo(_ownerId);
         } else {
-          const _estado = await estadoDeptoParaReparto(_ownerId, _deptoObjetivo);
+          // BUG 4: una sola lectura de estado+picker; REUSAMOS el asesor que ya eligio (sin segunda llamada).
+          const _est = await estadoDeptoParaReparto(_ownerId, _deptoObjetivo);
+          const _estado = _est.estado;
           if (_estado === 'asignable') {
-            _asesor = await elegirAsesorParaDepartamento(_ownerId, _deptoObjetivo);
+            _asesor = _est.asesor; // reusado: NO se vuelve a llamar al picker (cierra la ventana de carrera)
           } else if (_estado === 'sin_miembros') {
             // (4a) Depto SIN miembros -> ir al depto recibe_fallback (Administracion) INMEDIATO (no esperar 30 min).
             const _fbId = await deptoFallbackDe(_ownerId);
             if (_fbId && _fbId !== _deptoObjetivo) {
               const _estFb = await estadoDeptoParaReparto(_ownerId, _fbId);
-              if (_estFb === 'asignable') {
-                _asesor = await elegirAsesorParaDepartamento(_ownerId, _fbId);
+              if (_estFb.estado === 'asignable') {
+                _asesor = _estFb.asesor; // reusado (sin segunda llamada al picker)
                 if (_asesor) { try { await supabase.from('conversations').update({ departamento_id: _fbId }).eq('id', convId); } catch (eUpD) {} }
               }
             }
@@ -1336,7 +1343,22 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
             if (_cv && _cv.status === 'listo_humano') { _updAsesor.status = 'en_conversacion'; }
           }
         }
-        await supabase.from('conversations').update(_updAsesor).eq('id', convId);
+        // BUG 4 (cerrar ventana de carrera): UPDATE CONDICIONAL where asesor_id is null. Si otro mensaje
+        // concurrente ya asigno un asesor, este update NO pisa nada (0 filas) y respetamos esa asignacion.
+        // Solo aplica al camino reparto_v2 (_v2). Con flag OFF, comportamiento ACTUAL EXACTO (update directo).
+        if (_v2) {
+          const { data: _asg } = await supabase.from('conversations').update(_updAsesor)
+            .eq('id', convId).is('asesor_id', null).select('asesor_id');
+          if (!_asg || !_asg.length) {
+            // Perdimos la carrera: otro request ya asigno. Releer el asesor real para el resto del flujo.
+            try {
+              const { data: _re } = await supabase.from('conversations').select('asesor_id').eq('id', convId).maybeSingle();
+              if (_re && _re.asesor_id) { _asesor = _re.asesor_id; } // ya hay asesor: no encolar ni ofrecer fuera-de-horario
+            } catch (eRe) {}
+          }
+        } else {
+          await supabase.from('conversations').update(_updAsesor).eq('id', convId);
+        }
       }
     }
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
@@ -4155,8 +4177,18 @@ async function _equipoParticipantesDepto(ownerId, departamentoId) {
   const { data: mem } = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', departamentoId);
   const idsAse = (mem || []).map(function(m){ return m.asesor_id; }).filter(Boolean);
   if (idsAse.length) {
-    const { data: ases } = await supabase.from('asesores').select('auth_user_id').eq('admin_id', ownerId).in('id', idsAse);
-    (ases || []).forEach(function(a){ if (a && a.auth_user_id) set[a.auth_user_id] = true; });
+    // BUG 2: el chat interno es HUMANO-a-humano. EXCLUIR asesores es_ia=true (no mandarles push a un bot).
+    // DEFENSIVO: si la columna es_ia no existe, reintentar sin ella (todos pasan, como antes).
+    let ases = null;
+    try {
+      const r = await supabase.from('asesores').select('auth_user_id, es_ia').eq('admin_id', ownerId).in('id', idsAse);
+      if (r.error) throw r.error;
+      ases = r.data;
+    } catch (eIa) {
+      const r2 = await supabase.from('asesores').select('auth_user_id').eq('admin_id', ownerId).in('id', idsAse);
+      ases = r2.data;
+    }
+    (ases || []).forEach(function(a){ if (a && a.auth_user_id && a.es_ia !== true) set[a.auth_user_id] = true; });
   }
   return Object.keys(set);
 }
@@ -4209,6 +4241,19 @@ app.get('/api/equipo/threads', async function(req, res) {
     const ident = await _equipoIdentidad(req);
     if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
 
+    // BUG 3 (AVISO, NO auto-sembrar): si reparto_v2 esta ON y la cuenta NO tiene NINGUN departamento activo,
+    // señalamos sin_departamentos=true para que el front muestre un aviso ("configura tus departamentos").
+    // NO se crea ningun departamento automaticamente. Defensivo: ante cualquier error queda false (no avisa).
+    let sinDepartamentos = false;
+    try {
+      if (await repartoV2Activo(ident.ownerId)) {
+        const { count: nDeptos } = await supabase.from('departamentos')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', ident.ownerId).eq('activo', true);
+        sinDepartamentos = !(nDeptos > 0);
+      }
+    } catch (eSD) { sinDepartamentos = false; }
+
     // 1) Asegurar/obtener los canales de departamento del usuario.
     const deptoIds = await _equipoDepartamentosDe(ident);
     const canales = [];
@@ -4227,7 +4272,7 @@ app.get('/api/equipo/threads', async function(req, res) {
       .eq('admin_id', ident.ownerId).eq('tipo', 'dm').contains('participantes', [ident.authUserId]);
 
     const threads = canales.concat(dms || []);
-    if (!threads.length) return res.json({ ok: true, threads: [], esDueno: ident.esDueno });
+    if (!threads.length) return res.json({ ok: true, threads: [], esDueno: ident.esDueno, sin_departamentos: sinDepartamentos });
 
     // 3) Resolver nombres de los "otros" en DMs (mapa auth_user_id -> nombre).
     const otrosIds = {};
@@ -4273,7 +4318,59 @@ app.get('/api/equipo/threads', async function(req, res) {
       const tb = b.ultimo ? new Date(b.ultimo.created_at).getTime() : 0;
       return tb - ta;
     });
-    return res.json({ ok: true, threads: out, esDueno: ident.esDueno });
+    return res.json({ ok: true, threads: out, esDueno: ident.esDueno, sin_departamentos: sinDepartamentos });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// BUG 1 (DM) + FEATURE 2 (IA asistente interno): GET /api/equipo/personas -> roster DM-eable del tenant.
+// CONTRATO EXACTO: { ok:true, personas: [{ auth_user_id, nombre, esDueno, esIa }] }, EXCLUYENDO al que pregunta
+// (no DM a si mismo). Incluye:
+//   (a) el DUEÑO del tenant -> { auth_user_id: ownerId, nombre: company_name || 'Dueño', esDueno:true, esIa:false }
+//       (siempre, salvo que el que pregunta SEA el dueño; el dueño no es fila en asesores).
+//   (b) TODOS los asesores con auth_user_id no nulo (HUMANOS y los es_ia=true) ->
+//       { auth_user_id, nombre, esDueno:false, esIa:(a.es_ia===true) }. Los es_ia se incluyen porque la IA es un
+//       ASISTENTE INTERNO DM-eable (decision de Diego): el front les pone el tag 'IA'. Aislado por tenant (admin_id=ownerId).
+// DEFENSIVO: si la columna es_ia no existe, se reintenta sin ella y esIa queda false para todos.
+// El front, al elegir una persona, hace POST /api/equipo/enviar { destino:{ tipo:'dm', auth_user_id }, content }.
+app.get('/api/equipo/personas', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+
+    const personas = [];
+    // (a) El DUEÑO del tenant (no es fila en asesores). Se omite si el que pregunta ES el dueño (no DM a si mismo).
+    if (ident.ownerId !== ident.authUserId) {
+      let nombreDueno = 'Dueño';
+      try {
+        const { data: bs } = await supabase.from('business_settings').select('company_name').eq('user_id', ident.ownerId).maybeSingle();
+        if (bs && bs.company_name && String(bs.company_name).trim()) nombreDueno = String(bs.company_name).trim();
+      } catch (eBs) {}
+      personas.push({ auth_user_id: ident.ownerId, nombre: nombreDueno, esDueno: true, esIa: false });
+    }
+
+    // (b) TODOS los asesores del tenant con auth_user_id no nulo (humanos Y los es_ia). DEFENSIVO: si la columna
+    //     es_ia no existe, reintentar sin ella (esIa queda false para todos).
+    let ases = null, _hayEsIa = true;
+    try {
+      const r = await supabase.from('asesores').select('auth_user_id, nombre, es_ia').eq('admin_id', ident.ownerId);
+      if (r.error) throw r.error;
+      ases = r.data;
+    } catch (eIa) {
+      _hayEsIa = false;
+      const r2 = await supabase.from('asesores').select('auth_user_id, nombre').eq('admin_id', ident.ownerId);
+      ases = r2.data;
+    }
+    const vistos = {};
+    vistos[ident.authUserId] = true; // nunca incluir al que pregunta
+    if (ident.ownerId !== ident.authUserId) vistos[ident.ownerId] = true; // el dueño ya se agrego arriba
+    (ases || []).forEach(function(a){
+      if (!a || !a.auth_user_id) return;          // sin login: no DM-eable
+      if (vistos[a.auth_user_id]) return;         // dedupe (incluye al que pregunta y al dueño)
+      vistos[a.auth_user_id] = true;
+      personas.push({ auth_user_id: a.auth_user_id, nombre: (a.nombre || 'Compañero'), esDueno: false, esIa: (_hayEsIa && a.es_ia === true) });
+    });
+
+    return res.json({ ok: true, personas: personas });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -4316,6 +4413,108 @@ app.get('/api/equipo/mensajes', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// FEATURE 2 (IA como ASISTENTE INTERNO — decision de Diego): genera y guarda la respuesta INTERNA de un usuario IA
+// a un DM del equipo, usando Haiku (claude-haiku-4-5, barato). Se invoca FIRE-AND-FORGET desde /api/equipo/enviar
+// DESPUES de insertar el mensaje humano (no bloquea la respuesta del endpoint).
+// CONTRATO/GATING (todo defensivo, NUNCA tira al caller):
+//   - El thread debe ser un DM y `otroAuthId` el OTRO participante. Solo responde si ese otro es un asesor es_ia=true
+//     de ESTE tenant (admin_id=ownerId). AISLAMIENTO: la IA solo lee datos del MISMO tenant (ownerId).
+//   - GATED POR PAUSA: si el tenant esta en pausa total del Maestro (crm_pausado / _pausaGlobal) o pausa de IA
+//     (agente_pausado), NO responde (no gasta tokens).
+//   - Persona: agente_config del usuario IA (sanearAgenteConfig). Conocimiento: knowledge_base del tenant.
+//     Contexto: ultimos N team_messages del hilo. La respuesta se inserta como team_message del auth_user_id de la IA
+//     (leido_por arranca con la IA). NO se manda push FCM a la IA (no tiene device).
+//   - 🔴 GASTO: 1 llamada Haiku por pregunta interna a la IA. Se contabiliza con registrarUsoTokens(ownerId, ...).
+async function _equipoRespuestaIaInterna(ownerId, thread, otroAuthId) {
+  try {
+    if (!ownerId || !thread || thread.tipo !== 'dm' || !otroAuthId) return;
+
+    // 1) El OTRO participante debe ser un asesor es_ia=true de ESTE tenant. DEFENSIVO: si es_ia no existe -> no es IA.
+    let aseIa = null;
+    try {
+      const r = await supabase.from('asesores').select('id, es_ia, agente_config, nombre').eq('auth_user_id', otroAuthId).eq('admin_id', ownerId).maybeSingle();
+      if (r.error) throw r.error;
+      aseIa = r.data;
+    } catch (eCol) { return; } // sin columna es_ia o error -> tratamos como NO-IA (no responder)
+    if (!aseIa || aseIa.es_ia !== true) return; // el destino no es un usuario IA -> nada que hacer
+
+    // 2) GATED POR PAUSA (no gastar tokens si la IA esta apagada para este tenant).
+    let _bs = null;
+    try {
+      const r = await supabase.from('business_settings').select('crm_pausado, agente_pausado, eliminado_at').eq('user_id', ownerId).maybeSingle();
+      _bs = r.data;
+    } catch (eBs) { _bs = null; }
+    if (_pausaGlobal === true) return;                                   // kill-switch global del Maestro
+    if (_bs && (_bs.crm_pausado === true || _bs.eliminado_at)) return;   // pausa total / papelera del tenant
+    if (_bs && _bs.agente_pausado === true) return;                      // pausa de IA ("solo atencion")
+
+    // 3) Persona del usuario IA + knowledge_base del TENANT (aislamiento por ownerId).
+    const persona = sanearAgenteConfig(aseIa.agente_config, (aseIa.nombre || null));
+    let kbTxt = '';
+    try {
+      const { data: kb } = await supabase.from('knowledge_base').select('question, answer').eq('user_id', ownerId).limit(60);
+      kbTxt = (kb || []).map(function(k){ return '- ' + String(k.question || '').slice(0, 200) + ': ' + String(k.answer || '').slice(0, 400); }).join('\n').slice(0, 4000);
+    } catch (eKb) { kbTxt = ''; }
+
+    // 4) Contexto reciente del hilo (ultimos N mensajes). Mapear remitente -> 'IA' (la propia) vs 'Compañero'.
+    const N = 12;
+    let recientes = [];
+    try {
+      const { data: msgs } = await supabase.from('team_messages')
+        .select('sender_auth_user_id, content, created_at')
+        .eq('thread_id', thread.id).eq('admin_id', ownerId)
+        .order('created_at', { ascending: false }).limit(N);
+      recientes = (msgs || []).slice().reverse();
+    } catch (eM) { recientes = []; }
+    const histTxt = recientes.map(function(m){
+      const quien = (m.sender_auth_user_id === otroAuthId) ? 'Vos (asistente IA)' : 'Compañero';
+      return quien + ': ' + String(m.content || '').slice(0, 600);
+    }).join('\n').slice(0, 6000);
+    if (!histTxt) return; // nada que contestar
+
+    // 5) Prompt INTERNO (Haiku). La IA es un ASISTENTE del EQUIPO (no del lead): contesta consultas internas tipo
+    //    'resumime el lead X' / '¿que sabes de Y?'. Solo con datos de ESTE tenant. Si no sabe, lo dice (no inventa).
+    let sys = 'Sos un ASISTENTE INTERNO del equipo de trabajo (chat interno entre compañeros, NO con un cliente). '
+      + 'Respondes consultas internas del equipo de forma breve, util y directa, en español rioplatense. '
+      + 'Solo usas la informacion del negocio que se te da mas abajo; si no la tenes, decilo con sinceridad y NO inventes datos.';
+    if (persona && persona.persona) {
+      if (persona.nombre) sys += '\nTu nombre: ' + persona.nombre + '.';
+      if (persona.formaHablar) sys += '\nForma de hablar: ' + persona.formaHablar + '.';
+      if (persona.objetivo) sys += '\nObjetivo: ' + persona.objetivo + '.';
+      if (persona.noHacer) sys += '\nNo hagas: ' + persona.noHacer + '.';
+    }
+    if (kbTxt) sys += '\n\nBase de conocimiento del negocio (lo unico que sabes con certeza):\n' + kbTxt;
+
+    let respuesta = '';
+    try {
+      const r = await anthropic.messages.create({
+        model: 'claude-haiku-4-5', // FEATURE 2: consulta INTERNA del equipo => Haiku (barato), NUNCA Sonnet.
+        max_tokens: 400,
+        system: sys,
+        messages: [{ role: 'user', content: 'Conversacion interna reciente (vos sos el asistente IA):\n' + histTxt + '\n\nRespondé al ultimo mensaje del compañero.' }]
+      });
+      // 🔴 GASTO: contabilizar el Haiku contra el TENANT (regla 17).
+      try { if (r && r.usage) await registrarUsoTokens(ownerId, r.usage, 'equipo_chat_interno', PRECIO_HAIKU); } catch (eU) {}
+      respuesta = (r && r.content && r.content[0] && r.content[0].text) ? String(r.content[0].text).trim() : '';
+    } catch (eIa) { return; } // error de IA (saldo, red): no insertar nada, el caller ya respondio
+
+    if (!respuesta) return;
+
+    // 6) Insertar la respuesta como mensaje del usuario IA. leido_por arranca con la IA (ya "leyo" lo suyo).
+    //    NO se manda push FCM a la IA (no tiene device); el front la vera al refrescar el hilo.
+    try {
+      await supabase.from('team_messages').insert({
+        thread_id: thread.id,
+        admin_id: ownerId,
+        sender_auth_user_id: otroAuthId,
+        content: respuesta.slice(0, 4000),
+        media_url: null,
+        leido_por: [otroAuthId]
+      });
+    } catch (eIns) {}
+  } catch (e) { console.error('_equipoRespuestaIaInterna:', e && e.message); }
+}
+
 // POST /api/equipo/enviar { thread_id | destino, content, media_url? }
 //   - thread_id: enviar a un hilo existente (canal o dm) del que el usuario participa.
 //   - destino:   { tipo:'dm', auth_user_id } o { tipo:'departamento', departamento_id }
@@ -4343,7 +4542,14 @@ app.post('/api/equipo/enviar', async function(req, res) {
         // El destino debe pertenecer al MISMO tenant: o es el dueno, o es un asesor con admin_id=ownerId.
         let valido = (otro === ident.ownerId);
         if (!valido) {
-          const { data: aseDest } = await supabase.from('asesores').select('id').eq('auth_user_id', otro).eq('admin_id', ident.ownerId).maybeSingle();
+          // FEATURE 2: la IA es un ASISTENTE INTERNO DM-eable (decision de Diego). El destino solo debe pertenecer
+          // al MISMO tenant (admin_id=ownerId); los es_ia=true ya NO se rechazan (responden DMs internos con Haiku).
+          // Solo validamos pertenencia al equipo. DEFENSIVO: lectura simple por auth_user_id + admin_id.
+          let aseDest = null;
+          try {
+            const r = await supabase.from('asesores').select('id').eq('auth_user_id', otro).eq('admin_id', ident.ownerId).maybeSingle();
+            aseDest = r.data;
+          } catch (eDest) { aseDest = null; }
           valido = !!aseDest;
         }
         if (!valido) return res.status(403).json({ error: 'Destino fuera de tu equipo' });
@@ -4397,6 +4603,19 @@ app.post('/api/equipo/enviar', async function(req, res) {
       // Reusa el push FCM existente (0 tokens IA). bodyLiteral fuerza el texto del chat interno.
       try { await enviarPushAsesor(finales[i], nombreRemitente, '', 'Chat interno: ' + cuerpo); } catch (eP) {}
     }
+
+    // FEATURE 2 (IA como ASISTENTE INTERNO): si este thread es un DM cuyo OTRO participante es un asesor es_ia de
+    // ESTE tenant, disparamos (FIRE-AND-FORGET, sin bloquear la respuesta del endpoint) una respuesta interna con
+    // Haiku. 🔴 GASTO: 1 Haiku por pregunta interna a la IA (gated por pausa + aislado por tenant). El helper hace
+    // su propia validacion de pausa/identidad/tenant; aca solo evitamos el trabajo si el destino claramente no es IA.
+    if (thread.tipo === 'dm') {
+      const otroDm = (thread.participantes || []).find(function(p){ return p && p !== ident.authUserId; }) || null;
+      if (otroDm && content) {
+        // No await: que la respuesta del endpoint salga ya. El helper traga sus propios errores.
+        _equipoRespuestaIaInterna(ident.ownerId, thread, otroDm).catch(function(){});
+      }
+    }
+
     return res.json({ ok: true, id: msg && msg.id, thread_id: thread.id, created_at: msg && msg.created_at });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

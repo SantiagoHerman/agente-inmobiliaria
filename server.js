@@ -8340,6 +8340,75 @@ app.post('/api/conversations/cerrar', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== ELIMINAR LEAD (HARD DELETE) desde el panel de conversaciones =====
+// CONTRATO PARA EL FRONTEND:
+//   POST /api/conversations/eliminar  { conversation_id }   (Authorization: Bearer <token>, igual que /cerrar)
+//   Efecto: BORRADO DEFINITIVO (NO papelera) de la conversacion + TODOS sus mensajes + el contacto del lead,
+//           SOLO de esa conversacion. Respuesta: { ok:true }.
+// PERMISOS (regla dura): SOLO ADMINISTRADOR. Lo puede hacer el DUEÑO de la cuenta (auth_user_id === user_id del
+//   tenant, sin fila en `asesores`) O un asesor con visibilidad 'generales' (mismo criterio que esAdministrador()).
+//   Un asesor COMUN NO puede -> 403. El frontend ademas solo muestra el boton a admins (esAdminRol).
+// AISLAMIENTO POR TENANT (regla dura): el backend usa SERVICE KEY (bypassa RLS), asi que se verifica EXPLICITAMENTE
+//   que la conversacion pertenezca al tenant del que pide (su user_id si es dueño, o su admin_id si es asesor)
+//   ANTES de borrar. Si es de otra cuenta -> 403. Jamas se tocan datos de otro tenant.
+// ORDEN FK (hard delete, scopeado a esa conv/contacto): primero las tablas hijas que referencian la conversacion
+//   o el contacto (messages, citas, recontactos, aprendizaje_ia), luego la conversation, y por ultimo el contact.
+//   Best-effort por tabla (si alguna no existe en el esquema, no rompe), pero messages+conversation son criticas.
+app.post('/api/conversations/eliminar', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var conversation_id = req.body && req.body.conversation_id;
+    if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
+
+    // 1) Traer la conversacion (tenant dueño = user_id, y el contacto a borrar).
+    var c = await supabase.from('conversations').select('user_id, contact_id').eq('id', conversation_id).maybeSingle();
+    if (!c.data) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    var tenantId = c.data.user_id;
+    var contactId = c.data.contact_id;
+
+    // 2) Resolver identidad + AISLAMIENTO POR TENANT + SOLO ADMINISTRADOR (mismo patron que /cerrar y esAdministrador).
+    //    DUEÑO: auth_user_id === user_id del tenant y SIN fila en asesores -> es admin.
+    //    ASESOR: debe ser de la MISMA cuenta (admin_id === tenant) Y tener visibilidad 'generales' (esAdministrador()).
+    var esAdmin = false;
+    if (uid === tenantId) {
+      // Podria ser el dueño, o un asesor cuyo auth_user_id coincide. Chequeamos si hay fila de asesor.
+      var aSelf = await supabase.from('asesores').select('admin_id, rol, visibilidad').eq('auth_user_id', uid).maybeSingle();
+      if (!aSelf.data) { esAdmin = true; }                                  // dueño puro
+      else { esAdmin = (aSelf.data.admin_id === tenantId || !aSelf.data.admin_id) && esAdministrador(aSelf.data); }
+    } else {
+      var a = await supabase.from('asesores').select('admin_id, rol, visibilidad').eq('auth_user_id', uid).maybeSingle();
+      // Aislamiento: el asesor debe pertenecer a este tenant. Solo-admin: visibilidad 'generales'.
+      if (!a.data || a.data.admin_id !== tenantId) return res.status(403).json({ error: 'No autorizado' });
+      esAdmin = esAdministrador(a.data);
+    }
+    if (!esAdmin) return res.status(403).json({ error: 'Solo un administrador puede eliminar un lead' });
+
+    // 3) HARD DELETE respetando FKs, SCOPEADO a esta conversacion / contacto (nunca de mas).
+    //    Hijas que referencian la conversacion (best-effort por tabla; messages es critica).
+    var delMsg = await supabase.from('messages').delete().eq('conversation_id', conversation_id);
+    if (delMsg && delMsg.error) return res.status(500).json({ error: 'No se pudieron borrar los mensajes: ' + delMsg.error.message });
+    try { await supabase.from('citas').delete().eq('conversation_id', conversation_id); } catch (eC) {}
+    try { await supabase.from('recontactos').delete().eq('conversation_id', conversation_id); } catch (eR) {}
+    try { await supabase.from('aprendizaje_ia').delete().eq('conversation_id', conversation_id); } catch (eA) {}
+
+    //    La conversacion (critica). Re-scopeada por user_id (defensa en profundidad del aislamiento por tenant).
+    var delConv = await supabase.from('conversations').delete().eq('id', conversation_id).eq('user_id', tenantId);
+    if (delConv && delConv.error) return res.status(500).json({ error: 'No se pudo borrar la conversacion: ' + delConv.error.message });
+
+    //    El contacto del lead, SOLO si esta conversacion lo tenia (scopeado por contact_id + user_id del tenant).
+    //    Antes limpiamos las hijas que referencian al contacto y que no esten ligadas a la conv ya borrada.
+    if (contactId) {
+      try { await supabase.from('citas').delete().eq('contact_id', contactId); } catch (eCC) {}
+      try { await supabase.from('recontactos').delete().eq('contact_id', contactId); } catch (eRC) {}
+      var delCont = await supabase.from('contacts').delete().eq('id', contactId).eq('user_id', tenantId);
+      if (delCont && delCont.error) return res.status(500).json({ error: 'No se pudo borrar el contacto: ' + delCont.error.message });
+    }
+
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // CHEQUEO DIARIO de CONSUMO ANOMALO de IA por cliente (best-effort, jamas rompe). Reusa la MISMA logica
 // de anomalia del endpoint /api/maestro/consumo (costo > 3x la mediana con piso $1, o supera el tope $15)
 // sobre las ULTIMAS 24h. Por cada cliente anomalo nuevo crea una notif 'consumo_anomalo' (warning), con

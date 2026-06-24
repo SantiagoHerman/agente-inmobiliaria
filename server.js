@@ -2887,6 +2887,31 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       }).eq('id', conv.id);
     }
 
+    // ===== PARTE A (REGLA 22): RETORNO DEL LEAD A UN CASO CERRADO =====
+    // GATED por reparto_v2 (DEFENSIVO). Con el flag OFF (o columna ausente) NADA de esto corre -> comportamiento
+    // ACTUAL EXACTO: un lead 'cerrado' que escribe sigue como hoy (la IA responde si ai_enabled!==false, porque el
+    // status 'cerrado' nunca freno la generacion, solo el recontacto). El cierre completo (status=cerrado + asesor
+    // null + IA reactivada) lo aplica la DERIVACION (boton "Cerrar caso" del frontend / endpoint /api/conversations/cerrar).
+    //
+    //   - status='cerrado' + ai_enabled=true  => el lead "revive": volvemos a 'en_conversacion' y dejamos correr el
+    //                                            CICLO NORMAL de abajo (la IA atiende, clasifica, deriva, etc.).
+    //   - status='cerrado' + ai_enabled=false => DORMIDO: la IA quedo apagada a mano. El mensaje YA se guardo (paso 4),
+    //                                            pero NO reactivamos ni respondemos. NO tocamos ai_enabled. El gate de
+    //                                            mas abajo (ai_enabled===false) corta sin responder hasta que un humano
+    //                                            lo derive o reactive la IA a mano.
+    // El mensaje entrante ya quedo guardado arriba (paso 4): no se pierde nada en ningun caso.
+    if (convExistente && convExistente.status === 'cerrado' && conv.ai_enabled !== false) {
+      try {
+        if (await repartoV2Activo(user_id, _bsGate)) {
+          await supabase.from('conversations').update({
+            status: 'en_conversacion',
+            updated_at: new Date().toISOString()
+          }).eq('id', conv.id);
+          conv.status = 'en_conversacion'; // sincronizar el objeto en memoria: el ciclo de abajo lo trata como conv viva
+        }
+      } catch (eRev) { console.error('retorno lead cerrado:', eRev && eRev.message); }
+    }
+
     // 5) Si la IA esta activa, responder por WhatsApp.
     // (La pausa TOTAL del Maestro -crm_pausado- y la papelera -eliminado_at- ya cortaron mas arriba, ANTES de
     //  gastar un solo token. Aca queda solo la pausa POR-CONVERSACION: el agente no responde, pero el mensaje
@@ -3775,9 +3800,15 @@ async function revisarAvisosInternos() {
       const { data } = await supabase.from('business_settings').select('user_id, avisos_internos, aviso_resumen_fecha').not('avisos_internos', 'is', null);
       tenants = data || [];
     } catch (eT) { tenants = []; }
-    const hoyStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC; suficiente para dedupe diario)
-    const horaActual = new Date().getHours();
-    const minActual = new Date().getMinutes();
+    // FIX HORARIO (aviso #3): los tenants son de ARGENTINA (UTC-3). Antes se comparaba contra la hora UTC
+    // del server y se deduplicaba por la fecha UTC, lo que disparaba el resumen 3hs corridas y podia cruzar
+    // de dia a la medianoche local. Calculamos la hora local y la fecha local con offset fijo Argentina (-3).
+    // A FUTURO esto podria ser un offset por-tenant (business_settings.tz/utc_offset); por ahora -3 hardcodeado.
+    const _ARG_OFFSET_HORAS = -3;
+    const _ahoraArg = new Date(Date.now() + _ARG_OFFSET_HORAS * 60 * 60 * 1000); // "ahora" desplazado a hora Argentina (leido via getUTC*)
+    const hoyStr = _ahoraArg.toISOString().slice(0, 10); // YYYY-MM-DD en fecha LOCAL Argentina (dedupe diario correcto)
+    const horaActual = _ahoraArg.getUTCHours();   // hora LOCAL Argentina
+    const minActual = _ahoraArg.getUTCMinutes();  // minuto LOCAL Argentina
     for (let i = 0; i < tenants.length; i++) {
       const row = tenants[i];
       const ownerId = row.user_id;
@@ -8266,6 +8297,46 @@ app.post('/api/conversations/resumen', async function(req, res){
     if (!resumen) return res.status(422).json({ error: 'No se pudo generar el resumen (sin mensajes o error de IA)' });
     await supabase.from('conversations').update({ summary: resumen, updated_at: new Date().toISOString() }).eq('id', conversation_id);
     return res.json({ ok: true, summary: resumen });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== PARTE A (REGLA 22): CERRAR CASO desde la DERIVACION =====
+// CONTRATO PARA EL FRONTEND:
+//   POST /api/conversations/cerrar  { conversation_id }   (Authorization: Bearer <token>, igual que /resumen)
+//   Efecto (los 3 juntos, GATED por reparto_v2 ON): status='cerrado' + asesor_id=NULL + ai_enabled=true (IA reactivada).
+//   SIN recontacto: el status 'cerrado' ya frena el recontacto (no se toca esa logica). El caso queda a la espera de
+//   que el lead vuelva a escribir; cuando lo haga, el webhook lo "revive" (status='cerrado'+ai_enabled=true ->
+//   'en_conversacion' y corre el ciclo normal). Respuesta: { ok:true, status:'cerrado', ... }.
+// GATING (regla dura): con reparto_v2 OFF (o columna ausente) este endpoint NO cambia nada y responde 409
+//   { ok:false, gated:true } -> el frontend debe seguir usando el flujo ACTUAL (no mostrar el boton "Cerrar caso").
+// DEFENSIVO: el update pide solo las 3 columnas que sabemos que existen (status/asesor_id/ai_enabled ya se usan en todo
+//   el codigo); si el update fallara, responde 409 sin romper. Aislado por tenant (mismo check de dueño/asesor que /resumen).
+app.post('/api/conversations/cerrar', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var conversation_id = req.body && req.body.conversation_id;
+    if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
+    var c = await supabase.from('conversations').select('user_id').eq('id', conversation_id).maybeSingle();
+    if (!c.data) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    // Permitir al DUEÑO o a un ASESOR de la misma cuenta (mismo criterio de aislamiento que /resumen).
+    if (c.data.user_id !== uid) {
+      var aRes = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (!aRes.data || aRes.data.admin_id !== c.data.user_id) return res.status(403).json({ error: 'No autorizado' });
+    }
+    // REGLA DURA: solo con reparto_v2 ON del DUEÑO de la conversacion. Con flag OFF -> no tocar nada (comportamiento actual).
+    if (!(await repartoV2Activo(c.data.user_id))) {
+      return res.status(409).json({ ok: false, gated: true, error: 'reparto_v2 desactivado: cerrar-caso no disponible' });
+    }
+    // Los 3 efectos del cierre, en un solo update (defensivo: si fallara, 409 sin romper).
+    var upd = await supabase.from('conversations').update({
+      status: 'cerrado',
+      asesor_id: null,
+      ai_enabled: true,
+      updated_at: new Date().toISOString()
+    }).eq('id', conversation_id);
+    if (upd && upd.error) return res.status(409).json({ ok: false, error: 'No se pudo cerrar: ' + (upd.error.message || 'error de esquema') });
+    return res.json({ ok: true, status: 'cerrado', asesor_id: null, ai_enabled: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

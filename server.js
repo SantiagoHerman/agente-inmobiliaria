@@ -130,7 +130,9 @@ app.use(async function(req, res, next) {
 });
 
 const PORT = process.env.PORT || 3001;
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '' });
+// FASE 0 failover: el SDK ya reintenta 408/409/429/5xx (incluido 529 Overloaded) y respeta retry-after.
+// Subimos de 2 (default) a 4 reintentos para aguantar baches cortos de Anthropic sin caer en el silencio. 0 tokens extra (un reintento fallido no factura).
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '', maxRetries: 4 });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');
 
 // === Notificaciones push (FCM) via firebase-admin ===
@@ -588,6 +590,36 @@ async function avisarSiIaSinSaldo(err) {
       if (ya && ya.data && ya.data.length) return;
     } catch (eDup) { /* si la consulta falla, igual avisamos (mejor avisar de mas que callar un corte de IA) */ }
     crearNotifMaestro('ia_sin_saldo', 'La IA dejo de responder', 'Saldo de Anthropic agotado o insuficiente. Recarga creditos.', { severidad: 'critico' }).catch(function(){});
+  } catch (e) {}
+}
+
+// ============ FASE 0 FAILOVER: degradacion elegante ante caida del PROVEEDOR de IA (Anthropic) ============
+// Texto fijo al lead cuando la IA no pudo responder tras los reintentos del SDK (0 tokens de IA).
+const MSG_DEMORA_IA = 'Perdon, estamos con mucha demanda en este momento. Ya le aviso a un companero del equipo para que te responda a la brevedad 🙌';
+
+// Detecta si un error de anthropic.messages.create es un corte TRANSITORIO del proveedor (529 Overloaded, 5xx,
+// timeout, ECONNRESET) tras agotarse los reintentos del SDK. El saldo agotado NO cuenta (lo maneja avisarSiIaSinSaldo).
+function esErrorTransitorioIA(err) {
+  try {
+    var status = err && (err.status || err.statusCode);
+    var msg = String((err && err.message) || err || '').toLowerCase();
+    if (msg.indexOf('credit balance') >= 0 || msg.indexOf('insufficient') >= 0) return false;
+    if (status === 529 || (typeof status === 'number' && status >= 500)) return true;
+    if (status === 429) return true;
+    return /overloaded|timeout|timed out|econnreset|enotfound|econnrefused|socket hang up|network|fetch failed/.test(msg);
+  } catch (e) { return false; }
+}
+
+// Avisa al Maestro UNA vez cada 15 min (dedupe) que la IA esta caida por el proveedor. Best-effort: jamas relanza.
+async function avisarSiIaCaida(err) {
+  try {
+    if (!esErrorTransitorioIA(err)) return;
+    try {
+      var desde = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'ia_caida').gte('created_at', desde).limit(1);
+      if (ya && ya.data && ya.data.length) return;
+    } catch (eDup) {}
+    crearNotifMaestro('ia_caida', 'La IA no responde (proveedor)', 'Anthropic devolvio errores transitorios (529/5xx/timeout) tras los reintentos. Algunos leads recibieron un mensaje de demora y quedaron marcados para atencion humana.', { severidad: 'critico' }).catch(function(){});
   } catch (e) {}
 }
 
@@ -3516,7 +3548,20 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             } catch (eMem) {}
           }
         }
-      } catch (eGen) { console.error('Error generando respuesta (debounce):', eGen && eGen.message); try { avisarSiIaSinSaldo(eGen); } catch (eSaldo) {} }
+      } catch (eGen) {
+        console.error('Error generando respuesta (debounce):', eGen && eGen.message);
+        try { avisarSiIaSinSaldo(eGen); } catch (eSaldo) {}
+        // FASE 0 — DEGRADACION ELEGANTE: si fue un corte TRANSITORIO del proveedor (no saldo), en vez de SILENCIO:
+        // 1) mensaje fijo de demora al lead (0 tokens)  2) marca para retomar (derivarAHumano, resumen:false = NO llama IA)  3) aviso al Maestro.
+        try {
+          if (esErrorTransitorioIA(eGen) && telefono) {
+            try { await enviarWhatsapp(instanciaNombre, telefono, MSG_DEMORA_IA); } catch (eEnv) { console.error('demora IA envio:', eEnv && eEnv.message); }
+            try { await supabase.from('messages').insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: MSG_DEMORA_IA, enviado_por: 'Agente IA' }); } catch (eIns) {}
+            try { await derivarAHumano(_convId, user_id, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', pushTexto: (data.pushName || telefono), resumen: false }); } catch (eDer) { console.error('demora IA derivar:', eDer && eDer.message); }
+            try { await avisarSiIaCaida(eGen); } catch (eAv) {}
+          }
+        } catch (eDeg) { console.error('degradacion IA wa:', eDeg && eDeg.message); }
+      }
       finally {
         // Siempre liberar _genEnCurso: la conv nunca queda trabada y un eventual reintento ya
         // agendado por un mensaje nuevo podra disparar y responder.
@@ -9595,7 +9640,18 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
       // via attachment de la Send API, transcripcion de audio, traduccion entrante/saliente. Por ahora
       // multicanal hace lo minimo: texto. El envio de _ok=false ya quedo logueado en enviarMensajeMeta.
     }
-  } catch (e) { console.error('procesarMensajeMeta error:', e && e.message); }
+  } catch (e) {
+    console.error('procesarMensajeMeta error:', e && e.message);
+    // FASE 0 — Degradacion elegante en el canal Meta (mismo criterio que WhatsApp).
+    try {
+      if (esErrorTransitorioIA(e) && conv && conv.id && creds && senderId) {
+        try { await enviarMensajeMeta(creds.page_access_token, senderId, MSG_DEMORA_IA); } catch (eEnv) {}
+        try { await supabase.from('messages').insert({ conversation_id: conv.id, user_id: tenantUserId, role: 'ai', content: MSG_DEMORA_IA, enviado_por: 'Agente IA' }); } catch (eIns) {}
+        try { await derivarAHumano(conv.id, tenantUserId, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', resumen: false }); } catch (eDer) {}
+        try { await avisarSiIaCaida(e); } catch (eAv) {}
+      }
+    } catch (eDeg) { console.error('degradacion IA meta:', eDeg && eDeg.message); }
+  }
 }
 
 // --- GET /api/webhook/meta : verificacion del webhook (handshake de Meta). ---

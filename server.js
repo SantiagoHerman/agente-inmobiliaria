@@ -711,6 +711,9 @@ async function registrarConsultaAprendizaje(user_id, conversation_id, pregunta) 
     const _texto = 'El asistente tuvo una consulta que no supo resolver y necesita tu ayuda:\n\n"' + String(pregunta).trim().slice(0, 500) + '"\n\nRespondeme aca como deberia contestarse y, si tiene logica, lo guardo como regla para toda la cuenta.';
     if (_wa) { try { await enviarWhatsapp(nombreInstancia(user_id), _wa, _texto); } catch (eWa) { console.error('aprendizaje aviso dueno:', eWa && eWa.message); } }
     try { await enviarPushAsesor(user_id, 'El asistente necesita tu ayuda', null, String(pregunta).trim().slice(0, 180)); } catch (eP) {}
+    // AVISO INTERNO #1 (NO RESUELVE): ADEMAS de lo de arriba (sin removerlo), si avisos_internos.no_resuelve esta ON,
+    // postear un aviso interno en el chat del equipo (texto fijo + SQL, SIN IA, 0 tokens). Gated/defensivo adentro.
+    try { _avisoNoResuelve(user_id, conversation_id, pregunta).catch(function(){}); } catch (eAv) {}
     return true;
   } catch (e) { console.error('registrarConsultaAprendizaje:', e && e.message); return false; }
 }
@@ -1247,7 +1250,14 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     if (opts.setStatus) {
       const _upd = { status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() };
       if (typeof opts.lastMessage === 'string') { _upd.last_message = opts.lastMessage; _upd.last_role = opts.lastRole || 'ai'; }
-      await supabase.from('conversations').update(_upd).eq('id', convId);
+      // AVISO #2 (LEAD CALIENTE): registrar el momento de la derivacion. DEFENSIVO: si la columna derivado_at no
+      // existe, el update falla y reintentamos sin ella (el cron cae a updated_at como anchor). 0 tokens de IA.
+      try {
+        const { error: _eDer } = await supabase.from('conversations').update(Object.assign({ derivado_at: new Date().toISOString(), aviso_caliente_enviado: false }, _upd)).eq('id', convId);
+        if (_eDer) throw _eDer;
+      } catch (eDer) {
+        try { await supabase.from('conversations').update(_upd).eq('id', convId); } catch (eDer2) {}
+      }
     }
     // 2) Elegir/asignar asesor (solo si no tiene y no lo tomo el admin) — criterio identico al actual.
     // ETAPA 7: con reparto_v2 ON tambien necesitamos departamento_id para el picker por departamento.
@@ -3678,6 +3688,136 @@ async function escalarLeadsEnColaVencidos() {
   finally { _escalarEnCurso = false; }
 }
 
+// ============================================================================
+// CRON: AVISOS INTERNOS DE LA IA (#2 lead caliente, #3 resumen diario).
+// TEXTO FIJO + SQL, *SIN NINGUNA LLAMADA DE IA* (0 tokens). TODO opt-in / DEFAULT OFF:
+// cada aviso solo corre si el dueno lo prendio en business_settings.avisos_internos.
+// Lectura defensiva (columnas/keys ausentes => OFF). Aislado por tenant. Dedupe propio.
+// ============================================================================
+const _avisoCalienteMem = new Set();   // dedupe en memoria del aviso #2 (red dentro del proceso)
+var _avisosInternosEnCurso = false;
+async function revisarAvisosInternos() {
+  if (_avisosInternosEnCurso) return;
+  _avisosInternosEnCurso = true;
+  try {
+    const ahoraMs = Date.now();
+
+    // ===== AVISO #2 — LEAD CALIENTE SIN RESPUESTA =====
+    // Leads EN COLA (listo_humano, sin asesor, admin no la tomo) derivados hace >= minutos y sin respuesta humana.
+    let enCola = [];
+    try {
+      // Intento con derivado_at (anchor preciso). Si la columna no existe, caemos al set sin ella.
+      const r = await supabase.from('conversations')
+        .select('id, user_id, departamento_id, updated_at, derivado_at, aviso_caliente_enviado')
+        .eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+      if (r.error) throw r.error;
+      enCola = r.data || [];
+    } catch (eCol) {
+      try {
+        const r2 = await supabase.from('conversations')
+          .select('id, user_id, departamento_id, updated_at')
+          .eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+        enCola = r2.data || [];
+      } catch (eCol2) { enCola = []; }
+    }
+    const _cfgCache = {};
+    for (let i = 0; i < enCola.length; i++) {
+      const conv = enCola[i];
+      const ownerId = conv.user_id;
+      if (!ownerId) continue;
+      if (conv.aviso_caliente_enviado === true) continue;     // dedupe persistente
+      if (_avisoCalienteMem.has(conv.id)) continue;           // dedupe en memoria
+      if (!(ownerId in _cfgCache)) _cfgCache[ownerId] = await _avisosConfig(ownerId);
+      const cfg = _cfgCache[ownerId];
+      if (!cfg.lead_caliente.on) continue;                    // DEFAULT OFF
+      const minutos = cfg.lead_caliente.minutos || 20;
+      // Anchor de la derivacion: derivado_at si existe, si no updated_at.
+      let anchorMs = conv.derivado_at ? new Date(conv.derivado_at).getTime() : (conv.updated_at ? new Date(conv.updated_at).getTime() : 0);
+      if (!anchorMs || (ahoraMs - anchorMs) < minutos * 60 * 1000) continue;  // todavia no cumplio el tope
+      // ¿Alguien del equipo respondio despues de la derivacion? (mensaje role='human' posterior al anchor).
+      let respondio = false;
+      try {
+        const { data: hm } = await supabase.from('messages').select('id')
+          .eq('conversation_id', conv.id).eq('role', 'human')
+          .gt('created_at', new Date(anchorMs).toISOString()).limit(1).maybeSingle();
+        if (hm) respondio = true;
+      } catch (eHm) {}
+      if (respondio) { _avisoCalienteMem.add(conv.id); continue; } // ya lo atendieron: no avisar
+      // Nombre del lead + del depto (SQL, sin IA).
+      let leadRef = 'un lead';
+      try {
+        const { data: cv2 } = await supabase.from('conversations').select('contact_id').eq('id', conv.id).maybeSingle();
+        if (cv2 && cv2.contact_id) {
+          const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', cv2.contact_id).maybeSingle();
+          if (ct) {
+            const _n = (ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '';
+            const _t = (ct.phone && String(ct.phone).trim()) ? String(ct.phone).trim() : '';
+            leadRef = (_n || _t) ? (_n + (_t ? (_n ? ' (' + _t + ')' : _t) : '')) : 'un lead';
+          }
+        }
+      } catch (eL) {}
+      let deptoNombre = '';
+      if (conv.departamento_id) {
+        try { const { data: dp } = await supabase.from('departamentos').select('nombre').eq('id', conv.departamento_id).eq('user_id', ownerId).maybeSingle(); if (dp && dp.nombre) deptoNombre = String(dp.nombre); } catch (eD) {}
+      }
+      const texto = 'Lead caliente sin respuesta hace ' + minutos + ' min' + (deptoNombre ? (' en ' + deptoNombre) : '') + ': ' + leadRef + '.';
+      _avisoCalienteMem.add(conv.id); // marcar YA (anti doble-aviso entre ticks)
+      await _postearAvisoInterno(ownerId, conv.departamento_id || null, texto);
+      // Dedupe persistente best-effort (defensivo si la columna no existe).
+      try { await supabase.from('conversations').update({ aviso_caliente_enviado: true }).eq('id', conv.id); } catch (eMk) {}
+    }
+
+    // ===== AVISO #3 — RESUMEN DIARIO =====
+    // Para cada tenant con resumen.on, si la hora local ~ resumen.hora y no se mando hoy, postear un resumen por SQL.
+    // Tenants candidatos: los que tienen avisos_internos no nulo. Defensivo si la columna no existe.
+    let tenants = [];
+    try {
+      const { data } = await supabase.from('business_settings').select('user_id, avisos_internos, aviso_resumen_fecha').not('avisos_internos', 'is', null);
+      tenants = data || [];
+    } catch (eT) { tenants = []; }
+    const hoyStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC; suficiente para dedupe diario)
+    const horaActual = new Date().getHours();
+    const minActual = new Date().getMinutes();
+    for (let i = 0; i < tenants.length; i++) {
+      const row = tenants[i];
+      const ownerId = row.user_id;
+      if (!ownerId) continue;
+      const cfg = await _avisosConfig(ownerId);
+      if (!cfg.resumen.on) continue;                          // DEFAULT OFF
+      if (row.aviso_resumen_fecha === hoyStr) continue;       // ya se mando hoy (dedupe por fecha)
+      // Hora objetivo: postear si ya pasamos la hora configurada hoy (y aun no se mando). Ventana amplia para no
+      // perderlo si el cron no corrio justo a esa hora. Comparacion simple por hora:minuto (UTC del server).
+      const hh = parseInt(cfg.resumen.hora.split(':')[0], 10) || 0;
+      const mm = parseInt(cfg.resumen.hora.split(':')[1], 10) || 0;
+      const minObjetivo = hh * 60 + mm;
+      const minAhora = horaActual * 60 + minActual;
+      if (minAhora < minObjetivo) continue;                   // todavia no es la hora de hoy
+      // Conteos por SQL (sin IA). Defensivo: cada count traga su error y queda en 0.
+      const inicioHoy = new Date(); inicioHoy.setHours(0, 0, 0, 0);
+      const inicioHoyIso = inicioHoy.toISOString();
+      async function _cnt(filtro) { try { const { count } = await filtro; return count || 0; } catch (e) { return 0; } }
+      const nuevosHoy = await _cnt(supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).gte('created_at', inicioHoyIso));
+      const enColaCnt = await _cnt(supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).eq('status', 'listo_humano'));
+      const derivadosCnt = await _cnt(supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).eq('status', 'listo_humano').not('asesor_id', 'is', null));
+      const cerradosCnt = await _cnt(supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).eq('status', 'cerrado'));
+      const pendientesCnt = await _cnt(supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).eq('status', 'listo_humano').eq('last_role', 'contact'));
+      const texto = 'Resumen del dia:\n'
+        + '- Leads nuevos hoy: ' + nuevosHoy + '\n'
+        + '- En cola: ' + enColaCnt + '\n'
+        + '- Derivados (con asesor): ' + derivadosCnt + '\n'
+        + '- Cerrados: ' + cerradosCnt + '\n'
+        + '- Pendientes sin responder: ' + pendientesCnt;
+      // Postear al canal del depto default si existe, si no DM al dueno.
+      let depDefault = null;
+      try { const { data: dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); depDefault = dd && dd.id ? dd.id : null; } catch (eDD) {}
+      await _postearAvisoInterno(ownerId, depDefault, texto);
+      // Dedupe por fecha (best-effort, defensivo si la columna no existe).
+      try { await supabase.from('business_settings').update({ aviso_resumen_fecha: hoyStr }).eq('user_id', ownerId); } catch (eMk) {}
+    }
+  } catch (e) { console.error('Error en revisarAvisosInternos:', e && e.message); }
+  finally { _avisosInternosEnCurso = false; }
+}
+
 // ---- Envio del primer recontacto, solo en horario de oficina, con salvaguardas ----
 var _recontactoEnCurso = false;
 async function enviarRecontactosPendientes() {
@@ -3805,6 +3945,10 @@ setInterval(revisarInactividad, 60 * 60 * 1000);
 // ETAPA 8 (gated por reparto_v2 por-tenant): escalar leads en cola >30 min. Con flag OFF NO hace nada por cuenta.
 setInterval(escalarLeadsEnColaVencidos, 5 * 60 * 1000); // cada 5 min: granularidad para el umbral fijo de 30 min
 setTimeout(escalarLeadsEnColaVencidos, 80 * 1000); // primera corrida ~80s tras arrancar (cuando ya esta estable)
+// AVISOS INTERNOS (default OFF por cuenta): #2 lead caliente + #3 resumen diario. Texto fijo + SQL, SIN IA (0 tokens).
+// Cada 5 min: granularidad para el tope configurable del lead caliente (min 1 min) y la ventana del resumen diario.
+setInterval(revisarAvisosInternos, 5 * 60 * 1000);
+setTimeout(revisarAvisosInternos, 95 * 1000); // primera corrida ~95s tras arrancar
 setInterval(enviarReportesProgramados, 60 * 60 * 1000); // reportes programados: chequear cada hora
 setInterval(guardarSnapshotDiario, 60 * 60 * 1000); // snapshot de metricas: actualizar cada hora
 setTimeout(guardarSnapshotDiario, 50 * 1000); // primer snapshot al arrancar
@@ -4350,13 +4494,13 @@ app.get('/api/equipo/personas', async function(req, res) {
 
     // (b) TODOS los asesores del tenant con auth_user_id no nulo (humanos Y los es_ia). DEFENSIVO: si la columna
     //     es_ia no existe, reintentar sin ella (esIa queda false para todos).
-    let ases = null, _hayEsIa = true;
+    let ases = null, _hayEsIa = true, _hayCfg = true;
     try {
-      const r = await supabase.from('asesores').select('auth_user_id, nombre, es_ia').eq('admin_id', ident.ownerId);
+      const r = await supabase.from('asesores').select('auth_user_id, nombre, es_ia, agente_config').eq('admin_id', ident.ownerId);
       if (r.error) throw r.error;
       ases = r.data;
     } catch (eIa) {
-      _hayEsIa = false;
+      _hayEsIa = false; _hayCfg = false;
       const r2 = await supabase.from('asesores').select('auth_user_id, nombre').eq('admin_id', ident.ownerId);
       ases = r2.data;
     }
@@ -4366,11 +4510,59 @@ app.get('/api/equipo/personas', async function(req, res) {
     (ases || []).forEach(function(a){
       if (!a || !a.auth_user_id) return;          // sin login: no DM-eable
       if (vistos[a.auth_user_id]) return;         // dedupe (incluye al que pregunta y al dueño)
+      const _esIa = (_hayEsIa && a.es_ia === true);
+      // TOGGLE ASISTENTE DM (DEFAULT OFF): un usuario IA SOLO aparece en el roster si su asistente interno esta
+      // prendido (agente_config.asistente_interno===true). Asi no mostramos "bots mudos" que no contestarian el DM.
+      // DEFENSIVO: si no pudimos leer agente_config (columna ausente) o la key falta => off => no se muestra.
+      if (_esIa) {
+        const _on = !!(_hayCfg && a.agente_config && typeof a.agente_config === 'object' && a.agente_config.asistente_interno === true);
+        if (!_on) return; // bot mudo: no incluir en el roster DM-eable
+      }
       vistos[a.auth_user_id] = true;
-      personas.push({ auth_user_id: a.auth_user_id, nombre: (a.nombre || 'Compañero'), esDueno: false, esIa: (_hayEsIa && a.es_ia === true) });
+      personas.push({ auth_user_id: a.auth_user_id, nombre: (a.nombre || 'Compañero'), esDueno: false, esIa: _esIa });
     });
 
     return res.json({ ok: true, personas: personas });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// AVISOS INTERNOS (config a nivel cuenta). SOLO EL DUEÑO. Default todo OFF.
+// GET  /api/equipo/avisos-config -> { ok:true, config:{ no_resuelve, lead_caliente:{on,minutos}, resumen:{on,hora} } }
+// POST /api/equipo/avisos-config { config } -> guarda business_settings.avisos_internos (jsonb). Validacion estricta.
+// Lectura/guardado DEFENSIVOS: si la columna no existe, GET devuelve defaults OFF y POST informa que falta migrar.
+app.get('/api/equipo/avisos-config', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede ver esta configuración' });
+    const config = await _avisosConfig(ident.ownerId); // siempre devuelve la forma completa (OFF por defecto)
+    return res.json({ ok: true, config: config });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/equipo/avisos-config', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede cambiar esta configuración' });
+    const b = (req.body && req.body.config && typeof req.body.config === 'object') ? req.body.config : (req.body || {});
+    const lc = (b.lead_caliente && typeof b.lead_caliente === 'object') ? b.lead_caliente : {};
+    const rs = (b.resumen && typeof b.resumen === 'object') ? b.resumen : {};
+    let _min = Number(lc.minutos); if (!(_min > 0 && _min <= 240)) _min = 20;
+    let _hora = (typeof rs.hora === 'string' && /^\d{1,2}:\d{2}$/.test(rs.hora.trim())) ? rs.hora.trim() : '20:00';
+    // Normalizar la hora a HH:MM (2 digitos) por prolijidad.
+    const _hp = _hora.split(':'); _hora = ('0' + (parseInt(_hp[0], 10) || 0)).slice(-2) + ':' + ('0' + (parseInt(_hp[1], 10) || 0)).slice(-2);
+    const config = {
+      no_resuelve: b.no_resuelve === true,
+      lead_caliente: { on: lc.on === true, minutos: _min },
+      resumen: { on: rs.on === true, hora: _hora }
+    };
+    const { error } = await supabase.from('business_settings').update({ avisos_internos: config }).eq('user_id', ident.ownerId);
+    if (error) {
+      // DEFENSIVO: columna ausente u otro error de esquema -> avisar que falta correr la migracion (no romper).
+      return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar avisos_internos?): ' + (error.message || 'error de esquema') });
+    }
+    return res.json({ ok: true, config: config });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -4413,6 +4605,132 @@ app.get('/api/equipo/mensajes', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// AVISOS INTERNOS DE LA IA — TEXTO FIJO + SQL, *SIN NINGUNA LLAMADA DE IA* (0 TOKENS).
+// ----------------------------------------------------------------------------
+// REGLAS DURAS: TODO opt-in, DEFAULT OFF. Nada se postea hasta que el dueno prenda
+// el aviso correspondiente en business_settings.avisos_internos (jsonb). Lectura
+// SIEMPRE defensiva: si la columna o la key no existe => OFF. Aislado por tenant
+// (ownerId). Los avisos se postean como team_message al canal del DEPARTAMENTO que
+// corresponde (o, si no hay depto, DM al dueno) con un remitente 'Asistente' + push
+// a los miembros (reusa enviarPushAsesor, 0 tokens). Cada aviso tiene su dedupe.
+// ============================================================================
+
+// Lee la config de avisos del tenant, SIEMPRE defensiva. Devuelve SIEMPRE un objeto
+// con la forma esperada y todo OFF si la columna/keys no existen.
+async function _avisosConfig(ownerId) {
+  const def = { no_resuelve: false, lead_caliente: { on: false, minutos: 20 }, resumen: { on: false, hora: '20:00' } };
+  try {
+    if (!ownerId) return def;
+    let raw = null;
+    try {
+      const { data } = await supabase.from('business_settings').select('avisos_internos').eq('user_id', ownerId).maybeSingle();
+      raw = data && data.avisos_internos ? data.avisos_internos : null;
+    } catch (eCol) { return def; } // columna ausente -> todo OFF
+    if (!raw || typeof raw !== 'object') return def;
+    const lc = (raw.lead_caliente && typeof raw.lead_caliente === 'object') ? raw.lead_caliente : {};
+    const rs = (raw.resumen && typeof raw.resumen === 'object') ? raw.resumen : {};
+    let _min = Number(lc.minutos); if (!(_min > 0 && _min <= 240)) _min = 20;
+    let _hora = (typeof rs.hora === 'string' && /^\d{1,2}:\d{2}$/.test(rs.hora.trim())) ? rs.hora.trim() : '20:00';
+    return {
+      no_resuelve: raw.no_resuelve === true,
+      lead_caliente: { on: lc.on === true, minutos: _min },
+      resumen: { on: rs.on === true, hora: _hora }
+    };
+  } catch (e) { return def; }
+}
+
+// Resuelve el remitente 'Asistente' del tenant: el auth_user_id de un asesor es_ia de la cuenta si existe; si no,
+// el propio ownerId. Defensivo (si es_ia no existe, toma el primer asesor con login; ultimo fallback = ownerId).
+async function _avisoRemitente(ownerId) {
+  try {
+    try {
+      const { data } = await supabase.from('asesores').select('auth_user_id').eq('admin_id', ownerId).eq('es_ia', true).not('auth_user_id', 'is', null).limit(1);
+      if (data && data[0] && data[0].auth_user_id) return data[0].auth_user_id;
+    } catch (eIa) {}
+  } catch (e) {}
+  return ownerId; // sin usuario IA con login -> el aviso lo "firma" el dueno
+}
+
+// POSTEA un aviso interno (texto FIJO, sin IA) al canal del depto `departamentoId` (o, si es null/no resuelve,
+// DM al dueno) como team_message del remitente 'Asistente', y manda push a los miembros (reusa enviarPushAsesor).
+// Aislado por tenant. Defensivo: traga errores; nunca tira al caller. NO consume tokens de IA.
+async function _postearAvisoInterno(ownerId, departamentoId, texto) {
+  try {
+    if (!ownerId || !texto || !String(texto).trim()) return;
+    const senderId = await _avisoRemitente(ownerId);
+    let thread = null;
+    let destinatarios = [];
+    if (departamentoId) {
+      thread = await _equipoThreadDepto(ownerId, departamentoId);
+      destinatarios = await _equipoParticipantesDepto(ownerId, departamentoId); // incluye al dueno; excluye bots es_ia
+    }
+    if (!thread) {
+      // Sin depto (o no se pudo crear el canal): DM al dueno. El "otro" del DM es el remitente 'Asistente'.
+      const otro = (senderId && senderId !== ownerId) ? senderId : ownerId;
+      thread = await _equipoThreadDm(ownerId, ownerId, otro);
+      destinatarios = [ownerId];
+    }
+    if (!thread) return;
+    const cuerpo = String(texto).slice(0, 4000);
+    try {
+      await supabase.from('team_messages').insert({
+        thread_id: thread.id,
+        admin_id: ownerId,
+        sender_auth_user_id: senderId,
+        content: cuerpo,
+        media_url: null,
+        leido_por: [senderId]
+      });
+    } catch (eIns) { return; }
+    // Push a los miembros (0 tokens IA). Excluir al remitente. Dedupe.
+    const vistos = {};
+    for (let i = 0; i < destinatarios.length; i++) {
+      const p = destinatarios[i];
+      if (!p || p === senderId || vistos[p]) continue;
+      vistos[p] = true;
+      try { await enviarPushAsesor(p, 'Asistente', '', 'Aviso interno: ' + cuerpo.slice(0, 120)); } catch (eP) {}
+    }
+  } catch (e) { console.error('_postearAvisoInterno:', e && e.message); }
+}
+
+// Resuelve el departamento_id de una conversacion (para rutear el aviso a su canal). Defensivo: null si no hay.
+async function _avisoDeptoDeConv(ownerId, conversationId) {
+  try {
+    const { data } = await supabase.from('conversations').select('departamento_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle();
+    return (data && data.departamento_id) ? data.departamento_id : null;
+  } catch (e) { return null; }
+}
+
+// AVISO #1 — NO RESUELVE: la IA no supo resolver una consulta del lead. Texto FIJO + datos de la base (SQL). SIN IA.
+// Gated por avisos_internos.no_resuelve===true. Se llama desde registrarConsultaAprendizaje (regla 19), ADEMAS de lo
+// que ya hace ese flujo (NO remueve el WhatsApp al dueno). Dedupe: lo cubre el dedupe propio de regla 19 (1 por
+// consulta pendiente por conv). Aislado por tenant.
+async function _avisoNoResuelve(ownerId, conversationId, preguntaTexto) {
+  try {
+    if (!ownerId) return;
+    const cfg = await _avisosConfig(ownerId);
+    if (cfg.no_resuelve !== true) return; // DEFAULT OFF
+    // Datos del lead (nombre/telefono) por SQL, sin IA. Defensivo.
+    let leadRef = 'un lead';
+    try {
+      const { data: cv } = await supabase.from('conversations').select('contact_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle();
+      if (cv && cv.contact_id) {
+        const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', cv.contact_id).maybeSingle();
+        if (ct) {
+          const _n = (ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '';
+          const _t = (ct.phone && String(ct.phone).trim()) ? String(ct.phone).trim() : '';
+          leadRef = (_n || _t) ? (_n + (_t ? (_n ? ' (' + _t + ')' : _t) : '')) : 'un lead';
+        }
+      }
+    } catch (eL) {}
+    const dep = await _avisoDeptoDeConv(ownerId, conversationId);
+    const _q = String(preguntaTexto || '').trim().slice(0, 400);
+    const texto = 'La IA no pudo resolver una consulta del lead ' + leadRef + (_q ? (': "' + _q + '"') : '.');
+    await _postearAvisoInterno(ownerId, dep, texto);
+  } catch (e) { console.error('_avisoNoResuelve:', e && e.message); }
+}
+
 // FEATURE 2 (IA como ASISTENTE INTERNO — decision de Diego): genera y guarda la respuesta INTERNA de un usuario IA
 // a un DM del equipo, usando Haiku (claude-haiku-4-5, barato). Se invoca FIRE-AND-FORGET desde /api/equipo/enviar
 // DESPUES de insertar el mensaje humano (no bloquea la respuesta del endpoint).
@@ -4437,6 +4755,13 @@ async function _equipoRespuestaIaInterna(ownerId, thread, otroAuthId) {
       aseIa = r.data;
     } catch (eCol) { return; } // sin columna es_ia o error -> tratamos como NO-IA (no responder)
     if (!aseIa || aseIa.es_ia !== true) return; // el destino no es un usuario IA -> nada que hacer
+
+    // TOGGLE ASISTENTE DM (DEFAULT OFF): solo responde si agente_config.asistente_interno === true. Si la key no
+    // existe (o agente_config es null/raro) => false => NO responde, 0 gasto. Asi un usuario IA atiende leads pero
+    // NO contesta DMs internos a menos que el dueno lo prenda explicitamente. DEFENSIVO: lectura sin romper.
+    let _asistenteOn = false;
+    try { _asistenteOn = !!(aseIa.agente_config && typeof aseIa.agente_config === 'object' && aseIa.agente_config.asistente_interno === true); } catch (eAs) { _asistenteOn = false; }
+    if (!_asistenteOn) return; // asistente interno apagado -> no responde, 0 tokens
 
     // 2) GATED POR PAUSA (no gastar tokens si la IA esta apagada para este tenant).
     let _bs = null;

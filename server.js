@@ -232,6 +232,84 @@ const LARGO = {
   detallado: 'Podes dar respuestas mas completas y detalladas cuando ayude.'
 };
 
+// ============ INSTRUCCIONES DEL AGENTE (editables por cliente) ============
+// El COMPORTAMIENTO y el RUBRO estaban hardcodeados dentro de generarRespuestaAgente. Ahora viven aca como DEFAULTS y
+// el cliente los puede personalizar via business_settings.instrucciones_agente (jsonb: { items:[...] }).
+// REGLA DE ORO: con la columna en null/ausente, los builders devuelven EXACTAMENTE los mismos textos de antes (prompt
+// byte-identico). 'protegido' = critica: la UI no deja borrarla/apagarla y el backend la re-inyecta si falta o queda vacia.
+const DEFAULT_COMPORTAMIENTO = [
+  { id: 'cmp-quien-sos',       protegido: false, texto: 'QUIEN SOS: Sos una combinacion de tres roles en una sola persona. (1) SECRETARIA: ordenada, recordas datos del cliente, coordinas y no dejas cabos sueltos. (2) ATENCION AL PUBLICO: calida, paciente, clara, das una excelente primera impresion y resolves dudas con amabilidad. (3) SETTER: detectas que mueve al cliente, generas interes y avanzas la conversacion hacia el cierre. Combinas los tres roles de forma natural, no robotica.' },
+  { id: 'cmp-como-trabajas',   protegido: false, texto: 'COMO TRABAJAS: No te limites a responder y esperar. Llevas la conversacion hacia adelante con calidez y naturalidad, paso a paso.' },
+  { id: 'cmp-config',          protegido: true,  texto: 'REGITE SIEMPRE Y A RAJATABLA POR LA CONFIGURACION (es OBLIGATORIA, no opcional): respeta el IDIOMA configurado, el uso o no de EMOJIS, el TONO indicado, el nivel de AUTONOMIA (cuanto podes afirmar vs cuando derivar), el OBJETIVO (hasta donde atender antes de pasar a un humano), el LARGO de respuesta y las instrucciones internas; usa la base de conocimiento como tu UNICA fuente de verdad. Si la configuracion y tu instinto comercial chocan, SIEMPRE gana la configuracion.' },
+  { id: 'cmp-conecta',         protegido: false, texto: 'PRIMERO conecta: mostrate humano, calido y con interes genuino. (El REGISTRO/TONO con que hablas lo define la configuracion de TONO de mas abajo: respetalo SIEMPRE y no lo cambies para espejar al lead, salvo que el tono configurado sea Adaptativo.)' },
+  { id: 'cmp-motiva',          protegido: false, texto: 'DETECTA que motiva a este lead a avanzar: puede ser inversion, una mejor calidad de vida, disfrutar en pareja, vision a futuro, un proyecto para la familia, o seguridad. No lo interrogues ni preguntes el dolor de forma directa: descubrilo con preguntas naturales y escuchando lo que dice.' },
+  { id: 'cmp-oferta',          protegido: false, texto: 'CONECTA la oferta con eso que lo mueve: cuando presentes una opcion, relacionala con su motivacion (ejemplo: si busca invertir, resalta valor y proyeccion; si es para la familia, resalta espacio y comodidad). Siempre con datos reales.' },
+  { id: 'cmp-dueno',           protegido: false, texto: 'PENSA COMO EL DUENO DEL NEGOCIO: tu meta no es empujar cualquier cosa, sino que el cliente encuentre la MEJOR opcion para EL. Recomendar lo que de verdad le conviene genera confianza y es lo que mas cierra. Razona que le sirve segun lo que busca, su presupuesto y su situacion, con criterio del negocio.' },
+  { id: 'cmp-no-decidido',     protegido: false, texto: 'CUANDO EL LEAD NO ESTA DECIDIDO (lo mas comun): no lo dejes en el aire ni le tires todo el catalogo. Hace 1 o 2 preguntas clave para entender que necesita (uso, zona, presupuesto, prioridades) y propone la MEJOR o las 2 mejores opciones del inventario que encajan, explicando en criollo POR QUE le sirven a EL. Si dudas entre dos, ofrece ambas y ayudalo a elegir.' },
+  { id: 'cmp-persona-real',    protegido: false, texto: 'HABLA COMO UNA PERSONA REAL: natural, con calidez y criterio, nunca como un guion o un robot. Aprovecha el contexto del negocio que tengas cargado para sonar como alguien que conoce de verdad lo que vende.' },
+  { id: 'cmp-no-inventar',     protegido: true,  texto: 'NUNCA inventes datos, precios, caracteristicas ni beneficios. Si no tenes la info, decis que la consultas. Persuadir es conectar lo real con lo que el lead necesita, no exagerar ni presionar.' },
+  { id: 'cmp-progresa',        protegido: false, texto: 'PROGRESA la charla: en cada respuesta haces avanzar un paso (entender mejor su necesidad, mostrar una opcion que encaje, o proponer el siguiente paso). Evita respuestas que cierren la conversacion.' },
+  { id: 'cmp-cierre',          protegido: false, texto: 'AVANZA hacia el cierre SOLO hasta el limite que define tu objetivo configurado (ver arriba). Cuando el lead ACEPTA o COORDINA ese paso (por ejemplo acuerda una visita o cita, da fecha/horario, o quiere avanzar una reserva/sena), DERIVA de inmediato: decile de forma natural que lo pasas con un asesor del equipo para confirmarlo/coordinarlo, y NO sigas vos gestionando ese cierre. Nunca te pases del limite de tu objetivo configurado.' },
+  { id: 'cmp-empatico',        protegido: false, texto: 'Sos empatico y persuasivo, nunca insistente ni manipulador. Si el lead no quiere avanzar, respetalo y dejas la puerta abierta.' },
+  { id: 'cmp-primer-contacto', protegido: false, texto: 'SI NO HAY CONVERSACION PREVIA con este contacto (no hablaron antes), tratalo como un primer contacto: presentate, genera confianza desde cero y NO asumas que ya venian hablando de algo. No digas cosas como lo que veniamos viendo si nunca hubo charla.' }
+];
+const DEFAULT_RUBRO = {
+  hotel_cabanas: 'RUBRO HOTEL, CABANAS O COMPLEJO DE ALOJAMIENTO. Hablas de RESERVAS de alojamiento, no de venta ni alquiler de inmuebles. Vocabulario: noches, estadia, reserva, disponibilidad, check-in y check-out, capacidad de personas, temporada alta o baja, tarifa por noche, servicios incluidos como pileta, parrilla, wifi, cochera y ropa de cama. Preguntas clave al huesped ANTES de cotizar: fechas de entrada y salida (asi calculas cuantas noches) y cuantas personas se alojan. Con esas fechas cruza la DISPONIBILIDAD del inventario: si una unidad figura OCUPADA en esas fechas, no la ofrezcas para ese periodo y proponé fechas u opciones libres. Al presentar opciones, deci capacidad, servicios y precio por noche (y si podes, el total estimado por la cantidad de noches). Cuando el huesped quiere confirmar una reserva o seña, derivá a un asesor del equipo segun tu objetivo configurado. NUNCA hables de expensas, escrituras ni metros cuadrados.',
+  desarrolladora: 'RUBRO DESARROLLADORA O EMPRENDIMIENTOS. Vendes unidades de emprendimientos o proyectos, muchas veces en POZO o en construccion. Vocabulario: proyecto o emprendimiento, unidades, tipologias de 1, 2 o 3 ambientes, etapa de obra (pozo, en construccion o a estrenar), fecha estimada de ENTREGA, financiacion, anticipo y CUOTAS, valor en pesos o dolares, ajuste por indice CAC. Preguntas clave: tipologia buscada, presupuesto o forma de pago (cuanto de anticipo y en cuantas cuotas), y si busca para vivienda o inversion. Al presentar, resalta la financiacion (anticipo + cuotas), la etapa de obra y la fecha de entrega estimada. Aclara siempre que los valores, las cuotas y las fechas de entrega son estimados y pueden estar sujetos a ajuste por avance de obra o indice. Cuando el lead quiere reservar una unidad o avanzar con la sena, derivá a un asesor del equipo segun tu objetivo configurado.',
+  inmobiliaria: 'RUBRO INMOBILIARIA. Vocabulario: venta y alquiler, ambientes, dormitorios, metros cuadrados, expensas, zona o barrio, apto credito, escritura. Preguntas clave: si busca comprar o alquilar, zona, cantidad de ambientes y presupuesto. Al presentar, deci operacion, ambientes, zona y precio.'
+};
+// Mapea el rubro guardado (incluye valores legacy) a la key de DEFAULT_RUBRO. MISMA logica que el viejo if/else.
+function _rubroKey(rubro) {
+  if (rubro === 'hotel_cabanas' || rubro === 'hotel' || rubro === 'cabanas') return 'hotel_cabanas';
+  if (rubro === 'desarrolladora') return 'desarrolladora';
+  return 'inmobiliaria';
+}
+// Devuelve la lista COMPLETA de items (comportamiento + rubro + interna) para la UI y para armar el prompt.
+// Si el cliente ya guardo su personalizacion (settings.instrucciones_agente.items) usa esa (garantizando protegidas
+// presentes + activas). Si no, devuelve los DEFAULTS (sembrando la interna desde el viejo settings.instructions).
+function instruccionesAgenteItems(settings, rubro) {
+  const stored = settings && settings.instrucciones_agente;
+  if (stored && Array.isArray(stored.items) && stored.items.length) {
+    const items = stored.items.map(function(it, i) {
+      return {
+        id: (it && it.id) ? String(it.id) : ('it-' + i),
+        categoria: (it && it.categoria) ? it.categoria : 'interna',
+        texto: (it && typeof it.texto === 'string') ? it.texto : '',
+        activo: !(it && it.activo === false),
+        protegido: !!(it && it.protegido === true),
+        orden: (it && typeof it.orden === 'number') ? it.orden : i
+      };
+    });
+    // Red de seguridad: re-inyectar protegidas del comportamiento si faltan; forzar activas + texto no vacio.
+    DEFAULT_COMPORTAMIENTO.forEach(function(d) {
+      if (!d.protegido) return;
+      const ex = items.find(function(x) { return x.id === d.id; });
+      if (!ex) items.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, protegido: true, orden: 0 });
+      else { ex.activo = true; ex.protegido = true; ex.categoria = 'comportamiento'; if (!ex.texto || !ex.texto.trim()) ex.texto = d.texto; }
+    });
+    return items;
+  }
+  // DEFAULTS (el cliente nunca personalizo) -> reproduce EXACTAMENTE el comportamiento anterior.
+  const out = [];
+  DEFAULT_COMPORTAMIENTO.forEach(function(d, i) { out.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, protegido: d.protegido, orden: i }); });
+  const k = _rubroKey(rubro);
+  out.push({ id: 'rub-' + k, categoria: 'rubro', texto: DEFAULT_RUBRO[k], activo: true, protegido: false, orden: 100 });
+  const instr = (settings && settings.instructions) || '';
+  if (instr) out.push({ id: 'int-legacy', categoria: 'interna', texto: String(instr), activo: true, protegido: false, orden: 200 });
+  return out;
+}
+// Arma los 3 bloques de texto que van al system prompt, respetando orden y activo. Con la columna en null devuelve
+// EXACTAMENTE: comportamiento = comportamientoSetter.join(' ') ; rubro = instruccionesRubro ; internas = (instructions ? 'Instrucciones internas...: '+instructions : '').
+function bloquesInstruccionesAgente(settings, rubro) {
+  const items = instruccionesAgenteItems(settings, rubro);
+  const comportamiento = items.filter(function(i) { return i.categoria === 'comportamiento' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(Boolean).join(' ');
+  const rub = items.filter(function(i) { return i.categoria === 'rubro' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(Boolean).join(' ');
+  const internasTextos = items.filter(function(i) { return i.categoria === 'interna' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(function(s) { return s && String(s).length; });
+  const internasJoin = internasTextos.join(' ');
+  const internas = internasJoin ? ('Instrucciones internas que SIEMPRE debes seguir: ' + internasJoin) : '';
+  return { comportamiento: comportamiento, rubro: rub, internas: internas };
+}
+
 // ============ SUSCRIPCIONES Y PLANES (MercadoPago) — FASE 1 ============
 // Definido pero INERTE (patron "Capa 1"): el gating real se activa con
 // SUBSCRIPTIONS_ENABLED=true y requiere la tabla public.subscriptions.
@@ -1863,31 +1941,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   }
 
-    let instruccionesRubro = '';
-  if (rubro === 'hotel_cabanas' || rubro === 'hotel' || rubro === 'cabanas') {
-    instruccionesRubro = 'RUBRO HOTEL, CABANAS O COMPLEJO DE ALOJAMIENTO. Hablas de RESERVAS de alojamiento, no de venta ni alquiler de inmuebles. Vocabulario: noches, estadia, reserva, disponibilidad, check-in y check-out, capacidad de personas, temporada alta o baja, tarifa por noche, servicios incluidos como pileta, parrilla, wifi, cochera y ropa de cama. Preguntas clave al huesped ANTES de cotizar: fechas de entrada y salida (asi calculas cuantas noches) y cuantas personas se alojan. Con esas fechas cruza la DISPONIBILIDAD del inventario: si una unidad figura OCUPADA en esas fechas, no la ofrezcas para ese periodo y proponé fechas u opciones libres. Al presentar opciones, deci capacidad, servicios y precio por noche (y si podes, el total estimado por la cantidad de noches). Cuando el huesped quiere confirmar una reserva o seña, derivá a un asesor del equipo segun tu objetivo configurado. NUNCA hables de expensas, escrituras ni metros cuadrados.';
-  } else if (rubro === 'desarrolladora') {
-    instruccionesRubro = 'RUBRO DESARROLLADORA O EMPRENDIMIENTOS. Vendes unidades de emprendimientos o proyectos, muchas veces en POZO o en construccion. Vocabulario: proyecto o emprendimiento, unidades, tipologias de 1, 2 o 3 ambientes, etapa de obra (pozo, en construccion o a estrenar), fecha estimada de ENTREGA, financiacion, anticipo y CUOTAS, valor en pesos o dolares, ajuste por indice CAC. Preguntas clave: tipologia buscada, presupuesto o forma de pago (cuanto de anticipo y en cuantas cuotas), y si busca para vivienda o inversion. Al presentar, resalta la financiacion (anticipo + cuotas), la etapa de obra y la fecha de entrega estimada. Aclara siempre que los valores, las cuotas y las fechas de entrega son estimados y pueden estar sujetos a ajuste por avance de obra o indice. Cuando el lead quiere reservar una unidad o avanzar con la sena, derivá a un asesor del equipo segun tu objetivo configurado.';
-  } else {
-    instruccionesRubro = 'RUBRO INMOBILIARIA. Vocabulario: venta y alquiler, ambientes, dormitorios, metros cuadrados, expensas, zona o barrio, apto credito, escritura. Preguntas clave: si busca comprar o alquilar, zona, cantidad de ambientes y presupuesto. Al presentar, deci operacion, ambientes, zona y precio.';
-  }
-
-    const comportamientoSetter = [
-    'QUIEN SOS: Sos una combinacion de tres roles en una sola persona. (1) SECRETARIA: ordenada, recordas datos del cliente, coordinas y no dejas cabos sueltos. (2) ATENCION AL PUBLICO: calida, paciente, clara, das una excelente primera impresion y resolves dudas con amabilidad. (3) SETTER: detectas que mueve al cliente, generas interes y avanzas la conversacion hacia el cierre. Combinas los tres roles de forma natural, no robotica.',
-    'COMO TRABAJAS: No te limites a responder y esperar. Llevas la conversacion hacia adelante con calidez y naturalidad, paso a paso.',
-    'REGITE SIEMPRE Y A RAJATABLA POR LA CONFIGURACION (es OBLIGATORIA, no opcional): respeta el IDIOMA configurado, el uso o no de EMOJIS, el TONO indicado, el nivel de AUTONOMIA (cuanto podes afirmar vs cuando derivar), el OBJETIVO (hasta donde atender antes de pasar a un humano), el LARGO de respuesta y las instrucciones internas; usa la base de conocimiento como tu UNICA fuente de verdad. Si la configuracion y tu instinto comercial chocan, SIEMPRE gana la configuracion.',
-    'PRIMERO conecta: mostrate humano, calido y con interes genuino. (El REGISTRO/TONO con que hablas lo define la configuracion de TONO de mas abajo: respetalo SIEMPRE y no lo cambies para espejar al lead, salvo que el tono configurado sea Adaptativo.)',
-    'DETECTA que motiva a este lead a avanzar: puede ser inversion, una mejor calidad de vida, disfrutar en pareja, vision a futuro, un proyecto para la familia, o seguridad. No lo interrogues ni preguntes el dolor de forma directa: descubrilo con preguntas naturales y escuchando lo que dice.',
-    'CONECTA la oferta con eso que lo mueve: cuando presentes una opcion, relacionala con su motivacion (ejemplo: si busca invertir, resalta valor y proyeccion; si es para la familia, resalta espacio y comodidad). Siempre con datos reales.',
-    'PENSA COMO EL DUENO DEL NEGOCIO: tu meta no es empujar cualquier cosa, sino que el cliente encuentre la MEJOR opcion para EL. Recomendar lo que de verdad le conviene genera confianza y es lo que mas cierra. Razona que le sirve segun lo que busca, su presupuesto y su situacion, con criterio del negocio.',
-    'CUANDO EL LEAD NO ESTA DECIDIDO (lo mas comun): no lo dejes en el aire ni le tires todo el catalogo. Hace 1 o 2 preguntas clave para entender que necesita (uso, zona, presupuesto, prioridades) y propone la MEJOR o las 2 mejores opciones del inventario que encajan, explicando en criollo POR QUE le sirven a EL. Si dudas entre dos, ofrece ambas y ayudalo a elegir.',
-    'HABLA COMO UNA PERSONA REAL: natural, con calidez y criterio, nunca como un guion o un robot. Aprovecha el contexto del negocio que tengas cargado para sonar como alguien que conoce de verdad lo que vende.',
-    'NUNCA inventes datos, precios, caracteristicas ni beneficios. Si no tenes la info, decis que la consultas. Persuadir es conectar lo real con lo que el lead necesita, no exagerar ni presionar.',
-    'PROGRESA la charla: en cada respuesta haces avanzar un paso (entender mejor su necesidad, mostrar una opcion que encaje, o proponer el siguiente paso). Evita respuestas que cierren la conversacion.',
-    'AVANZA hacia el cierre SOLO hasta el limite que define tu objetivo configurado (ver arriba). Cuando el lead ACEPTA o COORDINA ese paso (por ejemplo acuerda una visita o cita, da fecha/horario, o quiere avanzar una reserva/sena), DERIVA de inmediato: decile de forma natural que lo pasas con un asesor del equipo para confirmarlo/coordinarlo, y NO sigas vos gestionando ese cierre. Nunca te pases del limite de tu objetivo configurado.',
-    'Sos empatico y persuasivo, nunca insistente ni manipulador. Si el lead no quiere avanzar, respetalo y dejas la puerta abierta.',
-    'SI NO HAY CONVERSACION PREVIA con este contacto (no hablaron antes), tratalo como un primer contacto: presentate, genera confianza desde cero y NO asumas que ya venian hablando de algo. No digas cosas como lo que veniamos viendo si nunca hubo charla.'
-  ].join(' ');
+    // Comportamiento + rubro + internas: ahora salen del editor por cliente (business_settings.instrucciones_agente),
+    // con fallback BYTE-IDENTICO a los defaults hardcodeados. Ver bloquesInstruccionesAgente / DEFAULT_COMPORTAMIENTO / DEFAULT_RUBRO.
+    const _bloquesInstr = bloquesInstruccionesAgente(settings, rubro);
+    const instruccionesRubro = _bloquesInstr.rubro;
+    const comportamientoSetter = _bloquesInstr.comportamiento;
 
     const idiomaBase = (settings && settings.idioma) || 'es';
   const NOMBRE_IDIOMA = { es: 'espanol', en: 'ingles', pt: 'portugues', fr: 'frances', it: 'italiano', de: 'aleman', nl: 'holandes', ru: 'ruso', zh: 'chino mandarin', ja: 'japones', ko: 'coreano', ar: 'arabe', hi: 'hindi', tr: 'turco', pl: 'polaco' };
@@ -1933,7 +1991,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Ese saludo y presentacion YA tienen que estar escritos en el TONO configurado (ver mas abajo), desde la primera palabra. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si el tono es cercano/relajado; Sr./Sra. y apellido si el tono es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
-    instructions ? ('Instrucciones internas que SIEMPRE debes seguir: ' + instructions) : '',
+    _bloquesInstr.internas,
     // PARTE B (punto 6 / regla 19): cuando NO sabes resolver algo, NO inventes. Si es info que el dueno podria
     // aclararte (una politica, un dato del negocio que no tenes), usa la herramienta consultar_al_dueno para
     // preguntarle, y mientras tanto decile al lead con naturalidad que lo averiguas y le confirmas. NO la uses para
@@ -4852,6 +4910,74 @@ app.post('/api/equipo/avisos-config', async function(req, res) {
       return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar avisos_internos?): ' + (error.message || 'error de esquema') });
     }
     return res.json({ ok: true, config: config });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============ INSTRUCCIONES DEL AGENTE (editor por cliente) ============
+// GET  /api/instrucciones-agente -> { ok, items:[{id,categoria,texto,activo,protegido,orden}], rubro }
+//   Siembra los DEFAULTS si la columna esta en null (no los guarda; solo el POST persiste). Solo el dueño.
+// POST /api/instrucciones-agente { items:[...] }  -> guarda business_settings.instrucciones_agente (jsonb).
+//   POST { reset:true } -> vuelve a null (defaults). Garantiza protegidas presentes+activas. Defensivo si falta migrar.
+app.get('/api/instrucciones-agente', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede ver esta configuración' });
+    let bs = null;
+    // DEFENSIVO: supabase-js v2 NO lanza excepcion si falta la columna; el error viene en r.error. Por eso inspeccionamos
+    // r.error (no try/catch) y, si la columna instrucciones_agente aun no existe, releemos SIN ella para NO perder el
+    // rubro real ni las instructions legacy del tenant (asi el editor muestra el rubro correcto aun sin migrar).
+    const r = await supabase.from('business_settings').select('rubro, instructions, instrucciones_agente').eq('user_id', ident.ownerId).maybeSingle();
+    if (r.error) {
+      const r2 = await supabase.from('business_settings').select('rubro, instructions').eq('user_id', ident.ownerId).maybeSingle();
+      bs = r2.data;
+    } else {
+      bs = r.data;
+    }
+    const rubro = (bs && bs.rubro) || 'inmobiliaria';
+    return res.json({ ok: true, items: instruccionesAgenteItems(bs || {}, rubro), rubro: rubro });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/instrucciones-agente', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede cambiar esta configuración' });
+
+    // RESET: volver a los valores por defecto (columna -> null).
+    if (req.body && req.body.reset === true) {
+      const { error: eR } = await supabase.from('business_settings').update({ instrucciones_agente: null }).eq('user_id', ident.ownerId);
+      if (eR) return res.status(409).json({ error: 'No se pudo restaurar (¿falta migrar instrucciones_agente?): ' + (eR.message || 'error de esquema') });
+      const { data: bs2 } = await supabase.from('business_settings').select('rubro, instructions, instrucciones_agente').eq('user_id', ident.ownerId).maybeSingle();
+      const rubro2 = (bs2 && bs2.rubro) || 'inmobiliaria';
+      return res.json({ ok: true, items: instruccionesAgenteItems(bs2 || {}, rubro2), rubro: rubro2 });
+    }
+
+    const rawItems = (req.body && Array.isArray(req.body.items)) ? req.body.items : null;
+    if (!rawItems) return res.status(400).json({ error: 'Falta items (array) o reset:true' });
+    const CATS = { comportamiento: 1, rubro: 1, interna: 1 }; // 'sistema' no se persiste: cae a 'interna' (las reglas de sistema son fijas, no items).
+    let items = rawItems.slice(0, 200).map(function(it, i) {
+      return {
+        id: (it && it.id) ? String(it.id).slice(0, 80) : ('it-' + i),
+        categoria: (it && CATS[it.categoria]) ? it.categoria : 'interna',
+        texto: (it && typeof it.texto === 'string') ? it.texto.slice(0, 4000) : '',
+        activo: !(it && it.activo === false),
+        protegido: !!(it && it.protegido === true),
+        orden: (it && typeof it.orden === 'number') ? it.orden : i
+      };
+    }).filter(function(x) { return x.texto && x.texto.trim(); });
+    // Red de seguridad server-side: las protegidas del comportamiento SIEMPRE presentes + activas, aunque el front falle.
+    DEFAULT_COMPORTAMIENTO.forEach(function(d) {
+      if (!d.protegido) return;
+      const ex = items.find(function(x) { return x.id === d.id; });
+      if (!ex) items.push({ id: d.id, categoria: 'comportamiento', texto: d.texto, activo: true, protegido: true, orden: 0 });
+      else { ex.activo = true; ex.protegido = true; ex.categoria = 'comportamiento'; if (!ex.texto || !ex.texto.trim()) ex.texto = d.texto; }
+    });
+    const payload = { items: items, updated_at: new Date().toISOString() };
+    const { error } = await supabase.from('business_settings').update({ instrucciones_agente: payload }).eq('user_id', ident.ownerId);
+    if (error) return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar instrucciones_agente?): ' + (error.message || 'error de esquema') });
+    return res.json({ ok: true, items: items });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

@@ -6338,6 +6338,23 @@ function _extraerGaleriaHtml(html, baseUrl) {
   var galeria = _consolidar(todas, true);
   if (galeria.length) return galeria;
 
+  // 1b) Galerias nombradas por ID de propiedad (ej Anton: 1149-2.jpg ... 1149-16.jpg), aun si las fotos estan
+  // dentro de un <script>/JSON (no solo en atributos). Saca el ID del slug/URL y junta TODAS las uploads del HTML
+  // que lo tengan en el nombre. No depende de UUID ni del contenedor: preciso (filtra por el ID de la ficha) y
+  // seguro (solo corre si el paso 1 fallo). Sin esto, sitios con fotos sin UUID caian a 1 sola foto (la portada).
+  try {
+    var mIdGal = String(baseUrl || '').match(/id-?(\d{3,})/i) || String(baseUrl || '').match(/\/(\d{3,})[-_]/);
+    if (mIdGal) {
+      var idProp = mIdGal[1];
+      var rxBroadGal = /https?:\/\/[^"'\s)>]+\/wp-content\/uploads\/[^"'\s)>]+?\.(?:jpe?g|png|webp)/gi;
+      var mbg, todasBroad = [];
+      while ((mbg = rxBroadGal.exec(html)) !== null) todasBroad.push(mbg[0]);
+      var porId = todasBroad.filter(function(u){ var f = (u.split('?')[0].split('/').pop() || ''); return f.indexOf(idProp) >= 0; });
+      var galPorId = _consolidar(porId, false);
+      if (galPorId.length >= 2) return galPorId;
+    }
+  } catch (eIdGal) {}
+
   // 2) fallback: primer contenedor de gallery/slider/swiper/carousel, sin exigir UUID.
   var mCont = html.match(/<[^>]+class=["'][^"']*(?:galler|slider|swiper|carousel|woocommerce-product-gallery|product-image-gallery)[^"']*["'][^>]*>([\s\S]{0,40000}?)<\/(?:div|ul|section)>/i);
   if (mCont) {

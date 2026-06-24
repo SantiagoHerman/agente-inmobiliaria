@@ -1828,7 +1828,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (conversation_id && !modoPrueba) { try { aprendizajeActivo = await repartoV2Activo(user_id); } catch (eAp) { aprendizajeActivo = false; } }
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
-  const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, images').eq('user_id', user_id).eq('activa', true);
+  const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images').eq('user_id', user_id).eq('activa', true);
 
   // MEMORIA DEL LEAD: traer datos ya conocidos del contacto (name/interest/budget/notes) para inyectarlos al prompt
   // y evitar re-preguntar o re-presentarse. No bloquea ni rompe si falla (campos opcionales).
@@ -1915,7 +1915,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         else fotosTxt = ' | fotos disponibles: si (sin categorizar)';
       }
     } catch (eImg) { fotosTxt = ''; }
-    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
   }).join(String.fromCharCode(10));
   }
 

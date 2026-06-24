@@ -6398,7 +6398,7 @@ async function parsearDetalleIA(html, url, user_id) {
       '{"titulo","descripcion","ref","operacion","tipo","precio","moneda","ubicacion","barrio","m2","ambientes","dormitorios","banos"}. ' +
       'Si un dato no aparece, deja "". No inventes.';
     var r = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5',
       max_tokens: 1500,
       system: sys,
       messages: [{ role: 'user', content: 'TEXTO DE LA FICHA:\n' + limpio }]
@@ -7016,13 +7016,22 @@ app.post('/api/scrape/detalle', async function(req, res) {
     // y mapeamos property_meta/_embedded al shape {url,titulo,descripcion,campos}. Las URLs que
     // wp-json no resuelva caen al camino HTML/IA de siempre (abajo).
     var resueltasWp = {};
+    // FIX scraping: solo aceptar el resultado wp-json si trae al menos UN dato de detalle "duro" (precio/ambientes/dorm/banos/parking/m2).
+    // Si solo trae taxonomias (Estado/Tipo/Ciudad/ID), el tema NO expone property_meta -> dejar caer la ficha al parser HTML,
+    // que SI saca esos campos (asi un sitio sin meta como antonbienesraices.com extrae todo). COSTO IA: $0.
+    function _wpJsonTieneDetalleUtil(campos) {
+      if (!campos) return false;
+      var duras = ['Precio', 'Ambientes', 'Habitaciones', 'Habitaciones / Cuartos', 'Baños', 'Parking', 'Plazas', 'Metros cubiertos', 'Metros totales'];
+      for (var i = 0; i < duras.length; i++) { if (campos[duras[i]]) return true; }
+      return false;
+    }
     try {
       var base0 = '';
       try { var u0 = new URL(typeof urls[0] === 'string' ? urls[0] : urls[0].url); base0 = u0.protocol + '//' + u0.host; } catch (e0) {}
       if (base0 && await _detectarWpJson(base0)) {
         var detsWp = await _traerDetallesWpJson(base0, urls);
         for (var iw = 0; iw < urls.length; iw++) {
-          if (detsWp[iw] && detsWp[iw].campos && Object.keys(detsWp[iw].campos).length > 0) {
+          if (detsWp[iw] && detsWp[iw].campos && _wpJsonTieneDetalleUtil(detsWp[iw].campos)) {
             var uw = typeof urls[iw] === 'string' ? urls[iw] : urls[iw].url;
             resueltasWp[uw] = detsWp[iw];
           }
@@ -7054,7 +7063,7 @@ app.post('/api/scrape/detalle', async function(req, res) {
         while ((m = re.exec(html)) !== null) {
           const k = m[1].trim();
           if (KNOWN.indexOf(k) === -1) continue;
-          const v = ((m[2] || '') + ' ' + (m[3] || '')).trim().replace(/\s+/g, ' ');
+          const v = ((m[2] || '') + ' ' + (m[3] || '')).trim().replace(/&#0*47;/g, '/').replace(/&#0*38;|&amp;/g, '&').replace(/&#0*39;/g, "'").replace(/\s+/g, ' ');
           if (k && v) campos[k] = v;
         }
         // titulo y descripcion desde meta og (flexible al orden de atributos)

@@ -864,7 +864,10 @@ function sanearAgenteConfig(cfg, nombreFallback) {
   const out = {
     nombre: _s(c.nombre) || _s(nombreFallback),
     formaHablar: formaHablar,
-    objetivo: _s(c.objetivo),
+    // FORM v4 (objetivo IA): el form guarda el VALUE del rubro (informar/agendar_visita/avanzar_reserva).
+    // Lo mapeamos a la FRASE rica de OBJETIVO (igual que el objetivo general) para que el prompt del usuario IA
+    // reciba la misma instrucción rica. Fallback: si llega un value desconocido o ya es texto libre, se deja tal cual.
+    objetivo: (function(){ var v = _s(c.objetivo); return (v && OBJETIVO[v]) ? OBJETIVO[v] : v; })(),
     conocimiento: _s(c.conocimiento),
     noHacer: _s(c.no_hacer) || _s(c.noHacer),
     datosQueUsa: _s(c.datos_que_usa) || _s(c.datosQueUsa)
@@ -4412,12 +4415,16 @@ async function _setDepartamentosUsuario(asesorId, adminId, departamentos) {
   const pedidos = [];
   departamentos.forEach(function(d){
     let id = null;
+    let modo = 'recibe';
     if (d && typeof d === 'object') {
       id = d.departamento_id || d.id || null;
+      // FORM v4 (punto 1): el botón "no recibe" por depto define modo='visualiza' (ve los mensajes del depto pero
+      // NO recibe asignaciones AUTOMÁTICAS de la IA; manual sí). El reparto automático ya EXCLUYE 'visualiza'.
+      if (d.modo === 'visualiza') modo = 'visualiza';
     } else {
-      id = d; // legacy: string id
+      id = d; // legacy: string id => recibe
     }
-    if (id) pedidos.push({ id: id, modo: 'recibe' });
+    if (id) pedidos.push({ id: id, modo: modo });
   });
   let filas = [];
   if (pedidos.length) {

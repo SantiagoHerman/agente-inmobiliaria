@@ -479,7 +479,12 @@ async function debeBloquearAcceso(user_id) {
 
 // Suma 1 al consumo de mensajes IA (best-effort, no rompe si falla). Modelo: PLAN primero, despues SALDO EXTRA.
 // El plan (ai_messages_this_period) se resetea cada ciclo; el extra (mensajes_extra: regalo/paquetes) NO se resetea.
-async function registrarUsoIA(user_id) {
+async function registrarUsoIA(user_id, cantidad) {
+  // COBRO v2: cobrar N "mensajes" en una sola llamada. Para NO duplicar la lógica de avisos 80/100% ni el split
+  // plan/extra, si N>1 reusamos la lógica de a-1 N veces (cada iteración relee el estado y avisa en el cruce exacto).
+  // Retrocompat: registrarUsoIA(user_id) o (user_id, 1) => una sola pasada, idéntico a antes.
+  var _n = (typeof cantidad === 'number' && cantidad > 1) ? Math.floor(cantidad) : 0;
+  if (_n > 1) { for (var _i = 0; _i < _n; _i++) { await registrarUsoIA(user_id); } return; }
   try {
     if (!SUBSCRIPTIONS_ENABLED || !user_id) return;
     const sub = await getSubscription(user_id);
@@ -817,6 +822,20 @@ async function repartoV2Activo(user_id, bs) {
     if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
     return !!(data && data.reparto_v2 === true);
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// ===== COBRO v2: FLAG POR-CUENTA cobrar_todo_v2 (mismo patrón defensivo que repartoV2Activo) =====
+// GATE de despliegue seguro: TODO el cobro NUEVO de "mensajes" (todo menos las 2 respuestas al lead que YA cobran)
+// va detrás de este flag por-tenant. FALSE / ausente / null / columna inexistente -> comportamiento ACTUAL EXACTO
+// (no descuenta nada nuevo). TRUE -> aplica los cargos confirmados por Diego. Ante cualquier error -> false.
+async function cobrarTodoV2Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'cobrar_todo_v2')) return bs.cobrar_todo_v2 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('cobrar_todo_v2').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> flag OFF (comportamiento actual)
+    return !!(data && data.cobrar_todo_v2 === true);
+  } catch (e) { return false; }
 }
 
 // ===== PARTE B (PUNTO 1): RUNTIME DEL USUARIO IA — leer la persona/config del asesor IA que cubre =====
@@ -1622,7 +1641,13 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     }
     // 4) Resumen (opcional) para que el asesor se ponga al dia.
     if (opts.resumen) {
-      try { const _res = await generarResumenConversacion(convId, user_id); if (_res) await supabase.from('conversations').update({ summary: _res }).eq('id', convId); } catch (eR) {}
+      try {
+        const _res = await generarResumenConversacion(convId, user_id);
+        if (_res) {
+          await supabase.from('conversations').update({ summary: _res }).eq('id', convId);
+          try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch (eCobRes) {}
+        }
+      } catch (eR) {}
     }
     return _asesor || null;
   } catch (e) { console.error('Error derivarAHumano (' + (motivo || '') + '):', e && e.message); return null; }
@@ -2268,7 +2293,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     await supabase.from('conversations').update({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
   }
 
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar };
+  // COBRO v2: flags para que el caller cobre +1 si hubo traducción saliente y +1 si la IA usó una tool (foto/consultar).
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -2828,6 +2854,7 @@ async function responderConsultaAdmin(user_id, pregunta) {
     const sys = 'Sos el asistente de reportes de un CRM inmobiliario. El ADMINISTRADOR te hace una consulta por WhatsApp. Responde SOLO con los datos provistos (el JSON de abajo), en espanol rioplatense, claro y conciso, en formato WhatsApp (texto plano, podes usar *negrita* y saltos de linea, sin tablas). Si te piden un dato que no esta en los datos, deci que no lo tenes disponible. Nunca inventes numeros.';
     const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 700, system: sys, messages: [{ role: 'user', content: 'Datos actuales del CRM:\n' + JSON.stringify(datos, null, 1) + '\n\nConsulta del administrador: ' + pregunta }] });
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'reporte_admin'); } catch(e){}
+    try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch(eCobRep){}
     return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : 'No pude generar el reporte.';
   } catch (e) { console.error('responderConsultaAdmin:', e && e.message); return 'No pude generar el reporte en este momento.'; }
 }
@@ -3406,7 +3433,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           if (resultado && resultado.reply) {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
             try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}
-            if (SUBSCRIPTIONS_ENABLED) { try { await registrarUsoIA(user_id); } catch (e) {} }
+            if (SUBSCRIPTIONS_ENABLED) { try {
+              // base 1 (YA cobraba, SIEMPRE). Con cobrar_todo_v2 ON: +1 si tradujo, +1 si uso tool, +1 si el lead mando audio.
+              var _extraResp = 0;
+              try { if (await cobrarTodoV2Activo(user_id)) { _extraResp = (resultado.huboTraduccion ? 1 : 0) + (resultado.usoTool ? 1 : 0) + ((typeof tipoMediaEntrante !== 'undefined' && tipoMediaEntrante === 'audio') ? 1 : 0); } } catch (eFlag) {}
+              await registrarUsoIA(user_id, 1 + _extraResp);
+            } catch (e) {} }
             // FOTOS: si la IA pidio mandar foto(s), enviarlas DESPUES del texto. Aislado en try/catch:
             // si una foto falla, NO afecta el flujo de texto ya enviado.
             try {
@@ -4297,8 +4329,8 @@ async function enviarRecontactosPendientes() {
       const agentNameRec = (bsRec && bsRec.agent_name) ? bsRec.agent_name : '';
       // Si el lead YA tuvo conversacion (hay memoria), el recontacto se arma DESDE su memoria (Sonnet, retoma lo
       // que le interesaba sin inventar). Si es primer contacto (lead importado sin charla) o si falla -> plantilla.
-      let texto = null;
-      if (!esPrimerContacto) { try { texto = await mensajeRecontactoIA(conv.user_id, conv.id, contacto.name, empresaRec, agentNameRec); } catch (eRcIA) {} }
+      let texto = null, _recEsIA = false;
+      if (!esPrimerContacto) { try { texto = await mensajeRecontactoIA(conv.user_id, conv.id, contacto.name, empresaRec, agentNameRec); if (texto) _recEsIA = true; } catch (eRcIA) {} }
       // En el PRIMER contacto (importado, sin charla) NO usamos el nombre importado (suele estar mal: "Agua Y Soda V G",
       // telefonos, etc.) -> saludo sin nombre. El nombre solo se usa cuando el lead lo dio en el chat.
       if (!texto) texto = mensajeRecontacto(esPrimerContacto ? '' : contacto.name, esPrimerContacto, empresaRec, agentNameRec);
@@ -4315,6 +4347,7 @@ async function enviarRecontactosPendientes() {
       await supabase.from('conversations').update({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
+      try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(conv.user_id)) await registrarUsoIA(conv.user_id, 1 + (idiomaRec ? 1 : 0)); } catch (eCobRec) {}
       console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
       enviados++;
       if (enviados >= RECONTACTO_CAP) break; // tope por tanda: el resto sale en las proximas corridas (cada 15 min)
@@ -5365,6 +5398,8 @@ async function _equipoRespuestaIaInterna(ownerId, thread, otroAuthId) {
     } catch (eIa) { return; } // error de IA (saldo, red): no insertar nada, el caller ya respondio
 
     if (!respuesta) return;
+    // COBRO v2: 1 mensaje por DM contestado del asistente interno (Haiku). Solo si hubo respuesta real.
+    try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 1); } catch (eCobEq) {}
 
     // 6) Insertar la respuesta como mensaje del usuario IA. leido_por arranca con la IA (ya "leyo" lo suyo).
     //    NO se manda push FCM a la IA (no tiene device); el front la vera al refrescar el hilo.
@@ -7047,6 +7082,7 @@ app.get('/api/scrape/lista', async function(req, res) {
       for (var hk = 0; hk < htmlsListado.length; hk++) { if ((htmlsListado[hk] || '').length > (htmlIA || '').length) htmlIA = htmlsListado[hk]; }
       var iaItems = await listarUrlsIA(htmlIA, base, user_id);
       if (iaItems.length > 0) {
+        try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 3); } catch (eCobScr) {}
         return res.json({ ok: true, total: iaItems.length, urls: iaItems, plataforma: 'ia', estrategia: 'ia' });
       }
     } catch (e) { /* nada mas que probar */ }
@@ -7343,6 +7379,8 @@ app.post('/api/clasificar-fotos', async (req, res) => {
       }));
       for (let j = 0; j < parciales.length; j++) resultados.push(parciales[j]);
     }
+    // COBRO v2: 1 mensaje POR PROPIEDAD (no por foto), solo si se clasifico al menos 1 foto NUEVA (las cacheadas no pagan).
+    try { if (SUBSCRIPTIONS_ENABLED && _uid && urlsNuevas.length > 0 && await cobrarTodoV2Activo(_uid)) await registrarUsoIA(_uid, 1); } catch (eCobFoto) {}
     // Opcional: si viene property_id, persistir el catalogo en properties.images (no rompe si falla).
     if (property_id) {
       try {

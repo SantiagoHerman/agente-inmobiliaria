@@ -409,7 +409,7 @@ async function dentroDelTopeIA(user_id) {
       const topeC = sub.limits_override.ai_messages;
       if (topeC === Infinity) return true;
       const usadoC = (typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
-      return usadoC < topeC;
+      return usadoC < topeC || (sub.mensajes_extra || 0) > 0; // saldo extra (regalo/paquete) extiende el tope
     }
     return true; // sin override -> saldo ILIMITADO hasta que se le saque la cortesia
   }
@@ -423,7 +423,7 @@ async function dentroDelTopeIA(user_id) {
   else if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // compat override viejo
   if (tope === Infinity) return true;
   const usado = (sub && typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
-  return usado < tope;
+  return usado < tope || (sub && (sub.mensajes_extra || 0) > 0); // saldo extra (regalo/paquete) extiende el tope del plan
 }
 
 // Senal AUTORITATIVA de corte por falta de pago. Replica EXACTAMENTE el gate del
@@ -477,34 +477,50 @@ async function debeBloquearAcceso(user_id) {
   } catch (e) { return false; } // ante cualquier error -> fail-open (no cortar el servicio)
 }
 
-// Suma 1 al contador de mensajes IA del periodo (best-effort, no rompe si falla).
+// Suma 1 al consumo de mensajes IA (best-effort, no rompe si falla). Modelo: PLAN primero, despues SALDO EXTRA.
+// El plan (ai_messages_this_period) se resetea cada ciclo; el extra (mensajes_extra: regalo/paquetes) NO se resetea.
 async function registrarUsoIA(user_id) {
   try {
     if (!SUBSCRIPTIONS_ENABLED || !user_id) return;
     const sub = await getSubscription(user_id);
     if (!sub) return;
     const usadoAntes = (typeof sub.ai_messages_this_period === 'number') ? sub.ai_messages_this_period : 0;
-    const nuevo = usadoAntes + 1;
-    await supabase.from('subscriptions').update({ ai_messages_this_period: nuevo }).eq('user_id', user_id);
-    // AVISO al dueno al CRUZAR el 80% y el 100% del tope. Deteccion por CRUCE (usadoAntes<umbral && nuevo>=umbral):
-    // dispara una sola vez por umbral y por periodo, SIN columnas/migracion (al resetear el contador mensual, vuelve
-    // a cruzar el mes que viene). El push es FCM al dueno -> NO gasta tokens de IA.
-    try {
-      if (sub.cortesia !== true) {
-        const planN = await planActual(user_id); // mismo criterio que dentroDelTopeIA (degrada a basico si la sub no esta vigente)
-        let tope = topeMensajesPlan(planN, sub);
-        if (sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages;
-        else if (typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override;
-        if (tope && tope !== Infinity && tope > 0) {
+    const extraAntes = (typeof sub.mensajes_extra === 'number') ? sub.mensajes_extra : 0;
+    // tope del plan del mes (o override del Maestro). Cortesia sin override = sin tope (Infinity).
+    let tope = Infinity;
+    if (sub.cortesia !== true) {
+      const planN = await planActual(user_id); // mismo criterio que dentroDelTopeIA (degrada a basico si la sub no esta vigente)
+      tope = topeMensajesPlan(planN, sub);
+      if (sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages;
+      else if (typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override;
+    }
+    if (usadoAntes < tope) {
+      // PLAN: este mensaje lo cubre el plan del mes -> suma al contador del periodo.
+      const nuevo = usadoAntes + 1;
+      await supabase.from('subscriptions').update({ ai_messages_this_period: nuevo }).eq('user_id', user_id);
+      // AVISO al dueno al CRUZAR el 80% y el 100% del tope (push FCM, NO gasta tokens). El de "agotado" SOLO si NO
+      // hay saldo extra que lo cubra (con extra, el agente sigue respondiendo y no corresponde avisar que paro).
+      try {
+        if (sub.cortesia !== true && tope !== Infinity && tope > 0) {
           const p80 = Math.floor(tope * 0.8);
-          if (usadoAntes < tope && nuevo >= tope) {
+          if (usadoAntes < tope && nuevo >= tope && extraAntes <= 0) {
             await enviarPushAsesor(user_id, 'Se agoto tu cupo de mensajes IA', '', 'El agente dejo de responder automaticamente este mes. Podes mejorar tu plan para reactivarlo o esperar al proximo periodo.');
           } else if (usadoAntes < p80 && nuevo >= p80) {
             await enviarPushAsesor(user_id, 'Cupo de mensajes IA al 80%', '', 'Usaste el 80% de tus mensajes IA del mes. Cuando se agote, el agente deja de responder hasta el proximo periodo o un upgrade.');
           }
         }
-      }
-    } catch (eAviso) {}
+      } catch (eAviso) {}
+    } else if (extraAntes > 0) {
+      // PLAN AGOTADO -> consumir del SALDO EXTRA (regalo/paquete). Persiste entre ciclos (el cron NO lo resetea).
+      const extraNuevo = extraAntes - 1;
+      await supabase.from('subscriptions').update({ mensajes_extra: extraNuevo }).eq('user_id', user_id);
+      try {
+        if (extraNuevo <= 0) {
+          await enviarPushAsesor(user_id, 'Se agoto tu saldo de mensajes IA', '', 'Se termino tu saldo extra de mensajes. El agente dejo de responder hasta el proximo periodo, un upgrade o un nuevo paquete.');
+        }
+      } catch (eAviso) {}
+    }
+    // (usadoAntes >= tope y extraAntes <= 0: no hay nada que consumir; dentroDelTopeIA ya habria bloqueado el mensaje)
   } catch (e) {}
 }
 
@@ -8697,7 +8713,8 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var nConv = stats.conversaciones || 0;
     var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
     var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
-    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, suscripcion: S });
+    var extraMovs = []; try { var em = await supabase.from('mensajes_extra_mov').select('cantidad, origen, nota, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(12); extraMovs = (em && em.data) || []; } catch (eEM) {}
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -8720,6 +8737,18 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
       var ov = {};
       ['ai_messages', 'asesores', 'contactos', 'propiedades'].forEach(function(k){ var v = req.body && req.body[k]; if (v === '' || v === null || typeof v === 'undefined') return; var n = parseInt(v, 10); if (!isNaN(n)) ov[k] = n; });
       await supabase.from('subscriptions').upsert({ user_id: uid, limits_override: ov }, { onConflict: 'user_id' });
+    } else if (accion === 'cargar_extra') {
+      // SALDO EXTRA de mensajes (regalo o paquete comprado). Suma (o resta si es negativo) al pool y registra el
+      // movimiento con su origen. Es el MISMO pool que persiste entre ciclos; solo cambia quien/por que lo carga.
+      var cantEx = parseInt(req.body && req.body.cantidad, 10);
+      var origenEx = (req.body && req.body.origen) ? String(req.body.origen) : 'regalo';
+      if (!isNaN(cantEx) && cantEx !== 0) {
+        var subEx = await getSubscription(uid);
+        var extraAct = (subEx && typeof subEx.mensajes_extra === 'number') ? subEx.mensajes_extra : 0;
+        var extraNuevoEx = Math.max(0, extraAct + cantEx);
+        await supabase.from('subscriptions').upsert({ user_id: uid, mensajes_extra: extraNuevoEx }, { onConflict: 'user_id' });
+        try { await supabase.from('mensajes_extra_mov').insert({ user_id: uid, cantidad: cantEx, origen: origenEx, nota: (req.body && req.body.nota) ? String(req.body.nota) : null }); } catch (eMovEx) {}
+      }
     } else if (accion === 'cortesia') {
       var darCortesia = (req.body && req.body.activo === true);
       var subC = await getSubscription(uid);

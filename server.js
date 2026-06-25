@@ -4533,8 +4533,12 @@ app.post('/api/asesores/activar', async (req, res) => {
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
     if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
-    // 1. Poner el asesor activo
-    await supabase.from('asesores').update({ activo: true, estado: 'activo' }).eq('id', asesor_id);
+    // 1. Poner el asesor activo. Ademas reactivar su DISPONIBILIDAD para que ENTRE al reparto: sin esto quedaba
+    // activo=true pero disponibilidad='pausa', y elegirAsesorParaDepartamento lo excluia ("lo activo y queda en pausa").
+    // No pisamos 'no_recibe' (puede ser intencional, ej. admin de solo-vision).
+    let _dispAct = 'conectado';
+    try { const { data: _aPrev } = await supabase.from('asesores').select('disponibilidad').eq('id', asesor_id).maybeSingle(); if (_aPrev && _aPrev.disponibilidad === 'no_recibe') _dispAct = 'no_recibe'; } catch (eDisp) {}
+    await supabase.from('asesores').update({ activo: true, estado: 'activo', disponibilidad: _dispAct }).eq('id', asesor_id);
     // 2. Buscar asesores activos de la inmobiliaria (excluyendo administradores: no reciben leads)
     // PARTE A (punto 10): con reparto_v2 ON, ademas se excluye a los que tienen disponibilidad='no_recibe'
     // (que es como se mapean ahora Administrador/Empleado). Con flag OFF, queda igual que antes.

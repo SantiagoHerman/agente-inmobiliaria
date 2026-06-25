@@ -8152,7 +8152,7 @@ app.get('/api/suscripcion', async function(req, res) {
     }
     // puede_cancelar: solo si hay un preapproval real cobrable.
     var puede_cancelar = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar });
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

@@ -335,11 +335,12 @@ const PRECIOS_MP = { basico: 55000, pro: 130000, premium: 330000, enterprise: 55
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
-  trial:      { ai_messages: 100,   asesores: 5,        contactos: 1000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  basico:     { ai_messages: 500,   asesores: 2,        contactos: 500,      reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false },
-  pro:        { ai_messages: 1800,  asesores: 5,        contactos: 3000,     reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  trial:      { ai_messages: 100,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  basico:     { ai_messages: 500,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  pro:        { ai_messages: 1800,  asesores: 10,       contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   premium:    { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
   enterprise: { ai_messages: 8000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+  // PENDIENTE: nivel 'personal' (a medida, min 15.000 msgs) aun no existe; cuando se cree, agregar asesores: Infinity, contactos: Infinity, reportes_ia: true, audio_traduccion: true.
 };
 // TOPES VIEJOS (grandfathering). Los clientes creados ANTES de PLANES_NUEVOS_DESDE conservan estos topes de mensajes
 // (no se les recorta a mitad de camino); los clientes NUEVOS arrancan con los topes nuevos de arriba (mas bajos, para
@@ -4503,11 +4504,13 @@ app.post('/api/asesores/crear', async (req, res) => {
     // se deriva de la visibilidad ('generales' = ver-todo). El rol queda como columna legacy de solo-lectura.
     if (rol && rol !== 'asesor' && rol !== 'administrador' && rol !== 'empleado') return res.status(400).json({ error: 'Rol invalido (debe ser asesor, administrador o empleado)' });
     const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : (rol === 'asesor' ? 'asesor' : null));
-    // Limite de usuarios por admin: por defecto 5, salvo override por cliente (limits_override.asesores, seteable desde el Maestro).
+    // Limite de usuarios por admin: sale del plan vigente (PLAN_LIMITS[plan].asesores), salvo override por cliente
+    // (limits_override.asesores, seteable desde el Maestro) que MANDA si es un numero > 0. Soporta Infinity (no bloquea).
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
-    let topeAsesores = 5;
+    const _planAse = await planActual(admin_id);
+    let topeAsesores = (PLAN_LIMITS[_planAse] || PLAN_LIMITS[PLAN_DEFECTO]).asesores;
     try { const { data: subA } = await supabase.from('subscriptions').select('limits_override').eq('user_id', admin_id).maybeSingle(); if (subA && subA.limits_override && typeof subA.limits_override.asesores === 'number' && subA.limits_override.asesores > 0) topeAsesores = subA.limits_override.asesores; } catch (eLim) {}
-    if (existentes && existentes.length >= topeAsesores) return res.status(400).json({ error: 'Maximo ' + topeAsesores + ' usuarios' });
+    if (topeAsesores !== Infinity && existentes && existentes.length >= topeAsesores) return res.status(400).json({ error: 'Maximo ' + topeAsesores + ' usuarios' });
     // El email interno se arma con el usuario (no se usa para login real, pero Auth lo requiere)
     // Obtener el email del admin para derivar el del asesor (emailAdmin + alias)
     const { data: adminData, error: errAdmin } = await supabase.auth.admin.getUserById(admin_id);
@@ -8958,12 +8961,14 @@ app.get('/api/maestro/soporte', async function(req, res){
 
 // ===== SOPORTE MAESTRO: helper para resolver email/empresa de un tenant (best-effort, cacheado por request). =====
 async function _datosTenant(uid) {
-  var out = { user_id: uid, email: '', empresa: '' };
+  var out = { user_id: uid, email: '', empresa: '', plan: '' };
   try {
     var u = await supabase.auth.admin.getUserById(uid);
     var usr = u && u.data && u.data.user;
     if (usr) { out.email = usr.email || ''; var meta = usr.user_metadata || {}; out.empresa = meta.company || meta.empresa || meta.name || ''; }
   } catch (e) {}
+  // Plan vigente del tenant (best-effort): para marcar prioridad de soporte (Enterprise/Personal). No bloquea si falla.
+  try { var s = await supabase.from('subscriptions').select('plan').eq('user_id', uid).maybeSingle(); if (s && s.data && s.data.plan) out.plan = String(s.data.plan); } catch (e2) {}
   return out;
 }
 
@@ -9000,7 +9005,7 @@ app.get('/api/maestro/soporte/clientes', async function(req, res){
     // Resolver email/empresa de cada tenant (en paralelo, best-effort).
     var uids = Object.keys(porCliente);
     var metas = await Promise.all(uids.map(function(u){ return _datosTenant(u); }));
-    for (var j = 0; j < uids.length; j++) { porCliente[uids[j]].email = metas[j].email; porCliente[uids[j]].empresa = metas[j].empresa; }
+    for (var j = 0; j < uids.length; j++) { porCliente[uids[j]].email = metas[j].email; porCliente[uids[j]].empresa = metas[j].empresa; porCliente[uids[j]].plan = metas[j].plan; }
     // Ordenar clientes: primero los que tienen pendientes, luego por ultima fecha desc.
     var lista = uids.map(function(u){ return porCliente[u]; }).sort(function(a, b){
       if ((b.pendientes > 0) !== (a.pendientes > 0)) return (b.pendientes > 0) ? 1 : -1;

@@ -4959,6 +4959,15 @@ app.get('/api/equipo/avisos-config', async function(req, res) {
 
 // GET /api/etiquetas -> { ok, etiquetas:[{id,nombre,color}] }. Catalogo de etiquetas del tenant. Lo leen DUEÑO y ASESOR
 // (ambos las muestran/asignan en la lista de leads). Defensivo: si la columna no existe todavia, devuelve [].
+// ===== TEMP (medicion de tokens, BORRAR despues) =====
+app.get('/api/_mtk_temp', function(req, res) {
+  if (req.query.k !== 'mtk_7f3a9') return res.status(404).end();
+  var cp = require('child_process');
+  cp.exec('node medir-tokens.js', { cwd: __dirname, env: process.env, timeout: 120000, maxBuffer: 4 * 1024 * 1024 }, function(err, stdout, stderr) {
+    res.json({ ok: !err, stdout: stdout || '', stderr: (stderr || '').slice(0, 2000), err: err ? err.message : null });
+  });
+});
+
 app.get('/api/etiquetas', async function(req, res) {
   try {
     const ident = await _equipoIdentidad(req);

@@ -1574,6 +1574,20 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         } else {
           await supabase.from('conversations').update(_updAsesor).eq('id', convId);
         }
+        // EXTRA: registrar un MENSAJE DE SISTEMA en el historial cuando se DERIVA a un asesor (solo reparto_v2,
+        // solo si quien quedo es un HUMANO, no usuario IA). Texto "Derivado a {Depto} · {Nombre}". DEFENSIVO: 0 tokens.
+        if (_v2 && _asesor && !_asesorEsIA) {
+          try {
+            const { data: _aseEvt } = await supabase.from('asesores').select('nombre').eq('id', _asesor).maybeSingle();
+            const _nomAse = (_aseEvt && _aseEvt.nombre) || 'un asesor';
+            let _nomDep = null;
+            if (_cv && _cv.departamento_id) {
+              try { const { data: _depEvt } = await supabase.from('departamentos').select('nombre').eq('id', _cv.departamento_id).maybeSingle(); _nomDep = _depEvt && _depEvt.nombre ? _depEvt.nombre : null; } catch (eDepN) {}
+            }
+            const _txtEvt = _nomDep ? ('Derivado a ' + _nomDep + ' · ' + _nomAse) : ('Derivado a ' + _nomAse);
+            await supabase.from('messages').insert({ conversation_id: convId, user_id: (_cv && _cv.user_id) || user_id, role: 'sistema', content: _txtEvt, enviado_por: 'Sistema' });
+          } catch (eEvt) {}
+        }
       }
     }
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA

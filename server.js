@@ -540,7 +540,7 @@ async function registrarUsoTokens(user_id, usage, etiqueta, precio) {
     const cr = usage.cache_read_input_tokens || 0;
     const cw = usage.cache_creation_input_tokens || 0;
     const costo = (i * P.in + o * P.out + cr * P.cache_read + cw * P.cache_write) / 1000000;
-    await supabase.from('ia_uso').insert({ user_id: user_id, input_tokens: i, output_tokens: o, cache_read: cr, cache_creation: cw, cost_usd: costo });
+    await supabase.from('ia_uso').insert({ user_id: user_id, input_tokens: i, output_tokens: o, cache_read: cr, cache_creation: cw, cost_usd: costo, etiqueta: etiqueta || null });
   } catch (e) {}
 }
 

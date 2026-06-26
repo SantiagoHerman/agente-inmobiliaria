@@ -8098,6 +8098,385 @@ app.post('/api/scrape/universal', async function(req, res) {
 });
 
 
+// ============================================================================
+// INVENTARIO MULTI-RUBRO  (HOTEL/CABAÑAS + DESARROLLADORA)  — ADITIVO
+// ----------------------------------------------------------------------------
+// Persiste los forms _FormHotel.tsx y _FormDesarrollo.tsx.
+//   - NO toca el camino inmobiliaria (properties para inmobiliaria sigue igual).
+//   - SIEMPRE setea user_id = el del JWT (verificarUsuario), nunca el del body
+//     (asi aplica la RLS auth.uid() = user_id de la migracion).
+//   - Fail-safe: si una tabla nueva no existe todavia (migracion no corrida)
+//     devuelve un JSON de error claro en vez de crashear.
+//   - Campos sin columna propia -> al jsonb correspondiente (no se pierde nada).
+// Tablas: inventory_group, hotel_tarifa, hotel_disponibilidad,
+//         developments, development_sectors, development_units,
+//         properties (+columnas tipo_inventario/atributos/group_id).
+// ============================================================================
+
+// Helpers locales: parseo numerico tolerante (los inputs del form mandan strings,
+// "" debe ir como NULL para no romper columnas numeric/int/date).
+function _invNum(v) {
+  if (v === null || v === undefined) return null;
+  var s = String(v).trim();
+  if (s === '') return null;
+  var n = Number(s);
+  return isNaN(n) ? null : n;
+}
+function _invInt(v) {
+  var n = _invNum(v);
+  return n === null ? null : Math.trunc(n);
+}
+function _invStr(v) {
+  if (v === null || v === undefined) return null;
+  var s = String(v).trim();
+  return s === '' ? null : s;
+}
+function _invDate(v) {
+  // El form de hotel manda <input type=date> => "YYYY-MM-DD" o "". Validacion blanda.
+  var s = _invStr(v);
+  if (!s) return null;
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : null;
+}
+// Detecta el error de "tabla/relacion inexistente" (migracion no corrida todavia)
+// o columna ausente (cache de PostgREST sin refrescar). Devuelve true si conviene
+// abortar con un mensaje claro en vez de seguir.
+function _invTablaFaltante(err) {
+  if (!err) return false;
+  var m = String((err && (err.message || err.details || err.hint || err.code)) || '').toLowerCase();
+  return /does not exist|could not find the table|relation .* does not exist|schema cache|pgrst205|pgrst204|42p01|undefined table/i.test(m);
+}
+
+// ---- POST /api/inventario/guardar -----------------------------------------
+// Body HOTEL:        { tipo_inventario:'hotel_cabanas', group:{nombre,modo},
+//                      unidad:{...}, atributos:{amenities,regimenes,franjas,politicas},
+//                      tarifas:[...], extras:[...], images:[...] }
+// Body DESARROLLO:   { tipo_inventario:'desarrolladora', development:{...},
+//                      dev_data:{amenities,planes,legal,material},
+//                      sectores:[...], unidades:[...] }
+app.post('/api/inventario/guardar', async function (req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+
+    var b = req.body || {};
+    var rubro = normalizarRubro(b.tipo_inventario || b.rubro || '');
+
+    // ======================= HOTEL / CABAÑAS ===============================
+    if (rubro === 'hotel_cabanas') {
+      var grupo = b.group || {};
+      var unidad = b.unidad || {};
+      var atributos = b.atributos || {};
+      var tarifas = Array.isArray(b.tarifas) ? b.tarifas : [];
+      var extras = Array.isArray(b.extras) ? b.extras : [];
+      var images = Array.isArray(b.images) ? b.images : [];
+
+      if (!_invStr(unidad.nombre)) return res.status(400).json({ error: 'Falta el nombre de la unidad' });
+
+      // 1) Complejo -> inventory_group (un grupo por nombre+user; reusar si ya existe)
+      var group_id = null;
+      var nombreComplejo = _invStr(grupo.nombre);
+      if (nombreComplejo) {
+        var gExist = await supabase.from('inventory_group')
+          .select('id').eq('user_id', user_id).eq('nombre', nombreComplejo).maybeSingle();
+        if (gExist.error && _invTablaFaltante(gExist.error)) {
+          return res.status(503).json({ error: 'La tabla inventory_group no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'inventory_group' });
+        }
+        if (gExist.data && gExist.data.id) {
+          group_id = gExist.data.id;
+        } else {
+          var gIns = await supabase.from('inventory_group').insert({
+            user_id: user_id,
+            nombre: nombreComplejo,
+            tipo: 'hotel_cabanas',
+            atributos: { modo: _invStr(grupo.modo) || 'unidad_real' }
+          }).select('id').maybeSingle();
+          if (gIns.error) {
+            if (_invTablaFaltante(gIns.error)) return res.status(503).json({ error: 'La tabla inventory_group no existe todavia. Corré la migracion.', tabla: 'inventory_group' });
+            return res.status(500).json({ error: 'Error guardando el complejo: ' + gIns.error.message });
+          }
+          group_id = gIns.data && gIns.data.id;
+        }
+      }
+
+      // 2) Unidad -> properties (tipo_inventario=hotel_cabanas, group_id, atributos jsonb)
+      //    Lo descriptivo basico va a columnas reales de properties; el resto al jsonb atributos.
+      var precioBase = null, monedaBase = 'ARS';
+      if (tarifas.length) {
+        // precio_base / moneda = la primer tarifa con precio (referencia para listados)
+        for (var ti = 0; ti < tarifas.length; ti++) {
+          var pr = _invNum(tarifas[ti].precio);
+          if (pr !== null) { precioBase = pr; monedaBase = _invStr(tarifas[ti].moneda) || 'ARS'; break; }
+        }
+      }
+      var filaProp = {
+        user_id: user_id,
+        tipo_inventario: 'hotel_cabanas',
+        group_id: group_id,
+        title: _invStr(unidad.nombre) || 'Sin nombre',
+        type: _invStr(unidad.tipo_unidad),
+        description: _invStr(unidad.descripcion),
+        precio_base: precioBase,
+        moneda: monedaBase,
+        activa: true,
+        // Todo lo que no tiene columna propia en properties va al jsonb atributos (no se pierde):
+        atributos: {
+          tipo_unidad: _invStr(unidad.tipo_unidad),
+          capacidad: _invInt(unidad.capacidad),
+          camas: _invInt(unidad.camas),
+          dormitorios: _invInt(unidad.dormitorios),
+          banos: _invInt(unidad.banos),
+          m2: _invNum(unidad.m2),
+          vista: _invStr(unidad.vista),
+          categoria_comercial: _invStr(unidad.categoria_comercial),
+          amenities: atributos.amenities || {},
+          regimenes: atributos.regimenes || [],
+          franjas: atributos.franjas || {},
+          politicas: atributos.politicas || {},
+          extras: extras,
+          images: images
+        }
+      };
+      var pIns = await supabase.from('properties').insert(filaProp).select('id').maybeSingle();
+      if (pIns.error) {
+        // Columnas aditivas ausentes => cache PostgREST sin refrescar tras la migracion.
+        if (_invTablaFaltante(pIns.error)) return res.status(503).json({ error: 'Faltan columnas nuevas en properties (tipo_inventario/atributos/group_id) o el cache de PostgREST no se refresco. Corré la migracion y NOTIFY pgrst.', tabla: 'properties' });
+        return res.status(500).json({ error: 'Error guardando la unidad: ' + pIns.error.message });
+      }
+      var property_id = pIns.data && pIns.data.id;
+
+      // 3) Tarifas -> hotel_tarifa (una fila por temporada). Sin precio ni temporada -> se saltea.
+      var tarifasOk = 0, tarifasErr = 0;
+      for (var t = 0; t < tarifas.length; t++) {
+        var tar = tarifas[t] || {};
+        if (!_invStr(tar.temporada) && _invNum(tar.precio) === null) continue;
+        var filaTar = {
+          property_id: property_id,
+          user_id: user_id,
+          temporada: _invStr(tar.temporada),
+          fecha_desde: _invDate(tar.desde),
+          fecha_hasta: _invDate(tar.hasta),
+          precio_noche: _invNum(tar.precio),
+          moneda: _invStr(tar.moneda) || 'ARS',
+          ocupacion_base: _invInt(tar.ocupacion_base),
+          precio_persona_extra: _invNum(tar.persona_extra),
+          min_noches: _invInt(tar.min_noches),
+          prioridad: t
+        };
+        var trIns = await supabase.from('hotel_tarifa').insert(filaTar);
+        if (trIns.error) {
+          if (_invTablaFaltante(trIns.error)) return res.status(503).json({ error: 'La tabla hotel_tarifa no existe todavia. Corré la migracion.', tabla: 'hotel_tarifa', property_id: property_id });
+          tarifasErr++;
+        } else tarifasOk++;
+      }
+
+      // 4) Disponibilidad: el form NO manda filas de disponibilidad por fecha todavia
+      //    (la seccion dice "se carga en proxima fase" y la disponibilidad sigue a las
+      //    tarifas). No insertamos en hotel_disponibilidad para no inventar datos.
+      //    El endpoint queda listo para recibirlas cuando el form las mande.
+
+      return res.json({
+        ok: true,
+        rubro: 'hotel_cabanas',
+        group_id: group_id,
+        property_id: property_id,
+        tarifas_guardadas: tarifasOk,
+        tarifas_con_error: tarifasErr
+      });
+    }
+
+    // ========================= DESARROLLADORA ==============================
+    if (rubro === 'desarrolladora') {
+      var dev = b.development || {};
+      var devData = b.dev_data || {};
+      var sectores = Array.isArray(b.sectores) ? b.sectores : [];
+      var unidades = Array.isArray(b.unidades) ? b.unidades : [];
+
+      if (!_invStr(dev.nombre)) return res.status(400).json({ error: 'Falta el nombre del emprendimiento' });
+
+      // 1) Emprendimiento -> developments (lo extra a dev_data jsonb)
+      var filaDev = {
+        user_id: user_id,
+        nombre: _invStr(dev.nombre),
+        tipo: _invStr(dev.tipo),
+        zona: _invStr(dev.zona),
+        descripcion: _invStr(dev.descripcion),
+        link: _invStr(dev.link),
+        estado_obra: _invStr(dev.estado_obra),
+        avance_pct: _invInt(dev.avance_pct),
+        fecha_entrega: _invStr(dev.fecha_entrega),
+        dev_data: {
+          amenities: devData.amenities || [],
+          planes: devData.planes || [],
+          legal: devData.legal || {},
+          material: devData.material || {}
+        }
+      };
+      var dIns = await supabase.from('developments').insert(filaDev).select('id').maybeSingle();
+      if (dIns.error) {
+        if (_invTablaFaltante(dIns.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+        return res.status(500).json({ error: 'Error guardando el emprendimiento: ' + dIns.error.message });
+      }
+      var development_id = dIns.data && dIns.data.id;
+
+      // 2) Sectores -> development_sectors. Guardamos el orden del form (idx) para mapear
+      //    cada unidad a su sector. El form NO liga aun unidad->sector explicitamente
+      //    (ver nota de campos sin destino), asi que las unidades quedan con sector_id null.
+      var sectorIds = [];
+      var sectoresOk = 0;
+      for (var s = 0; s < sectores.length; s++) {
+        var sec = sectores[s] || {};
+        if (!_invStr(sec.nombre)) { sectorIds.push(null); continue; }
+        var filaSec = {
+          development_id: development_id,
+          user_id: user_id,
+          nombre: _invStr(sec.nombre),
+          tipo: _invStr(sec.tipo),
+          fecha_entrega: _invStr(sec.fecha_entrega),
+          sector_data: {}
+        };
+        var sIns = await supabase.from('development_sectors').insert(filaSec).select('id').maybeSingle();
+        if (sIns.error) {
+          if (_invTablaFaltante(sIns.error)) return res.status(503).json({ error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id });
+          sectorIds.push(null);
+        } else { sectorIds.push(sIns.data && sIns.data.id); sectoresOk++; }
+      }
+
+      // 3) Unidades -> development_units (lo extra a unit_data jsonb)
+      var unidadesOk = 0, unidadesErr = 0;
+      for (var u = 0; u < unidades.length; u++) {
+        var un = unidades[u] || {};
+        var filaUn = {
+          development_id: development_id,
+          sector_id: null, // el form aun no liga unidad->sector (documentado en el resumen)
+          user_id: user_id,
+          tipo_producto: _invStr(un.tipo_producto),
+          numero: _invStr(un.numero),
+          tipologia: _invStr(un.tipologia),
+          m2_cubiertos: _invNum(un.m2_cubiertos),
+          m2_totales: _invNum(un.m2_totales),
+          superficie_terreno: _invNum(un.superficie_terreno),
+          frente: _invNum(un.frente),
+          fondo: _invNum(un.fondo),
+          orientacion: _invStr(un.orientacion),
+          piso: _invStr(un.piso),
+          precio: _invNum(un.precio),
+          precio_estado: _invStr(un.precio_estado) || 'a_consultar',
+          moneda: _invStr(un.moneda) || 'USD',
+          estado: _invStr(un.estado) || 'disponible',
+          unit_data: {},
+          images: []
+        };
+        var uIns = await supabase.from('development_units').insert(filaUn);
+        if (uIns.error) {
+          if (_invTablaFaltante(uIns.error)) return res.status(503).json({ error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id });
+          unidadesErr++;
+        } else unidadesOk++;
+      }
+
+      return res.json({
+        ok: true,
+        rubro: 'desarrolladora',
+        development_id: development_id,
+        sectores_guardados: sectoresOk,
+        unidades_guardadas: unidadesOk,
+        unidades_con_error: unidadesErr
+      });
+    }
+
+    // Rubro no soportado por este endpoint (inmobiliaria usa su propio camino intacto).
+    return res.status(400).json({ error: 'Rubro no soportado por /api/inventario/guardar: ' + (b.tipo_inventario || b.rubro || '(vacio)') + '. Este endpoint solo cubre hotel_cabanas y desarrolladora; inmobiliaria usa su flujo propio.' });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message });
+  }
+});
+
+// ---- GET /api/inventario/cargar -------------------------------------------
+// Devuelve el inventario del rubro del usuario (filtrado por user_id, via RLS y
+// filtro explicito) para que el form pueda precargar.
+//   - hotel_cabanas: grupos + unidades (properties tipo_inventario=hotel_cabanas)
+//                    + tarifas por unidad.
+//   - desarrolladora: emprendimientos + sectores + unidades.
+//   - inmobiliaria: NO se toca aca (tiene su propio listado de properties); se
+//     devuelve un hint para que el front use el endpoint inmobiliaria de siempre.
+// El rubro sale de business_settings.rubro; si no hay, se infiere por ?rubro=.
+app.get('/api/inventario/cargar', async function (req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+
+    var rubro = normalizarRubro((req.query && req.query.rubro) || '');
+    if (!req.query || !req.query.rubro) {
+      try {
+        var bs = await supabase.from('business_settings').select('rubro').eq('user_id', user_id).maybeSingle();
+        rubro = normalizarRubro((bs && bs.data && bs.data.rubro) || '');
+      } catch (eBs) {}
+    }
+
+    // ======================= HOTEL / CABAÑAS ===============================
+    if (rubro === 'hotel_cabanas') {
+      var grupos = await supabase.from('inventory_group')
+        .select('*').eq('user_id', user_id).order('created_at', { ascending: true });
+      if (grupos.error && _invTablaFaltante(grupos.error)) {
+        return res.status(503).json({ error: 'La tabla inventory_group no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'inventory_group' });
+      }
+      var unidadesH = await supabase.from('properties')
+        .select('*').eq('user_id', user_id).eq('tipo_inventario', 'hotel_cabanas');
+      if (unidadesH.error && _invTablaFaltante(unidadesH.error)) {
+        return res.status(503).json({ error: 'Faltan columnas nuevas en properties. Corré la migracion y NOTIFY pgrst.', tabla: 'properties' });
+      }
+      var tarifasH = await supabase.from('hotel_tarifa').select('*').eq('user_id', user_id);
+      if (tarifasH.error && _invTablaFaltante(tarifasH.error)) {
+        return res.status(503).json({ error: 'La tabla hotel_tarifa no existe todavia. Corré la migracion.', tabla: 'hotel_tarifa' });
+      }
+      // Agrupar tarifas por property_id para que el front las precargue por unidad.
+      var tarifasPorProp = {};
+      (tarifasH.data || []).forEach(function (tr) {
+        (tarifasPorProp[tr.property_id] = tarifasPorProp[tr.property_id] || []).push(tr);
+      });
+      var unidadesOut = (unidadesH.data || []).map(function (p) {
+        return Object.assign({}, p, { tarifas: tarifasPorProp[p.id] || [] });
+      });
+      return res.json({
+        ok: true,
+        rubro: 'hotel_cabanas',
+        grupos: grupos.data || [],
+        unidades: unidadesOut
+      });
+    }
+
+    // ========================= DESARROLLADORA ==============================
+    if (rubro === 'desarrolladora') {
+      var devs = await supabase.from('developments')
+        .select('*').eq('user_id', user_id).order('created_at', { ascending: true });
+      if (devs.error && _invTablaFaltante(devs.error)) {
+        return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+      }
+      var secs = await supabase.from('development_sectors').select('*').eq('user_id', user_id);
+      if (secs.error && _invTablaFaltante(secs.error)) {
+        return res.status(503).json({ error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors' });
+      }
+      var uns = await supabase.from('development_units').select('*').eq('user_id', user_id);
+      if (uns.error && _invTablaFaltante(uns.error)) {
+        return res.status(503).json({ error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units' });
+      }
+      // Anidar sectores y unidades dentro de su emprendimiento.
+      var secsPorDev = {}, unsPorDev = {};
+      (secs.data || []).forEach(function (s) { (secsPorDev[s.development_id] = secsPorDev[s.development_id] || []).push(s); });
+      (uns.data || []).forEach(function (u) { (unsPorDev[u.development_id] = unsPorDev[u.development_id] || []).push(u); });
+      var devsOut = (devs.data || []).map(function (d) {
+        return Object.assign({}, d, { sectores: secsPorDev[d.id] || [], unidades: unsPorDev[d.id] || [] });
+      });
+      return res.json({ ok: true, rubro: 'desarrolladora', emprendimientos: devsOut });
+    }
+
+    // Inmobiliaria u otro: este endpoint no maneja inmobiliaria (flujo intacto aparte).
+    return res.json({ ok: true, rubro: rubro, inmobiliaria: true, mensaje: 'El rubro inmobiliaria usa su propio listado de properties; /api/inventario/cargar solo cubre hotel_cabanas y desarrolladora.' });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message });
+  }
+});
+
+
 // ===== SCRAPER CORREGIDO: extraccion completa por propiedad =====
 function limpiarHTML2(html) {
   if (!html) return '';

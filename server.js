@@ -1385,7 +1385,8 @@ async function manejarRespuestaFueraHorario(convId, user_id, texto, telefono, in
       return true; // consumido (no seguir el flujo de IA)
     }
     // Reapuntar la conv al otro depto y derivar (derivarAHumano elige el asesor/usuario IA disponible del depto).
-    await supabase.from('conversations').update({ departamento_id: _otro.id }).eq('id', convId);
+    // R4: re-derivacion buscando otro depto = clasificacion IA -> departamento_manual=false. DEFENSIVO/best-effort.
+    try { await supabase.from('conversations').update({ departamento_id: _otro.id, departamento_manual: false }).eq('id', convId); } catch (eDm) { try { await supabase.from('conversations').update({ departamento_id: _otro.id }).eq('id', convId); } catch (eDm2) {} }
     await cerrarOfertaFueraHorario(convId);
     const _asesor = await derivarAHumano(convId, _ownerId, 'fuera_horario_derivar', { setStatus: false, push: true, pushTitulo: 'Lead derivado de otra area', pushTexto: telefono || '', resumen: true });
     // Avisar al lead que lo estamos derivando (plantilla fija, sin tokens de IA).
@@ -1631,7 +1632,9 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
               const _estFb = await estadoDeptoParaReparto(_ownerId, _fbId);
               if (_estFb.estado === 'asignable') {
                 _asesor = _estFb.asesor; // reusado (sin segunda llamada al picker)
-                if (_asesor) { try { await supabase.from('conversations').update({ departamento_id: _fbId }).eq('id', convId); } catch (eUpD) {} }
+                // R4: este depto lo fija la IA (fallback de reparto) -> departamento_manual=false (clasificacion automatica).
+                // DEFENSIVO: best-effort; si la columna departamento_manual no existe, igual escribimos el depto.
+                if (_asesor) { try { await supabase.from('conversations').update({ departamento_id: _fbId, departamento_manual: false }).eq('id', convId); } catch (eUpD) { try { await supabase.from('conversations').update({ departamento_id: _fbId }).eq('id', convId); } catch (eUpD2) {} } }
               }
             }
             // (4d) Si el fallback tampoco resolvio (no hay fallback, o no esta disponible) -> ULTIMA INSTANCIA: avisar al gerente.
@@ -1704,7 +1707,8 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
             if (_cv && _cv.departamento_id) {
               try { const { data: _depEvt } = await supabase.from('departamentos').select('nombre').eq('id', _cv.departamento_id).maybeSingle(); _nomDep = _depEvt && _depEvt.nombre ? _depEvt.nombre : null; } catch (eDepN) {}
             }
-            const _txtEvt = _nomDep ? ('Derivado a ' + _nomDep + ' · ' + _nomAse) : ('Derivado a ' + _nomAse);
+            // R3(c): dejar explicito que fue LA IA quien derivo, y a que Depto + Usuario. Texto FIJO (0 tokens).
+            const _txtEvt = _nomDep ? ('La IA derivó el lead a ' + _nomAse + ' (' + _nomDep + ')') : ('La IA derivó el lead a ' + _nomAse);
             await supabase.from('messages').insert({ conversation_id: convId, user_id: (_cv && _cv.user_id) || user_id, role: 'sistema', content: _txtEvt, enviado_por: 'Sistema' });
           } catch (eEvt) {}
         }
@@ -3509,7 +3513,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           if (_deptoConfPend) {
             if (_esAfirmacionLead(texto)) {
               await cerrarConfirmacionDerivacion(_convId);
-              try { await supabase.from('conversations').update({ departamento_id: _deptoConfPend }).eq('id', _convId); } catch (eUp) {}
+              // R4: depto fijado por la IA (confirmacion de derivacion) -> departamento_manual=false. DEFENSIVO/best-effort.
+              try { await supabase.from('conversations').update({ departamento_id: _deptoConfPend, departamento_manual: false }).eq('id', _convId); } catch (eUp) { try { await supabase.from('conversations').update({ departamento_id: _deptoConfPend }).eq('id', _convId); } catch (eUp2) {} }
               try {
                 await derivarAHumano(_convId, user_id, 'confirmacion_derivar', { setStatus: true, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
               } catch (eDer) { console.error('confirmacion derivar:', eDer && eDer.message); }
@@ -3582,6 +3587,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 if (_deptoPend && nuevoEstado === 'listo_humano') {
                   await cerrarConfirmacionDerivacion(_convId);
                   await supabase.from('conversations').update({ departamento_id: _deptoPend, status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', _convId);
+                  // R4: depto fijado por la IA -> departamento_manual=false. Write APARTE best-effort (no romper el update critico de arriba si la columna no existe).
+                  try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
                   await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
                   _yaDerivoEnEsteMensaje = true;
                 }
@@ -3624,6 +3631,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   }
                   if (_reDerivar) {
                     await supabase.from('conversations').update({ departamento_id: _departamentoId, asesor_id: null, updated_at: new Date().toISOString() }).eq('id', _convId);
+                    // R4: re-derivacion por cambio de tema = clasificacion IA -> departamento_manual=false. Write APARTE best-effort.
+                    try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
                     await derivarAHumano(_convId, user_id, 'cambio_tema_rederivar', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
                     _yaDerivoEnEsteMensaje = true;
                   }
@@ -3639,7 +3648,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               try {
                 const { data: _cvDep } = await supabase.from('conversations').select('departamento_id').eq('id', _convId).maybeSingle();
                 if (_cvDep && !_cvDep.departamento_id) {
-                  await supabase.from('conversations').update({ departamento_id: _departamentoId }).eq('id', _convId);
+                  // R4: depto deducido por la IA -> departamento_manual=false. DEFENSIVO/best-effort.
+                  try { await supabase.from('conversations').update({ departamento_id: _departamentoId, departamento_manual: false }).eq('id', _convId); } catch (eDm) { try { await supabase.from('conversations').update({ departamento_id: _departamentoId }).eq('id', _convId); } catch (eDm2) {} }
                 }
               } catch (eDepW) { console.error('Error guardando departamento_id:', eDepW && eDepW.message); }
             }

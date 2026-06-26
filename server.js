@@ -4232,6 +4232,130 @@ async function escalarLeadsEnColaVencidos() {
   finally { _escalarEnCurso = false; }
 }
 
+// ===== RESPALDO v2 (PLAN B): DERIVACION POR TIMEOUT DE LA IA =====
+// GATED por el flag por-tenant business_settings.respaldo_v2 (DEFAULT false). Con el flag OFF (o ausente/columna
+// inexistente) NADA de esto corre por esa cuenta -> CERO cambio de comportamiento. Objetivo: que un lead NUNCA quede
+// COLGADO si la IA no le respondio (ej: se acabo el credito de mensajes y la IA esta bloqueada, o fallo algun sistema).
+//
+// Busca conversaciones donde el ULTIMO mensaje es del LEAD (entrante, role='contact'), tiene mas de
+// respaldo_umbral_min minutos (DEFAULT 3) sin respuesta posterior (ni 'ai' ni 'human'), el lead NO esta YA con un
+// humano (status != 'listo_humano', sin asesor humano atendiendo) y la cuenta tiene respaldo_v2=true. Para esos:
+// DERIVA a un humano EQUITATIVAMENTE REUSANDO derivarAHumano (que por dentro: con reparto_v2 ON elige por
+// departamento via elegirAsesorParaDepartamento; si no, round-robin del pool via elegirAsesorActivo -el asesor
+// activo+disponible con MENOS leads en 'listo_humano'-; si NADIE disponible -> avisa al DUENO). derivarAHumano setea
+// asesor_id + status='listo_humano' + ai_enabled=false (el humano toma; la IA NO lo pisa despues = decision 4),
+// manda push (enviarPushAsesor) e inserta el mensaje de sistema "Derivado a ...". Encima de eso, este cron inserta
+// un mensaje de SISTEMA propio ("Respaldo: la IA no respondio en X min, derivado a <asesor>").
+//
+// Respeta PAUSAS: si crm_pausado / eliminado_at / _pausaGlobal -> NO deriva (igual que el resto del sistema).
+// Anti DOBLE-DERIVACION: marca conversations.respaldo_derivado=true (best-effort, defensivo si la columna no existe)
+// + un Set en memoria como red dentro del proceso. Y NO toca conversaciones que ya estan en 'listo_humano' o con
+// asesor humano asignado. Mismo patron que revisarInactividad / escalarLeadsEnColaVencidos (setInterval + guard).
+const _respaldoDerivado = new Set();
+var _respaldoEnCurso = false;
+async function revisarRespaldoTimeout() {
+  if (_respaldoEnCurso) return; // evitar solapamiento entre ticks
+  _respaldoEnCurso = true;
+  try {
+    const UMBRAL_DEFAULT_MIN = 5;     // default del umbral si la cuenta no lo configuro (Diego: 5 min)
+    const ahoraMs = Date.now();
+    // Candidatas: conversaciones donde el lead escribio ultimo (last_role='contact') y la IA todavia atiende
+    // (status NO es 'listo_humano' -> no esta ya en la cola humana). Pre-filtro barato con columnas de la conv;
+    // luego confirmamos contra messages que de verdad no hubo respuesta posterior.
+    const { data: candidatas } = await supabase
+      .from('conversations')
+      .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at')
+      .eq('last_role', 'contact')
+      .in('status', ['en_conversacion', 'interesado', 'recontacto']);
+    if (!candidatas || candidatas.length === 0) return;
+    // Caches por tenant (una query chica como mucho por cuenta y por tick).
+    const _flagCache = {};   // respaldo_v2 ON?
+    const _umbralCache = {}; // respaldo_umbral_min en ms
+    const _pausaCache = {};  // cuenta pausada / en papelera?
+    for (const conv of candidatas) {
+      if (_respaldoDerivado.has(conv.id)) continue; // ya derivado por respaldo en este proceso
+      const ownerId = conv.user_id;
+      if (!ownerId) continue;
+      // REGLA Diego: el respaldo SOLO actua si la IA esta ACTIVA en el lead (ai_enabled !== false). Si un humano la apago, no se mete.
+      if (conv.ai_enabled === false) continue;
+      // Doble-derivacion defensiva: si la conv ya tiene asesor HUMANO o el admin la tomo, saltar (no pisar atencion humana).
+      if (conv.asesor_id || conv.admin_tomo === true) continue;
+      // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO derivar (comportamiento actual). Fail-safe.
+      if (!(ownerId in _flagCache)) {
+        try {
+          const { data: bsF, error: eF } = await supabase.from('business_settings').select('respaldo_v2, respaldo_umbral_min').eq('user_id', ownerId).maybeSingle();
+          if (eF) { _flagCache[ownerId] = false; }
+          else {
+            _flagCache[ownerId] = !!(bsF && bsF.respaldo_v2 === true);
+            let _min = bsF && Number(bsF.respaldo_umbral_min);
+            if (!_min || _min < 1 || _min > 240) _min = UMBRAL_DEFAULT_MIN;
+            _umbralCache[ownerId] = _min * 60 * 1000;
+          }
+        } catch (eFc) { _flagCache[ownerId] = false; } // ante cualquier fallo -> OFF (nunca romper)
+      }
+      if (_flagCache[ownerId] !== true) continue;
+      const UMBRAL_MS = _umbralCache[ownerId] || (UMBRAL_DEFAULT_MIN * 60 * 1000);
+      // PAUSAS: kill-switch global del Maestro, pausa total de la cuenta (crm_pausado) o papelera (eliminado_at) -> NO derivar.
+      if (_pausaGlobal === true) continue;
+      if (!(ownerId in _pausaCache)) {
+        let _pausada = false;
+        try { const { data: _bsP } = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', ownerId).maybeSingle(); _pausada = !!(_bsP && (_bsP.crm_pausado === true || _bsP.eliminado_at)); } catch (eP) { _pausada = false; }
+        _pausaCache[ownerId] = _pausada;
+      }
+      if (_pausaCache[ownerId] === true) continue;
+      // Dedupe persistente (best-effort): si ya se marco respaldo_derivado, saltar. Defensivo si la columna no existe.
+      try {
+        const { data: _d } = await supabase.from('conversations').select('respaldo_derivado').eq('id', conv.id).maybeSingle();
+        if (_d && _d.respaldo_derivado === true) { _respaldoDerivado.add(conv.id); continue; }
+      } catch (eD) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
+      // ULTIMO mensaje de la conversacion: tiene que ser del LEAD (role='contact') y tener > umbral minutos.
+      const { data: ult } = await supabase
+        .from('messages')
+        .select('role, created_at')
+        .eq('conversation_id', conv.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!ult || ult.role !== 'contact' || !ult.created_at) continue; // ya hubo respuesta (ai/human/sistema) o sin datos
+      const transcurrido = ahoraMs - new Date(ult.created_at).getTime();
+      if (transcurrido < UMBRAL_MS) continue; // todavia no cumplio el umbral: la IA aun puede responder
+      // -> La IA NO respondio en el umbral. DERIVAR a un humano de forma equitativa REUSANDO derivarAHumano.
+      // Marcar en memoria YA (antes de derivar) para que ticks concurrentes no re-deriven.
+      _respaldoDerivado.add(conv.id);
+      const _minTxt = Math.round(UMBRAL_MS / 60000);
+      let _asesorId = null;
+      try {
+        // setStatus:true -> status='listo_humano' + ai_enabled=false (el humano toma; la IA no lo pisa = decision 4).
+        // push:true -> avisa al asesor asignado (enviarPushAsesor por dentro).
+        // resumen:FALSE -> CERO IA / CERO tokens (regla de Diego). El respaldo es el plan B para cuando NO hay credito o
+        // fallo la IA; seria absurdo que gaste IA justo ahi. derivarAHumano con resumen:false NO llama a ningun modelo.
+        _asesorId = await derivarAHumano(conv.id, ownerId, 'respaldo_timeout', {
+          setStatus: true,
+          push: true,
+          pushTitulo: 'Respaldo automatico: lead sin respuesta de la IA',
+          pushTexto: 'La IA no respondio en ' + _minTxt + ' min (sin credito o un problema). Te paso el lead.',
+          resumen: false
+        });
+      } catch (eDer) { console.error('Respaldo derivarAHumano:', eDer && eDer.message); }
+      // Mensaje de SISTEMA propio del respaldo (0 tokens de IA). Nombre del asesor si quedo uno asignado.
+      try {
+        let _nomAse = null;
+        if (_asesorId) {
+          try { const { data: _ase } = await supabase.from('asesores').select('nombre').eq('id', _asesorId).maybeSingle(); _nomAse = _ase && _ase.nombre ? _ase.nombre : null; } catch (eN) {}
+        }
+        const _txt = _asesorId
+          ? ('Respaldo automatico (la IA no respondio en ' + _minTxt + ' min por falta de credito o un problema): derivado a ' + (_nomAse || 'un asesor'))
+          : ('Respaldo automatico (la IA no respondio en ' + _minTxt + ' min por falta de credito o un problema): sin asesor disponible -> avisado al responsable');
+        await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txt, enviado_por: 'Sistema' });
+      } catch (eMsg) {}
+      // Marca persistente best-effort para no re-derivar en proximos ticks (defensivo si la columna no existe).
+      try { await supabase.from('conversations').update({ respaldo_derivado: true }).eq('id', conv.id); } catch (eMark) { /* columna ausente: el Set ya dedupea */ }
+      console.log('Respaldo v2: lead ' + conv.id + ' derivado por timeout (' + _minTxt + ' min sin respuesta de la IA)' + (_asesorId ? (' -> asesor ' + _asesorId) : ' -> sin asesor, avisado al dueno'));
+    }
+  } catch (e) { console.error('Error en revisarRespaldoTimeout:', e && e.message); }
+  finally { _respaldoEnCurso = false; }
+}
+
 // ============================================================================
 // CRON: AVISOS INTERNOS DE LA IA (#2 lead caliente, #3 resumen diario).
 // TEXTO FIJO + SQL, *SIN NINGUNA LLAMADA DE IA* (0 tokens). TODO opt-in / DEFAULT OFF:
@@ -4743,6 +4867,11 @@ setInterval(revisarInactividad, 60 * 60 * 1000);
 // ETAPA 8 (gated por reparto_v2 por-tenant): escalar leads en cola >30 min. Con flag OFF NO hace nada por cuenta.
 setInterval(escalarLeadsEnColaVencidos, 5 * 60 * 1000); // cada 5 min: granularidad para el umbral fijo de 30 min
 setTimeout(escalarLeadsEnColaVencidos, 80 * 1000); // primera corrida ~80s tras arrancar (cuando ya esta estable)
+// RESPALDO v2 (PLAN B, gated por respaldo_v2 por-tenant): si la IA no le respondio a un lead en X min (default 3),
+// derivar a un humano para que NO quede colgado. Con flag OFF NO hace nada por cuenta. Cada 1 min (mismo patron que
+// revisarInactividad): granularidad fina para el umbral chico (default 3 min, configurable por cuenta).
+setInterval(revisarRespaldoTimeout, 60 * 1000);
+setTimeout(revisarRespaldoTimeout, 65 * 1000); // primera corrida ~65s tras arrancar (cuando ya esta estable)
 // AVISOS INTERNOS (default OFF por cuenta): #2 lead caliente + #3 resumen diario. Texto fijo + SQL, SIN IA (0 tokens).
 // Cada 5 min: granularidad para el tope configurable del lead caliente (min 1 min) y la ventana del resumen diario.
 setInterval(revisarAvisosInternos, 5 * 60 * 1000);

@@ -8630,6 +8630,37 @@ function _maestroToken(){ var payload=Buffer.from(JSON.stringify({ exp: Math.flo
 function _maestroTokenOk(tok){ try{ if(!tok) return false; var parts=String(tok).split('.'); if(parts.length!==2) return false; var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(parts[0]).digest('hex'); if(sig!==parts[1]) return false; var p=JSON.parse(Buffer.from(parts[0],'base64').toString()); return p.exp > Math.floor(Date.now()/1000); }catch(e){ return false; } }
 function maestroAuth(req){ var auth=req.headers.authorization||req.headers.Authorization||''; var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null; return _maestroTokenOk(tok); }
 
+// ===== TERMINAL DE CLAUDE (Panel Maestro) — asistente conversacional sobre el FUNCIONAMIENTO del producto =====
+// SOLO el dueño/dev (mismo gate que el resto del Maestro). Reusa el CONOCIMIENTO del agente de soporte. NO ve código
+// en vivo ni la base, NO ejecuta acciones (sin tools), NO hace cambios.
+// 🔴 GASTO (de Diego, NO de un cliente): 1 llamada a claude-haiku-4-5 por pregunta. NO llama a registrarUsoIA (no
+// descuenta mensajes de ningún cliente). Logueo de costo aparte SOLO si MAESTRO_OWNER_USER_ID está seteado.
+var MAESTRO_OWNER_USER_ID = process.env.MAESTRO_OWNER_USER_ID || '';
+app.post('/api/maestro/claude', async function(req, res) {
+  try {
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var pregunta = (req.body && req.body.pregunta) ? String(req.body.pregunta).slice(0, 4000) : '';
+    if (!pregunta.trim()) return res.status(400).json({ error: 'La consulta esta vacia' });
+    var historial = Array.isArray(req.body && req.body.historial) ? req.body.historial : [];
+    var msgs = historial
+      .filter(function (m) { return m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim(); })
+      .slice(-12)
+      .map(function (m) { return { role: m.role, content: String(m.content).slice(0, 4000) }; });
+    msgs.push({ role: 'user', content: pregunta });
+    var sys = 'Sos la terminal interna de Claude dentro del Panel Maestro del CRM Raices. Te usa SOLO el dueno/dev (y a futuro un soporte de confianza). Responde en espanol rioplatense, claro y conciso, sobre COMO FUNCIONA el producto y como explicarselo a un cliente. Podes ser mas tecnico que el agente de cara al cliente. IMPORTANTE: NO ves el codigo en vivo ni la base de datos y NO ejecutas acciones; si te piden un dato puntual de la cuenta de un cliente o ejecutar un cambio, aclaralo y explica donde verlo/hacerlo en el panel. Si algo no esta en el conocimiento de abajo, deci que no te consta en vez de inventar.\n\nCONOCIMIENTO DEL PRODUCTO:\n' + CONOCIMIENTO_SOPORTE;
+    var respuesta = '';
+    try {
+      var r = await anthropic.messages.create({ model: 'claude-haiku-4-5', max_tokens: 900, system: sys, messages: msgs });
+      try { if (MAESTRO_OWNER_USER_ID && r && r.usage) await registrarUsoTokens(MAESTRO_OWNER_USER_ID, r.usage, 'maestro_claude', PRECIO_HAIKU); } catch (eU) {}
+      respuesta = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+    } catch (eIA) {
+      console.error('maestro/claude IA:', eIA && eIA.message);
+      return res.status(502).json({ error: 'No pude consultar a Claude en este momento.' });
+    }
+    return res.json({ ok: true, respuesta: respuesta || 'No pude generar una respuesta.' });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // ===== KILL-SWITCH GLOBAL (#15): "Pausar TODO el sistema" =====
 // Flag global persistido en superadmin_config.pausa_global (fila id=1). Cuando esta en true, el GATE TEMPRANO del
 // webhook lo trata como pausa TOTAL para TODOS los clientes -> cero tokens de IA, mensaje crudo guardado, igual que

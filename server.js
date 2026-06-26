@@ -7186,6 +7186,30 @@ app.post('/api/scrape/detalle', async function(req, res) {
         if (ogM && ogM[1]) ogImg = ogM[1].trim();
         var galeriaHtml = [];
         try { galeriaHtml = _extraerGaleriaHtml(html, u); } catch (eG) { galeriaHtml = []; }
+
+        // FIX galeria (universal WP): si la galeria HTML quedo POBRE (<2 fotos) — caso antonbienesraices, donde las
+        // fotos no tienen UUID ni el ID en la URL —, sacar el postId del HTML (body class `postid-NNNN`, o el
+        // shortlink `?p=NNNN`) y traer los adjuntos del post via /wp-json .../media?parent=NNNN. ADITIVO: solo corre
+        // cuando hoy quedaria 1 foto (og:image). No toca Houzez/GRAMAR/Tokko/wp-json. 0 tokens IA (HTTP a wp-json).
+        if (galeriaHtml.length < 2) {
+          try {
+            var _mPid = html.match(/\bpostid-(\d{2,})\b/i)
+                     || html.match(/rel=["']shortlink["'][^>]*[?&]p=(\d{2,})/i)
+                     || html.match(/[?&]p=(\d{2,})["'][^>]*rel=["']shortlink["']/i);
+            if (_mPid && _mPid[1]) {
+              var _baseMedia = '';
+              try { var _uu = new URL(u); _baseMedia = _uu.protocol + '//' + _uu.host; } catch (eB) { _baseMedia = ''; }
+              if (_baseMedia) {
+                var _pm = await _resolverMediaPorParent(_baseMedia, [_mPid[1]]);
+                var _fotosParent = (_pm && _pm[String(_mPid[1])]) ? _pm[String(_mPid[1])] : [];
+                if (_fotosParent && _fotosParent.length > galeriaHtml.length) {
+                  galeriaHtml = _fotosParent.slice(0, 15);
+                }
+              }
+            }
+          } catch (eParent) { /* si falla, queda la galeria HTML/og de siempre */ }
+        }
+
         function _adjuntarFotos(det) {
           if (!det || typeof det !== 'object') return det;
           // si ya trae fotos (p.ej. de un camino que las provea), no tocar.

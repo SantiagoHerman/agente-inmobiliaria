@@ -874,13 +874,15 @@ async function repartoV2Activo(user_id, bs) {
 // va detrás de este flag por-tenant. FALSE / ausente / null / columna inexistente -> comportamiento ACTUAL EXACTO
 // (no descuenta nada nuevo). TRUE -> aplica los cargos confirmados por Diego. Ante cualquier error -> false.
 async function cobrarTodoV2Activo(user_id, bs) {
+  // Diego (2026-06-26): "activá v2 en todo" -> el COBRO TOTAL es ahora el comportamiento por DEFECTO para todos.
+  // Solo se apaga si un tenant tiene explicitamente cobrar_todo_v2 = false (override por-cuenta, requiere que exista la columna).
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'cobrar_todo_v2')) return bs.cobrar_todo_v2 === true;
-    if (!user_id) return false;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'cobrar_todo_v2')) return bs.cobrar_todo_v2 !== false;
+    if (!user_id) return true;
     const { data, error } = await supabase.from('business_settings').select('cobrar_todo_v2').eq('user_id', user_id).maybeSingle();
-    if (error) return false; // columna ausente u otro error -> flag OFF (comportamiento actual)
-    return !!(data && data.cobrar_todo_v2 === true);
-  } catch (e) { return false; }
+    if (error) return true; // columna ausente u otro error -> default ON (v2 para todos)
+    return data ? (data.cobrar_todo_v2 !== false) : true;
+  } catch (e) { return true; }
 }
 
 // ===== PARTE B (PUNTO 1): RUNTIME DEL USUARIO IA — leer la persona/config del asesor IA que cubre =====

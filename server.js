@@ -331,7 +331,51 @@ const MP_BASE = 'https://api.mercadopago.com';
 const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7', enterprise: process.env.MP_PLAN_ENTERPRISE || '' };
 // Precios mensuales en ARS por nivel (HARDCODE). El preapproval directo (mpCrearSuscripcion) usa ESTE monto en
 // auto_recurring.transaction_amount: asi el checkout NO depende del GET del plan en MP (que a veces falla -> MP 500).
-const PRECIOS_MP = { basico: 55000, pro: 130000, premium: 330000, enterprise: 550000 };
+// NOTA: ya NO es la fuente del cobro (eso es precioPlanARS, atado al dolar). Queda como mapa de niveles validos
+// y precio BASE de referencia (lo usa el guard de aceptar-plan). Mantener en sync con BASE_PESOS.
+const PRECIOS_MP = { basico: 55000, pro: 130000, premium: 350000, enterprise: 620000 };
+
+// ============ DOLAR BLUE REF (ratchet / high-water-mark) ============
+// Todos los precios nuevos se atan al blue VENTA con un piso que SOLO sube. Se guarda 1 valor GLOBAL en
+// app_config.dolar_ref (NO por-tenant). Base inicial 1530 (a ese valor los precios dan exactos los base).
+const DOLAR_REF_BASE = 1530;
+var _dolarRefCache = DOLAR_REF_BASE; // cache en memoria: el path de COBRO usa esto (NO hace fetch). El cron lo refresca.
+
+// Lee el ref guardado de la DB y lo cachea. DEFENSIVO: si falla o no hay fila/tabla, deja el ultimo cache (o base).
+async function obtenerDolarRef() {
+  try {
+    var r = await supabase.from('app_config').select('dolar_ref').eq('id', 1).maybeSingle();
+    var v = r && r.data && Number(r.data.dolar_ref);
+    if (v && isFinite(v) && v >= DOLAR_REF_BASE) { _dolarRefCache = v; return v; }
+  } catch (e) { console.error('obtenerDolarRef:', e && e.message); }
+  return _dolarRefCache;
+}
+function dolarRefSync() { return _dolarRefCache; } // valor SINCRONICO para el cobro: nunca hace red, usa el cache.
+
+// JOB (corre en el cron, NO en el cobro): fetch blue.venta, ratchea max(ref, venta) y guarda. Best-effort.
+async function actualizarDolarRef() {
+  try {
+    var refActual = await obtenerDolarRef();
+    var venta = null;
+    try {
+      var resp = await fetch('https://dolarapi.com/v1/dolares/blue');
+      if (resp && resp.ok) { var j = await resp.json(); var vv = j && Number(j.venta); if (vv && isFinite(vv) && vv > 0) venta = vv; }
+    } catch (eF) { console.error('actualizarDolarRef fetch dolarapi:', eF && eF.message); }
+    var nuevo = Math.max(refActual, DOLAR_REF_BASE, venta || 0); // RATCHET: solo sube
+    if (nuevo > refActual) { await supabase.from('app_config').update({ dolar_ref: nuevo, dolar_ref_updated_at: new Date().toISOString() }).eq('id', 1); }
+    _dolarRefCache = nuevo;
+  } catch (e) { console.error('actualizarDolarRef:', e && e.message); }
+}
+
+// Precios BASE en ARS a dolar_ref=1530 (los 4 planes fijos). A 1530 dan EXACTO estos valores; si el blue sube, suben proporcional.
+const BASE_PESOS = { basico: 55000, pro: 130000, premium: 350000, enterprise: 620000 };
+function precioPlanARS(nivel) {
+  var base = BASE_PESOS[nivel];
+  if (typeof base === 'undefined' || base === null) return null;
+  var ref = dolarRefSync();
+  if (!ref || !isFinite(ref) || ref < DOLAR_REF_BASE) ref = DOLAR_REF_BASE;
+  return Math.round(base * ref / DOLAR_REF_BASE);
+}
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
@@ -677,7 +721,7 @@ async function mpCrearPlan(nombre, montoARS, backUrl) {
 // (NO del GET del plan en MP: ese GET a veces falla -> transaction_amount undefined -> MP 500). Tampoco
 // mandamos free_trial: el preapproval DIRECTO (sin plan) no lo soporta y tira 500. Conserva external_reference.
 async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nivel, startDateISO) {
-  var monto = PRECIOS_MP[nivel];
+  var monto = precioPlanARS(nivel); // monto atado al dolar (queda CONGELADO en MP al crear/modificar el preapproval)
   // Sin precio configurado para este nivel => transaction_amount undefined => MP 500. Cortamos con un error claro ANTES.
   if (typeof monto === 'undefined' || monto === null) {
     throw new Error('Plan sin precio configurado: ' + nivel);
@@ -8238,7 +8282,9 @@ app.get('/api/suscripcion', async function(req, res) {
     }
     // puede_cancelar: solo si hay un preapproval real cobrable.
     var puede_cancelar = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar });
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
+      // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.
+      precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync() });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -8337,7 +8383,7 @@ app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
     if (['basico','pro','premium','enterprise'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
-    var monto = PRECIOS_MP[nivel];
+    var monto = precioPlanARS(nivel); // monto atado al dolar (queda CONGELADO en MP al crear/modificar el preapproval)
     if (typeof monto === 'undefined' || monto === null) return res.status(400).json({ error: 'Plan sin precio configurado: ' + nivel });
     var sub = await getSubscription(user_id);
     var tieneMPactivo = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
@@ -9575,6 +9621,9 @@ async function revisarSuscripciones() {
 }
 setInterval(revisarSuscripciones, 6 * 60 * 60 * 1000);
 setTimeout(revisarSuscripciones, 120 * 1000);
+// DOLAR REF: ratchet del blue. Warm-up del cache al boot + refresco cada 6h. Corre aunque SUBSCRIPTIONS_ENABLED=false.
+setTimeout(actualizarDolarRef, 20 * 1000);
+setInterval(actualizarDolarRef, 6 * 60 * 60 * 1000);
 
 // MONITOREO (#19): chequea que Supabase y el servidor de WhatsApp (Evolution) respondan. Si algo se cae,
 // crea una notificacion 'sistema' (critico) en el Maestro -> llega al panel y (con FCM) al celular. Best-effort.

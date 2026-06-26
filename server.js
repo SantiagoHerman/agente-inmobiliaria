@@ -4384,7 +4384,23 @@ async function enviarRecontactosPendientes() {
       .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at')
       .eq('status', 'recontacto');
     if (!enRecontacto || enRecontacto.length === 0) return;
+    // GATE recontacto_v2 (default OFF): una cuenta con el flag ON usa el motor NUEVO (paulatino/aleatorio/seguro)
+    // y se EXCLUYE de este loop legacy. Con el flag OFF (o sin columna) el comportamiento es IDENTICO al actual.
+    // Cacheamos el flag por user_id (1 sola lectura por cuenta) para no multiplicar queries.
+    const _v2FlagCache = {};
+    async function _esCuentaV2(uid) {
+      if (Object.prototype.hasOwnProperty.call(_v2FlagCache, uid)) return _v2FlagCache[uid];
+      let v2 = false;
+      try {
+        const { data: bsF } = await supabase.from('business_settings').select('recontacto_v2').eq('user_id', uid).maybeSingle();
+        v2 = !!(bsF && bsF.recontacto_v2 === true);
+      } catch (eF) { v2 = false; } // fail-safe: si la columna no existe / error -> tratar como legacy (flag OFF)
+      _v2FlagCache[uid] = v2;
+      return v2;
+    }
     for (const conv of enRecontacto) {
+      // Si la cuenta tiene recontacto_v2 ON, NO la procesa el loop legacy: la atiende el motor nuevo mas abajo.
+      if (await _esCuentaV2(conv.user_id)) continue;
       // SALVAGUARDA 1: respetar el maximo de recontactos
       const maxRec = (conv.recontacto_max != null) ? conv.recontacto_max : 5;
       const countRec = conv.recontacto_count || 0;
@@ -4451,8 +4467,239 @@ async function enviarRecontactosPendientes() {
       if (enviados >= RECONTACTO_CAP) break; // tope por tanda: el resto sale en las proximas corridas (cada 15 min)
       await new Promise(function(r){ setTimeout(r, 8000 + Math.floor(Math.random() * 12000)); }); // espaciar 8-20s entre envios (anti-baneo)
     }
+    // MOTOR NUEVO (gateado): procesa SOLO las cuentas con recontacto_v2 = true. Las cuentas legacy ya
+    // se procesaron arriba. Si falla, no afecta al camino legacy (todo dentro de su propio try/catch).
+    try { await _enviarRecontactosV2(ahoraMs); } catch (eV2) { console.error('Error en _enviarRecontactosV2:', eV2 && eV2.message); }
   } catch (e) { console.error('Error en enviarRecontactosPendientes:', e && e.message); }
   finally { _recontactoEnCurso = false; }
+}
+
+// ============================================================================
+// MOTOR RECONTACTO v2 (anti-baneo): PAULATINO + ALEATORIO + SEGURO. Gateado por
+// business_settings.recontacto_v2 = true. Un numero "quieto" NUNCA salta a cientos
+// de mensajes/dia: rampa de warm-up por dia de actividad + goteo por franja horaria
+// + aleatorizacion + caps duros. Ante cualquier duda, ERRAR HACIA MENOS (plata/baneo).
+//
+// Diferencias clave vs legacy:
+//   - TOPE DIARIO POR CUENTA via warm-up (no un cap global de 20/tanda).
+//   - GOTEO: reparte el cupo restante a lo largo de los minutos que quedan de la franja.
+//   - ALEATORIO: N_real = round(N * (1 + (rand-0.5)*0.8)), piso 0, techo = cupo restante.
+//   - CAP de seguridad por tanda por cuenta = 8.
+//   - recontacto_categoria 'frio' (gracia 48hs, SIEMPRE plantilla sin nombre, sub-cupo)
+//     vs 'viejo' (arranca rampa como dia 3, puede usar IA-memoria).
+//   - Pausas: recontacto_pausado (cuenta), recontacto_pausado_lead / recontacto_excluido (conv).
+// ============================================================================
+
+// Rampa de warm-up: dado el dia de actividad devuelve el tope diario de envios.
+// dia1=40, dia2=60, dia3=90, dia4=130, dia5=180, dia6=240, dia7=300, dia8+=+25%/dia hasta topeMax.
+function _topeWarmup(diaActividad, topeMax) {
+  const TM = (Number.isFinite(topeMax) && topeMax > 0) ? topeMax : 400;
+  const d = (Number.isFinite(diaActividad) && diaActividad > 0) ? Math.floor(diaActividad) : 1;
+  const base = [40, 60, 90, 130, 180, 240, 300]; // dia 1..7
+  if (d <= 7) return Math.min(base[d - 1], TM);
+  // dia 8 en adelante: partir de 300 y crecer +25% por cada dia extra, con techo en topeMax.
+  let tope = 300;
+  for (let i = 8; i <= d; i++) {
+    tope = Math.round(tope * 1.25);
+    if (tope >= TM) return TM;
+  }
+  return Math.min(tope, TM);
+}
+
+// Modo de agresividad (multiplicador suave del N objetivo del goteo). Conservador por defecto.
+function _factorAgresividad(modo) {
+  if (modo === 'suave' || modo === 'lento') return 0.6;
+  if (modo === 'agresivo' || modo === 'rapido') return 1.4;
+  return 1.0; // 'normal' / null / desconocido
+}
+
+// Minutos restantes de la franja horaria de oficina AHORA (Argentina UTC-3). Si no podemos
+// determinarla con confianza, devolvemos un valor chico (goteo lento) -> errar hacia MENOS.
+function _minutosRestantesFranja(horario) {
+  try {
+    if (!horario) return 0;
+    const ahora = new Date();
+    const utc = ahora.getTime() + ahora.getTimezoneOffset() * 60000;
+    const arg = new Date(utc - 3 * 60 * 60000);
+    const dias = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
+    const cfg = horario[dias[arg.getDay()]];
+    if (!cfg || cfg.cerrado || cfg.atiende === false) return 0;
+    const minutosAhora = arg.getHours() * 60 + arg.getMinutes();
+    const aMin = function(str, fb) {
+      const s = String(str == null ? '' : str).trim();
+      if (!s) return (fb == null) ? null : fb;
+      const p = s.split(':'); const h = Number(p[0]); const m = (p.length > 1) ? Number(p[1]) : 0;
+      if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return (fb == null) ? null : fb;
+      return h * 60 + m;
+    };
+    let finFranja = null;
+    if (Array.isArray(cfg.franjas)) {
+      // tomar el fin de la franja en la que estamos AHORA (si estamos dentro de alguna)
+      for (const f of cfg.franjas) {
+        if (!f || typeof f !== 'object') continue;
+        const d = aMin(f.desde, null), h = aMin(f.hasta, null);
+        if (d == null || h == null || h <= d) continue;
+        if (minutosAhora >= d && minutosAhora <= h) { if (finFranja == null || h > finFranja) finFranja = h; }
+      }
+    } else {
+      const d = aMin(cfg.desde, 9 * 60), h = aMin(cfg.hasta, 18 * 60);
+      if (minutosAhora >= d && minutosAhora <= h) finFranja = h;
+    }
+    if (finFranja == null) return 0; // no estamos dentro de ninguna franja -> nada
+    return Math.max(0, finFranja - minutosAhora);
+  } catch (e) { return 0; }
+}
+
+async function _enviarRecontactosV2(ahoraMs) {
+  const UN_DIA_MS = 24 * 60 * 60 * 1000;
+  const CAP_TANDA_CUENTA = 8; // tope DURO de envios por tanda por cuenta (anti-baneo): el resto va en proximas corridas
+  const FRANJA_INTERVALO_MIN = 15; // el cron corre cada 15 min: usamos esta ventana para el goteo
+  const hoyStr = (function(){ const a = new Date(); const u = a.getTime() + a.getTimezoneOffset()*60000; const arg = new Date(u - 3*60*60000); return arg.toISOString().slice(0,10); })();
+
+  // Cuentas con el flag ON. Si la columna no existe (migracion no corrida) -> no hay cuentas v2 -> no hace nada.
+  let cuentasV2 = [];
+  try {
+    const { data: cc } = await supabase
+      .from('business_settings')
+      .select('user_id, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+      .eq('recontacto_v2', true);
+    cuentasV2 = Array.isArray(cc) ? cc : [];
+  } catch (eCol) { return; } // sin columna / error -> no procesar nada v2 (fail-safe)
+  if (cuentasV2.length === 0) return;
+
+  for (const bs of cuentasV2) {
+    try {
+      const uid = bs.user_id;
+      // PAUSAS de cuenta (mismas reglas que legacy + pausa propia de recontacto)
+      if (_pausaGlobal === true || bs.crm_pausado === true || bs.agente_pausado === true || bs.eliminado_at) continue;
+      if (bs.recontacto_pausado === true) continue;
+      // HORARIO de oficina: si estamos fuera, no mandar.
+      if (!dentroHorarioOficina(bs.horario_oficina)) continue;
+
+      // --- WARM-UP: avanzar el dia SOLO cuando cambia la fecha de envio (los dias que efectivamente mando). ---
+      let warmupDia = (Number.isFinite(bs.recontacto_warmup_dia) ? bs.recontacto_warmup_dia : 0) || 0;
+      let enviadosHoy = (Number.isFinite(bs.recontacto_enviados_hoy) ? bs.recontacto_enviados_hoy : 0) || 0;
+      const fechaPrev = bs.recontacto_enviados_fecha ? String(bs.recontacto_enviados_fecha).slice(0,10) : null;
+      if (fechaPrev !== hoyStr) {
+        // Dia nuevo de actividad: avanzar la rampa y resetear el contador del dia.
+        warmupDia = warmupDia + 1;
+        enviadosHoy = 0;
+        try { await supabase.from('business_settings').update({ recontacto_warmup_dia: warmupDia, recontacto_enviados_hoy: 0, recontacto_enviados_fecha: hoyStr }).eq('user_id', uid); } catch (eUp) { continue; }
+      }
+      const topeMax = Number.isFinite(bs.recontacto_tope_max) ? bs.recontacto_tope_max : 400;
+      const topeDiario = _topeWarmup(warmupDia, topeMax);
+      const cupoRestante = Math.max(0, topeDiario - enviadosHoy);
+      if (cupoRestante <= 0) continue; // ya se cumplio el cupo del dia -> nada mas hoy
+
+      // --- GOTEO: repartir el cupo restante a lo largo de los minutos restantes de la franja. ---
+      const minRestantes = _minutosRestantesFranja(bs.horario_oficina);
+      if (minRestantes <= 0) continue; // fuera de franja util -> nada
+      const tandasRestantes = Math.max(1, Math.ceil(minRestantes / FRANJA_INTERVALO_MIN));
+      const factor = _factorAgresividad(bs.recontacto_agresividad);
+      let nObjetivo = (cupoRestante / tandasRestantes) * factor; // N objetivo "parejo" para esta tanda
+      // ALEATORIZAR: a veces 0, a veces mas. round(N*(1+(rand-0.5)*0.8)) => +-40%.
+      let nReal = Math.round(nObjetivo * (1 + (Math.random() - 0.5) * 0.8));
+      if (!Number.isFinite(nReal) || nReal < 0) nReal = 0;
+      // Techos: cupo del dia, y CAP DURO por tanda por cuenta.
+      nReal = Math.min(nReal, cupoRestante, CAP_TANDA_CUENTA);
+      if (nReal <= 0) continue; // esta tanda no manda (goteo: es normal y deseado)
+
+      // Sub-cupo de FRIOS: porcentaje del cupo DIARIO reservado/limitado para frios (anti-quema de base fria).
+      const subPct = Number.isFinite(bs.recontacto_subcupo_frio) ? bs.recontacto_subcupo_frio : 60;
+      const subcupoFriosDia = Math.max(0, Math.floor(topeDiario * Math.max(0, Math.min(100, subPct)) / 100));
+
+      // --- Candidatas de esta cuenta en estado recontacto ---
+      const { data: convs } = await supabase
+        .from('conversations')
+        .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido')
+        .eq('user_id', uid)
+        .eq('status', 'recontacto');
+      if (!convs || convs.length === 0) continue;
+
+      const empresaRec = bs.company_name ? bs.company_name : '';
+      const agentNameRec = bs.agent_name ? bs.agent_name : '';
+      const inst = { instancia_nombre: nombreInstancia(uid) };
+
+      let enviadosCuenta = 0;       // enviados en ESTA tanda para esta cuenta
+      let friosEnviadosTanda = 0;   // frios enviados en esta tanda (para respetar el sub-cupo diario, best-effort)
+
+      for (const conv of convs) {
+        if (enviadosCuenta >= nReal) break; // alcanzamos el objetivo de la tanda
+        // Exclusiones / pausas por conversacion
+        if (conv.recontacto_excluido === true || conv.recontacto_pausado_lead === true) continue;
+        // Maximo de recontactos por conversacion
+        const maxRec = (conv.recontacto_max != null) ? conv.recontacto_max : 5;
+        const countRec = conv.recontacto_count || 0;
+        if (countRec >= maxRec) continue;
+        // Categoria (default 'frio')
+        const categoria = (conv.recontacto_categoria === 'viejo') ? 'viejo' : 'frio';
+        // 1 recontacto por dia por conversacion (mismo registro que legacy: tabla recontactos)
+        const { data: ultimoRec } = await supabase
+          .from('recontactos')
+          .select('enviado_at')
+          .eq('conversation_id', conv.id)
+          .order('enviado_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (ultimoRec && ultimoRec.enviado_at) {
+          if ((ahoraMs - new Date(ultimoRec.enviado_at).getTime()) < UN_DIA_MS) continue;
+        }
+        // GRACIA a contactos nuevos (sin recontacto previo): 48hs para frios, 24hs para viejos.
+        if (!ultimoRec && conv.created_at) {
+          const graciaMs = (categoria === 'frio') ? (48 * 60 * 60 * 1000) : UN_DIA_MS;
+          if ((ahoraMs - new Date(conv.created_at).getTime()) < graciaMs) continue;
+        }
+        // Sub-cupo de frios (best-effort por tanda, proporcional a esta corrida): si ya superamos lo que
+        // corresponde a frios en esta tanda, saltar la conversacion fria (los viejos siguen).
+        if (categoria === 'frio') {
+          const friosPorTanda = Math.max(1, Math.ceil(subcupoFriosDia / tandasRestantes));
+          if (friosEnviadosTanda >= friosPorTanda) continue;
+        }
+        // Datos del contacto
+        const { data: contacto } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle();
+        if (!contacto || !contacto.phone) continue;
+
+        // ¿Primer contacto (sin charla real)? Misma deteccion que legacy.
+        const { data: msgsPrevios } = await supabase.from('messages').select('id').eq('conversation_id', conv.id).neq('origen', 'historial_importado').limit(1);
+        const esPrimerContacto = !msgsPrevios || msgsPrevios.length === 0;
+
+        // ARMAR TEXTO. FRIO: primer mensaje SIEMPRE plantilla sin nombre (gratis, no infla gasto IA).
+        // VIEJO: si hay charla previa puede usar IA-memoria (Sonnet, reenganche); si no, plantilla.
+        let texto = null, _recEsIA = false;
+        const permiteIA = (categoria === 'viejo') && !esPrimerContacto;
+        if (permiteIA) { try { texto = await mensajeRecontactoIA(uid, conv.id, contacto.name, empresaRec, agentNameRec); if (texto) _recEsIA = true; } catch (eIA) {} }
+        if (!texto) {
+          // FRIO o primer contacto: nunca usar el nombre importado (suele venir mal).
+          const usarNombre = (categoria === 'viejo' && !esPrimerContacto) ? contacto.name : '';
+          texto = mensajeRecontacto(usarNombre, esPrimerContacto, empresaRec, agentNameRec);
+        }
+        if (!texto || !texto.trim()) continue; // nunca mandar vacio
+
+        // Traduccion (igual que legacy)
+        let textoEnviar = texto, idiomaRec = null;
+        if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es' && await planPermite(uid, 'audio_traduccion')) {
+          try { const tr = await traducir(texto, conv.idioma_lead, uid); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto v2:', eTr && eTr.message); }
+        }
+
+        // Registrar + enviar (mismo flujo que legacy)
+        const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: uid, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
+        await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
+        await supabase.from('conversations').update({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
+        await supabase.from('recontactos').insert({ user_id: uid, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
+        await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
+        try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(uid)) await registrarUsoIA(uid, 1 + (idiomaRec ? 1 : 0)); } catch (eCob) {}
+
+        enviadosCuenta++;
+        if (categoria === 'frio') friosEnviadosTanda++;
+        // Incrementar el contador diario de la cuenta por CADA envio (persistente).
+        enviadosHoy++;
+        try { await supabase.from('business_settings').update({ recontacto_enviados_hoy: enviadosHoy, recontacto_enviados_fecha: hoyStr }).eq('user_id', uid); } catch (eInc) {}
+        console.log('Recontacto v2 ENVIADO conv ' + conv.id + ' (cat ' + categoria + ', intento ' + (countRec+1) + ', cuenta ' + uid + ')');
+        // Espaciar 8-20s entre envios (anti-baneo), igual que legacy.
+        await new Promise(function(r){ setTimeout(r, 8000 + Math.floor(Math.random() * 12000)); });
+      }
+    } catch (eCuenta) { console.error('Error recontacto v2 cuenta ' + (bs && bs.user_id) + ':', eCuenta && eCuenta.message); }
+  }
 }
 
 // Reintenta automaticamente los mensajes que quedaron 'fallido' (WhatsApp estaba desconectado)
@@ -7644,6 +7891,11 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
     const leads = (req.body && req.body.leads) || [];
+    // Categoria de recontacto para los leads importados (recontacto v2). Default 'frio' (primer mensaje plantilla,
+    // gracia 48hs). Se puede pasar a nivel body (req.body.categoria, aplica a todos) o por lead (lead.categoria).
+    // Solo se aceptan 'frio'/'viejo'; cualquier otro valor cae a 'frio'. Con recontacto_v2 OFF la columna no se lee.
+    const _normCat = function(c){ return (c === 'viejo') ? 'viejo' : 'frio'; };
+    const categoriaBody = (req.body && req.body.categoria != null) ? _normCat(req.body.categoria) : null;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     if (!Array.isArray(leads) || leads.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });
     let creados = 0; let yaExistian = 0; let errores = 0; let conHistorial = 0;
@@ -7677,7 +7929,13 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
         const { data: convExistente } = await supabase.from('conversations').select('id').eq('contact_id', contactoId).maybeSingle();
         let convId;
         if (!convExistente) {
-          const { data: convNueva } = await supabase.from('conversations').insert({ user_id: user_id, contact_id: contactoId, channel: 'whatsapp', status: 'recontacto', ai_enabled: true }).select('id').single();
+          // recontacto_categoria: por-lead > body > 'frio'. Importados son frios por defecto (primer msg plantilla).
+          const categoriaLead = (lead.categoria != null) ? _normCat(lead.categoria) : (categoriaBody != null ? categoriaBody : 'frio');
+          const _baseConv = { user_id: user_id, contact_id: contactoId, channel: 'whatsapp', status: 'recontacto', ai_enabled: true };
+          let { data: convNueva, error: errConv } = await supabase.from('conversations').insert(Object.assign({}, _baseConv, { recontacto_categoria: categoriaLead })).select('id').single();
+          // FAIL-SAFE: si la migracion v2 aun no corrio (columna inexistente -> PGRST204), reintentar SIN la columna
+          // para no romper la importacion. Con flag OFF esa columna no se lee igual.
+          if (errConv) { const r2 = await supabase.from('conversations').insert(_baseConv).select('id').single(); convNueva = r2.data; }
           convId = convNueva ? convNueva.id : null;
         } else {
           convId = convExistente.id;

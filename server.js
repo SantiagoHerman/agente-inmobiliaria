@@ -377,14 +377,39 @@ function precioPlanARS(nivel) {
   return Math.round(base * ref / DOLAR_REF_BASE);
 }
 
+// ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====
+// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 15.000 msgs) a USD 0,04 c/u x dolar.
+// Recarga: pago UNICO (Checkout Pro) para sumar mensajes al pool, min 200 a USD 0,06 c/u x dolar (requiere plan activo).
+// Ambos precios atados al MISMO dolar ratchet (dolarRefSync) que los planes fijos.
+const PERSONAL_USD_POR_MSG = 0.04;
+const PERSONAL_MIN_MSGS = 15000;
+const PERSONAL_MAX_MSGS = 2000000; // tope de cordura: evita montos absurdos por typo/manipulacion
+const RECARGA_USD_POR_MSG = 0.06;
+const RECARGA_MIN_MSGS = 200;
+const RECARGA_MAX_MSGS = 1000000;
+// Piso de dolar (mismo guard que precioPlanARS): nunca por debajo del base, ni con un cache corrupto.
+function _dolarSeguro() { var ref = dolarRefSync(); return (!ref || !isFinite(ref) || ref < DOLAR_REF_BASE) ? DOLAR_REF_BASE : ref; }
+function precioPersonalARS(cantMsgs) {
+  var n = parseInt(cantMsgs, 10);
+  if (!Number.isSafeInteger(n) || n < PERSONAL_MIN_MSGS || n > PERSONAL_MAX_MSGS) return null;
+  return Math.round(n * PERSONAL_USD_POR_MSG * _dolarSeguro());
+}
+function precioRecargaARS(cantMsgs) {
+  var n = parseInt(cantMsgs, 10);
+  if (!Number.isSafeInteger(n) || n < RECARGA_MIN_MSGS || n > RECARGA_MAX_MSGS) return null;
+  return Math.round(n * RECARGA_USD_POR_MSG * _dolarSeguro());
+}
+
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
   trial:      { ai_messages: 100,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   basico:     { ai_messages: 500,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   pro:        { ai_messages: 1800,  asesores: 10,       contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   premium:    { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
-  enterprise: { ai_messages: 8000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
-  // PENDIENTE: nivel 'personal' (a medida, min 15.000 msgs) aun no existe; cuando se cree, agregar asesores: Infinity, contactos: Infinity, reportes_ia: true, audio_traduccion: true.
+  enterprise: { ai_messages: 8000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
+  // 'personal' (a medida): el CUPO real lo fija limits_override.ai_messages = la cantidad elegida (>=15.000) al contratar.
+  // Aca ai_messages: 15000 es solo el piso/fallback si por algun motivo no hubiera override.
+  personal:   { ai_messages: 15000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
 };
 // TOPES VIEJOS (grandfathering). Los clientes creados ANTES de PLANES_NUEVOS_DESDE conservan estos topes de mensajes
 // (no se les recorta a mitad de camino); los clientes NUEVOS arrancan con los topes nuevos de arriba (mas bajos, para
@@ -720,16 +745,21 @@ async function mpCrearPlan(nombre, montoARS, backUrl) {
 // creamos la preapproval SIN plan, con status:'pending'. El MONTO sale HARDCODE de PRECIOS_MP[nivel]
 // (NO del GET del plan en MP: ese GET a veces falla -> transaction_amount undefined -> MP 500). Tampoco
 // mandamos free_trial: el preapproval DIRECTO (sin plan) no lo soporta y tira 500. Conserva external_reference.
-async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nivel, startDateISO) {
-  var monto = precioPlanARS(nivel); // monto atado al dolar (queda CONGELADO en MP al crear/modificar el preapproval)
+async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nivel, startDateISO, montoOverride) {
+  // montoOverride: monto en ARS ya calculado (lo usa el Plan Personal, cuyo monto NO sale de BASE_PESOS sino de la
+  // cantidad de mensajes elegida). Si no viene, se usa el precio fijo del nivel (precioPlanARS).
+  var monto = (typeof montoOverride === 'number' && montoOverride > 0) ? Math.round(montoOverride) : precioPlanARS(nivel);
   // Sin precio configurado para este nivel => transaction_amount undefined => MP 500. Cortamos con un error claro ANTES.
   if (typeof monto === 'undefined' || monto === null) {
     throw new Error('Plan sin precio configurado: ' + nivel);
   }
   // El GET del plan es SOLO para el "reason" (texto). NO para el precio. Si falla, seguimos con un reason por defecto.
+  // Personal no tiene plan en MP (preapproval directo con monto a medida) -> planId vacio -> se saltea el GET.
   var plan = null;
-  try { plan = await mpFetch('/preapproval_plan/' + planId, 'GET', null); }
-  catch (e) { console.error('mpCrearSuscripcion GET plan (no critico, se usa precio hardcode):', e && e.message); }
+  if (planId) {
+    try { plan = await mpFetch('/preapproval_plan/' + planId, 'GET', null); }
+    catch (e) { console.error('mpCrearSuscripcion GET plan (no critico, se usa precio hardcode):', e && e.message); }
+  }
   var autoRecurring = {
     frequency: 1,
     frequency_type: 'months',
@@ -761,6 +791,27 @@ async function mpCancelarSuscripcion(preapprovalId) {
 // Consulta el estado de una suscripcion por id.
 async function mpConsultarSuscripcion(preapprovalId) {
   return await mpFetch('/preapproval/' + preapprovalId, 'GET', null);
+}
+
+// Consulta un PAGO unico por id (Checkout Pro). Lo usa el webhook para acreditar la recarga.
+async function mpConsultarPago(paymentId) {
+  return await mpFetch('/v1/payments/' + paymentId, 'GET', null);
+}
+
+// URL publica del webhook (este mismo backend). MP manda aca las notificaciones del pago unico de la recarga.
+const MP_WEBHOOK_URL = process.env.MP_WEBHOOK_URL || 'https://agente-inmobiliaria-production-7e1c.up.railway.app/api/webhook/mercadopago';
+
+// Crea una PREFERENCIA de pago UNICO (Checkout Pro) para la recarga de mensajes (no recurrente).
+// external_reference lleva 'recarga|user_id|cantidad' (siempre se propaga al pago -> el webhook lo lee de ahi).
+async function mpCrearPreferencia(titulo, montoARS, externalRef, backUrl, metadata) {
+  var body = {
+    items: [{ title: String(titulo).slice(0, 250), quantity: 1, unit_price: Math.round(montoARS), currency_id: 'ARS' }],
+    external_reference: externalRef,
+    metadata: metadata || {},
+    back_urls: { success: backUrl, pending: backUrl, failure: backUrl },
+    notification_url: MP_WEBHOOK_URL
+  };
+  return await mpFetch('/checkout/preferences', 'POST', body);
 }
 
 // ============ FUNCION REUTILIZABLE: genera la respuesta del agente ============
@@ -8286,7 +8337,9 @@ app.get('/api/suscripcion', async function(req, res) {
     var puede_cancelar = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
     return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
       // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.
-      precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync() });
+      precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync(),
+      // Plan Personal (a medida) y Recarga (pago unico): el front calcula el precio = cantidad * usd_por_msg * dolar_ref.
+      personal: { usd_por_msg: PERSONAL_USD_POR_MSG, min: PERSONAL_MIN_MSGS }, recarga: { usd_por_msg: RECARGA_USD_POR_MSG, min: RECARGA_MIN_MSGS } });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -8298,22 +8351,33 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
     var email = (req.body && req.body.email) ? String(req.body.email) : '';
-    if (['basico','pro','premium','enterprise'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
+    if (['basico','pro','premium','enterprise','personal'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
     if (!email) return res.status(400).json({ error: 'Falta email del pagador' });
-    // Los planes son GLOBALES (del SaaS), no per-tenant.
-    var planId = PLANES_MP[nivel] || null;
-    if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
+    // PERSONAL: volumen a medida. monto = cantidad * 0,04 USD * dolar; cupo = cantidad (limits_override). Sin plan MP, sin trial (cobra ya).
+    var planId = null;
+    var montoOverride = null;
+    var cantPersonal = null;
+    if (nivel === 'personal') {
+      cantPersonal = parseInt(req.body && req.body.cantidad, 10);
+      if (isNaN(cantPersonal) || cantPersonal < PERSONAL_MIN_MSGS) return res.status(400).json({ error: 'El Plan Personal arranca en ' + PERSONAL_MIN_MSGS + ' mensajes' });
+      montoOverride = precioPersonalARS(cantPersonal);
+      if (!montoOverride) return res.status(400).json({ error: 'Cantidad invalida' });
+    } else {
+      // Los planes fijos son GLOBALES (del SaaS), no per-tenant.
+      planId = PLANES_MP[nivel] || null;
+      if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
+    }
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
-    // B1: TRIAL de 4 dias con tarjeta upfront. Solo para una cuenta NUEVA que arranca su suscripcion (no para un
-    // upgrade desde active/cortesia: ese cobra ya). Diferimos el 1er cobro con start_date = ahora + 4 dias.
+    // B1: TRIAL de 4 dias con tarjeta upfront. Solo para una cuenta NUEVA con un plan FIJO (no upgrade, no personal).
+    // Personal cobra al toque (sin trial) para no chocar con el cap de 100 mensajes del trial.
     var subPrev = await getSubscription(user_id);
     var yaActivo = !!(subPrev && (subPrev.status === 'active' || subPrev.status === 'past_due' || subPrev.cortesia === true));
     var startDateISO = null;
-    if (!yaActivo) {
+    if (nivel !== 'personal' && !yaActivo) {
       var d4 = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000);
       startDateISO = d4.toISOString();
     }
-    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, startDateISO);
+    var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, startDateISO, montoOverride);
     // Guardar el plan ELEGIDO en la fila para que se apliquen sus limites al activarse (el webhook NO incluye
     // 'plan' en su upsert -> se preserva). Asi un Enterprise queda con 20.000 y no cae al default. Si el tenant
     // NO esta active/cortesia, lo dejamos en 'trial' y marcamos trial_con_tarjeta=true: durante esos 4 dias la IA
@@ -8321,12 +8385,19 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     // a 'active' (cupo del plan). Si YA esta active (upgrade), NO tocamos status ni el flag (no cortar el acceso).
     try {
       var filaPlan = { user_id: user_id, plan: nivel };
-      if (!yaActivo) { filaPlan.status = 'trial'; filaPlan.trial_con_tarjeta = true; }
+      if (nivel === 'personal') {
+        // Cupo a medida via limits_override (preserva otros overrides del Maestro).
+        filaPlan.limits_override = Object.assign({}, (subPrev && subPrev.limits_override) || {}, { ai_messages: cantPersonal });
+        // CRITICO: Personal NO tiene trial, pero NO debe servir gratis antes de pagar. status='trial' (sin trial_con_tarjeta)
+        // -> debeBloquearAcceso lo corta hasta que el webhook lo pase a 'active' al confirmarse el pago. Si ya estaba activo
+        // (upgrade raro via checkout), NO tocamos su status para no cortarle el acceso.
+        if (!yaActivo) filaPlan.status = 'trial';
+      } else if (!yaActivo) { filaPlan.status = 'trial'; filaPlan.trial_con_tarjeta = true; }
       // DEFENSIVO: la columna trial_con_tarjeta puede no existir aun (migracion pendiente). Si el upsert falla por
       // eso, reintentamos sin ese campo: el cliente queda en 'trial' (bloqueado hasta el pago, como antes) en vez
       // de romper el checkout. Una vez corrida la migracion, el trial atiende capeado a 100 normalmente.
       var upT = await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
-      if (upT && upT.error && !yaActivo) {
+      if (upT && upT.error && !yaActivo && nivel !== 'personal') {
         var filaSinFlag = { user_id: user_id, plan: nivel, status: 'trial' };
         await supabase.from('subscriptions').upsert(filaSinFlag, { onConflict: 'user_id' });
       }
@@ -8384,8 +8455,17 @@ app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
-    if (['basico','pro','premium','enterprise'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
-    var monto = precioPlanARS(nivel); // monto atado al dolar (queda CONGELADO en MP al crear/modificar el preapproval)
+    if (['basico','pro','premium','enterprise','personal'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
+    // Personal: monto a medida segun la cantidad elegida (min 15.000); el resto, precio fijo del nivel.
+    var cantPersonalCambio = null;
+    var monto;
+    if (nivel === 'personal') {
+      cantPersonalCambio = parseInt(req.body && req.body.cantidad, 10);
+      if (isNaN(cantPersonalCambio) || cantPersonalCambio < PERSONAL_MIN_MSGS) return res.status(400).json({ error: 'El Plan Personal arranca en ' + PERSONAL_MIN_MSGS + ' mensajes' });
+      monto = precioPersonalARS(cantPersonalCambio);
+    } else {
+      monto = precioPlanARS(nivel); // monto atado al dolar (queda CONGELADO en MP al crear/modificar el preapproval)
+    }
     if (typeof monto === 'undefined' || monto === null) return res.status(400).json({ error: 'Plan sin precio configurado: ' + nivel });
     var sub = await getSubscription(user_id);
     var tieneMPactivo = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
@@ -8393,7 +8473,8 @@ app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
       // Sin suscripcion activa -> no hay nada que "cambiar". El front debe usar /checkout (alta nueva con trial).
       return res.status(409).json({ error: 'No tenes una suscripcion activa para cambiar', usar_checkout: true });
     }
-    if (sub.plan === nivel) return res.status(400).json({ error: 'Ya tenes ese plan' });
+    // Personal puede "re-cambiar" la cantidad aunque ya sea personal (cambia el monto/cupo); los fijos no se re-eligen iguales.
+    if (sub.plan === nivel && nivel !== 'personal') return res.status(400).json({ error: 'Ya tenes ese plan' });
     var prevPlan = sub.plan || null;
     // PUT al preapproval existente: solo cambia el monto recurrente (mismo id, misma tarjeta -> sin doble cobro).
     // MP exige el bloque auto_recurring completo en el update del monto.
@@ -8405,7 +8486,17 @@ app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
       return res.status(502).json({ error: 'No se pudo actualizar la suscripcion en MercadoPago: ' + (eMP && eMP.message) });
     }
     // Actualizar el plan en la DB (el webhook puede llegar despues; lo dejamos consistente ya). status intacto.
-    await supabase.from('subscriptions').update({ plan: nivel }).eq('user_id', user_id);
+    var updCambio = { plan: nivel };
+    var ovCambio = (sub.limits_override && typeof sub.limits_override === 'object') ? Object.assign({}, sub.limits_override) : {};
+    if (nivel === 'personal') {
+      ovCambio.ai_messages = cantPersonalCambio; // cupo a medida
+      updCambio.limits_override = ovCambio;
+    } else if (prevPlan === 'personal') {
+      // Sale de personal a un plan fijo: quitar SOLO el cupo a-medida (preserva otros overrides del Maestro).
+      delete ovCambio.ai_messages;
+      updCambio.limits_override = ovCambio;
+    }
+    await supabase.from('subscriptions').update(updCambio).eq('user_id', user_id);
     // NOTIF MAESTRO (best-effort): cambio de plan iniciado por el cliente.
     crearNotifMaestro('suscripcion_cambio', 'Cambio de plan', 'Un cliente cambio de plan' + (prevPlan ? ': ' + prevPlan + ' -> ' + nivel : ' a ' + nivel) + '.', { ref_user_id: user_id, ref_id: sub.mp_preapproval_id, severidad: 'info' }).catch(function(){});
     return res.json({ ok: true, plan: nivel });
@@ -8418,7 +8509,13 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
   try {
     if (!MP_TOKEN || !SUBSCRIPTIONS_ENABLED) return;
     var tipo = String((req.body && (req.body.type || req.body.topic)) || '');
-    var dataId = (req.body && req.body.data && req.body.data.id) || (req.query && req.query['data.id']) || null;
+    var dataId = (req.body && req.body.data && req.body.data.id) || (req.query && req.query['data.id']) || (req.query && req.query.id) || null;
+    // RECARGA: el pago UNICO (Checkout Pro) llega con tipo EXACTO 'payment' (distinto de 'subscription_authorized_payment',
+    // que es el cobro recurrente de una suscripcion). Lo procesamos aparte y cortamos.
+    if (tipo === 'payment') {
+      if (dataId) { await procesarPagoRecarga(dataId); }
+      return;
+    }
     if (tipo.indexOf('subscription') < 0 && tipo.indexOf('preapproval') < 0) return;
     if (!dataId) return;
     var sus = await mpConsultarSuscripcion(dataId);
@@ -8472,6 +8569,86 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
 });
 
 // (endpoint temporal /api/mp-setup-planes eliminado: los 3 planes base ya estan creados y sus IDs viven en PLANES_MP)
+
+// RECARGA: procesa un pago UNICO aprobado y acredita los mensajes al pool mensajes_extra (mismo que cargar_extra del Maestro).
+// IDEMPOTENTE: dedupe por payment_id guardado en mensajes_extra_mov.nota ('recarga_mp:<id>'); si MP reintenta, no duplica.
+async function procesarPagoRecarga(paymentId) {
+  try {
+    // RE-CONSULTA el pago real en MP (no confiamos en el body del webhook): solo aprobados.
+    var pago = await mpConsultarPago(paymentId);
+    if (!pago || pago.status !== 'approved') return;
+    // external_reference = 'recarga|<user_id>|<cantidad>' (siempre se propaga del preference al pago).
+    var ext = String(pago.external_reference || '');
+    var meta = pago.metadata || {};
+    var uid = null, cant = NaN;
+    if (ext.indexOf('recarga|') === 0) {
+      var parts = ext.split('|');
+      uid = parts[1] || null;
+      cant = parseInt(parts[2], 10);
+    } else {
+      // backup por metadata (por si MP no propaga el external_reference en algun flujo)
+      if ((meta.tipo || meta.type) !== 'recarga') return; // no es una recarga -> no tocar nada
+      uid = meta.user_id || null;
+      cant = parseInt(meta.cantidad_mensajes || meta.cantidad, 10);
+    }
+    // VALIDACIONES DURAS: uid con forma de UUID + cantidad entera dentro de rango (mismo del endpoint).
+    if (!uid || !/^[0-9a-fA-F-]{32,40}$/.test(String(uid))) return;
+    if (!Number.isSafeInteger(cant) || cant < RECARGA_MIN_MSGS || cant > RECARGA_MAX_MSGS) { console.error('procesarPagoRecarga cant fuera de rango:', cant); return; }
+    // VERIFICAR EL MONTO PAGADO contra lo que esa cantidad deberia costar (evita acreditar de mas si el external_reference
+    // viniera inflado o el pago fuera parcial). El monto queda congelado al dolar de creacion (>= base) y el dolar solo
+    // ratchea hacia arriba -> el pagado cae entre el piso (dolar base) y el techo (dolar actual + margen de redondeo).
+    var pagado = Number(pago.transaction_amount) || 0;
+    var piso = Math.round(cant * RECARGA_USD_POR_MSG * DOLAR_REF_BASE) * 0.98;
+    var techo = Math.round(cant * RECARGA_USD_POR_MSG * _dolarSeguro()) * 1.05;
+    if (pago.currency_id !== 'ARS' || pagado < piso || pagado > techo) {
+      console.error('procesarPagoRecarga monto no coincide: pagado=' + pagado + ' rango=[' + Math.round(piso) + ',' + Math.round(techo) + '] cant=' + cant);
+      crearNotifMaestro('recarga_revisar', 'Recarga a revisar', 'Un pago de recarga no coincide con la cantidad (pagado ' + pagado + ', cant ' + cant + '). Revisar a mano.', { ref_user_id: uid, ref_id: String(paymentId), severidad: 'warning' }).catch(function(){});
+      return;
+    }
+    var notaDedupe = 'recarga_mp:' + String(paymentId);
+    // DEDUPE (1/2): pre-check rapido para los reintentos SECUENCIALES de MP (cubre el caso comun aun sin indice unico).
+    var yaProc = await supabase.from('mensajes_extra_mov').select('id').eq('nota', notaDedupe).limit(1);
+    if (yaProc && yaProc.data && yaProc.data.length > 0) return; // ya procesado
+    // DEDUPE (2/2) MARCA-PRIMERO: insertamos la marca ANTES de acreditar. Con el INDICE UNICO parcial sobre nota
+    // ('recarga_mp:%') esto es el lock real contra notificaciones CONCURRENTES: el insert duplicado falla (23505) y NO se
+    // acredita. Asi nunca queda "acreditado sin marca" (si la marca falla, no se acredita y MP reintenta).
+    var marca = await supabase.from('mensajes_extra_mov').insert({ user_id: uid, cantidad: cant, origen: 'recarga_mp', nota: notaDedupe });
+    if (marca && marca.error) {
+      var ec = String((marca.error.code || '') + ' ' + (marca.error.message || ''));
+      if (ec.indexOf('23505') >= 0 || /duplicate|unique/i.test(ec)) return; // ya procesado (indice unico) -> no duplicar
+      console.error('procesarPagoRecarga marca:', marca.error.message); return; // otro error -> no acreditar (MP reintenta)
+    }
+    // Acreditar al pool mensajes_extra (mismo pool que cargar_extra del Maestro), ya con la marca persistida.
+    var subR = await getSubscription(uid);
+    var extraAct = (subR && typeof subR.mensajes_extra === 'number') ? subR.mensajes_extra : 0;
+    var extraNuevo = Math.max(0, extraAct + cant);
+    await supabase.from('subscriptions').upsert({ user_id: uid, mensajes_extra: extraNuevo }, { onConflict: 'user_id' });
+    crearNotifMaestro('recarga_mensajes', 'Recarga de mensajes', 'Un cliente compro ' + cant + ' mensajes extra (recarga MP).', { ref_user_id: uid, ref_id: String(paymentId), severidad: 'info' }).catch(function(){});
+  } catch (e) { console.error('procesarPagoRecarga:', e && e.message); }
+}
+
+// RECARGA: inicia el checkout de un PAGO UNICO para comprar mensajes extra. Solo clientes con plan activo (o cortesia).
+app.post('/api/recarga/checkout', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
+    var email = (req.body && req.body.email) ? String(req.body.email) : '';
+    var cant = parseInt(req.body && req.body.cantidad, 10);
+    if (isNaN(cant) || cant < RECARGA_MIN_MSGS) return res.status(400).json({ error: 'La recarga arranca en ' + RECARGA_MIN_MSGS + ' mensajes' });
+    // GATE: solo con plan activo (mismo patron que cambiar-plan) o cortesia. Sin eso, primero hay que tener un plan.
+    var sub = await getSubscription(user_id);
+    var tieneMPactivo = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
+    var esCortesia = !!(sub && sub.cortesia === true);
+    if (!tieneMPactivo && !esCortesia) return res.status(409).json({ error: 'Necesitas un plan activo para comprar mensajes', usar_checkout: true });
+    var monto = precioRecargaARS(cant);
+    if (typeof monto === 'undefined' || monto === null || monto <= 0) return res.status(400).json({ error: 'Cantidad invalida' });
+    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var extRef = 'recarga|' + user_id + '|' + cant;
+    var pref = await mpCrearPreferencia('Recarga ' + cant + ' mensajes IA - Raices CRM', monto, extRef, backUrl, { tipo: 'recarga', user_id: user_id, cantidad_mensajes: cant });
+    return res.json({ ok: true, init_point: pref && (pref.init_point || pref.sandbox_init_point), id: pref && pref.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 
 // Crea el plan ENTERPRISE en MercadoPago (una vez). Gateado por auth Maestro. Misma config que los otros
 // (mensual, 4 dias de prueba, ARS, credito+debito) via mpCrearPlan. Devuelve el id para cargarlo en la env

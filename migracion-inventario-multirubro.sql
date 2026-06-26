@@ -1,32 +1,28 @@
 -- ============================================================================
 -- MIGRACION INVENTARIO MULTI-RUBRO  (ADITIVA — no toca datos de inmobiliaria)
 -- ----------------------------------------------------------------------------
--- Objetivo: habilitar los rubros HOTEL/CABAÑAS y DESARROLLADORA SIN romper el
--- inventario inmobiliario existente (tabla `properties`).
+-- Objetivo: habilitar los rubros HOTEL/CABAÑAS y DESARROLLADORA con SEPARACION
+-- TOTAL: cada rubro vive en SUS PROPIAS tablas, sin compartir con inmobiliaria.
+--
+-- `properties` queda 100% INMOBILIARIA e INTACTA (esta migracion NO la toca:
+--  no agrega columnas, no la lee, no la modifica).
 --
 -- El rubro del cliente vive en business_settings.rubro:
 --   'inmobiliaria' | 'hotel_cabanas' | 'desarrolladora'
 --
--- Todo es IF NOT EXISTS / ADD COLUMN IF NOT EXISTS: re-ejecutable e idempotente.
+-- HOTEL:        hotel_complejos / hotel_unidades / hotel_tarifa / hotel_disponibilidad
+-- DESARROLLO:   developments / development_sectors / development_units  (sin cambios)
+--
+-- Todo es IF NOT EXISTS / DROP POLICY IF EXISTS: re-ejecutable e idempotente.
 -- Mismo patron de seguridad que `properties`: RLS ON + policy auth.uid() = user_id.
 -- ============================================================================
 
--- ----------------------------------------------------------------------------
--- 1) properties: columnas ADITIVAS (default = comportamiento inmobiliaria actual)
---    tipo_inventario default 'inmobiliaria' => las filas existentes NO cambian.
--- ----------------------------------------------------------------------------
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS tipo_inventario text DEFAULT 'inmobiliaria';
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS atributos jsonb DEFAULT '{}'::jsonb;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS group_id uuid;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS precio_base numeric;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS moneda text DEFAULT 'ARS';
-
 -- ============================================================================
--- 2) HOTEL / CABAÑAS
+-- 1) HOTEL / CABAÑAS  (tablas autocontenidas — NO usan properties)
 -- ============================================================================
 
 -- Complejo / agrupador de unidades (un hotel, un complejo de cabañas, etc.)
-CREATE TABLE IF NOT EXISTS inventory_group (
+CREATE TABLE IF NOT EXISTS hotel_complejos (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id     uuid,
   nombre      text,
@@ -37,10 +33,28 @@ CREATE TABLE IF NOT EXISTS inventory_group (
   created_at  timestamptz DEFAULT now()
 );
 
--- Tarifas por temporada de una unidad/property
+-- Unidad de hotel/cabaña (pertenece a un complejo). Tabla propia de hotel.
+CREATE TABLE IF NOT EXISTS hotel_unidades (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  complejo_id  uuid,
+  user_id      uuid,
+  numero       text,
+  title        text,
+  type         text,
+  capacidad    int,
+  descripcion  text,
+  precio_base  numeric,
+  moneda       text,
+  atributos    jsonb DEFAULT '{}'::jsonb,
+  images       jsonb DEFAULT '[]'::jsonb,
+  activa       boolean DEFAULT true,
+  created_at   timestamptz DEFAULT now()
+);
+
+-- Tarifas por temporada de una unidad de hotel
 CREATE TABLE IF NOT EXISTS hotel_tarifa (
   id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  property_id          uuid,
+  unidad_id            uuid,
   user_id              uuid,
   temporada            text,
   fecha_desde          date,
@@ -54,10 +68,10 @@ CREATE TABLE IF NOT EXISTS hotel_tarifa (
   prioridad            int
 );
 
--- Disponibilidad diaria por unidad/property
+-- Disponibilidad diaria por unidad de hotel
 CREATE TABLE IF NOT EXISTS hotel_disponibilidad (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  property_id       uuid,
+  unidad_id         uuid,
   user_id           uuid,
   fecha             date,
   unidades_totales  int,
@@ -67,7 +81,7 @@ CREATE TABLE IF NOT EXISTS hotel_disponibilidad (
 );
 
 -- ============================================================================
--- 3) DESARROLLADORA
+-- 2) DESARROLLADORA  (SIN CAMBIOS — se mantiene igual)
 -- ============================================================================
 
 -- Emprendimiento / proyecto
@@ -123,10 +137,11 @@ CREATE TABLE IF NOT EXISTS development_units (
 );
 
 -- ============================================================================
--- 4) RLS + POLICIES (mismo patron que properties: cada usuario ve solo lo suyo)
+-- 3) RLS + POLICIES (mismo patron que properties: cada usuario ve solo lo suyo)
 -- ============================================================================
 
-ALTER TABLE inventory_group       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hotel_complejos       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hotel_unidades        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hotel_tarifa          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hotel_disponibilidad  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE developments          ENABLE ROW LEVEL SECURITY;
@@ -136,8 +151,12 @@ ALTER TABLE development_units     ENABLE ROW LEVEL SECURITY;
 -- Una policy "ALL" por tabla (SELECT/INSERT/UPDATE/DELETE) restringida a auth.uid() = user_id.
 -- DROP previo para que la migracion sea re-ejecutable sin error de "policy ya existe".
 
-DROP POLICY IF EXISTS inventory_group_owner ON inventory_group;
-CREATE POLICY inventory_group_owner ON inventory_group
+DROP POLICY IF EXISTS hotel_complejos_owner ON hotel_complejos;
+CREATE POLICY hotel_complejos_owner ON hotel_complejos
+  FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS hotel_unidades_owner ON hotel_unidades;
+CREATE POLICY hotel_unidades_owner ON hotel_unidades
   FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 DROP POLICY IF EXISTS hotel_tarifa_owner ON hotel_tarifa;
@@ -161,24 +180,29 @@ CREATE POLICY development_units_owner ON development_units
   FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- ============================================================================
--- 5) INDICES
+-- 4) INDICES
 -- ============================================================================
+
+CREATE INDEX IF NOT EXISTS idx_hotel_unidades_complejo
+  ON hotel_unidades (complejo_id);
+
+CREATE INDEX IF NOT EXISTS idx_hotel_tarifa_unidad
+  ON hotel_tarifa (unidad_id);
+
+CREATE INDEX IF NOT EXISTS idx_hotel_disponibilidad_unidad_fecha
+  ON hotel_disponibilidad (unidad_id, fecha);
 
 CREATE INDEX IF NOT EXISTS idx_development_units_dev_estado_tipologia
   ON development_units (development_id, estado, tipologia);
 
-CREATE INDEX IF NOT EXISTS idx_hotel_disponibilidad_prop_fecha
-  ON hotel_disponibilidad (property_id, fecha);
-
--- Indices de apoyo por user_id (consultas tipicas del front, filtran por dueño)
-CREATE INDEX IF NOT EXISTS idx_inventory_group_user       ON inventory_group (user_id);
-CREATE INDEX IF NOT EXISTS idx_hotel_tarifa_property      ON hotel_tarifa (property_id);
-CREATE INDEX IF NOT EXISTS idx_developments_user          ON developments (user_id);
-CREATE INDEX IF NOT EXISTS idx_development_sectors_dev     ON development_sectors (development_id);
+-- Indices de apoyo por user_id / FK (consultas tipicas del front, filtran por dueño)
+CREATE INDEX IF NOT EXISTS idx_hotel_complejos_user        ON hotel_complejos (user_id);
+CREATE INDEX IF NOT EXISTS idx_developments_user           ON developments (user_id);
+CREATE INDEX IF NOT EXISTS idx_development_sectors_dev      ON development_sectors (development_id);
 
 -- ============================================================================
--- 6) Refrescar el cache de esquema de PostgREST
---    (gotcha conocido: ADD COLUMN / CREATE TABLE via API no refresca el cache
---     y los writes fallan en silencio con PGRST204 hasta este NOTIFY)
+-- 5) Refrescar el cache de esquema de PostgREST
+--    (gotcha conocido: CREATE TABLE via API no refresca el cache y los writes
+--     fallan en silencio con PGRST205/PGRST204 hasta este NOTIFY)
 -- ============================================================================
 NOTIFY pgrst, 'reload schema';

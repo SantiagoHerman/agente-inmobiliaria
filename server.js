@@ -8108,9 +8108,10 @@ app.post('/api/scrape/universal', async function(req, res) {
 //   - Fail-safe: si una tabla nueva no existe todavia (migracion no corrida)
 //     devuelve un JSON de error claro en vez de crashear.
 //   - Campos sin columna propia -> al jsonb correspondiente (no se pierde nada).
-// Tablas: inventory_group, hotel_tarifa, hotel_disponibilidad,
-//         developments, development_sectors, development_units,
-//         properties (+columnas tipo_inventario/atributos/group_id).
+// Tablas HOTEL (propias, NO usan properties): hotel_complejos, hotel_unidades,
+//         hotel_tarifa, hotel_disponibilidad.
+// Tablas DESARROLLO: developments, development_sectors, development_units.
+// `properties` queda 100% inmobiliaria e intacta (este endpoint no la toca).
 // ============================================================================
 
 // Helpers locales: parseo numerico tolerante (los inputs del form mandan strings,
@@ -8172,34 +8173,34 @@ app.post('/api/inventario/guardar', async function (req, res) {
 
       if (!_invStr(unidad.nombre)) return res.status(400).json({ error: 'Falta el nombre de la unidad' });
 
-      // 1) Complejo -> inventory_group (un grupo por nombre+user; reusar si ya existe)
-      var group_id = null;
+      // 1) Complejo -> hotel_complejos (un complejo por nombre+user; reusar si ya existe)
+      var complejo_id = null;
       var nombreComplejo = _invStr(grupo.nombre);
       if (nombreComplejo) {
-        var gExist = await supabase.from('inventory_group')
+        var gExist = await supabase.from('hotel_complejos')
           .select('id').eq('user_id', user_id).eq('nombre', nombreComplejo).maybeSingle();
         if (gExist.error && _invTablaFaltante(gExist.error)) {
-          return res.status(503).json({ error: 'La tabla inventory_group no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'inventory_group' });
+          return res.status(503).json({ error: 'La tabla hotel_complejos no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'hotel_complejos' });
         }
         if (gExist.data && gExist.data.id) {
-          group_id = gExist.data.id;
+          complejo_id = gExist.data.id;
         } else {
-          var gIns = await supabase.from('inventory_group').insert({
+          var gIns = await supabase.from('hotel_complejos').insert({
             user_id: user_id,
             nombre: nombreComplejo,
             tipo: 'hotel_cabanas',
             atributos: { modo: _invStr(grupo.modo) || 'unidad_real' }
           }).select('id').maybeSingle();
           if (gIns.error) {
-            if (_invTablaFaltante(gIns.error)) return res.status(503).json({ error: 'La tabla inventory_group no existe todavia. Corré la migracion.', tabla: 'inventory_group' });
+            if (_invTablaFaltante(gIns.error)) return res.status(503).json({ error: 'La tabla hotel_complejos no existe todavia. Corré la migracion.', tabla: 'hotel_complejos' });
             return res.status(500).json({ error: 'Error guardando el complejo: ' + gIns.error.message });
           }
-          group_id = gIns.data && gIns.data.id;
+          complejo_id = gIns.data && gIns.data.id;
         }
       }
 
-      // 2) Unidad -> properties (tipo_inventario=hotel_cabanas, group_id, atributos jsonb)
-      //    Lo descriptivo basico va a columnas reales de properties; el resto al jsonb atributos.
+      // 2) Unidad -> hotel_unidades (tabla propia de hotel; complejo_id, atributos jsonb)
+      //    Lo descriptivo basico va a columnas reales de hotel_unidades; el resto al jsonb atributos.
       var precioBase = null, monedaBase = 'ARS';
       if (tarifas.length) {
         // precio_base / moneda = la primer tarifa con precio (referencia para listados)
@@ -8208,17 +8209,19 @@ app.post('/api/inventario/guardar', async function (req, res) {
           if (pr !== null) { precioBase = pr; monedaBase = _invStr(tarifas[ti].moneda) || 'ARS'; break; }
         }
       }
-      var filaProp = {
+      var filaUnidadH = {
         user_id: user_id,
-        tipo_inventario: 'hotel_cabanas',
-        group_id: group_id,
+        complejo_id: complejo_id,
+        numero: _invStr(unidad.numero),
         title: _invStr(unidad.nombre) || 'Sin nombre',
         type: _invStr(unidad.tipo_unidad),
-        description: _invStr(unidad.descripcion),
+        capacidad: _invInt(unidad.capacidad),
+        descripcion: _invStr(unidad.descripcion),
         precio_base: precioBase,
         moneda: monedaBase,
+        images: images,
         activa: true,
-        // Todo lo que no tiene columna propia en properties va al jsonb atributos (no se pierde):
+        // Todo lo descriptivo extra/amenities/regimenes/franjas/politicas/extras va al jsonb atributos (no se pierde):
         atributos: {
           tipo_unidad: _invStr(unidad.tipo_unidad),
           capacidad: _invInt(unidad.capacidad),
@@ -8232,17 +8235,16 @@ app.post('/api/inventario/guardar', async function (req, res) {
           regimenes: atributos.regimenes || [],
           franjas: atributos.franjas || {},
           politicas: atributos.politicas || {},
-          extras: extras,
-          images: images
+          extras: extras
         }
       };
-      var pIns = await supabase.from('properties').insert(filaProp).select('id').maybeSingle();
+      var pIns = await supabase.from('hotel_unidades').insert(filaUnidadH).select('id').maybeSingle();
       if (pIns.error) {
-        // Columnas aditivas ausentes => cache PostgREST sin refrescar tras la migracion.
-        if (_invTablaFaltante(pIns.error)) return res.status(503).json({ error: 'Faltan columnas nuevas en properties (tipo_inventario/atributos/group_id) o el cache de PostgREST no se refresco. Corré la migracion y NOTIFY pgrst.', tabla: 'properties' });
+        // Tabla/columna ausente => migracion no corrida o cache PostgREST sin refrescar.
+        if (_invTablaFaltante(pIns.error)) return res.status(503).json({ error: 'La tabla hotel_unidades no existe todavia (o el cache de PostgREST no se refresco). Corré la migracion y NOTIFY pgrst.', tabla: 'hotel_unidades' });
         return res.status(500).json({ error: 'Error guardando la unidad: ' + pIns.error.message });
       }
-      var property_id = pIns.data && pIns.data.id;
+      var unidad_id = pIns.data && pIns.data.id;
 
       // 3) Tarifas -> hotel_tarifa (una fila por temporada). Sin precio ni temporada -> se saltea.
       var tarifasOk = 0, tarifasErr = 0;
@@ -8250,7 +8252,7 @@ app.post('/api/inventario/guardar', async function (req, res) {
         var tar = tarifas[t] || {};
         if (!_invStr(tar.temporada) && _invNum(tar.precio) === null) continue;
         var filaTar = {
-          property_id: property_id,
+          unidad_id: unidad_id,
           user_id: user_id,
           temporada: _invStr(tar.temporada),
           fecha_desde: _invDate(tar.desde),
@@ -8264,7 +8266,7 @@ app.post('/api/inventario/guardar', async function (req, res) {
         };
         var trIns = await supabase.from('hotel_tarifa').insert(filaTar);
         if (trIns.error) {
-          if (_invTablaFaltante(trIns.error)) return res.status(503).json({ error: 'La tabla hotel_tarifa no existe todavia. Corré la migracion.', tabla: 'hotel_tarifa', property_id: property_id });
+          if (_invTablaFaltante(trIns.error)) return res.status(503).json({ error: 'La tabla hotel_tarifa no existe todavia. Corré la migracion.', tabla: 'hotel_tarifa', unidad_id: unidad_id });
           tarifasErr++;
         } else tarifasOk++;
       }
@@ -8277,8 +8279,8 @@ app.post('/api/inventario/guardar', async function (req, res) {
       return res.json({
         ok: true,
         rubro: 'hotel_cabanas',
-        group_id: group_id,
-        property_id: property_id,
+        complejo_id: complejo_id,
+        unidad_id: unidad_id,
         tarifas_guardadas: tarifasOk,
         tarifas_con_error: tarifasErr
       });
@@ -8393,8 +8395,8 @@ app.post('/api/inventario/guardar', async function (req, res) {
 // ---- GET /api/inventario/cargar -------------------------------------------
 // Devuelve el inventario del rubro del usuario (filtrado por user_id, via RLS y
 // filtro explicito) para que el form pueda precargar.
-//   - hotel_cabanas: grupos + unidades (properties tipo_inventario=hotel_cabanas)
-//                    + tarifas por unidad.
+//   - hotel_cabanas: complejos (hotel_complejos) + unidades (hotel_unidades)
+//                    + tarifas por unidad (hotel_tarifa).
 //   - desarrolladora: emprendimientos + sectores + unidades.
 //   - inmobiliaria: NO se toca aca (tiene su propio listado de properties); se
 //     devuelve un hint para que el front use el endpoint inmobiliaria de siempre.
@@ -8414,27 +8416,27 @@ app.get('/api/inventario/cargar', async function (req, res) {
 
     // ======================= HOTEL / CABAÑAS ===============================
     if (rubro === 'hotel_cabanas') {
-      var grupos = await supabase.from('inventory_group')
+      var grupos = await supabase.from('hotel_complejos')
         .select('*').eq('user_id', user_id).order('created_at', { ascending: true });
       if (grupos.error && _invTablaFaltante(grupos.error)) {
-        return res.status(503).json({ error: 'La tabla inventory_group no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'inventory_group' });
+        return res.status(503).json({ error: 'La tabla hotel_complejos no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'hotel_complejos' });
       }
-      var unidadesH = await supabase.from('properties')
-        .select('*').eq('user_id', user_id).eq('tipo_inventario', 'hotel_cabanas');
+      var unidadesH = await supabase.from('hotel_unidades')
+        .select('*').eq('user_id', user_id);
       if (unidadesH.error && _invTablaFaltante(unidadesH.error)) {
-        return res.status(503).json({ error: 'Faltan columnas nuevas en properties. Corré la migracion y NOTIFY pgrst.', tabla: 'properties' });
+        return res.status(503).json({ error: 'La tabla hotel_unidades no existe todavia. Corré la migracion y NOTIFY pgrst.', tabla: 'hotel_unidades' });
       }
       var tarifasH = await supabase.from('hotel_tarifa').select('*').eq('user_id', user_id);
       if (tarifasH.error && _invTablaFaltante(tarifasH.error)) {
         return res.status(503).json({ error: 'La tabla hotel_tarifa no existe todavia. Corré la migracion.', tabla: 'hotel_tarifa' });
       }
-      // Agrupar tarifas por property_id para que el front las precargue por unidad.
-      var tarifasPorProp = {};
+      // Agrupar tarifas por unidad_id para que el front las precargue por unidad.
+      var tarifasPorUnidad = {};
       (tarifasH.data || []).forEach(function (tr) {
-        (tarifasPorProp[tr.property_id] = tarifasPorProp[tr.property_id] || []).push(tr);
+        (tarifasPorUnidad[tr.unidad_id] = tarifasPorUnidad[tr.unidad_id] || []).push(tr);
       });
       var unidadesOut = (unidadesH.data || []).map(function (p) {
-        return Object.assign({}, p, { tarifas: tarifasPorProp[p.id] || [] });
+        return Object.assign({}, p, { tarifas: tarifasPorUnidad[p.id] || [] });
       });
       return res.json({
         ok: true,

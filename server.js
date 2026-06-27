@@ -284,7 +284,7 @@ const DEFAULT_RUBRO = {
   desarrolladora: 'RUBRO DESARROLLADORA O EMPRENDIMIENTOS. Vendes unidades de emprendimientos o proyectos, muchas veces en POZO o en construccion. Vocabulario: proyecto o emprendimiento, unidades, tipologias de 1, 2 o 3 ambientes, etapa de obra (pozo, en construccion o a estrenar), fecha estimada de ENTREGA, financiacion, anticipo y CUOTAS, valor en pesos o dolares, ajuste por indice CAC. Preguntas clave: tipologia buscada, presupuesto o forma de pago (cuanto de anticipo y en cuantas cuotas), y si busca para vivienda o inversion. Al presentar, resalta la financiacion (anticipo + cuotas), la etapa de obra y la fecha de entrega estimada. Aclara siempre que los valores, las cuotas y las fechas de entrega son estimados y pueden estar sujetos a ajuste por avance de obra o indice. Cuando el lead quiere reservar una unidad o avanzar con la sena, derivá a un asesor del equipo segun tu objetivo configurado.',
   inmobiliaria: 'RUBRO INMOBILIARIA. Vocabulario: venta y alquiler, ambientes, dormitorios, metros cuadrados, expensas, zona o barrio, apto credito, escritura. Preguntas clave: si busca comprar o alquilar, zona, cantidad de ambientes y presupuesto. Al presentar, deci operacion, ambientes, zona y precio.'
 };
-// AGENTE PREMIUM EN REAL ESTATE: metodo de venta experto destilado de los mejores vendedores + 50 libros + perfil de IA transparente (memoria-vendedor). Se inyecta en el system prompt CACHEADO (gasto minimo). Aplicado a TODOS por default; un cliente lo apaga con business_settings.agente_premium_re=false. NO toca la identidad del agente (eso lo maneja la regla de IDENTIDAD del prompt). Solo eleva la TECNICA de venta: diagnostico, objeciones, storytelling, deseo con datos reales, proximo paso y derivacion.
+// AGENTE PREMIUM EN REAL ESTATE: metodo de venta experto destilado de los mejores vendedores + 50 libros + perfil de IA transparente (memoria-vendedor). Se inyecta en el system prompt CACHEADO (gasto minimo). Aplicado a TODOS por default; un cliente lo apaga con business_settings.agente_premium_re=false. NO toca la identidad del agente (eso lo maneja la regla de IDENTIDAD del prompt, ~server.js:2809). Solo eleva la TECNICA de venta: diagnostico, objeciones, storytelling, deseo con datos reales, proximo paso y derivacion.
 const PREMIUM_PLAYBOOK = 'MODO AGENTE PREMIUM EN REAL ESTATE (sos un vendedor o vendedora de elite, al nivel de los mejores del mundo, pero calido y humano; tu mision es llevar al lead de frio a CALIENTE con la mayor eficacia, sin presionar y sin inventar nada): '
   + '(1) DIAGNOSTICA antes de ofrecer: primero entende QUE busca y POR QUE (su motivacion real: inversion, familia, calidad de vida, seguridad), su plazo, sus criterios y sus dudas. Escucha mas de lo que hablas; haces 1 o 2 preguntas clave, no un interrogatorio. '
   + '(2) CONECTA con su motivacion: presenta LA mejor opcion (1 o 2, nunca un listado largo) y contale la historia de uso, como seria su vida o su inversion ahi, siempre con datos reales del inventario. '
@@ -295,6 +295,18 @@ const PREMIUM_PLAYBOOK = 'MODO AGENTE PREMIUM EN REAL ESTATE (sos un vendedor o 
   + 'ANGULO INVERSION: si el lead piensa en invertir, sabes argumentar con datos el valor del inmueble como activo durable y la oportunidad del mercado, sin humo ni promesas exageradas. '
   + 'VALOR DE FONDO: sos asesor o asesora, no un vendedor a presion; recomendas lo que de verdad le conviene al cliente, porque eso es lo que mas cierra y mas confianza genera. '
   + 'LIMITE: respeta SIEMPRE tu objetivo configurado; cuando el lead acepta o coordina el paso, o aparece alta carga emocional, un tema legal sensible o una duda documental, DERIVA a un asesor humano del equipo.';
+// PERFIL DE PERSONA GENDERED (solo refina COMO se presenta el agente cuando PREMIUM esta ON y hay genero definido).
+// ADITIVO y OPCIONAL: si no hay genero -> no se inyecta (queda neutral, como hoy). NO toca la regla de IDENTIDAD
+// (~server.js:2809: "Sos una persona del equipo; NUNCA digas que sos IA"): estos perfiles solo ELEVAN la presentacion y el
+// estilo (calidez + criterio de vendedor/a top), nunca contradicen la identidad. Se inyectan en el bloque CACHEADO.
+const PREMIUM_PERSONA_M = 'PERFIL DE PERSONA: sos un asesor inmobiliario profesional, calido y experimentado, que combina la calidez de quien atiende de verdad con el criterio de un vendedor top. Hablas natural, rioplatense, con seguridad tranquila, sin avasallar. Tu norte es que el cliente encuentre la mejor opcion para el. La verdad vende: nunca exageras ni inventas.';
+const PREMIUM_PERSONA_F = 'PERFIL DE PERSONA: sos una asesora inmobiliaria profesional, calida y experimentada, que combina la calidez de quien atiende de verdad con el criterio de una vendedora top. Hablas natural, rioplatense, con seguridad tranquila, sin avasallar. Tu norte es que el cliente encuentre la mejor opcion para ella. La verdad vende: nunca exageras ni inventas.';
+// Devuelve el perfil gendered segun genero ('hombre'/'mujer'); cualquier otro valor => '' (neutral, sin inyeccion).
+function _premiumPersona(genero) {
+  if (genero === 'hombre') return PREMIUM_PERSONA_M;
+  if (genero === 'mujer') return PREMIUM_PERSONA_F;
+  return '';
+}
 // Mapea el rubro guardado (incluye valores legacy) a la key de DEFAULT_RUBRO. MISMA logica que el viejo if/else.
 function _rubroKey(rubro) {
   if (rubro === 'hotel_cabanas' || rubro === 'hotel' || rubro === 'cabanas') return 'hotel_cabanas';
@@ -1373,7 +1385,13 @@ function sanearAgenteConfig(cfg, nombreFallback) {
     objetivo: (function(){ var v = _s(c.objetivo); return (v && OBJETIVO[v]) ? OBJETIVO[v] : v; })(),
     conocimiento: _s(c.conocimiento),
     noHacer: _s(c.no_hacer) || _s(c.noHacer),
-    datosQueUsa: _s(c.datos_que_usa) || _s(c.datosQueUsa)
+    datosQueUsa: _s(c.datos_que_usa) || _s(c.datosQueUsa),
+    // AGENTE PREMIUM por usuario IA: premium ON por default (igual al global). Solo OFF explicito apaga el playbook.
+    // FIX clave: el frontend del Usuario IA escribe 'agente_premium_re' (no 'premium'). Aceptamos AMBAS claves:
+    // prioriza agente_premium_re si viene definida (clave del form), si no cae a 'premium' (compat). Solo false explicito apaga.
+    premium: (c.agente_premium_re !== undefined ? c.agente_premium_re !== false : c.premium !== false),
+    // GENERO del usuario IA: 'hombre'/'mujer' (refina presentacion gendered cuando premium ON); cualquier otra cosa => '' (neutral).
+    genero: (function(){ var v = _s(c.genero); return (v === 'hombre' || v === 'mujer') ? v : ''; })()
   };
   // 'persona': hay config util? (al menos un nombre o algun campo con contenido). Si no, el caller cae a genérico.
   out.persona = !!(out.nombre || out.formaHablar || out.objetivo || out.conocimiento || out.noHacer || out.datosQueUsa);
@@ -2765,6 +2783,21 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // arriba (agentName/tono/objetivo). Los DATOS del negocio (inventario/precios/fechas) SIEMPRE salen del user_id
   // del tenant (ya cargados arriba); 'datos_que_usa' solo MODULA cuales de esos datos puede ofrecer este usuario IA.
   const _ic = agenteConfig || {};
+  // AGENTE PREMIUM EN REAL ESTATE — resolucion del flag y del genero (aditivo, default ON):
+  //  - premium efectivo: para un USUARIO IA manda agenteConfig.premium (ON salvo false explicito); sin usuario IA,
+  //    manda settings.agente_premium_re (ON salvo false explicito) -> default exacto al ya desplegado.
+  //  - genero efectivo: para un USUARIO IA, agenteConfig.genero; sin usuario IA, settings.agent_genero. Si no hay
+  //    genero -> '' => NO se inyecta persona gendered (neutral, como hoy).
+  const _premiumOn = agenteConfig
+    ? (agenteConfig.premium !== false)
+    : !(settings && settings.agente_premium_re === false);
+  const _generoEfectivo = (agenteConfig && agenteConfig.genero)
+    || (settings && settings.agent_genero)
+    || '';
+  // Bloque premium: playbook (si ON) + perfil gendered (si ON y hay genero). Si OFF => '' => .filter(Boolean) lo descarta y el prompt queda IDENTICO al de hoy.
+  const _bloquePremium = _premiumOn
+    ? (PREMIUM_PLAYBOOK + (_premiumPersona(_generoEfectivo) ? ('\n' + _premiumPersona(_generoEfectivo)) : ''))
+    : '';
   const bloqueIAConocimiento = _ic.conocimiento ? ('LO QUE SABES Y MANEJAS VOS (tu conocimiento propio como parte del equipo): ' + _ic.conocimiento) : '';
   const bloqueIANoHacer = _ic.noHacer ? ('LO QUE NO DEBES HACER (limites estrictos, respetalos siempre): ' + _ic.noHacer) : '';
   const bloqueIADatos = _ic.datosQueUsa ? ('QUE DATOS PODES USAR (de los datos del negocio cargados mas abajo, usa SOLO los que correspondan a esto): ' + _ic.datosQueUsa) : '';
@@ -2780,8 +2813,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     'FOTOS DE PROPIEDADES: Cuando el lead te PIDA ver una foto de una propiedad (por ejemplo: mandame una del dormitorio, mostrame la pileta, tenes fotos de la cocina), usa la herramienta enviar_foto_propiedad indicando el numero de la propiedad (campo numero del inventario, ej: 12) y la categoria pedida. Solo podes mandar fotos de propiedades que en el inventario digan fotos disponibles. Las categorias validas son: dormitorio, bano, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Si no tenes claro de que propiedad habla, primero preguntale cual antes de usar la herramienta. No inventes fotos que no existan.',
     instruccionesRubro,
     comportamientoSetter,
-    // AGENTE PREMIUM EN REAL ESTATE (aplicado a TODOS por default; un cliente lo apaga con agente_premium_re=false). Va en el bloque CACHEADO -> gasto minimo. El .filter(Boolean) de abajo lo descarta si queda ''.
-    (settings && settings.agente_premium_re === false) ? '' : PREMIUM_PLAYBOOK,
+    // AGENTE PREMIUM EN REAL ESTATE (aplicado a TODOS por default; se apaga con agente_premium_re=false a nivel cuenta
+    // o agente_config.premium=false en un usuario IA). + perfil gendered opcional segun genero. Resuelto arriba en
+    // _bloquePremium. Va en el bloque CACHEADO -> gasto minimo. El .filter(Boolean) de abajo lo descarta si queda ''.
+    _bloquePremium,
     instruccionIdioma,
     'Respondes consultas de clientes por WhatsApp.',
     'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Ese saludo y presentacion YA tienen que estar escritos en el TONO configurado (ver mas abajo), desde la primera palabra. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si el tono es cercano/relajado; Sr./Sra. y apellido si el tono es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',

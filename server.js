@@ -851,6 +851,107 @@ async function avisarSiIaCaida(err) {
   } catch (e) {}
 }
 
+// ============================================================================
+// FEATURE #23 — FAILOVER IA via AWS BEDROCK (gateado y APAGADO por default)
+// ----------------------------------------------------------------------------
+// Objetivo: si la API directa de Anthropic se cae (529/5xx/timeout/red), reintentar
+// EL MISMO request contra Claude servido por AWS Bedrock. Asi, ante un outage del
+// proveedor directo, los leads cliente-facing siguen siendo atendidos.
+//
+// REGLA DURA (apagado por default):
+//   - Solo se activa si BEDROCK_ENABLED=true Y estan las credenciales de AWS
+//     (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY, o un perfil/role en el entorno) Y
+//     el paquete @anthropic-ai/bedrock-sdk esta instalado (require defensivo).
+//   - Si falta CUALQUIERA de esas tres cosas, _bedrockReady=false y llamarIAConFailover
+//     se comporta EXACTAMENTE como anthropic.messages.create (cero cambio de comportamiento,
+//     cero dependencia nueva obligatoria).
+//
+// Modelos: Bedrock usa IDs DISTINTOS a la API directa (ej. claude-sonnet-4-6 ->
+// 'us.anthropic.claude-sonnet-4-...-v1:0'). Se mapean por env (BEDROCK_MODEL_CLIENTE /
+// BEDROCK_MODEL_INTERNO) para no hardcodear un ID que Diego quizas no tenga habilitado.
+// Si no hay mapeo para el modelo pedido, NO se intenta Bedrock (se relanza el error
+// original de Anthropic) — nunca se manda un modelId invalido.
+//
+// COMO EXTENDERLO al resto de las llamadas: cualquier `await anthropic.messages.create(P)`
+// se reemplaza por `await llamarIAConFailover(P, etiqueta)`. La firma del request es
+// identica; el wrapper no toca params. Hoy se aplica al call principal cliente-facing
+// (generarRespuestaAgente / MODELO_CLIENTE). El resto sigue usando anthropic directo.
+let _bedrockReady = false;
+let _bedrockClient = null;
+const BEDROCK_ENABLED = String(process.env.BEDROCK_ENABLED || '').toLowerCase() === 'true';
+const BEDROCK_REGION = process.env.AWS_REGION || process.env.BEDROCK_REGION || 'us-east-1';
+// Mapa modelo-directo -> modelId de Bedrock (por env, sin hardcodear un inference profile que no exista).
+const _BEDROCK_MODEL_MAP = {};
+try {
+  if (process.env.BEDROCK_MODEL_CLIENTE) _BEDROCK_MODEL_MAP[MODELO_CLIENTE] = String(process.env.BEDROCK_MODEL_CLIENTE).trim();
+  if (process.env.BEDROCK_MODEL_INTERNO) _BEDROCK_MODEL_MAP[MODELO_INTERNO] = String(process.env.BEDROCK_MODEL_INTERNO).trim();
+} catch (e) {}
+try {
+  const _tieneCreds = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) ||
+                      !!process.env.AWS_PROFILE || !!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || !!process.env.AWS_WEB_IDENTITY_TOKEN_FILE;
+  if (BEDROCK_ENABLED && _tieneCreds) {
+    // require DEFENSIVO: si el paquete no esta instalado, NO rompe (queda _bedrockReady=false).
+    const { AnthropicBedrock } = require('@anthropic-ai/bedrock-sdk');
+    _bedrockClient = new AnthropicBedrock({
+      awsRegion: BEDROCK_REGION,
+      // El SDK de Bedrock toma las credenciales del entorno (AWS_ACCESS_KEY_ID/SECRET o el role).
+      // Se pasan explicitas solo si estan en env (para entornos sin perfil/role).
+      awsAccessKey: process.env.AWS_ACCESS_KEY_ID || undefined,
+      awsSecretKey: process.env.AWS_SECRET_ACCESS_KEY || undefined,
+      awsSessionToken: process.env.AWS_SESSION_TOKEN || undefined,
+      maxRetries: 2
+    });
+    _bedrockReady = true;
+    console.log('[FAILOVER] Bedrock listo (region ' + BEDROCK_REGION + ', modelos mapeados: ' + Object.keys(_BEDROCK_MODEL_MAP).join(',') + ')');
+  } else if (BEDROCK_ENABLED && !_tieneCreds) {
+    console.log('[FAILOVER] BEDROCK_ENABLED=true pero faltan credenciales AWS -> failover Bedrock DESACTIVADO');
+  } else {
+    console.log('[FAILOVER] Bedrock no configurado (BEDROCK_ENABLED!=true) -> comportamiento actual exacto (solo Anthropic directo)');
+  }
+} catch (e) {
+  // Paquete ausente o error de init: failover OFF, sistema sigue 100% con Anthropic directo.
+  _bedrockReady = false;
+  console.log('[FAILOVER] @anthropic-ai/bedrock-sdk no disponible (' + (e && e.message) + ') -> failover Bedrock DESACTIVADO (comportamiento actual exacto)');
+}
+
+// Avisa al Maestro UNA vez cada 15 min (dedupe) que se cayo al failover de Bedrock. Best-effort.
+async function _avisarFailoverBedrock(etiqueta) {
+  try {
+    var desde = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'ia_failover_bedrock').gte('created_at', desde).limit(1);
+    if (ya && ya.data && ya.data.length) return;
+    crearNotifMaestro('ia_failover_bedrock', 'IA respondiendo via Bedrock (failover)', 'Anthropic directo fallo (transitorio) y el sistema esta respondiendo via AWS Bedrock. Revisa el estado del proveedor directo.' + (etiqueta ? ' Origen: ' + etiqueta : ''), { severidad: 'warning' }).catch(function(){});
+  } catch (e) {}
+}
+
+// WRAPPER de failover. Intenta Anthropic directo; si falla con un error TRANSITORIO del
+// proveedor (no por saldo, no por request invalido) y Bedrock esta listo + hay modelId
+// mapeado, reintenta el MISMO request via Bedrock. Si Bedrock tampoco anda, relanza el
+// error ORIGINAL de Anthropic (asi el caller activa su degradacion elegante de siempre).
+// `params` se pasa TAL CUAL a messages.create (no se muta). `etiqueta` es solo para logs/avisos.
+async function llamarIAConFailover(params, etiqueta) {
+  try {
+    return await anthropic.messages.create(params);
+  } catch (err) {
+    // Solo failover ante cortes TRANSITORIOS del proveedor. Saldo agotado / request invalido NO se reintenta en Bedrock.
+    if (!_bedrockReady || !esErrorTransitorioIA(err)) throw err;
+    const bedrockModel = _BEDROCK_MODEL_MAP[params && params.model];
+    if (!bedrockModel) throw err; // sin modelId de Bedrock para ese modelo -> no se intenta (evita modelId invalido)
+    try {
+      // MISMO request, solo cambia el model al inference profile de Bedrock.
+      const paramsBedrock = Object.assign({}, params, { model: bedrockModel });
+      const r = await _bedrockClient.messages.create(paramsBedrock);
+      console.log('[FAILOVER] respondido via Bedrock' + (etiqueta ? ' (' + etiqueta + ')' : '') + ' tras fallo de Anthropic directo: ' + (err && err.message));
+      _avisarFailoverBedrock(etiqueta).catch(function(){});
+      return r;
+    } catch (errBedrock) {
+      // Bedrock tampoco respondio: relanzar el error ORIGINAL de Anthropic (degradacion del caller intacta).
+      console.error('[FAILOVER] Bedrock tambien fallo' + (etiqueta ? ' (' + etiqueta + ')' : '') + ': ' + (errBedrock && errBedrock.message) + ' | error original Anthropic: ' + (err && err.message));
+      throw err;
+    }
+  }
+}
+
 // ---- MercadoPago via REST (sin SDK, sin dependencias nuevas; fetch es global en Node 18+) ----
 async function mpFetch(path, metodo, cuerpo) {
   if (!MP_TOKEN) throw new Error('MercadoPago no configurado (falta MERCADOPAGO_ACCESS_TOKEN)');
@@ -2725,13 +2826,15 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // retroceda). Va en bloque dinamico (no cacheado). Permite acortar el historial sin perder contexto -> baja tokens.
   if (memoriaViva) systemBlocks.push({ type: 'text', text: 'MEMORIA DE LA CONVERSACION (donde venis con este lead; segui DESDE ACA, no repreguntes lo ya hablado ni retrocedas): ' + memoriaViva });
 
-  const completion = await anthropic.messages.create({
+  // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
+  // failover a Bedrock si esta gateado/encendido). Sin BEDROCK_ENABLED + creds, es identico a anthropic.messages.create.
+  const completion = await llamarIAConFailover({
     model: MODELO_CLIENTE,
     max_tokens: 500,
     system: systemBlocks,
     tools: toolsAgente,
     messages: mensajesParaIA
-  });
+  }, 'generarRespuestaAgente');
 
   // mediaAEnviar: fotos que el webhook debera mandar DESPUES del texto. Vacio si la IA no pidio foto.
   let mediaAEnviar = [];
@@ -2753,7 +2856,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             { role: 'assistant', content: completion.content },
             { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolDueno.id, content: 'Consulta registrada y enviada al dueno. Decile al lead con naturalidad que estas averiguando ese dato y le confirmas enseguida; segui la conversacion normal con lo que si podes responder.' }] }
           ]);
-          const _c2 = await anthropic.messages.create({ model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsT2 });
+          const _c2 = await llamarIAConFailover({ model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsT2 }, 'generarRespuestaAgente:turno2-dueno');
           const _b2 = (_c2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
           if (_b2 && _b2.text) _textoCierre = _b2.text;
           if (_c2 && _c2.usage && completion && completion.usage) {
@@ -2819,13 +2922,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           { role: 'assistant', content: completion.content },
           { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse ? toolUse.id : 'sin_id', content: toolResultTexto }] }
         ]);
-        const completion2 = await anthropic.messages.create({
+        const completion2 = await llamarIAConFailover({
           model: MODELO_CLIENTE,
           max_tokens: 500,
           system: systemBlocks,
           tools: toolsAgente,
           messages: mensajesTurno2
-        });
+        }, 'generarRespuestaAgente:turno2-foto');
         const b2 = (completion2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
         if (b2 && b2.text) textoFinal = b2.text;
         // acumular uso del segundo turno (incluye tokens de cache para que el costo logueado sea exacto)
@@ -10103,6 +10206,8 @@ app.post('/api/citas', async function(req, res) {
     if (citaId && tipoCita === 'alquiler_temporal' && fechaFinISO) {
       try { await generarTareasAlquiler(ownerId, citaId, fh.toISOString(), fechaFinISO, fila.titulo); } catch (eGen) { console.error('POST /api/citas generarTareas:', eGen && eGen.message); }
     }
+    // FEATURE #21: PUSH a Google Calendar (best-effort, no bloquea ni rompe la creacion). Inerte sin Calendar conectado.
+    if (citaId) { syncCitaACalendar(ownerId, citaId).catch(function(e){ console.error('POST /api/citas syncCalendar:', e && e.message); }); }
     return res.json({ ok: true, id: citaId });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -10172,6 +10277,12 @@ app.post('/api/citas/actualizar', async function(req, res) {
         if (cambioFechas) await recalcularTareasAlquiler(ownerId, b.id, ciFinal, coFinal, actual.titulo);
       }
     } catch (eTareas) { console.error('actualizar cita motor tareas:', eTareas && eTareas.message); }
+    // FEATURE #21: reflejar el cambio en Google Calendar (best-effort). Cancelada -> borrar el evento; resto -> upsert.
+    try {
+      var _estadoFinalCal = (typeof upd.estado !== 'undefined') ? upd.estado : actual.estado;
+      if (_estadoFinalCal === 'cancelada') { borrarCitaDeCalendar(ownerId, b.id).catch(function(e){ console.error('cita cancel syncCalendar:', e && e.message); }); }
+      else { syncCitaACalendar(ownerId, b.id).catch(function(e){ console.error('cita upd syncCalendar:', e && e.message); }); }
+    } catch (eCal) { console.error('actualizar cita syncCalendar:', eCal && eCal.message); }
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -12770,5 +12881,486 @@ app.get('/api/meta/credenciales', async function(req, res) {
     return res.json({ ok: true, page: armar(fPage), instagram: armar(fIg) });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+
+// ============================================================================
+// ============================================================================
+// ESQUELETOS DE INTEGRACIONES EXTERNAS (gateadas y APAGADAS por default)
+// ----------------------------------------------------------------------------
+// REGLA DURA COMUN a #17, #19 y #21:
+//   - TODO gateado por env de credenciales. Si la credencial NO esta -> el flujo
+//     responde 503 "no configurado" y NO hace nada (cero cambio de comportamiento).
+//   - Ningun paquete npm nuevo es OBLIGATORIO: googleapis se carga con require
+//     defensivo (try/catch); si no esta instalado, los endpoints de Google
+//     responden 503 con instrucciones, sin romper el arranque del proceso.
+//   - No se toca el webhook de WhatsApp, ni generarRespuestaAgente, ni los crons
+//     existentes, ni hacerBackup. Estos endpoints SOLO agregan rutas nuevas.
+// ============================================================================
+// ============================================================================
+
+// ------------------------------------------------------------------ helpers comunes
+// State CSRF firmado para los callbacks OAuth (sin tabla nueva): HMAC del user_id + nonce + exp.
+// Se firma con MAESTRO_SECRET si existe, si no con SUPABASE_SERVICE_KEY (siempre presente). Asi el
+// callback puede confiar en el user_id sin guardar nada intermedio. Vida corta (10 min).
+const _OAUTH_STATE_SECRET = process.env.MAESTRO_SECRET || process.env.SUPABASE_SERVICE_KEY || 'raices-oauth-fallback';
+function _oauthStateFirmar(userId, proposito) {
+  try {
+    const payload = Buffer.from(JSON.stringify({ u: String(userId), p: String(proposito || ''), n: _cripto.randomBytes(8).toString('hex'), exp: Math.floor(Date.now() / 1000) + 600 })).toString('base64url');
+    const sig = _cripto.createHmac('sha256', _OAUTH_STATE_SECRET).update(payload).digest('hex');
+    return payload + '.' + sig;
+  } catch (e) { return ''; }
+}
+function _oauthStateLeer(state, proposito) {
+  try {
+    if (!state) return null;
+    const parts = String(state).split('.');
+    if (parts.length !== 2) return null;
+    const sig = _cripto.createHmac('sha256', _OAUTH_STATE_SECRET).update(parts[0]).digest('hex');
+    const a = Buffer.from(sig), b = Buffer.from(parts[1]);
+    if (a.length !== b.length || !_cripto.timingSafeEqual(a, b)) return null;
+    const p = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+    if (!p || p.exp < Math.floor(Date.now() / 1000)) return null;
+    if (proposito && p.p !== proposito) return null;
+    return p.u; // user_id
+  } catch (e) { return null; }
+}
+// Mini-pagina HTML de cierre para los callbacks OAuth (se abren en popup/redirect).
+function _oauthCierreHtml(titulo, detalle, ok) {
+  const color = ok ? '#16a34a' : '#dc2626';
+  return '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + titulo + '</title></head>' +
+    '<body style="font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">' +
+    '<div style="text-align:center;max-width:420px;padding:24px"><div style="font-size:48px;color:' + color + '">' + (ok ? '&#10003;' : '&#10007;') + '</div>' +
+    '<h2 style="margin:12px 0">' + titulo + '</h2><p style="color:#94a3b8">' + detalle + '</p>' +
+    '<p style="color:#64748b;font-size:13px">Ya podes cerrar esta ventana y volver a Raices CRM.</p></div>' +
+    '<script>try{if(window.opener){window.opener.postMessage({raicesOauth:true,ok:' + (ok ? 'true' : 'false') + '},"*");}setTimeout(function(){window.close();},1500);}catch(e){}</script></body></html>';
+}
+
+// ============================================================================
+// FEATURE #17 — MESSENGER OAUTH (conectar la Pagina de Facebook del cliente)
+// ----------------------------------------------------------------------------
+// Messenger ya esta validado end-to-end (envio/recepcion via Graph). Lo que falta
+// para clientes reales es el FLUJO OAUTH que conecta la Pagina del cliente sin que
+// el cliente tenga que copiar/pegar un page_access_token a mano.
+//
+// FLUJO:
+//   1) GET /api/meta/oauth/start  -> redirige a Meta (Facebook Login) con app_id + scopes.
+//   2) Meta vuelve con ?code a    -> GET /api/meta/oauth/callback
+//   3) callback: code -> user access token -> /me/accounts -> page_access_token de
+//      la Pagina elegida -> se guarda (upsert) en messenger_credentials (la MISMA
+//      tabla que el webhook /api/webhook/meta ya consume). Se deja activo=false hasta
+//      que el cliente lo active desde la pantalla de Integraciones (no auto-encender).
+//
+// GATEADO por META_APP_ID + META_APP_SECRET. Si faltan -> 503 "no configurado": el boton
+// del front no arranca nada (cero comportamiento). NO toca el webhook ni el envio.
+const META_APP_ID = process.env.META_APP_ID || '';
+const META_APP_SECRET = process.env.META_APP_SECRET || '';
+const META_OAUTH_REDIRECT = process.env.META_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta/oauth/callback');
+// Scopes minimos para Messenger: leer las Paginas del usuario y mensajear desde ellas.
+const META_OAUTH_SCOPES = 'pages_show_list,pages_messaging,pages_manage_metadata,business_management';
+function _metaOauthConfigurado() { return !!(META_APP_ID && META_APP_SECRET); }
+
+// GET /api/meta/oauth/start — arranca el OAuth (redirige a Meta). Auth por JWT (?token= o Bearer).
+// El user_id va firmado en el `state` (CSRF + identidad), no hay tabla intermedia.
+app.get('/api/meta/oauth/start', async function(req, res) {
+  try {
+    if (!_metaOauthConfigurado()) return res.status(503).json({ error: 'Messenger OAuth no configurado (faltan META_APP_ID / META_APP_SECRET).' });
+    // Auth: aceptar token por query (?token=) para poder abrir el flujo en una nueva pestania, o por header.
+    let uid = await verificarUsuario(req);
+    if (!uid && req.query.token) { try { const { data } = await supabase.auth.getUser(String(req.query.token)); if (data && data.user) uid = data.user.id; } catch (e) {} }
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const state = _oauthStateFirmar(uid, 'meta');
+    if (!state) return res.status(500).json({ error: 'No se pudo iniciar el flujo' });
+    const url = 'https://www.facebook.com/' + META_GRAPH_VERSION + '/dialog/oauth' +
+      '?client_id=' + encodeURIComponent(META_APP_ID) +
+      '&redirect_uri=' + encodeURIComponent(META_OAUTH_REDIRECT) +
+      '&state=' + encodeURIComponent(state) +
+      '&response_type=code' +
+      '&scope=' + encodeURIComponent(META_OAUTH_SCOPES);
+    return res.redirect(url);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/meta/oauth/estado — el front pregunta si el flujo OAuth de Meta esta DISPONIBLE
+// (credenciales de la app cargadas en el backend). Default = apagado: si faltan META_APP_ID /
+// META_APP_SECRET devuelve disponible:false y el boton del front no arranca nada. NO toca el webhook.
+app.get('/api/meta/oauth/estado', async function(req, res) {
+  try {
+    return res.json({ ok: true, disponible: _metaOauthConfigurado() });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/meta/oauth/callback — recibe el ?code, lo cambia por el page_access_token y lo guarda.
+app.get('/api/meta/oauth/callback', async function(req, res) {
+  try {
+    if (!_metaOauthConfigurado()) return res.status(503).send(_oauthCierreHtml('Messenger no configurado', 'Faltan credenciales de la app de Meta.', false));
+    if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a la Pagina.', false));
+    const code = req.query.code ? String(req.query.code) : '';
+    const uid = _oauthStateLeer(req.query.state, 'meta');
+    if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido de conexion vencio o no es valido. Reintentá desde Raices CRM.', false));
+
+    // 1) code -> short-lived USER access token
+    const tokenUrl = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/oauth/access_token' +
+      '?client_id=' + encodeURIComponent(META_APP_ID) +
+      '&client_secret=' + encodeURIComponent(META_APP_SECRET) +
+      '&redirect_uri=' + encodeURIComponent(META_OAUTH_REDIRECT) +
+      '&code=' + encodeURIComponent(code);
+    const tr = await fetch(tokenUrl);
+    const tj = await tr.json().catch(function(){ return null; });
+    if (!tr.ok || !tj || !tj.access_token) { console.error('meta oauth token:', JSON.stringify(tj).slice(0, 300)); return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'Meta no devolvio un token de acceso. Reintentá.', false)); }
+    let userToken = tj.access_token;
+
+    // 2) (best-effort) intercambiar a long-lived user token (60 dias) — mejor que el short-lived.
+    try {
+      const llUrl = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/oauth/access_token' +
+        '?grant_type=fb_exchange_token&client_id=' + encodeURIComponent(META_APP_ID) +
+        '&client_secret=' + encodeURIComponent(META_APP_SECRET) +
+        '&fb_exchange_token=' + encodeURIComponent(userToken);
+      const lr = await fetch(llUrl); const lj = await lr.json().catch(function(){ return null; });
+      if (lr.ok && lj && lj.access_token) userToken = lj.access_token;
+    } catch (e) {}
+
+    // 3) /me/accounts -> Paginas administradas (cada una trae su page_access_token, que es de larga duracion).
+    const acUrl = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/me/accounts?fields=id,name,access_token&access_token=' + encodeURIComponent(userToken);
+    const ar = await fetch(acUrl); const aj = await ar.json().catch(function(){ return null; });
+    const paginas = (aj && Array.isArray(aj.data)) ? aj.data : [];
+    if (!paginas.length) return res.status(400).send(_oauthCierreHtml('Sin Paginas', 'La cuenta no administra ninguna Pagina de Facebook, o no se otorgaron los permisos. Reintentá eligiendo la Pagina.', false));
+    // Si hay una sola Pagina, se conecta directo. Si hay varias, se toma la primera y se documenta que
+    // el front deberia ofrecer un selector (TODO front). Cada page_access_token aca ya es de larga duracion.
+    const pagina = paginas[0];
+    if (!pagina || !pagina.id || !pagina.access_token) return res.status(502).send(_oauthCierreHtml('Sin token de Pagina', 'No se obtuvo el token de la Pagina. Revisá los permisos de mensajeria.', false));
+
+    // 4) Suscribir la Pagina a la app (para que los webhooks de mensajes lleguen). Best-effort.
+    try {
+      await fetch('https://graph.facebook.com/' + META_GRAPH_VERSION + '/' + encodeURIComponent(pagina.id) + '/subscribed_apps?subscribed_fields=messages,messaging_postbacks&access_token=' + encodeURIComponent(pagina.access_token), { method: 'POST' });
+    } catch (e) { console.error('meta oauth subscribe page:', e && e.message); }
+
+    // 5) Guardar en messenger_credentials (MISMA tabla que el webhook consume). activo=false: el cliente lo
+    //    activa luego desde Integraciones (no auto-encender un canal nuevo). app_secret = META_APP_SECRET (global
+    //    de la app, sirve para validar la firma del webhook). verify_token: se conserva el existente o se deja null.
+    const fila = { user_id: uid, canal: 'page', page_id: String(pagina.id), page_access_token: String(pagina.access_token), app_secret: META_APP_SECRET, activo: false };
+    try {
+      const { data: existe } = await supabase.from('messenger_credentials').select('id, verify_token, activo').eq('user_id', uid).eq('canal', 'page').maybeSingle();
+      if (existe) {
+        // conservar verify_token y el estado activo previo (no apagar un canal que ya estaba andando).
+        if (typeof existe.activo === 'boolean') fila.activo = existe.activo;
+        const { error } = await supabase.from('messenger_credentials').update(fila).eq('id', existe.id);
+        if (error) { console.error('meta oauth save update:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+      } else {
+        const { error } = await supabase.from('messenger_credentials').insert(fila);
+        if (error) { console.error('meta oauth save insert:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+      }
+    } catch (e) { console.error('meta oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
+
+    const aviso = (paginas.length > 1) ? (' Se conecto "' + (pagina.name || pagina.id) + '". Tenes ' + paginas.length + ' Paginas; si queres otra, reconectá.') : (' Pagina conectada: ' + (pagina.name || pagina.id) + '.');
+    return res.status(200).send(_oauthCierreHtml('Messenger conectado', 'Activala desde Integraciones para empezar a responder.' + aviso, true));
+  } catch (e) { console.error('GET /api/meta/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Messenger.', false)); }
+});
+
+// ============================================================================
+// GOOGLE OAUTH2 COMPARTIDO (#19 Drive + #21 Calendar usan el MISMO proyecto Google)
+// ----------------------------------------------------------------------------
+// Un solo OAuth2 client de Google sirve a Drive y Calendar (mismo client_id/secret,
+// distinto `scope` segun el proposito). El refresh_token se guarda por tenant en la
+// tabla google_oauth_tokens (una fila por user_id + proposito).
+//
+// GATEADO por GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET. Si faltan -> 503. Si el paquete
+// googleapis no esta instalado -> 503 con instruccion de instalarlo. Cero dependencia
+// obligatoria, cero cambio de comportamiento sin credenciales.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_OAUTH_REDIRECT = process.env.GOOGLE_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/google/oauth/callback');
+const GOOGLE_SCOPE_DRIVE = 'https://www.googleapis.com/auth/drive.file';      // solo archivos creados por la app (minimo)
+const GOOGLE_SCOPE_CALENDAR = 'https://www.googleapis.com/auth/calendar.events'; // crear/editar/borrar eventos
+function _googleConfigurado() { return !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET); }
+
+// require DEFENSIVO de googleapis: si no esta instalado, _googleapis=null y los endpoints responden 503.
+let _googleapis = null;
+try { _googleapis = require('googleapis').google; console.log('[GOOGLE] googleapis disponible'); }
+catch (e) { _googleapis = null; console.log('[GOOGLE] googleapis NO instalado -> Drive/Calendar OFF hasta `npm i googleapis` (no rompe nada)'); }
+
+// Crea un OAuth2 client de google (o null si falta config/paquete).
+function _googleOAuthClient() {
+  if (!_googleConfigurado() || !_googleapis) return null;
+  return new _googleapis.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT);
+}
+
+// Guarda/actualiza el refresh_token del tenant para un proposito ('drive'|'calendar') en google_oauth_tokens.
+async function _googleGuardarToken(userId, proposito, tokens) {
+  const fila = {
+    user_id: userId, proposito: proposito,
+    refresh_token: tokens.refresh_token || null,
+    access_token: tokens.access_token || null,
+    token_expiry: tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null,
+    scope: tokens.scope || null
+  };
+  const { data: existe } = await supabase.from('google_oauth_tokens').select('id, refresh_token').eq('user_id', userId).eq('proposito', proposito).maybeSingle();
+  if (existe) {
+    // Google solo manda refresh_token la PRIMERA vez (con prompt=consent). Si ahora no vino, conservamos el guardado.
+    if (!fila.refresh_token && existe.refresh_token) delete fila.refresh_token;
+    const { error } = await supabase.from('google_oauth_tokens').update(fila).eq('id', existe.id);
+    if (error) throw new Error(error.message);
+  } else {
+    const { error } = await supabase.from('google_oauth_tokens').insert(fila);
+    if (error) throw new Error(error.message);
+  }
+}
+
+// Devuelve un OAuth2 client YA autenticado con el refresh_token del tenant para ese proposito, o null
+// si el tenant nunca conecto Google (=> el caller no hace nada, inerte).
+async function _googleClientAutenticado(userId, proposito) {
+  try {
+    const oauth = _googleOAuthClient();
+    if (!oauth) return null;
+    const { data, error } = await supabase.from('google_oauth_tokens').select('refresh_token').eq('user_id', userId).eq('proposito', proposito).maybeSingle();
+    if (error || !data || !data.refresh_token) return null;
+    oauth.setCredentials({ refresh_token: data.refresh_token });
+    return oauth;
+  } catch (e) { console.error('_googleClientAutenticado:', e && e.message); return null; }
+}
+
+// GET /api/google/oauth/start — arranca el OAuth de Google. ?proposito=drive|calendar. Auth por JWT.
+app.get('/api/google/oauth/start', async function(req, res) {
+  try {
+    if (!_googleConfigurado()) return res.status(503).json({ error: 'Google no configurado (faltan GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).' });
+    if (!_googleapis) return res.status(503).json({ error: 'Falta instalar la dependencia googleapis (npm i googleapis).' });
+    let uid = await verificarUsuario(req);
+    if (!uid && req.query.token) { try { const { data } = await supabase.auth.getUser(String(req.query.token)); if (data && data.user) uid = data.user.id; } catch (e) {} }
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const proposito = (req.query.proposito === 'calendar') ? 'calendar' : 'drive';
+    const scope = (proposito === 'calendar') ? GOOGLE_SCOPE_CALENDAR : GOOGLE_SCOPE_DRIVE;
+    const oauth = _googleOAuthClient();
+    const url = oauth.generateAuthUrl({
+      access_type: 'offline',           // necesario para recibir refresh_token
+      prompt: 'consent',                // fuerza el refresh_token aun en reconexiones
+      scope: [scope],
+      state: _oauthStateFirmar(uid, 'google:' + proposito)
+    });
+    return res.redirect(url);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/google/oauth/callback — recibe el ?code, lo cambia por tokens y guarda el refresh_token.
+app.get('/api/google/oauth/callback', async function(req, res) {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).send(_oauthCierreHtml('Google no configurado', 'Faltan credenciales o la dependencia googleapis.', false));
+    if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a Google.', false));
+    const code = req.query.code ? String(req.query.code) : '';
+    const stateRaw = String(req.query.state || '');
+    // El proposito viaja dentro del state ('google:drive' | 'google:calendar'). Validamos ambos.
+    let uid = _oauthStateLeer(stateRaw, 'google:drive'); let proposito = 'drive';
+    if (!uid) { uid = _oauthStateLeer(stateRaw, 'google:calendar'); proposito = 'calendar'; }
+    if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido vencio o no es valido. Reintentá desde Raices CRM.', false));
+    const oauth = _googleOAuthClient();
+    const { tokens } = await oauth.getToken(code);
+    if (!tokens) return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'Google no devolvio tokens. Reintentá.', false));
+    if (!tokens.refresh_token) {
+      // Sin refresh_token no podemos operar offline. Suele pasar si el usuario ya habia consentido antes
+      // sin revocar; con prompt=consent no deberia, pero lo informamos por las dudas.
+      const { data: prev } = await supabase.from('google_oauth_tokens').select('refresh_token').eq('user_id', uid).eq('proposito', proposito).maybeSingle();
+      if (!prev || !prev.refresh_token) return res.status(400).send(_oauthCierreHtml('Falta permiso offline', 'Google no entrego un token de actualizacion. Revocá el acceso a la app en tu cuenta de Google y reintentá.', false));
+    }
+    await _googleGuardarToken(uid, proposito, tokens);
+    const titulo = (proposito === 'calendar') ? 'Google Calendar conectado' : 'Google Drive conectado';
+    return res.status(200).send(_oauthCierreHtml(titulo, 'Listo. Ya podes usarlo desde Raices CRM.', true));
+  } catch (e) { console.error('GET /api/google/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Google.', false)); }
+});
+
+// GET /api/google/estado — el front consulta que tiene conectado (drive/calendar) y si la feature esta disponible.
+app.get('/api/google/estado', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    let ownerId = uid;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+    let drive = false, calendar = false;
+    try {
+      const { data } = await supabase.from('google_oauth_tokens').select('proposito, refresh_token').eq('user_id', ownerId);
+      (data || []).forEach(function(f){ if (f.refresh_token) { if (f.proposito === 'drive') drive = true; if (f.proposito === 'calendar') calendar = true; } });
+    } catch (e) {}
+    let backupDrivePlan = false; try { backupDrivePlan = await planPermite(ownerId, 'backup_drive'); } catch (e) {}
+    return res.json({ ok: true, configurado: _googleConfigurado() && !!_googleapis, drive_conectado: drive, calendar_conectado: calendar, backup_drive_plan: backupDrivePlan });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============================================================================
+// FEATURE #19 — BACKUP A GOOGLE DRIVE (export del cliente -> Drive del dueno)
+// ----------------------------------------------------------------------------
+// Hoy hay backups internos (tabla `backups`, 1 cada 30 min). Esto AGREGA la opcion de
+// subir un export del cliente a SU Google Drive. NO reemplaza ni toca hacerBackup().
+//
+// GATEADO por: (a) Google configurado + googleapis instalado + tenant con Drive conectado,
+// y (b) flag por cuenta backup_drive del plan (premium+ en PLAN_LIMITS). Si algo falta ->
+// no hace nada (503 en el endpoint manual; el cron, si se prende, saltea la cuenta).
+//
+// Por ahora el disparo es MANUAL (endpoint). Queda DOCUMENTADO como engancharlo a un cron.
+
+// Arma el export de datos del cliente (mismas tablas que hacerBackup + opcional 'sistema').
+async function _armarExportCliente(userId, incluirSistema) {
+  const tablas = ['conversations','messages','contacts','recontactos','business_settings','properties','knowledge_base','whatsapp_instancias','citas'];
+  if (incluirSistema) { tablas.push('subscriptions'); tablas.push('ia_uso'); }
+  const contenido = { _meta: { user_id: userId, generado_en: new Date().toISOString(), incluye_sistema: !!incluirSistema } };
+  for (const t of tablas) {
+    try { const { data } = await supabase.from(t).select('*').eq('user_id', userId); contenido[t] = data || []; }
+    catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
+  }
+  return contenido;
+}
+
+// Sube un JSON a la carpeta "Raices CRM Backups" del Drive del tenant. Crea la carpeta si no existe.
+// Devuelve { ok, fileId, fileName } o lanza. Best-effort de carpeta: si no se puede crear, sube a raiz.
+async function _subirBackupADrive(userId, contenido) {
+  const oauth = await _googleClientAutenticado(userId, 'drive');
+  if (!oauth) throw new Error('Drive no conectado para esta cuenta');
+  const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+  // Buscar/crear carpeta contenedora.
+  let folderId = null;
+  try {
+    const q = "mimeType='application/vnd.google-apps.folder' and name='Raices CRM Backups' and trashed=false";
+    const lr = await drive.files.list({ q: q, fields: 'files(id,name)', spaces: 'drive' });
+    if (lr.data.files && lr.data.files.length) folderId = lr.data.files[0].id;
+    else { const cr = await drive.files.create({ requestBody: { name: 'Raices CRM Backups', mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' }); folderId = cr.data.id; }
+  } catch (e) { console.error('drive carpeta:', e && e.message); folderId = null; }
+  const fileName = 'raices-backup-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+  const Readable = require('stream').Readable;
+  const body = Readable.from([JSON.stringify(contenido)]);
+  const meta = { name: fileName }; if (folderId) meta.parents = [folderId];
+  const up = await drive.files.create({ requestBody: meta, media: { mimeType: 'application/json', body: body }, fields: 'id,name' });
+  return { ok: true, fileId: up.data.id, fileName: up.data.name };
+}
+
+// POST /api/backup/drive — dispara MANUALMENTE un backup a Drive para la cuenta del JWT.
+// body: { sistema?: bool } para incluir tablas de sistema. Gateado por plan backup_drive + Drive conectado.
+app.post('/api/backup/drive', async function(req, res) {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Backup a Drive no disponible (Google no configurado o falta googleapis).' });
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    let ownerId = uid;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+    // Gate por plan: backup_drive (premium+). Si el plan no lo habilita -> 403.
+    try {
+      if (!(await planPermite(ownerId, 'backup_drive'))) return res.status(403).json({ error: 'Tu plan no incluye backup a Google Drive (disponible en Premium o superior).' });
+    } catch (e) {}
+    // Gate por conexion: el tenant debe haber conectado su Drive.
+    const cli = await _googleClientAutenticado(ownerId, 'drive');
+    if (!cli) return res.status(409).json({ error: 'Conectá tu Google Drive primero (Integraciones).' });
+    const contenido = await _armarExportCliente(ownerId, req.body && req.body.sistema === true);
+    const r = await _subirBackupADrive(ownerId, contenido);
+    return res.json({ ok: true, file: r.fileName, fileId: r.fileId });
+  } catch (e) { console.error('POST /api/backup/drive:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error subiendo a Drive' }); }
+});
+
+// CRON OPCIONAL (DOCUMENTADO, NO ARRANCADO): para subir a Drive periodicamente a las cuentas
+// premium+ que tengan Drive conectado, descomentar el setInterval de abajo. Por default queda
+// INERTE (no se agenda) para no cambiar comportamiento ni gastar cuota sin que Diego lo decida.
+//   - Recorre business_settings, filtra por plan backup_drive + Drive conectado, y sube el export.
+//   - Es CERO IA (solo lee/escribe DB + Drive API).
+async function _cronBackupDrive() {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return;
+    const { data: settings } = await supabase.from('business_settings').select('user_id');
+    if (!settings) return;
+    const uids = [...new Set(settings.map(function(s){ return s.user_id; }))];
+    for (const uid of uids) {
+      try {
+        if (!(await planPermite(uid, 'backup_drive'))) continue;
+        const cli = await _googleClientAutenticado(uid, 'drive');
+        if (!cli) continue;
+        const contenido = await _armarExportCliente(uid, false);
+        await _subirBackupADrive(uid, contenido);
+        console.log('[backup-drive] subido para ' + uid);
+      } catch (e2) { console.error('[backup-drive] user ' + uid + ':', e2 && e2.message); }
+    }
+  } catch (e) { console.error('_cronBackupDrive:', e && e.message); }
+}
+// Para activarlo (cuando Diego lo decida): descomentar las 2 lineas siguientes.
+// setInterval(_cronBackupDrive, 6 * 60 * 60 * 1000); // cada 6 hs
+// setTimeout(_cronBackupDrive, 5 * 60 * 1000);
+
+// ============================================================================
+// FEATURE #21 — AGENDA -> GOOGLE CALENDAR (sync push de citas)
+// ----------------------------------------------------------------------------
+// La agenda nativa (tabla `citas`) ya existe. Esto AGREGA un sync PUSH: al crear/editar/
+// cancelar una cita, reflejarla en el Google Calendar del dueno y guardar el id del evento
+// remoto en citas.google_event_id (columna nueva; migracion defensiva mas abajo).
+//
+// GATEADO por: Google configurado + googleapis + Calendar conectado por el tenant. Si falta
+// algo -> las funciones de sync NO hacen nada (return temprano) y la cita nativa sigue igual.
+// Es ADITIVO: el sync se llama best-effort DESPUES de que la cita ya se guardo en la DB.
+
+// Convierte una fila `citas` a un evento de Google Calendar.
+function _citaAEventoGoogle(cita) {
+  const ev = { summary: (cita.titulo || 'Cita') + (cita.lead_nombre ? (' - ' + cita.lead_nombre) : ''), description: (cita.notas || '') + (cita.lead_telefono ? ('\nTel: ' + cita.lead_telefono) : '') };
+  const ini = cita.fecha_hora ? new Date(cita.fecha_hora) : null;
+  const fin = cita.fecha_fin ? new Date(cita.fecha_fin) : (ini ? new Date(ini.getTime() + 60 * 60 * 1000) : null);
+  if (cita.todo_el_dia) {
+    // Eventos de dia completo: usan `date` (YYYY-MM-DD). end.date es EXCLUSIVO en Google.
+    const d = function(x){ return x.toISOString().slice(0, 10); };
+    const finDia = fin || (ini ? new Date(ini.getTime() + 24 * 3600 * 1000) : null);
+    ev.start = { date: ini ? d(ini) : undefined };
+    ev.end = { date: finDia ? d(new Date(finDia.getTime() + 24 * 3600 * 1000)) : undefined };
+  } else {
+    ev.start = { dateTime: ini ? ini.toISOString() : undefined };
+    ev.end = { dateTime: fin ? fin.toISOString() : undefined };
+  }
+  return ev;
+}
+
+// PUSH: crear/actualizar el evento de una cita en el Calendar del tenant. Best-effort.
+// Si la cita ya tiene google_event_id -> update; si no -> insert y guarda el id en citas.
+async function syncCitaACalendar(ownerId, citaId) {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return;
+    const oauth = await _googleClientAutenticado(ownerId, 'calendar');
+    if (!oauth) return; // tenant no conecto Calendar -> inerte
+    const { data: cita } = await supabase.from('citas').select('*').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
+    if (!cita) return;
+    const cal = _googleapis.calendar({ version: 'v3', auth: oauth });
+    const evento = _citaAEventoGoogle(cita);
+    let geid = cita.google_event_id || null;
+    if (geid) {
+      try { await cal.events.update({ calendarId: 'primary', eventId: geid, requestBody: evento }); return; }
+      catch (e) { if (e && (e.code === 404 || e.code === 410)) geid = null; else { console.error('syncCitaACalendar update:', e && e.message); return; } }
+    }
+    const ins = await cal.events.insert({ calendarId: 'primary', requestBody: evento });
+    const nuevoId = ins && ins.data && ins.data.id;
+    if (nuevoId) {
+      // Guardar google_event_id. DEFENSIVO: si la columna no existe (migracion no corrida) NO rompe.
+      try { await supabase.from('citas').update({ google_event_id: nuevoId }).eq('id', citaId).eq('user_id', ownerId); }
+      catch (e) { console.error('syncCitaACalendar guardar id (corré la migracion google_event_id):', e && e.message); }
+    }
+  } catch (e) { console.error('syncCitaACalendar:', e && e.message); }
+}
+
+// PUSH: borrar el evento remoto de una cita cancelada. Best-effort.
+async function borrarCitaDeCalendar(ownerId, citaId) {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return;
+    const oauth = await _googleClientAutenticado(ownerId, 'calendar');
+    if (!oauth) return;
+    const { data: cita } = await supabase.from('citas').select('google_event_id').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
+    if (!cita || !cita.google_event_id) return;
+    const cal = _googleapis.calendar({ version: 'v3', auth: oauth });
+    try { await cal.events.delete({ calendarId: 'primary', eventId: cita.google_event_id }); } catch (e) { if (!(e && (e.code === 404 || e.code === 410))) console.error('borrarCitaDeCalendar:', e && e.message); }
+    try { await supabase.from('citas').update({ google_event_id: null }).eq('id', citaId).eq('user_id', ownerId); } catch (e) {}
+  } catch (e) { console.error('borrarCitaDeCalendar:', e && e.message); }
+}
+
+// MIGRACION DEFENSIVA en arranque: agrega citas.google_event_id si falta y refresca el cache de
+// PostgREST (NOTIFY pgrst). Usa la RPC `exec_sql` si existe en la base; si NO existe, no rompe:
+// loguea que hay que correr la migracion a mano (el codigo de sync ya es defensivo si la columna falta).
+async function _migracionCalendarDefensiva() {
+  try {
+    if (!_googleConfigurado()) return; // sin Google no tiene sentido tocar el schema
+    const sql = "ALTER TABLE citas ADD COLUMN IF NOT EXISTS google_event_id text; NOTIFY pgrst, 'reload schema';";
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql: sql });
+      if (error) { console.log('[migracion calendar] RPC exec_sql fallo (' + error.message + '). Corré a mano: ' + sql); }
+      else console.log('[migracion calendar] citas.google_event_id OK + NOTIFY pgrst');
+    } catch (e) { console.log('[migracion calendar] no se pudo aplicar via RPC. Corré a mano en Supabase: ' + sql); }
+  } catch (e) {}
+}
+setTimeout(_migracionCalendarDefensiva, 8 * 1000);
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

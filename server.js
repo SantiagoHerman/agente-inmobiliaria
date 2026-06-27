@@ -3573,6 +3573,151 @@ async function detectarYAgendarCita(user_id, conversation_id) {
   } catch (e) { console.error('detectarYAgendarCita:', e && e.message); }
 }
 
+// ============================================================================
+// MOTOR DE TAREAS DE EQUIPO (alquiler temporal) — CERO IA. Solo fechas + texto fijo.
+// Al crear/confirmar un evento tipo `alquiler_temporal`, genera automaticamente las
+// tareas de LIMPIEZA (una ANTES del check-in y otra DESPUES del check-out), las
+// asigna a un miembro del equipo por rol (round-robin) y avisa por WhatsApp/push.
+// Todo defensivo: si las tablas nuevas no existen aun (migracion sin correr), NO
+// rompe la creacion de la cita (solo no genera tareas).
+// ============================================================================
+
+// Plantillas por defecto (editables por el dueno via business_settings.tarea_plantillas).
+// offset_min relativo al ancla: negativo = antes; positivo = despues.
+const _TAREA_PLANTILLAS_DEFAULT = [
+  { tipo: 'limpieza_pre',  ancla: 'check_in',  offset_min: -180, rol: 'limpieza', titulo: 'Limpieza pre check-in' },
+  { tipo: 'limpieza_post', ancla: 'check_out', offset_min: 60,   rol: 'limpieza', titulo: 'Limpieza post check-out' }
+];
+
+// Lee las plantillas del tenant; si no definio ninguna, cae al default. Defensivo.
+async function obtenerTareaPlantillas(ownerId) {
+  try {
+    const { data } = await supabase.from('business_settings').select('tarea_plantillas').eq('user_id', ownerId).maybeSingle();
+    const pl = data && data.tarea_plantillas;
+    if (Array.isArray(pl) && pl.length > 0) return pl;
+  } catch (e) { /* columna/tabla puede no existir aun -> default */ }
+  return _TAREA_PLANTILLAS_DEFAULT;
+}
+
+// Round-robin simple por rol: del set de miembros activos con ese rol, elige el que
+// MENOS tareas pendientes/en_curso tiene (reparto parejo). Devuelve id o null.
+// Defensivo: si no hay tabla/miembros, devuelve null (la tarea queda sin asignar).
+async function elegirMiembroEquipo(ownerId, rol) {
+  try {
+    let q = supabase.from('equipo_miembros').select('id').eq('user_id', ownerId).eq('activo', true);
+    if (rol) q = q.eq('rol', rol);
+    const { data: miembros } = await q;
+    if (!miembros || miembros.length === 0) {
+      // Sin nadie con ese rol exacto: probar cualquier miembro activo del tenant.
+      const { data: cualquiera } = await supabase.from('equipo_miembros').select('id').eq('user_id', ownerId).eq('activo', true);
+      if (!cualquiera || cualquiera.length === 0) return null;
+      return await _miembroMenosCargado(cualquiera.map(function(m){ return m.id; }));
+    }
+    return await _miembroMenosCargado(miembros.map(function(m){ return m.id; }));
+  } catch (e) { return null; }
+}
+async function _miembroMenosCargado(ids) {
+  try {
+    if (!ids || ids.length === 0) return null;
+    if (ids.length === 1) return ids[0];
+    let mejor = ids[0], mejorCarga = Infinity;
+    for (const id of ids) {
+      const { count } = await supabase.from('tareas_evento').select('id', { count: 'exact', head: true }).eq('asignado_a', id).in('estado', ['pendiente', 'en_curso']);
+      const carga = (typeof count === 'number') ? count : 0;
+      if (carga < mejorCarga) { mejorCarga = carga; mejor = id; }
+    }
+    return mejor;
+  } catch (e) { return ids[0]; }
+}
+
+// GENERA las tareas de un evento alquiler_temporal. checkInISO = fecha_hora;
+// checkOutISO = fecha_fin. Idempotente por (evento_id, tipo): no duplica si ya
+// existe una tarea no-cancelada de ese tipo para el evento. Defensivo: nunca rompe.
+async function generarTareasAlquiler(ownerId, eventoId, checkInISO, checkOutISO, tituloEvento) {
+  try {
+    if (!eventoId) return;
+    const plantillas = await obtenerTareaPlantillas(ownerId);
+    for (const p of plantillas) {
+      try {
+        const anclaISO = (p.ancla === 'check_out') ? checkOutISO : checkInISO;
+        if (!anclaISO) continue; // si es post check-out y no hay fecha_fin, se omite
+        const base = new Date(anclaISO);
+        if (isNaN(base.getTime())) continue;
+        const fechaTarea = new Date(base.getTime() + (Number(p.offset_min) || 0) * 60 * 1000);
+        // Idempotencia: no duplicar misma (evento, tipo) no cancelada.
+        const { data: ya } = await supabase.from('tareas_evento').select('id').eq('evento_id', eventoId).eq('tipo', p.tipo).neq('estado', 'cancelada').limit(1);
+        if (ya && ya.length > 0) continue;
+        const asignado = await elegirMiembroEquipo(ownerId, p.rol);
+        await supabase.from('tareas_evento').insert({
+          user_id: ownerId,
+          evento_id: eventoId,
+          tipo: p.tipo,
+          titulo: (p.titulo ? String(p.titulo).slice(0, 160) : 'Tarea') + (tituloEvento ? (' — ' + String(tituloEvento).slice(0, 80)) : ''),
+          fecha_hora: fechaTarea.toISOString(),
+          asignado_a: asignado,
+          estado: 'pendiente',
+          origen: 'auto'
+        });
+      } catch (eItem) { console.error('generarTareasAlquiler item:', eItem && eItem.message); }
+    }
+  } catch (e) { console.error('generarTareasAlquiler:', e && e.message); }
+}
+
+// Reprogramacion: al cambiar las fechas de un alquiler, recalcular las tareas
+// AUTO no-hechas (pendiente/en_curso) y borrar/recrear; las hechas/canceladas se
+// respetan. Cancelacion del evento: cancelar tareas pendientes. Defensivo.
+async function recalcularTareasAlquiler(ownerId, eventoId, checkInISO, checkOutISO, tituloEvento) {
+  try {
+    if (!eventoId) return;
+    // Borrar las AUTO aun no-hechas para regenerarlas con las nuevas fechas.
+    await supabase.from('tareas_evento').delete().eq('evento_id', eventoId).eq('origen', 'auto').in('estado', ['pendiente', 'en_curso']);
+    await generarTareasAlquiler(ownerId, eventoId, checkInISO, checkOutISO, tituloEvento);
+  } catch (e) { console.error('recalcularTareasAlquiler:', e && e.message); }
+}
+async function cancelarTareasDeEvento(ownerId, eventoId) {
+  try {
+    if (!eventoId) return;
+    await supabase.from('tareas_evento').update({ estado: 'cancelada', actualizado_en: new Date().toISOString() }).eq('user_id', ownerId).eq('evento_id', eventoId).in('estado', ['pendiente', 'en_curso']);
+  } catch (e) { console.error('cancelarTareasDeEvento:', e && e.message); }
+}
+
+// CRON: avisar al EQUIPO de las tareas proximas (ventana 24h) aun no avisadas.
+// Mismo patron EXACTO que enviarRecordatoriosCitas: claim optimista (marca antes
+// de enviar) + WhatsApp al telefono del miembro + push si tiene auth_user_id.
+// CERO IA, CERO tokens. Texto fijo. Defensivo: si la tabla no existe, no rompe.
+async function enviarAvisosTareas() {
+  try {
+    const ahoraMs = Date.now();
+    const ahoraISO = new Date(ahoraMs).toISOString();
+    const en24hISO = new Date(ahoraMs + 24 * 60 * 60 * 1000).toISOString();
+    const { data: tareas } = await supabase.from('tareas_evento').select('*').eq('estado', 'pendiente').eq('aviso_enviado', false).gte('fecha_hora', ahoraISO).lte('fecha_hora', en24hISO);
+    if (!tareas || tareas.length === 0) return;
+    for (const tarea of tareas) {
+      try {
+        // CLAIM optimista: marcar avisado ANTES de enviar (evita doble envio si dos
+        // ejecuciones se solapan). Update condicional: solo gana si seguia en false.
+        const claim = await supabase.from('tareas_evento').update({ aviso_enviado: true }).eq('id', tarea.id).eq('aviso_enviado', false).select('id');
+        if (!claim || !claim.data || claim.data.length === 0) continue;
+        // Resolver el miembro asignado (telefono + push opcional).
+        let miembro = null;
+        if (tarea.asignado_a) { const { data: m } = await supabase.from('equipo_miembros').select('nombre, telefono, auth_user_id, activo').eq('id', tarea.asignado_a).maybeSingle(); if (m) miembro = m; }
+        const fh = new Date(tarea.fecha_hora);
+        let cuando = tarea.fecha_hora;
+        try { cuando = fh.toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (eF) {}
+        const queTarea = tarea.titulo || (tarea.tipo === 'limpieza_post' ? 'Limpieza post check-out' : (tarea.tipo === 'limpieza_pre' ? 'Limpieza pre check-in' : 'Tarea'));
+        if (miembro && miembro.activo && miembro.telefono) {
+          const inst = nombreInstancia(tarea.user_id);
+          const saludo = miembro.nombre ? (' ' + String(miembro.nombre).split(' ')[0]) : '';
+          const txt = 'Hola' + saludo + ', tenes una tarea agendada: ' + queTarea + ' para el ' + cuando + '. Avisanos si hay algun inconveniente.';
+          try { await enviarWhatsapp(inst, miembro.telefono, txt, null); } catch (eW) { console.error('aviso tarea whatsapp:', eW && eW.message); }
+        }
+        // Push opcional (si el miembro tiene login propio).
+        if (miembro && miembro.auth_user_id) { try { await enviarPushAsesor(miembro.auth_user_id, 'Tarea agendada', '', queTarea + ' — ' + cuando); } catch (eP) {} }
+      } catch (eT) { console.error('aviso tarea:', eT && eT.message); }
+    }
+  } catch (e) { console.error('enviarAvisosTareas:', e && e.message); }
+}
+
 // CRON: recordatorio de cita al LEAD (WhatsApp) + aviso al asesor (push), para citas agendadas en las proximas 24h
 // que aun no se recordaron. NO gasta tokens (solo WhatsApp + push). Marca recordatorio_enviado para no repetir.
 async function enviarRecordatoriosCitas() {
@@ -5883,6 +6028,10 @@ setTimeout(enviarRecontactosPendientes, 60 * 1000);
 // Recordatorios de citas: revisar cada 30 min (recordatorio al lead + aviso al asesor de citas en las proximas 24h)
 setInterval(enviarRecordatoriosCitas, 30 * 60 * 1000);
 setTimeout(enviarRecordatoriosCitas, 70 * 1000);
+// Avisos al EQUIPO de tareas de alquiler (limpieza pre/post): MISMO scheduler de 30 min.
+// Cero IA, cero tokens (WhatsApp + push, texto fijo). Defensivo: si la tabla no existe, no rompe.
+setInterval(enviarAvisosTareas, 30 * 60 * 1000);
+setTimeout(enviarAvisosTareas, 80 * 1000);
 // Backup automatico cada 30 minutos (foto completa de todos los datos por user)
 setInterval(hacerBackup, 30 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
@@ -9930,10 +10079,31 @@ app.post('/api/citas', async function(req, res) {
     if (isNaN(fh.getTime())) return res.status(400).json({ error: 'fecha_hora invalida' });
     // Un asesor comun solo puede crear citas a SU nombre (no asignarlas a otro); dueno/admin pueden elegir.
     var asesorCita = esAsesorComun ? asesorIdProp : (b.asesor_id || asesorIdProp || null);
-    var fila = { user_id: ownerId, fecha_hora: fh.toISOString(), tipo: (['visita','llamada','reunion'].indexOf(b.tipo) >= 0 ? b.tipo : 'visita'), titulo: (b.titulo ? String(b.titulo).slice(0,160) : 'Cita'), estado: 'agendada', notas: (b.notas ? String(b.notas).slice(0,500) : null), lead_nombre: (b.lead_nombre ? String(b.lead_nombre).slice(0,120) : null), lead_telefono: (b.lead_telefono ? String(b.lead_telefono).slice(0,40) : null), asesor_id: asesorCita, contact_id: b.contact_id || null, conversation_id: b.conversation_id || null, origen: 'manual' };
+    // Tipos AMPLIADOS: ademas de visita/llamada/reunion, ahora alquiler y alquiler_temporal
+    // (eventos con rango: fecha_hora = check-in, fecha_fin = check-out). ADITIVO: si b.tipo
+    // no entra en la lista, cae a 'visita' (comportamiento conservador de siempre).
+    var TIPOS_CITA = ['visita','llamada','reunion','alquiler','alquiler_temporal'];
+    var tipoCita = (TIPOS_CITA.indexOf(b.tipo) >= 0) ? b.tipo : 'visita';
+    var esAlquiler = (tipoCita === 'alquiler' || tipoCita === 'alquiler_temporal');
+    var fila = { user_id: ownerId, fecha_hora: fh.toISOString(), tipo: tipoCita, titulo: (b.titulo ? String(b.titulo).slice(0,160) : 'Cita'), estado: 'agendada', notas: (b.notas ? String(b.notas).slice(0,500) : null), lead_nombre: (b.lead_nombre ? String(b.lead_nombre).slice(0,120) : null), lead_telefono: (b.lead_telefono ? String(b.lead_telefono).slice(0,40) : null), asesor_id: asesorCita, contact_id: b.contact_id || null, conversation_id: b.conversation_id || null, origen: 'manual' };
+    // Campos nuevos de la AGENDA NATIVA. Se agregan SOLO si vienen (defensivo: si la
+    // migracion aun no corrio, igual no fuerza columnas inexistentes a valores raros).
+    var fechaFinISO = null;
+    if (b.fecha_fin) { var ff = new Date(b.fecha_fin); if (!isNaN(ff.getTime())) { fechaFinISO = ff.toISOString(); fila.fecha_fin = fechaFinISO; } }
+    if (b.property_id) fila.property_id = b.property_id;
+    if (b.unidad) fila.unidad = String(b.unidad).slice(0,120);
+    if (typeof b.todo_el_dia === 'boolean') fila.todo_el_dia = b.todo_el_dia;
+    else if (esAlquiler) fila.todo_el_dia = true; // alquileres son por rango de dias por defecto
     var r = await supabase.from('citas').insert(fila).select('id').single();
     if (r.error) return res.status(500).json({ error: r.error.message });
-    return res.json({ ok: true, id: r.data && r.data.id });
+    var citaId = r.data && r.data.id;
+    // MOTOR DE TAREAS (cero IA): si es alquiler_temporal y tenemos check-out, generar las
+    // tareas de limpieza pre/post y avisar al equipo. Best-effort: si falla, la cita YA
+    // quedo creada (no se revierte) y no se devuelve error al usuario.
+    if (citaId && tipoCita === 'alquiler_temporal' && fechaFinISO) {
+      try { await generarTareasAlquiler(ownerId, citaId, fh.toISOString(), fechaFinISO, fila.titulo); } catch (eGen) { console.error('POST /api/citas generarTareas:', eGen && eGen.message); }
+    }
+    return res.json({ ok: true, id: citaId });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/citas/actualizar', async function(req, res) {
@@ -9945,20 +10115,250 @@ app.post('/api/citas/actualizar', async function(req, res) {
     if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (!esAdministrador(ase.data)) soloAsesorId = ase.data.id; }
     var b = req.body || {};
     if (!b.id) return res.status(400).json({ error: 'Falta id' });
-    var verq = supabase.from('citas').select('id').eq('id', b.id).eq('user_id', ownerId);
+    // Traemos la fila ACTUAL (no solo el id) para poder recalcular tareas de alquiler
+    // con las fechas/tipo resultantes. Defensivo: si las columnas nuevas no existen,
+    // el select('*') igual trae lo que haya.
+    var verq = supabase.from('citas').select('*').eq('id', b.id).eq('user_id', ownerId);
     if (soloAsesorId) verq = verq.eq('asesor_id', soloAsesorId);
     var dueno = await verq.maybeSingle();
     if (!dueno || !dueno.data) return res.status(404).json({ error: 'Cita no encontrada' });
+    var actual = dueno.data;
     var upd = {};
     if (b.estado && ['agendada','confirmada','cumplida','cancelada'].indexOf(b.estado) >= 0) upd.estado = b.estado;
     if (b.fecha_hora) { var fh2 = new Date(b.fecha_hora); if (!isNaN(fh2.getTime())) { upd.fecha_hora = fh2.toISOString(); upd.recordatorio_enviado = false; } }
     if (typeof b.notas === 'string') upd.notas = b.notas.slice(0,500);
+    // --- AGENDA NATIVA: campos nuevos editables ---
+    // Reasignar asesor: SOLO dueno/admin (un asesor comun no puede pasar su cita a otro).
+    // soloAsesorId != null => es asesor comun => se ignora b.asesor_id.
+    if (!soloAsesorId && typeof b.asesor_id !== 'undefined') upd.asesor_id = b.asesor_id || null;
+    if (typeof b.property_id !== 'undefined') upd.property_id = b.property_id || null;
+    if (b.fecha_fin) { var ff2 = new Date(b.fecha_fin); if (!isNaN(ff2.getTime())) upd.fecha_fin = ff2.toISOString(); }
+    else if (b.fecha_fin === null) upd.fecha_fin = null;
+    if (typeof b.unidad === 'string') upd.unidad = b.unidad.slice(0,120);
+    var TIPOS_UPD = ['visita','llamada','reunion','alquiler','alquiler_temporal'];
+    if (b.tipo && TIPOS_UPD.indexOf(b.tipo) >= 0) upd.tipo = b.tipo;
     if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
+    upd.actualizado_en = new Date().toISOString();
     var updq = supabase.from('citas').update(upd).eq('id', b.id).eq('user_id', ownerId);
     if (soloAsesorId) updq = updq.eq('asesor_id', soloAsesorId);
     var r = await updq;
+    if (r.error) {
+      // Defensivo: si la migracion aun no corrio, columnas nuevas (asesor_id ya existe,
+      // pero property_id/fecha_fin/unidad/actualizado_en podrian faltar) hacen fallar el
+      // update. Reintentar SOLO con los campos clasicos para no romper la edicion vieja.
+      var updSafe = {};
+      ['estado','fecha_hora','recordatorio_enviado','notas','asesor_id'].forEach(function(k){ if (typeof upd[k] !== 'undefined') updSafe[k] = upd[k]; });
+      if (Object.keys(updSafe).length > 0) {
+        var updq2 = supabase.from('citas').update(updSafe).eq('id', b.id).eq('user_id', ownerId);
+        if (soloAsesorId) updq2 = updq2.eq('asesor_id', soloAsesorId);
+        var r2 = await updq2;
+        if (r2.error) return res.status(500).json({ error: r2.error.message });
+      } else {
+        return res.status(500).json({ error: r.error.message });
+      }
+    }
+    // MOTOR DE TAREAS (cero IA): efectos sobre las tareas del alquiler segun el cambio.
+    try {
+      var tipoFinal = (typeof upd.tipo !== 'undefined') ? upd.tipo : actual.tipo;
+      var estadoFinal = (typeof upd.estado !== 'undefined') ? upd.estado : actual.estado;
+      var ciFinal = (typeof upd.fecha_hora !== 'undefined') ? upd.fecha_hora : actual.fecha_hora;
+      var coFinal = (typeof upd.fecha_fin !== 'undefined') ? upd.fecha_fin : actual.fecha_fin;
+      if (estadoFinal === 'cancelada') {
+        // Cancelar el alquiler => cancelar sus tareas pendientes (no avisar al equipo).
+        await cancelarTareasDeEvento(ownerId, b.id);
+      } else if (tipoFinal === 'alquiler_temporal' && coFinal) {
+        // Cambiaron fechas/tipo de un alquiler temporal => recalcular tareas no-hechas.
+        var cambioFechas = (typeof upd.fecha_hora !== 'undefined') || (typeof upd.fecha_fin !== 'undefined') || (typeof upd.tipo !== 'undefined');
+        if (cambioFechas) await recalcularTareasAlquiler(ownerId, b.id, ciFinal, coFinal, actual.titulo);
+      }
+    } catch (eTareas) { console.error('actualizar cita motor tareas:', eTareas && eTareas.message); }
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== TAREAS DE EVENTO + EQUIPO (motor de tareas, CERO IA) =====
+// Mismo modelo de scoping que /api/citas: service key + filtro por user_id (ownerId).
+// El asesor comun ve/edita; el aislamiento es por TENANT (no por asesor) — las tareas
+// de limpieza son del negocio, no de un vendedor en particular.
+
+// Resuelve el ownerId (tenant) a partir del JWT. Helper local para no repetir.
+async function _resolverTenant(req) {
+  var userId = await verificarUsuario(req);
+  if (!userId) return { error: 401 };
+  var ownerId = userId, asesorId = null, esAdmin = true;
+  var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+  if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; asesorId = ase.data.id; esAdmin = esAdministrador(ase.data); }
+  return { userId: userId, ownerId: ownerId, asesorId: asesorId, esAdmin: esAdmin, esDueno: !(ase && ase.data) };
+}
+
+// GET /api/citas/:id/tareas — lista las tareas de un evento del tenant.
+app.get('/api/citas/:id/tareas', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    // Verificar que el evento sea del tenant antes de exponer sus tareas.
+    var cita = await supabase.from('citas').select('id').eq('id', req.params.id).eq('user_id', t.ownerId).maybeSingle();
+    if (!cita || !cita.data) return res.status(404).json({ error: 'Cita no encontrada' });
+    var r = await supabase.from('tareas_evento').select('*').eq('user_id', t.ownerId).eq('evento_id', req.params.id).order('fecha_hora', { ascending: true });
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, tareas: r.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/tareas — lista tareas del tenant (filtros opcionales desde/hasta/estado/asignado_a).
+app.get('/api/tareas', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    var q = supabase.from('tareas_evento').select('*').eq('user_id', t.ownerId);
+    if (req.query.desde) { var d = new Date(req.query.desde); if (!isNaN(d.getTime())) q = q.gte('fecha_hora', d.toISOString()); }
+    if (req.query.hasta) { var h = new Date(req.query.hasta); if (!isNaN(h.getTime())) q = q.lte('fecha_hora', h.toISOString()); }
+    if (req.query.estado) q = q.eq('estado', String(req.query.estado));
+    if (req.query.asignado_a) q = q.eq('asignado_a', String(req.query.asignado_a));
+    var r = await q.order('fecha_hora', { ascending: true });
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, tareas: r.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/tareas — crear una tarea MANUAL (atada o no a un evento).
+app.post('/api/tareas', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    if (!b.fecha_hora) return res.status(400).json({ error: 'Falta fecha_hora' });
+    var fh = new Date(b.fecha_hora);
+    if (isNaN(fh.getTime())) return res.status(400).json({ error: 'fecha_hora invalida' });
+    // Si viene evento_id, verificar que el evento sea del tenant.
+    if (b.evento_id) {
+      var cita = await supabase.from('citas').select('id').eq('id', b.evento_id).eq('user_id', t.ownerId).maybeSingle();
+      if (!cita || !cita.data) return res.status(404).json({ error: 'Cita no encontrada' });
+    }
+    var TIPOS_TAREA = ['limpieza','limpieza_pre','limpieza_post','mantenimiento','entrega_llaves','retiro_llaves','inventario','custom'];
+    var fila = {
+      user_id: t.ownerId,
+      evento_id: b.evento_id || null,
+      tipo: (TIPOS_TAREA.indexOf(b.tipo) >= 0 ? b.tipo : 'custom'),
+      titulo: (b.titulo ? String(b.titulo).slice(0,160) : 'Tarea'),
+      fecha_hora: fh.toISOString(),
+      duracion_min: (typeof b.duracion_min === 'number' ? b.duracion_min : null),
+      asignado_a: b.asignado_a || null,
+      estado: 'pendiente',
+      notas: (b.notas ? String(b.notas).slice(0,500) : null),
+      origen: 'manual'
+    };
+    var r = await supabase.from('tareas_evento').insert(fila).select('id').single();
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, id: r.data && r.data.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/tareas/actualizar — cambiar estado / asignado_a / fecha_hora / notas.
+app.post('/api/tareas/actualizar', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    if (!b.id) return res.status(400).json({ error: 'Falta id' });
+    var dueno = await supabase.from('tareas_evento').select('id').eq('id', b.id).eq('user_id', t.ownerId).maybeSingle();
+    if (!dueno || !dueno.data) return res.status(404).json({ error: 'Tarea no encontrada' });
+    var upd = {};
+    if (b.estado && ['pendiente','en_curso','hecha','cancelada'].indexOf(b.estado) >= 0) upd.estado = b.estado;
+    if (typeof b.asignado_a !== 'undefined') upd.asignado_a = b.asignado_a || null;
+    if (b.fecha_hora) { var fh3 = new Date(b.fecha_hora); if (!isNaN(fh3.getTime())) { upd.fecha_hora = fh3.toISOString(); upd.aviso_enviado = false; } }
+    if (typeof b.notas === 'string') upd.notas = b.notas.slice(0,500);
+    if (b.tipo && ['limpieza','limpieza_pre','limpieza_post','mantenimiento','entrega_llaves','retiro_llaves','inventario','custom'].indexOf(b.tipo) >= 0) upd.tipo = b.tipo;
+    if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
+    upd.actualizado_en = new Date().toISOString();
+    var r = await supabase.from('tareas_evento').update(upd).eq('id', b.id).eq('user_id', t.ownerId);
     if (r.error) return res.status(500).json({ error: r.error.message });
     return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/equipo — lista los miembros del equipo del tenant.
+app.get('/api/equipo', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    var r = await supabase.from('equipo_miembros').select('*').eq('user_id', t.ownerId).order('nombre', { ascending: true });
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, miembros: r.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/equipo — crear o editar un miembro del equipo (upsert por id).
+app.post('/api/equipo', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    // Solo dueno/admin gestionan el equipo (mismo criterio que reasignar asesor).
+    if (!t.esDueno && !t.esAdmin) return res.status(403).json({ error: 'Sin permiso' });
+    var b = req.body || {};
+    var ROLES = ['limpieza','mantenimiento','llaves','otro'];
+    if (b.id) {
+      // Editar: verificar pertenencia al tenant.
+      var prev = await supabase.from('equipo_miembros').select('id').eq('id', b.id).eq('user_id', t.ownerId).maybeSingle();
+      if (!prev || !prev.data) return res.status(404).json({ error: 'Miembro no encontrado' });
+      var upd = {};
+      if (typeof b.nombre === 'string' && b.nombre.trim()) upd.nombre = b.nombre.trim().slice(0,120);
+      if (b.rol && ROLES.indexOf(b.rol) >= 0) upd.rol = b.rol;
+      if (typeof b.telefono === 'string') upd.telefono = b.telefono.slice(0,40) || null;
+      if (typeof b.activo === 'boolean') upd.activo = b.activo;
+      if (typeof b.auth_user_id !== 'undefined') upd.auth_user_id = b.auth_user_id || null;
+      if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
+      var ru = await supabase.from('equipo_miembros').update(upd).eq('id', b.id).eq('user_id', t.ownerId);
+      if (ru.error) return res.status(500).json({ error: ru.error.message });
+      return res.json({ ok: true, id: b.id });
+    }
+    // Crear.
+    if (!b.nombre || !String(b.nombre).trim()) return res.status(400).json({ error: 'Falta nombre' });
+    var fila = {
+      user_id: t.ownerId,
+      nombre: String(b.nombre).trim().slice(0,120),
+      rol: (ROLES.indexOf(b.rol) >= 0 ? b.rol : 'otro'),
+      telefono: (b.telefono ? String(b.telefono).slice(0,40) : null),
+      auth_user_id: b.auth_user_id || null,
+      activo: (typeof b.activo === 'boolean' ? b.activo : true)
+    };
+    var r = await supabase.from('equipo_miembros').insert(fila).select('id').single();
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, id: r.data && r.data.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET/POST /api/tarea-plantillas — leer/editar los offsets de tareas del tenant (JSONB).
+app.get('/api/tarea-plantillas', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    var plantillas = await obtenerTareaPlantillas(t.ownerId);
+    return res.json({ ok: true, plantillas: plantillas, default: _TAREA_PLANTILLAS_DEFAULT });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/tarea-plantillas', async function(req, res) {
+  try {
+    var t = await _resolverTenant(req);
+    if (t.error) return res.status(401).json({ error: 'No autorizado' });
+    if (!t.esDueno && !t.esAdmin) return res.status(403).json({ error: 'Sin permiso' });
+    var b = req.body || {};
+    if (!Array.isArray(b.plantillas)) return res.status(400).json({ error: 'plantillas debe ser un array' });
+    // Saneo minimo de cada item (no confiar en el cliente).
+    var limpio = b.plantillas.slice(0, 20).map(function(p){
+      return {
+        tipo: String((p && p.tipo) || 'custom').slice(0,40),
+        ancla: (p && p.ancla === 'check_out') ? 'check_out' : 'check_in',
+        offset_min: (p && typeof p.offset_min === 'number') ? p.offset_min : 0,
+        rol: String((p && p.rol) || 'limpieza').slice(0,40),
+        titulo: String((p && p.titulo) || 'Tarea').slice(0,120)
+      };
+    });
+    // upsert por user_id: si la fila de settings del tenant aun no existe, la crea
+    // (mismo patron que negocio_descripcion / rubro). Asi no se "pierde" el guardado.
+    var r = await supabase.from('business_settings').upsert({ user_id: t.ownerId, tarea_plantillas: limpio }, { onConflict: 'user_id' });
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, plantillas: limpio });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

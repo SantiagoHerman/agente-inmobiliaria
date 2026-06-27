@@ -2366,6 +2366,21 @@ app.post('/api/enviar-media', async (req, res) => {
     const contenidoCartelito = caption || ('[' + media_tipo + ']');
     const { data: msgIns } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: contenidoCartelito, enviado_por: enviado_por || 'Asesor', media_url: media_url, media_tipo: media_tipo, estado_envio: 'enviando' }).select('id').maybeSingle();
     await supabase.from('conversations').update({ last_message: contenidoCartelito, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // RACE #1 (IA-vs-humano) — "Tomar conversacion" AUTOMATICO tambien al enviar MEDIA/VOZ (no solo texto). Si un
+    // humano manda una nota de voz / foto con la IA encendida, la IA queda sin posibilidad de responder (igual que el
+    // boton "Tomar conversacion" y que /api/whatsapp/send). NO cambia el status, solo apaga ai_enabled. Este endpoint
+    // es exclusivo de humanos (insert role:'human'), asi que jamas pausa a la IA en sus propios envios.
+    {
+      const { data: _convEstado } = await supabase.from('conversations').select('status, ai_enabled').eq('id', conversation_id).maybeSingle();
+      if (_convEstado && _convEstado.ai_enabled === true && _convEstado.status !== 'listo_humano') {
+        await supabase.from('conversations').update({ ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+      }
+      // Admin escribiendo en un lead sin asignar -> congelar (admin_tomo) para que el reparto no lo reasigne.
+      if ((enviado_por || 'Asesor') === 'Administrador') {
+        const { data: _ca } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).maybeSingle();
+        if (_ca && !_ca.asesor_id) { try { await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id); } catch (e) {} }
+      }
+    }
     // Responder YA: el mensaje quedo guardado. El envio a WhatsApp sigue en segundo plano.
     res.json({ ok: true });
     // Envio a Evolution en segundo plano (no bloquea la respuesta)

@@ -1027,16 +1027,33 @@ function esAdministrador(ase) {
 
 // M19: REPARTO EQUITATIVO compartido. Dado un array de ids de asesores candidatos, devuelve el id con MENOR
 // carga = menor cantidad de conversations asignadas con status='listo_humano' (D1=B). Mismo criterio exacto que
-// antes estaba duplicado en elegirAsesorActivo y elegirAsesorParaDepartamento. Empata = gana el primero (igual
-// que los bucles originales: estricto '<'). idsCandidatos vacio/nulo -> null.
+// antes estaba duplicado en elegirAsesorActivo y elegirAsesorParaDepartamento. idsCandidatos vacio/nulo -> null.
+//
+// RACE #4 (MITIGACION, no eliminacion total): el conteo de carga es un read-count-then-pick NO atomico. Dos
+// derivaciones de leads DISTINTOS casi simultaneas leen el mismo snapshot de cargas, ambas ven al mismo asesor
+// como "el menos cargado" y las dos caen sobre el (concentracion injusta). La asignacion final la hace el caller
+// con un UPDATE sobre conversations (no hay lock entre el conteo y ese UPDATE), por eso aca NO podemos hacerlo
+// 100% atomico sin reescribir todos los callers. Mitigamos dentro de esta funcion (cambio acotado):
+//   DESEMPATE ALEATORIO entre TODOS los que estan en el minimo (no "gana el primero" siempre). Antes, con empate,
+//   el bucle '<' devolvia SIEMPRE el primer id del array -> dos derivaciones simultaneas con el mismo snapshot
+//   elegian deterministicamente al mismo asesor. Ahora, si N asesores empatan en el minimo, se elige uno al azar
+//   -> la probabilidad de colision baja a ~1/N y, a lo largo de muchas derivaciones, el reparto no se concentra
+//   en uno solo. Es la mejor mitigacion posible sin un lock/secuencia en la base.
+// NOTA: para una garantia DURA habria que mover conteo+asignacion a un RPC con SELECT ... FOR UPDATE o a una
+// secuencia round-robin por tenant; queda fuera de este cambio acotado (no reescribir todo). 0 IA, aislamiento
+// por-tenant intacto (los idsCandidatos ya vienen filtrados por admin_id desde cada caller).
 async function asesorMenorCarga(idsCandidatos) {
-  let mejor = null; let menos = Infinity;
+  let empatados = []; let menos = Infinity;
   for (const id of (idsCandidatos || [])) {
     const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('asesor_id', id).eq('status', 'listo_humano');
     const n = count || 0;
-    if (n < menos) { menos = n; mejor = id; }
+    if (n < menos) { menos = n; empatados = [id]; }      // nuevo minimo: reinicia el grupo de empatados
+    else if (n === menos) { empatados.push(id); }         // mismo minimo: se suma al desempate aleatorio
   }
-  return mejor;
+  if (!empatados.length) return null;
+  if (empatados.length === 1) return empatados[0];
+  // Desempate aleatorio entre los de menor carga (mitiga la concentracion descrita arriba).
+  return empatados[Math.floor(Math.random() * empatados.length)];
 }
 
 // Elige el asesor ACTIVO con menos leads asignados (reparto equitativo). Devuelve su id o null.
@@ -4379,6 +4396,138 @@ app.post('/api/whatsapp/send', async (req, res) => {
   }
 });
 
+// ============ ASIGNACION / REASIGNACION MANUAL DE UN LEAD (RACE #3) ============
+// PROBLEMA QUE RESUELVE: antes el frontend (app/conversaciones/page.tsx ~asignarAsesor) escribia el asesor_id
+// DIRECTO a Supabase desde el cliente. Dos admins reasignando el MISMO lead casi a la vez = last-write-wins:
+// gana el ultimo update, sin registro de que hubo pisada. Ahora la escritura pasa por ESTE endpoint con:
+//   1) Validacion de identidad por token (verificarUsuario).
+//   2) Aislamiento por TENANT (convPerteneceAUsuario) — derivado de conv.user_id, NO confiado del body.
+//   3) OPTIMISTIC CONCURRENCY: el cliente manda el asesor_id que cree vigente (expected_asesor_id). El UPDATE
+//      se CONDICIONA por ese valor; si en el medio otro admin ya reasigno, el update no matchea ninguna fila y
+//      devolvemos 409 (conflicto) con el estado fresco para que el front relea y reintente. CERO IA/tokens.
+// COMPORTAMIENTO PRESERVADO (igual que el front hacia): elegir depto+persona, sin-asignar, flag admin_tomo,
+//   departamento_manual (R4), mensaje de SISTEMA en el historial de pases (R3). Texto fijo, 0 tokens.
+app.post('/api/conversaciones/asignar', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const conversation_id = body.conversation_id;
+    // asesor_id: '' o null => desasignar. expected_asesor_id: lo que el front cree vigente (puede ser null).
+    const nuevoAsesorRaw = body.asesor_id;
+    const val = (nuevoAsesorRaw === '' || nuevoAsesorRaw === undefined) ? null : nuevoAsesorRaw;
+    // departamento_id solo se considera si el front lo manda explicito (reparto_v2). undefined => no tocar.
+    const tieneDepto = Object.prototype.hasOwnProperty.call(body, 'departamento_id');
+    const deptoVal = tieneDepto ? (body.departamento_id || null) : undefined;
+    // expected_asesor_id: si el front no lo manda (no hasOwnProperty) => no exigimos concurrencia (compat).
+    const tieneExpected = Object.prototype.hasOwnProperty.call(body, 'expected_asesor_id');
+    const expectedAsesor = tieneExpected ? (body.expected_asesor_id || null) : undefined;
+    // quien asigna (nombre para el historial) — best-effort, no critico.
+    const quienAsigna = (body.quien_asigna && String(body.quien_asigna).trim()) || 'El administrador';
+
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
+
+    // 1) Leer la conversacion (tenant dueño REAL + estado actual para concurrencia/historial).
+    const { data: conv } = await supabase
+      .from('conversations')
+      .select('id, user_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual')
+      .eq('id', conversation_id)
+      .maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+
+    // 2) AISLAMIENTO POR TENANT: dueño o asesor de la misma cuenta. Cualquier otro -> 403.
+    if (!(await convPerteneceAUsuario(conv.user_id, _uidToken))) return res.status(403).json({ error: 'No autorizado' });
+    const ownerId = conv.user_id; // tenant derivado de la conversacion (NO del body)
+
+    const asePrev = conv.asesor_id || null;
+    const depPrev = conv.departamento_id || null;
+    const depEraManual = conv.departamento_manual === true;
+
+    // 3) OPTIMISTIC CONCURRENCY (relectura + condicion): si el front mando expected_asesor_id y NO coincide con
+    //    el asesor_id que tiene la conv AHORA, otro admin reasigno en el medio -> 409 con estado fresco. El front
+    //    relee y decide. (Si no mando expected, seguimos sin condicionar: compat con llamadas viejas.)
+    if (tieneExpected && (expectedAsesor || null) !== asePrev) {
+      return res.status(409).json({
+        error: 'conflicto',
+        message: 'La asignacion de este lead cambio mientras lo reasignabas. Reintenta.',
+        actual: { asesor_id: asePrev, departamento_id: depPrev, departamento_manual: depEraManual }
+      });
+    }
+
+    // 4) Armar el update (misma logica que tenia el front).
+    const upd = { asesor_id: val };
+    if (val) { upd.ultimo_asesor_id = val; upd.admin_tomo = false; }
+    if (deptoVal !== undefined) upd.departamento_id = deptoVal;
+
+    // R4 (DESASIGNAR INTELIGENTE): clave del depto/flag final tras este cambio.
+    let depFinal = (deptoVal !== undefined) ? deptoVal : depPrev;
+    let manualFinal = undefined; // valor optimista de departamento_manual (undefined = no tocar)
+    const wantManualTrue = !!(val && deptoVal); // asignacion humana con area explicita
+    if (val === null && deptoVal === undefined) {
+      // DESASIGNAR sin depto explicito: si el depto actual era MANUAL -> limpiarlo; si era de la IA -> conservar.
+      if (depEraManual) { upd.departamento_id = null; depFinal = null; manualFinal = false; }
+    }
+
+    // 5) ESCRITURA CONDICIONADA por el asesor_id esperado (optimistic concurrency a nivel DB). Si entre la
+    //    relectura y aca otro proceso pisa el asesor_id, el .match no devuelve filas -> 409.
+    let q = supabase.from('conversations').update(upd).eq('id', conversation_id);
+    if (tieneExpected) {
+      q = (expectedAsesor === null) ? q.is('asesor_id', null) : q.eq('asesor_id', expectedAsesor);
+    }
+    const { data: updRows, error: updErr } = await q.select('id');
+    if (updErr) { console.error('Error update asignar:', updErr.message); return res.status(500).json({ error: 'Error al asignar' }); }
+    if (tieneExpected && (!updRows || updRows.length === 0)) {
+      // No matcheo: alguien cambio el asesor_id en el medio. Releer y devolver conflicto.
+      const { data: fresh } = await supabase.from('conversations').select('asesor_id, departamento_id, departamento_manual').eq('id', conversation_id).maybeSingle();
+      return res.status(409).json({
+        error: 'conflicto',
+        message: 'La asignacion de este lead cambio mientras lo reasignabas. Reintenta.',
+        actual: fresh || null
+      });
+    }
+
+    // Write APARTE best-effort del flag departamento_manual=true (no romper la asignacion si la columna no existe).
+    if (wantManualTrue) { manualFinal = true; try { await supabase.from('conversations').update({ departamento_manual: true }).eq('id', conversation_id); } catch (eDm) {} }
+
+    // 6) R3 (HISTORIAL DE PASES): mensaje de SISTEMA con TEXTO FIJO (0 IA/tokens). Mismo wording que el front.
+    let mensajeSistema = null;
+    try {
+      const cambioAse = val !== asePrev;
+      const cambioDep = deptoVal !== undefined && deptoVal !== depPrev;
+      let texto = null;
+      if (val) {
+        if (cambioAse || cambioDep) {
+          const { data: aseDest } = await supabase.from('asesores').select('nombre').eq('id', val).maybeSingle();
+          const nomDest = (aseDest && aseDest.nombre) || 'un asesor';
+          let nomDep = null;
+          if (depFinal) { try { const { data: dd } = await supabase.from('departamentos').select('nombre').eq('id', depFinal).maybeSingle(); nomDep = (dd && dd.nombre) || null; } catch (eDn) {} }
+          let nomPrev = null;
+          if (asePrev) { try { const { data: ap } = await supabase.from('asesores').select('nombre').eq('id', asePrev).maybeSingle(); nomPrev = (ap && ap.nombre) || null; } catch (ePn) {} }
+          const destStr = nomDep ? (nomDest + ' (' + nomDep + ')') : nomDest;
+          texto = (nomPrev && nomPrev !== nomDest)
+            ? (quienAsigna + ' pasó el lead de ' + nomPrev + ' a ' + destStr)
+            : (quienAsigna + ' pasó el lead a ' + destStr);
+        }
+      } else if (asePrev) {
+        texto = quienAsigna + ' sacó la asignación (queda sin asignar). El historial se mantiene.';
+      }
+      if (texto) {
+        const { data: evt } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: ownerId, role: 'sistema', content: texto, enviado_por: 'Sistema' }).select('*').maybeSingle();
+        mensajeSistema = evt || null;
+      }
+    } catch (eHist) {}
+
+    return res.json({
+      ok: true,
+      asignacion: { asesor_id: val, ultimo_asesor_id: val || conv.ultimo_asesor_id || null, departamento_id: depFinal, departamento_manual: (manualFinal !== undefined ? manualFinal : depEraManual) },
+      mensaje_sistema: mensajeSistema
+    });
+  } catch (err) {
+    console.error('Error en /api/conversaciones/asignar:', err && err.message);
+    return res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
 // ============ MULTI-CLIENTE: conectar WhatsApp propio de cada inmobiliaria ============
 // La URL publica del backend (para configurar el webhook de cada instancia automaticamente)
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || 'https://agente-inmobiliaria-production-7e1c.up.railway.app';
@@ -6957,19 +7106,37 @@ app.post('/api/equipo/leido', async function(req, res) {
     if (!thread) return res.status(404).json({ error: 'Hilo no encontrado' });
     if (!(await _equipoEsParticipante(ident, thread))) return res.status(403).json({ error: 'No participas de este hilo' });
 
-    // Mensajes del hilo (de este tenant) que aun NO me tienen en leido_por y que no envie yo.
-    const { data: pend } = await supabase.from('team_messages')
-      .select('id, leido_por')
-      .eq('thread_id', b.thread_id).eq('admin_id', ident.ownerId)
-      .neq('sender_auth_user_id', ident.authUserId)
-      .not('leido_por', 'cs', '{' + ident.authUserId + '}');
+    // RACE #7: marcar "leido" de forma ATOMICA. Antes esto era un read-modify-write sobre el array uuid[]
+    // leido_por: se leia en Node, se le agregaba authUserId y se reescribia el array completo. Dos acuses
+    // concurrentes (dos lectores, o lector + envio que toca el mismo mensaje) se pisaban -> se perdia un
+    // auth_user_id y los contadores de no-leidos quedaban mal. Fix: un UPDATE set-based en la base (RPC
+    // equipo_marcar_leido) que hace el merge con array_append condicionado por NOT (leido_por @> [uid]).
+    // Postgres serializa los UPDATE sobre la misma fila -> cada acuse se aplica sobre el valor mas reciente
+    // (sin ventana read->write en el cliente) y el dedupe lo garantiza el WHERE. Aislado por tenant (admin_id).
+    // DEFENSIVO: si el RPC aun NO existe en la base (migracion-leido-por-atomico.sql sin correr) o falla,
+    // caemos al patron historico por-fila (best-effort) para no romper la funcionalidad antes de migrar.
     let marcados = 0;
-    for (let i = 0; i < (pend || []).length; i++) {
-      const m = pend[i];
-      const nuevo = Array.isArray(m.leido_por) ? m.leido_por.slice() : [];
-      if (nuevo.indexOf(ident.authUserId) < 0) nuevo.push(ident.authUserId);
-      const { error } = await supabase.from('team_messages').update({ leido_por: nuevo }).eq('id', m.id).eq('admin_id', ident.ownerId);
-      if (!error) marcados++;
+    let _rpcOk = false;
+    try {
+      const { data: _n, error: _eRpc } = await supabase.rpc('equipo_marcar_leido', {
+        p_thread_id: b.thread_id, p_admin_id: ident.ownerId, p_uid: ident.authUserId
+      });
+      if (!_eRpc) { marcados = (typeof _n === 'number') ? _n : (Number(_n) || 0); _rpcOk = true; }
+    } catch (eRpc) { _rpcOk = false; }
+    if (!_rpcOk) {
+      // FALLBACK historico (RPC ausente): read-modify-write por fila. Conserva la ventana de carrera pero no rompe.
+      const { data: pend } = await supabase.from('team_messages')
+        .select('id, leido_por')
+        .eq('thread_id', b.thread_id).eq('admin_id', ident.ownerId)
+        .neq('sender_auth_user_id', ident.authUserId)
+        .not('leido_por', 'cs', '{' + ident.authUserId + '}');
+      for (let i = 0; i < (pend || []).length; i++) {
+        const m = pend[i];
+        const nuevo = Array.isArray(m.leido_por) ? m.leido_por.slice() : [];
+        if (nuevo.indexOf(ident.authUserId) < 0) nuevo.push(ident.authUserId);
+        const { error } = await supabase.from('team_messages').update({ leido_por: nuevo }).eq('id', m.id).eq('admin_id', ident.ownerId);
+        if (!error) marcados++;
+      }
     }
     return res.json({ ok: true, marcados: marcados });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }

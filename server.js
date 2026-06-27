@@ -2503,6 +2503,82 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }).join(String.fromCharCode(10));
   }
 
+  // ===== INVENTARIO DE DESARROLLOS / EMPRENDIMIENTOS (ADITIVO + GATEADO) =====
+  // Una cuenta puede ofrecer emprendimientos (developments/development_units) ADEMAS de
+  // sus propiedades. Se incluye SOLO si:
+  //   - el rubro es 'desarrolladora' (cuenta dedicada), o
+  //   - es 'inmobiliaria' con el modulo habilitado (business_settings.inventario_desarrollo_on === true).
+  // Si el flag esta OFF (default) -> bloque vacio => .filter(Boolean) lo descarta y el prompt
+  // es el ACTUAL EXACTO. Aislamiento por tenant: SIEMPRE filtra por user_id (ademas de RLS).
+  // Cero gasto extra de tokens/queries para las cuentas que NO usan el modulo.
+  let inventarioDesarrollos = '';
+  try {
+    const _rubroCuenta = normalizarRubro(rubro);
+    const _devOn = (_rubroCuenta === 'desarrolladora') ||
+      (_rubroCuenta === 'inmobiliaria' && settings && settings.inventario_desarrollo_on === true);
+    if (_devOn) {
+      const { data: _devs, error: _devErr } = await supabase.from('developments')
+        .select('id, nombre, tipo, zona, descripcion, link, estado_obra, avance_pct, fecha_entrega, dev_data')
+        .eq('user_id', user_id).eq('activo', true);
+      // Si la tabla no existe todavia (migracion no corrida) NO rompemos: queda sin desarrollos.
+      if (!_devErr && _devs && _devs.length > 0) {
+        const _devIds = _devs.map(function(d){ return d.id; });
+        const { data: _units } = await supabase.from('development_units')
+          .select('development_id, tipo_producto, numero, tipologia, m2_cubiertos, m2_totales, superficie_terreno, piso, orientacion, precio, precio_estado, moneda, estado')
+          .in('development_id', _devIds).eq('user_id', user_id);
+        const _unitsPorDev = {};
+        (_units || []).forEach(function(u){ (_unitsPorDev[u.development_id] = _unitsPorDev[u.development_id] || []).push(u); });
+        const _ESTADO_OBRA_TXT = { pozo: 'en pozo', en_construccion: 'en construccion', terminado: 'terminado' };
+        const _bloques = _devs.map(function(d){
+          const _us = _unitsPorDev[d.id] || [];
+          // Resumen comercial "Quedan X de <tipologia> desde <moneda> <precio>" (solo disponibles).
+          const _disp = _us.filter(function(u){ return (u.estado || 'disponible') === 'disponible'; });
+          const _byTip = {};
+          _disp.forEach(function(u){
+            const _k = u.tipologia || u.tipo_producto || 'unidad';
+            if (!_byTip[_k]) _byTip[_k] = { count: 0, min: null, moneda: u.moneda || 'USD' };
+            _byTip[_k].count++;
+            const _pr = Number(u.precio);
+            if (u.precio && !isNaN(_pr) && (_byTip[_k].min === null || _pr < _byTip[_k].min)) { _byTip[_k].min = _pr; _byTip[_k].moneda = u.moneda || 'USD'; }
+          });
+          const _resumen = Object.keys(_byTip).map(function(k){
+            const r = _byTip[k];
+            return 'Quedan ' + r.count + ' de ' + k + (r.min !== null ? ' desde ' + r.moneda + ' ' + r.min : '');
+          });
+          // Planes de pago (anticipo + cuotas + ajuste) si fueron cargados en dev_data.
+          let _planesTxt = '';
+          try {
+            const _planes = d.dev_data && Array.isArray(d.dev_data.planes) ? d.dev_data.planes : [];
+            const _pl = _planes.filter(function(p){ return p && (p.nombre || p.anticipo || p.cuotas); }).map(function(p){
+              return (p.nombre || 'Plan') + ': ' + (p.anticipo ? 'anticipo ' + p.anticipo : '') + (p.cuotas ? (p.anticipo ? ' + ' : '') + p.cuotas + ' cuotas' : '') + (p.ajuste && p.ajuste !== 'fijo' ? ' (ajuste ' + p.ajuste + ')' : '') + (p.moneda ? ' [' + p.moneda + ']' : '');
+            });
+            if (_pl.length > 0) _planesTxt = ' | financiacion: ' + _pl.join(' ; ');
+          } catch (ePl) { _planesTxt = ''; }
+          const _amen = (d.dev_data && Array.isArray(d.dev_data.amenities) && d.dev_data.amenities.length > 0) ? (' | amenities: ' + d.dev_data.amenities.join(', ')) : '';
+          const _cab = '* EMPRENDIMIENTO: ' + (d.nombre || 'Sin nombre') + (d.tipo ? ' (' + d.tipo + ')' : '') +
+            (d.zona ? ' | zona: ' + d.zona : '') +
+            (d.estado_obra ? ' | obra: ' + (_ESTADO_OBRA_TXT[d.estado_obra] || d.estado_obra) : '') +
+            (d.avance_pct ? ' | avance: ' + d.avance_pct + '%' : '') +
+            (d.fecha_entrega ? ' | entrega estimada: ' + d.fecha_entrega : '') +
+            _planesTxt + _amen +
+            (d.link ? ' | link: ' + d.link : '') +
+            (d.descripcion ? ' | ' + d.descripcion : '');
+          const _resTxt = _resumen.length > 0 ? ('\n  Disponibilidad: ' + _resumen.join(' ; ')) : '\n  Disponibilidad: consultar (sin unidades disponibles cargadas)';
+          // Detalle por unidad disponible (acotado a las primeras para no inflar el prompt).
+          const _detalle = _disp.slice(0, 30).map(function(u){
+            const _med = (u.tipo_producto === 'lote')
+              ? (u.superficie_terreno ? u.superficie_terreno + ' m2 terreno' : '')
+              : [u.m2_cubiertos ? u.m2_cubiertos + ' m2 cub' : '', u.piso ? 'piso ' + u.piso : ''].filter(Boolean).join(', ');
+            const _precio = (u.precio_estado === 'a_consultar' || !u.precio) ? 'a consultar' : ((u.moneda || 'USD') + ' ' + u.precio + (u.precio_estado === 'desde' ? ' (desde)' : ''));
+            return '  - ' + (u.tipologia || u.tipo_producto || 'unidad') + (u.numero ? ' N' + u.numero : '') + (_med ? ' | ' + _med : '') + (u.orientacion ? ' | ' + u.orientacion : '') + ' | ' + _precio;
+          });
+          return _cab + _resTxt + (_detalle.length > 0 ? ('\n' + _detalle.join('\n')) : '');
+        });
+        if (_bloques.length > 0) inventarioDesarrollos = _bloques.join('\n');
+      }
+    }
+  } catch (eDev) { console.error('inventario desarrollos:', eDev && eDev.message); inventarioDesarrollos = ''; }
+
   let historial = [];
   if (modoPrueba && historialManual) {
     historial = historialManual.map(function(m){ return { role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }; });
@@ -2589,6 +2665,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
     'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:', inventario, '',
+    // INVENTARIO DE DESARROLLOS (ADITIVO + GATEADO): solo presente si la cuenta tiene el modulo activo.
+    // Con el flag OFF, inventarioDesarrollos === '' => .filter(Boolean) descarta estas 2 lineas y el prompt es el ACTUAL EXACTO.
+    inventarioDesarrollos ? 'Emprendimientos / desarrollos disponibles (proyectos en pozo, en construccion o terminados; ofrecelos cuando el cliente busca obra nueva, financiacion en cuotas o inversion). Usa SOLO estos; no inventes unidades ni precios. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. Si el emprendimiento tiene link, compartilo:' : '',
+    inventarioDesarrollos || '',
     'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
   ].filter(Boolean).join('\n');
 

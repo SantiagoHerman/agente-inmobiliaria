@@ -1739,9 +1739,29 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     let _v2NoEsperar = false;
     if (_cv && !_cv.asesor_id && !_cv.admin_tomo) {
       const _ownerId = _cv.user_id || user_id;
+      // RESPALDO (Plan B): si el caller pasa una LISTA EXPLICITA de candidatos (opts.candidatos = ids de asesor),
+      // repartir EQUITATIVAMENTE SOLO entre ESOS usuarios (reuso asesorMenorCarga), salteando el pool general y el
+      // reparto por departamento. Se filtra antes a HUMANOS del MISMO owner, activos y que reciben (no 'no_recibe'),
+      // para no asignar a un pausado, a un bot, ni a alguien de otro tenant (aislamiento). Si tras filtrar no queda
+      // nadie, _asesor cae null y sigue el camino normal de "sin asesor" (avisar al dueno). DEFENSIVO: si la columna
+      // es_ia/disponibilidad no existe, el filtro degrada bien (no excluye de mas). 0 tokens de IA.
+      let _candListo = false;
+      if (Array.isArray(opts.candidatos) && opts.candidatos.length > 0) {
+        try {
+          const { data: _cands } = await supabase.from('asesores')
+            .select('id, es_ia, activo, disponibilidad, admin_id')
+            .eq('admin_id', _ownerId)
+            .in('id', opts.candidatos);
+          const _ids = (_cands || [])
+            .filter(function(a){ return a.activo !== false && a.es_ia !== true && a.disponibilidad !== 'no_recibe'; })
+            .map(function(a){ return a.id; });
+          _asesor = _ids.length ? await asesorMenorCarga(_ids) : null;
+        } catch (eCand) { _asesor = null; }
+        _candListo = true; // el camino de candidatos ya resolvio (con o sin asesor): NO usar pool/depto
+      }
       // ETAPA 7: reparto real por departamento SOLO si el flag por-tenant esta ON. Flag OFF (o ausente/
       // columna inexistente) => comportamiento ACTUAL EXACTO (elegirAsesorActivo, pool general).
-      const _v2 = await repartoV2Activo(_ownerId);
+      const _v2 = _candListo ? false : await repartoV2Activo(_ownerId);
       _v2Activo = _v2; // ETAPA 9c: visible fuera de este bloque para la cascada de fuera-de-horario
       if (_v2) {
         // ===== FASE 2 (PUNTOS 3+4): ESCALERA DE ESCALADO =====
@@ -1791,8 +1811,9 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         // Nota: si la cascada no encontro candidato, _asesor queda null. Segun el camino, ya se aviso al gerente
         // (sin_miembros sin fallback / solo_no_recibe -> _v2NoEsperar=true) o queda EN ESPERA con tope (todos_pausa).
         // El manejo de cola/fuera-de-horario de mas abajo solo aplica cuando corresponde esperar.
-      } else {
-        // Flag OFF: comportamiento ACTUAL EXACTO.
+      } else if (!_candListo) {
+        // Flag OFF: comportamiento ACTUAL EXACTO. (Si vino por lista de candidatos del respaldo, _asesor YA quedo
+        // resuelto arriba con asesorMenorCarga sobre esa lista -> NO tocar el pool general.)
         _asesor = await elegirAsesorActivo(_ownerId);
       }
       if (_asesor) {
@@ -4488,6 +4509,7 @@ async function revisarRespaldoTimeout() {
     // Caches por tenant (una query chica como mucho por cuenta y por tick).
     const _flagCache = {};   // respaldo_v2 ON?
     const _umbralCache = {}; // respaldo_umbral_min en ms
+    const _usuariosCache = {}; // respaldo_usuarios: lista de ids de asesor a los que repartir (vacia = pool normal)
     const _pausaCache = {};  // cuenta pausada / en papelera?
     for (const conv of candidatas) {
       if (_respaldoDerivado.has(conv.id)) continue; // ya derivado por respaldo en este proceso
@@ -4500,6 +4522,8 @@ async function revisarRespaldoTimeout() {
       // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO derivar (comportamiento actual). Fail-safe.
       if (!(ownerId in _flagCache)) {
         try {
+          // DEFENSIVO: leer respaldo_usuarios aparte para que, si esa columna AUN no existe (migracion no corrida),
+          // el select principal (respaldo_v2/umbral) no falle y el respaldo siga andando sin lista (pool normal).
           const { data: bsF, error: eF } = await supabase.from('business_settings').select('respaldo_v2, respaldo_umbral_min').eq('user_id', ownerId).maybeSingle();
           if (eF) { _flagCache[ownerId] = false; }
           else {
@@ -4508,6 +4532,12 @@ async function revisarRespaldoTimeout() {
             if (!_min || _min < 1 || _min > 240) _min = UMBRAL_DEFAULT_MIN;
             _umbralCache[ownerId] = _min * 60 * 1000;
           }
+          let _usuarios = [];
+          try {
+            const { data: bsU } = await supabase.from('business_settings').select('respaldo_usuarios').eq('user_id', ownerId).maybeSingle();
+            if (bsU && Array.isArray(bsU.respaldo_usuarios)) _usuarios = bsU.respaldo_usuarios.filter(function(x){ return !!x; });
+          } catch (eU) { _usuarios = []; } // columna ausente / error -> sin lista (pool normal)
+          _usuariosCache[ownerId] = _usuarios;
         } catch (eFc) { _flagCache[ownerId] = false; } // ante cualquier fallo -> OFF (nunca romper)
       }
       if (_flagCache[ownerId] !== true) continue;
@@ -4540,17 +4570,33 @@ async function revisarRespaldoTimeout() {
       // Marcar en memoria YA (antes de derivar) para que ticks concurrentes no re-deriven.
       _respaldoDerivado.add(conv.id);
       const _minTxt = Math.round(UMBRAL_MS / 60000);
+      // MOTIVO de la derivacion (texto en claro para el chat + push). SIN COSTO IA: debeBloquearAcceso y
+      // dentroDelTopeIA SOLO leen la DB (suscripcion/uso), no llaman a ningun modelo. Si la cuenta esta sin pago al
+      // dia (cancelled/suspended/trial-sin-tarjeta) o se le agoto el cupo de mensajes -> 'sin_saldo'; si no -> 'tecnico'.
+      // DEFENSIVO: ambos son fail-open (ante error -> false), asi que ante duda cae a 'tecnico' (mensaje neutro).
+      let _sinSaldo = false;
+      try { _sinSaldo = (await debeBloquearAcceso(ownerId)) || !(await dentroDelTopeIA(ownerId)); } catch (eMot) { _sinSaldo = false; }
+      const _motivo = _sinSaldo ? 'sin_saldo' : 'tecnico';
+      // Frase en CLARO del motivo (texto FIJO, 0 tokens) para el mensaje de sistema y el push.
+      const _fraseMotivo = _sinSaldo
+        ? 'La IA no respondio por falta de saldo de mensajes, te paso el lead'
+        : 'La IA no respondio por problemas tecnicos, te paso el lead';
+      // Lista configurada de usuarios del respaldo (puede estar vacia -> pool/reparto normal de derivarAHumano).
+      const _candidatos = (Array.isArray(_usuariosCache[ownerId]) && _usuariosCache[ownerId].length > 0) ? _usuariosCache[ownerId] : null;
       let _asesorId = null;
       try {
         // setStatus:true -> status='listo_humano' + ai_enabled=false (el humano toma; la IA no lo pisa = decision 4).
         // push:true -> avisa al asesor asignado (enviarPushAsesor por dentro).
         // resumen:FALSE -> CERO IA / CERO tokens (regla de Diego). El respaldo es el plan B para cuando NO hay credito o
         // fallo la IA; seria absurdo que gaste IA justo ahi. derivarAHumano con resumen:false NO llama a ningun modelo.
-        _asesorId = await derivarAHumano(conv.id, ownerId, 'respaldo_timeout', {
+        // candidatos: si esta poblado, derivarAHumano reparte EQUITATIVAMENTE solo entre ESOS usuarios; si es null,
+        // usa su reparto normal (pool/departamento). El motivo viaja como 4to arg (hoy solo para logging).
+        _asesorId = await derivarAHumano(conv.id, ownerId, 'respaldo_' + _motivo, {
           setStatus: true,
           push: true,
+          candidatos: _candidatos,
           pushTitulo: 'Respaldo automatico: lead sin respuesta de la IA',
-          pushTexto: 'La IA no respondio en ' + _minTxt + ' min (sin credito o un problema). Te paso el lead.',
+          pushTexto: _fraseMotivo + '.',
           resumen: false
         });
       } catch (eDer) { console.error('Respaldo derivarAHumano:', eDer && eDer.message); }
@@ -4560,14 +4606,15 @@ async function revisarRespaldoTimeout() {
         if (_asesorId) {
           try { const { data: _ase } = await supabase.from('asesores').select('nombre').eq('id', _asesorId).maybeSingle(); _nomAse = _ase && _ase.nombre ? _ase.nombre : null; } catch (eN) {}
         }
+        // Mensaje en CLARO con el MOTIVO (texto FIJO, 0 tokens). sin_saldo vs tecnico segun _fraseMotivo.
         const _txt = _asesorId
-          ? ('Respaldo automatico (la IA no respondio en ' + _minTxt + ' min por falta de credito o un problema): derivado a ' + (_nomAse || 'un asesor'))
-          : ('Respaldo automatico (la IA no respondio en ' + _minTxt + ' min por falta de credito o un problema): sin asesor disponible -> avisado al responsable');
+          ? (_fraseMotivo + ': derivado a ' + (_nomAse || 'un asesor'))
+          : (_fraseMotivo + ': sin asesor disponible -> avisado al responsable');
         await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txt, enviado_por: 'Sistema' });
       } catch (eMsg) {}
       // Marca persistente best-effort para no re-derivar en proximos ticks (defensivo si la columna no existe).
       try { await supabase.from('conversations').update({ respaldo_derivado: true }).eq('id', conv.id); } catch (eMark) { /* columna ausente: el Set ya dedupea */ }
-      console.log('Respaldo v2: lead ' + conv.id + ' derivado por timeout (' + _minTxt + ' min sin respuesta de la IA)' + (_asesorId ? (' -> asesor ' + _asesorId) : ' -> sin asesor, avisado al dueno'));
+      console.log('Respaldo v2: lead ' + conv.id + ' derivado por timeout (' + _minTxt + ' min sin respuesta de la IA, motivo=' + _motivo + (_candidatos ? ', lista=' + _candidatos.length : '') + ')' + (_asesorId ? (' -> asesor ' + _asesorId) : ' -> sin asesor, avisado al dueno'));
     }
   } catch (e) { console.error('Error en revisarRespaldoTimeout:', e && e.message); }
   finally { _respaldoEnCurso = false; }

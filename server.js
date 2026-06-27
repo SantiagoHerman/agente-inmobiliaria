@@ -526,6 +526,60 @@ async function dentroDelTopeIA(user_id) {
   return usado < tope || (sub && (sub.mensajes_extra || 0) > 0); // saldo extra (regalo/paquete) extiende el tope del plan
 }
 
+// ===== TOPE NOCTURNO (decision d): limite de mensajes IA por cuenta en la franja FUERA de horario de oficina =====
+// Motivo: con la IA atendiendo 24/7, las noches (sin humanos) pueden disparar gasto. Este tope SOLO aplica cuando
+// estamos FUERA del horario de oficina del tenant y SOLO si el dueno lo configuro. CONFIG (la escribe el front):
+//   - business_settings.tope_nocturno_msgs (int): cupo de mensajes IA por noche. 0 / ausente => SIN tope (generoso).
+// El CONTADOR del dia lo maneja SOLO el backend en una jsonb aparte (business_settings.tope_nocturno_uso
+// = { dia: 'YYYY-MM-DD' local AR, usado: int }) para no pisar la config del front. DEFAULT GENEROSO/INERTE:
+// columnas ausentes o cup <= 0 => NO limita (comportamiento actual). 0 IA: solo lee/escribe DB.
+function _fechaLocalArg() {
+  const arg = new Date(Date.now() - 3 * 60 * 60000); // hora AR (leido via getUTC*)
+  return arg.toISOString().slice(0, 10);
+}
+async function _leerTopeNocturno(user_id) {
+  // Devuelve { max, dia, usado, horario } o null si no aplica (sin cupo / columnas ausentes).
+  try {
+    let row = null;
+    try {
+      const { data } = await supabase.from('business_settings').select('tope_nocturno_msgs, tope_nocturno_uso, horario_oficina').eq('user_id', user_id).maybeSingle();
+      row = data || null;
+    } catch (eCol) {
+      // Columna nueva ausente: reintentar leyendo solo el horario (sin tope nocturno -> inerte).
+      return null;
+    }
+    if (!row) return null;
+    let _max = Number(row.tope_nocturno_msgs); if (!(_max > 0)) return null; // 0 / invalido -> sin limite (generoso)
+    const uso = row.tope_nocturno_uso && typeof row.tope_nocturno_uso === 'object' ? row.tope_nocturno_uso : {};
+    const _dia = (typeof uso.dia === 'string') ? uso.dia : null;
+    const _usado = Number(uso.usado);
+    return { max: _max, dia: _dia, usado: (_usado >= 0 ? _usado : 0), horario: row.horario_oficina || null };
+  } catch (e) { return null; }
+}
+// True si la cuenta TODAVIA puede responder con IA esta noche (o si el tope nocturno no aplica). FAIL-OPEN.
+async function dentroDelTopeNocturno(user_id) {
+  try {
+    const tn = await _leerTopeNocturno(user_id);
+    if (!tn) return true; // sin cupo configurado -> siempre pasa (comportamiento actual)
+    // Solo aplica FUERA de horario. Sin horario cargado -> no hay "noche" definida -> no limitar (consistente con (b)).
+    if (!tn.horario) return true;
+    if (dentroHorarioOficina(tn.horario)) return true; // estamos DENTRO de horario: el tope nocturno no corre
+    const hoy = _fechaLocalArg();
+    const usadoHoy = (tn.dia === hoy) ? tn.usado : 0; // contador del dia local AR
+    return usadoHoy < tn.max;
+  } catch (e) { return true; } // fail-open: ante error no cortar el servicio
+}
+// Suma 1 al contador nocturno del dia (best-effort, 0 IA). Solo cuenta si estamos fuera de horario y hay cupo.
+async function registrarMensajeNocturno(user_id) {
+  try {
+    const tn = await _leerTopeNocturno(user_id);
+    if (!tn || !tn.horario || dentroHorarioOficina(tn.horario)) return; // solo de noche y con cupo configurado
+    const hoy = _fechaLocalArg();
+    const usadoHoy = (tn.dia === hoy) ? tn.usado : 0;
+    try { await supabase.from('business_settings').update({ tope_nocturno_uso: { dia: hoy, usado: usadoHoy + 1 } }).eq('user_id', user_id); } catch (eUpd) {}
+  } catch (e) {}
+}
+
 // Senal AUTORITATIVA de corte por falta de pago. Replica EXACTAMENTE el gate del
 // webhook (~1271-1294) + planActual + cortesia + grandfathered, SIN alterarlo: solo
 // computa lo mismo de forma reusable. FAIL-OPEN: ante cualquier error o duda -> false.
@@ -922,6 +976,11 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
     }
     await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null });
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    // FIX #2: el humano respondio DESDE EL CELULAR (la respuesta entra por el webhook como saliente). Igual que el
+    // envio por la app, esto resuelve la espera -> reseteamos la escalada SLA (jsonb sla_avisos + Set _slaAvisoMem)
+    // para que un nuevo ciclo de espera vuelva a escalar desde p1. Best-effort/0 IA.
+    try { await supabase.from('conversations').update({ sla_avisos: {} }).eq('id', conv.id); } catch (eSlaClr) {}
+    try { _slaAvisoMem.delete(conv.id + ':p1'); _slaAvisoMem.delete(conv.id + ':p2'); _slaAvisoMem.delete(conv.id + ':p3'); } catch (eMemClr) {}
     console.log('Mensaje saliente (celular) guardado en conversacion ' + conv.id);
   } catch (e) { console.error('Error en guardarMensajeSaliente:', e && e.message); }
 }
@@ -1100,6 +1159,22 @@ async function repartoV2Activo(user_id, bs) {
     if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
     return !!(data && data.reparto_v2 === true);
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// ===== FIX #1: FLAG POR-CUENTA ia_fuera_horario (mismo patron defensivo que repartoV2Activo) =====
+// GATE del comportamiento NUEVO de fuera-de-horario: cuando un lead necesita un humano y estamos FUERA del horario
+// de oficina, en vez de derivar a un asesor ausente (offline) la IA le avisa "te respondemos a la brevedad" y AGENDA
+// el pase (handoff_pendiente) para cuando entren los humanos. La IA general SIGUE atendiendo 24/7 (no se pausa).
+// Default OFF: false / ausente / null / columna inexistente -> comportamiento ANTERIOR (oferta de derivacion de la
+// etapa 9c). TRUE -> path nuevo (encolarHandoffFueraHorario). Ante cualquier error -> false (NUNCA romper).
+async function iaFueraHorarioActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_fuera_horario')) return bs.ia_fuera_horario === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_fuera_horario').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> flag OFF (comportamiento anterior)
+    return !!(data && data.ia_fuera_horario === true);
+  } catch (e) { return false; }
 }
 
 // ===== COBRO v2: FLAG POR-CUENTA cobrar_todo_v2 (mismo patrón defensivo que repartoV2Activo) =====
@@ -1507,6 +1582,41 @@ async function enviarMensajeFueraHorario(convId, user_id) {
   } catch (e) { console.error('enviarMensajeFueraHorario:', e && e.message); return false; }
 }
 
+// DECISION (d): FUERA DE HORARIO con humanos offline. En vez de ofrecer derivar a un humano que NO esta (offline),
+// le avisamos al lead que un asesor le responde "a la brevedad" (plantilla FIJA, 0 tokens) y DEJAMOS EL PASE
+// AGENDADO: marcamos conversations.handoff_pendiente=true para que, cuando ENTRE el horario, el cron de cola
+// (escalarLeadsEnColaVencidos) lo retome y lo asigne a un humano disponible. La IA general SIGUE atendiendo
+// mientras (no se toca ai_enabled). Reusa el dedupe _fueraHorarioAvisada para no repetir el aviso ni abrir la
+// oferta de derivacion. Devuelve true si avi­so (o ya estaba avisada), false si no pudo. NO consume tokens de IA.
+async function encolarHandoffFueraHorario(convId, user_id) {
+  try {
+    if (!convId || !user_id) return false;
+    // Marca persistente del pase agendado (best-effort, defensivo si la columna no existe).
+    try { await supabase.from('conversations').update({ handoff_pendiente: true }).eq('id', convId); } catch (eHp) {}
+    if (_fueraHorarioAvisada.has(convId)) return true; // ya avisado en este proceso (no spamear)
+    try {
+      const { data: _flag } = await supabase.from('conversations').select('fuera_horario_avisada').eq('id', convId).maybeSingle();
+      if (_flag && _flag.fuera_horario_avisada === true) { _fueraHorarioAvisada.add(convId); return true; }
+    } catch (eFlag) {}
+    // Telefono del lead via la conversacion -> contacto.
+    let _telefono = null;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('contact_id').eq('id', convId).maybeSingle();
+      if (_cv && _cv.contact_id) {
+        const { data: _ct } = await supabase.from('contacts').select('phone').eq('id', _cv.contact_id).maybeSingle();
+        _telefono = _ct && _ct.phone ? String(_ct.phone).trim() : null;
+      }
+    } catch (eTel) {}
+    if (!_telefono) return false;
+    _fueraHorarioAvisada.add(convId); // marcar YA (antes del envio): evita doble aviso; tambien BLOQUEA la oferta de derivacion
+    const _texto = 'En este momento estamos fuera del horario de atencion. Un asesor te responde a la brevedad apenas se conecte. Gracias por escribirnos.';
+    try { await enviarWhatsapp(nombreInstancia(user_id), _telefono, _texto); } catch (eWa) { console.error('handoff fuera horario WhatsApp:', eWa && eWa.message); }
+    try { await supabase.from('messages').insert({ conversation_id: convId, user_id: user_id, role: 'ai', content: _texto, enviado_por: 'Sistema' }); } catch (eMsg) {}
+    try { await supabase.from('conversations').update({ fuera_horario_avisada: true }).eq('id', convId); } catch (eMark) {}
+    return true;
+  } catch (e) { console.error('encolarHandoffFueraHorario:', e && e.message); return false; }
+}
+
 // ETAPA 9c: hay un ofrecimiento de fuera-de-horario pendiente para esta conversacion?
 // 2 capas: Set en memoria (red dentro del proceso) + flag persistente fuera_horario_avisada (defensivo).
 async function tieneOfertaFueraHorarioPendiente(convId) {
@@ -1527,6 +1637,9 @@ async function cerrarOfertaFueraHorario(convId) {
     if (!convId) return;
     _fueraHorarioAvisada.delete(convId);
     try { await supabase.from('conversations').update({ fuera_horario_avisada: false }).eq('id', convId); } catch (eMark) {}
+    // FIX (1b): al cerrar el ofrecimiento, el pase agendado off-hours dejo de aplicar -> limpiar handoff_pendiente
+    // para no cortocircuitar una oferta REAL posterior. Write APARTE best-effort/defensivo (columna opcional).
+    try { await supabase.from('conversations').update({ handoff_pendiente: false }).eq('id', convId); } catch (eHp) {}
   } catch (e) {}
 }
 
@@ -1542,8 +1655,15 @@ async function manejarRespuestaFueraHorario(convId, user_id, texto, telefono, in
     if (!(await tieneOfertaFueraHorarioPendiente(convId))) return false; // no hay oferta pendiente
     // Solo nos metemos si la conv sigue EN COLA (listo_humano, sin asesor, no la tomo el admin). Si ya la tomaron
     // o se asigno alguien, la oferta quedo obsoleta -> la cerramos y dejamos seguir el flujo normal.
-    const { data: _cv } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, departamento_id, user_id').eq('id', convId).maybeSingle();
+    const { data: _cv } = await supabase.from('conversations').select('status, asesor_id, admin_tomo, departamento_id, user_id, handoff_pendiente').eq('id', convId).maybeSingle();
     if (!_cv || _cv.status !== 'listo_humano' || _cv.asesor_id || _cv.admin_tomo === true) { await cerrarOfertaFueraHorario(convId); return false; }
+    // FIX #3: distinguir OFERTA REAL de derivacion vs solo el AVISO DE ESPERA (pase agendado off-hours). El path nuevo
+    // de fuera-de-horario (encolarHandoffFueraHorario) marca handoff_pendiente=true y NO ofrece derivar a nadie: solo
+    // avisa "te respondemos a la brevedad". En ese caso, un "si" del lead (que nunca pidio derivar) NO debe re-derivar.
+    // Salimos SIN consumir el mensaje: el pase queda agendado (handoff_pendiente). OJO: la conv esta en cola/pausada
+    // (status='listo_humano' => ai_enabled=false, garantizado por el guard de arriba); NO sigue el flujo normal de IA.
+    // Queda esperando a que un humano la tome EN HORARIO (el cron de cola la retoma cuando vuelve el horario).
+    if (_cv.handoff_pendiente === true) return false;
     const _ownerId = _cv.user_id || user_id;
     if (!_esAfirmacionLead(texto)) {
       // El lead NO quiere derivar (o no se entiende como un si claro): no consumimos el mensaje, queda en cola.
@@ -1956,7 +2076,23 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
       // llamada nueva a Claude). Igual avisamos al dueno (la conv queda en cola como hoy, el cron la escala al
       // vencer el tope). Con flag OFF (_v2Activo=false) NO se ejecuta -> comportamiento ACTUAL.
       if (_v2Activo) {
-        try { await enviarMensajeFueraHorario(convId, _cv.user_id || user_id); } catch (eFH) { console.error('Etapa9c fuera horario:', eFH && eFH.message); }
+        // DECISION (d): si estamos FUERA del horario de oficina del tenant, los humanos estan offline: NO ofrecer
+        // derivar a alguien que no esta. En cambio, avisar "te respondemos a la brevedad" + AGENDAR el pase
+        // (handoff_pendiente) para que el cron de cola lo retome cuando entre el horario. La IA general sigue
+        // atendiendo (no se toca ai_enabled). DECISION (b): sin horario cargado -> tratar como EN horario (no
+        // encolar a la nada) -> comportamiento ACTUAL (oferta de fuera-de-horario). Lectura defensiva del horario.
+        let _horarioTenant = null;
+        try { const { data: _bsH } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', _cv.user_id || user_id).maybeSingle(); _horarioTenant = _bsH && _bsH.horario_oficina ? _bsH.horario_oficina : null; } catch (eHt) { _horarioTenant = null; }
+        const _fueraDeHorario = _horarioTenant ? !dentroHorarioOficina(_horarioTenant) : false; // sin horario => como EN horario (b)
+        // FIX #1: el path NUEVO de fuera-de-horario (aviso "a la brevedad" + AGENDAR el pase) corre SOLO si el dueno
+        // activo el flag por-cuenta ia_fuera_horario. Con el flag OFF (default) -> comportamiento ANTERIOR (oferta de
+        // derivacion a otra area). La IA general sigue atendiendo igual en ambos casos (no se toca ai_enabled).
+        let _iaFueraHorario = false;
+        try { _iaFueraHorario = await iaFueraHorarioActivo(_cv.user_id || user_id); } catch (eIFH) { _iaFueraHorario = false; }
+        try {
+          if (_fueraDeHorario && _iaFueraHorario) { await encolarHandoffFueraHorario(convId, _cv.user_id || user_id); }
+          else { await enviarMensajeFueraHorario(convId, _cv.user_id || user_id); }
+        } catch (eFH) { console.error('Etapa9c fuera horario:', eFH && eFH.message); }
       }
       await avisarDuenoColaSinAsesor(convId, _cv.user_id || user_id);
     }
@@ -3742,6 +3878,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         }
       } catch (e) { console.error('enforcement suscripcion:', e && e.message); }
     }
+    // TOPE NOCTURNO (decision d): gate ADICIONAL e INDEPENDIENTE del plan. Solo aplica FUERA del horario de oficina
+    // y solo si el dueno lo configuro (business_settings.tope_nocturno on + max>0). Sin config => inerte (no corre).
+    // Frena la respuesta de la IA cuando la cuenta supero su cupo nocturno (mismo efecto que dentroDelTopeIA false),
+    // para acotar el gasto de las noches sin humanos. FAIL-OPEN: ante error no corta. 0 IA (solo lee/escribe DB).
+    try {
+      if (!(await dentroDelTopeNocturno(user_id))) {
+        await enviarWhatsapp(instanciaNombre, telefono, 'En este momento estamos fuera del horario de atencion. Un asesor te responde a la brevedad apenas se conecte. Gracias por escribirnos.');
+        return;
+      }
+      // Pasa el gate: contar este mensaje en el cupo nocturno (no-op si estamos en horario o sin tope configurado).
+      try { await registrarMensajeNocturno(user_id); } catch (eRn) {}
+    } catch (eTn) { console.error('tope nocturno:', eTn && eTn.message); }
     // === DEBOUNCE POR CONVERSACION ===
     // En vez de generar la respuesta YA (lo que con 2 webhooks concurrentes hacia que la IA se presente 2 veces),
     // agrupamos la rafaga: cada mensaje reinicia el reloj; al vencer DEBOUNCE_MS se genera UNA sola respuesta.
@@ -3938,6 +4086,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     await supabase.from('conversations').update({ departamento_id: _departamentoId, asesor_id: null, updated_at: new Date().toISOString() }).eq('id', _convId);
                     // R4: re-derivacion por cambio de tema = clasificacion IA -> departamento_manual=false. Write APARTE best-effort.
                     try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
+                    // FIX (1c): al resetear asesor_id por cambio de tema, el pase agendado off-hours dejo de aplicar
+                    // (re-derivamos a otro depto) -> limpiar handoff_pendiente para no cortocircuitar una oferta REAL
+                    // posterior. Write APARTE best-effort/defensivo (columna opcional).
+                    try { await supabase.from('conversations').update({ handoff_pendiente: false }).eq('id', _convId); } catch (eHp) {}
                     await derivarAHumano(_convId, user_id, 'cambio_tema_rederivar', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
                     _yaDerivoEnEsteMensaje = true;
                   }
@@ -4090,6 +4242,14 @@ app.post('/api/whatsapp/send', async (req, res) => {
     }
     const { data: msgInsertado } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, content_original: (textoEnviar !== texto ? textoEnviar : null), idioma: idiomaMsg, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' }).select('id').single();
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // FIX #2: RESET de la escalada SLA cuando un HUMANO responde. El escalado (revisarAvisosInternos #4) dedupea por
+    // escalon con conversations.sla_avisos (jsonb persistente) + el Set en memoria _slaAvisoMem. Si nunca se limpian,
+    // un NUEVO ciclo de espera (el lead vuelve a escribir tras esta respuesta humana) jamas re-dispararia los avisos.
+    // Limpiamos AMBOS aca, en el mismo punto donde se registra la respuesta humana, para que el proximo ciclo escale
+    // de nuevo desde p1. Best-effort/0 IA: si la columna sla_avisos no existe, el update falla en silencio (el Set
+    // igual se purga). Se borran las 3 claves (p1/p2/p3) de ESTA conv del Set en memoria.
+    try { await supabase.from('conversations').update({ sla_avisos: {} }).eq('id', conversation_id); } catch (eSlaClr) {}
+    try { _slaAvisoMem.delete(conversation_id + ':p1'); _slaAvisoMem.delete(conversation_id + ':p2'); _slaAvisoMem.delete(conversation_id + ':p3'); } catch (eMemClr) {}
     // RACE #1 (CRITICO) — IA-vs-HUMANO = "Tomar conversacion" AUTOMATICO. Cuando un HUMANO (asesor/admin) escribe en
     // un lead con la IA encendida, equivale a apretar "Tomar conversacion": la IA queda SIN posibilidad de responder
     // (ai_enabled=false), asi no le pisa la respuesta al humano delante del cliente. NO cambiamos el status (igual que
@@ -4291,13 +4451,15 @@ app.get('/api/whatsapp/estado', async (req, res) => {
 // ============ CRON: pasar a Recontacto las conversaciones inactivas (3 dias sin respuesta) ============
 // ---- Helpers de recontacto ----
 
-// Devuelve true si AHORA estamos dentro del horario de oficina del user (segun su config).
-// Fail-safe: si no hay config o falla, devuelve false (no enviar).
-function dentroHorarioOficina(horario) {
+// Devuelve true si en el instante `tsMs` (epoch ms) estamos dentro del horario de oficina del user.
+// Fail-safe: si no hay config o falla, devuelve false (no enviar). Variante con timestamp explicito:
+// la usa la escalada SLA para evaluar el horario SOBRE EL ANCHOR (el momento en que arranco la espera),
+// no sobre "ahora". `dentroHorarioOficina(horario)` queda como `dentroHorarioOficinaEn(horario, Date.now())`.
+function dentroHorarioOficinaEn(horario, tsMs) {
   try {
     if (!horario) return false;
     // Hora local Argentina (UTC-3)
-    const ahora = new Date();
+    const ahora = new Date(typeof tsMs === 'number' ? tsMs : Date.now());
     const utc = ahora.getTime() + ahora.getTimezoneOffset() * 60000;
     const arg = new Date(utc - 3 * 60 * 60000);
     const dias = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
@@ -4343,6 +4505,11 @@ function dentroHorarioOficina(horario) {
     }
     return enFranjaLegacy(cfg.desde, cfg.hasta);
   } catch (e) { return false; }
+}
+
+// Compat: misma firma/comportamiento de siempre (evalua "ahora"). Todos los call-sites existentes la siguen usando.
+function dentroHorarioOficina(horario) {
+  return dentroHorarioOficinaEn(horario, Date.now());
 }
 
 // ===== ETAPA 9a: HORARIO POR USUARIO (solo se consulta con reparto_v2 ON) =====
@@ -4533,6 +4700,7 @@ async function escalarLeadsEnColaVencidos() {
     // Cache del flag reparto_v2 por tenant (una query chica por cuenta como mucho).
     const _flagCache = {};
     const _topeCache = {}; // FASE 2 (punto 4): cache del tope de espera por tenant.
+    const _horarioCache = {}; // FIX (2): cache del horario_oficina por tenant (para diferir pases agendados off-hours).
     for (const conv of enCola) {
       if (_escaladoFallback.has(conv.id)) continue; // ya escalado en este proceso
       const ownerId = conv.user_id;
@@ -4553,6 +4721,23 @@ async function escalarLeadsEnColaVencidos() {
         const { data: _f } = await supabase.from('conversations').select('escalado_fallback').eq('id', conv.id).maybeSingle();
         if (_f && _f.escalado_fallback === true) { _escaladoFallback.add(conv.id); continue; }
       } catch (eF) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
+      // FIX (2): intent del dueno = no despertar a nadie de noche. Para los PASES AGENDADOS fuera-de-horario
+      // (handoff_pendiente=true), NO escalar mientras estamos FUERA del horario de oficina: el escalado avisa al
+      // dueno/gerente por WhatsApp (~mas abajo) y no queremos mandarlo a humanos offline de madrugada. Se DIFIERE
+      // (NO marcamos escalado_fallback ni el Set): cuando vuelve el horario, este mismo cron lo retoma normalmente.
+      // DEFENSIVO: columna handoff_pendiente opcional (try/catch). Sin horario cargado => no filtra => escala como hoy.
+      try {
+        const { data: _hp } = await supabase.from('conversations').select('handoff_pendiente').eq('id', conv.id).maybeSingle();
+        if (_hp && _hp.handoff_pendiente === true) {
+          if (!(ownerId in _horarioCache)) {
+            let _ho = null;
+            try { const { data: _bsH } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', ownerId).maybeSingle(); _ho = _bsH && _bsH.horario_oficina ? _bsH.horario_oficina : null; } catch (eHoR) { _ho = null; }
+            _horarioCache[ownerId] = _ho;
+          }
+          const _horarioOwner = _horarioCache[ownerId];
+          if (_horarioOwner && !dentroHorarioOficinaEn(_horarioOwner, ahoraMs)) continue; // off-hours: diferir (no escalar, no marcar)
+        }
+      } catch (eHp) { /* columna ausente u otro error: seguir con el flujo normal (escalar como hoy) */ }
       // Tiempo en cola: usar el timestamp del ULTIMO mensaje (si no hay, caer a updated_at de la conv).
       let anchorMs = conv.updated_at ? new Date(conv.updated_at).getTime() : 0;
       try {
@@ -4581,6 +4766,10 @@ async function escalarLeadsEnColaVencidos() {
             if (!_asgEsc || !_asgEsc.length) {
               _asignado = null; _yaTomado = true; // ya hay asesor/admin a cargo: no robar, no avisar al dueno
             } else {
+              // FIX (1a): ya hay un humano asignado en la manana -> el pase agendado off-hours dejo de aplicar.
+              // Limpiar handoff_pendiente para que una oferta REAL posterior (manejarRespuestaFueraHorario) no se
+              // cortocircuite. Write APARTE best-effort/defensivo (columna opcional): no debe romper la asignacion.
+              try { await supabase.from('conversations').update({ handoff_pendiente: false }).eq('id', conv.id); } catch (eHp) {}
               console.log('Etapa8 fallback: lead ' + conv.id + ' escalado al depto fallback -> asesor ' + _asignado);
             }
           }
@@ -4642,7 +4831,7 @@ async function revisarRespaldoTimeout() {
       .from('conversations')
       .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at')
       .eq('last_role', 'contact')
-      .in('status', ['en_conversacion', 'interesado', 'recontacto']);
+      .in('status', ['en_conversacion', 'interesado']); // (e) 'recontacto' fuera: redundante (no es atencion activa de la IA)
     if (!candidatas || candidatas.length === 0) return;
     // Caches por tenant (una query chica como mucho por cuenta y por tick).
     const _flagCache = {};   // respaldo_v2 ON?
@@ -4765,6 +4954,7 @@ async function revisarRespaldoTimeout() {
 // Lectura defensiva (columnas/keys ausentes => OFF). Aislado por tenant. Dedupe propio.
 // ============================================================================
 const _avisoCalienteMem = new Set();   // dedupe en memoria del aviso #2 (red dentro del proceso)
+const _slaAvisoMem = new Set();        // dedupe en memoria del aviso #4 (escalada SLA), clave 'convId:pN'
 var _avisosInternosEnCurso = false;
 async function revisarAvisosInternos() {
   if (_avisosInternosEnCurso) return;
@@ -4893,6 +5083,132 @@ async function revisarAvisosInternos() {
       await _postearAvisoInterno(ownerId, depDefault, texto);
       // Dedupe por fecha (best-effort, defensivo si la columna no existe).
       try { await supabase.from('business_settings').update({ aviso_resumen_fecha: hoyStr }).eq('user_id', ownerId); } catch (eMk) {}
+    }
+
+    // ===== AVISO #4 — ESCALADA SLA (lead asignado a un humano que tarda en responder) =====
+    // Target: conversaciones LISTO_HUMANO + con asesor asignado + ultimo mensaje del LEAD (last_role='contact').
+    // 0 IA: texto FIJO + SQL. Gated por avisos_internos.sla_humano.on (DEFAULT OFF). Cada escalon UNA sola vez
+    // (dedupe por-escalon: columna jsonb conversations.sla_avisos + Set en memoria como red). Escalones (min,
+    // configurables): p1 -> canal "Todos" + push al asesor; p2 -> canal "Todos" + aviso al admin/Administracion;
+    // p3 -> canal "Todos" + WhatsApp al dueno (NO se repite). Regla de horario: si la espera ARRANCO fuera de
+    // horario, no se escala (lead que escribio de noche no dispara avisos a humanos offline); sin horario cargado
+    // => se avisa SIEMPRE (decision del dueno).
+    let _slaCandidatas = [];
+    try {
+      const { data: _sc } = await supabase.from('conversations')
+        .select('id, user_id, departamento_id, asesor_id, last_role, updated_at')
+        .eq('status', 'listo_humano').not('asesor_id', 'is', null).eq('last_role', 'contact');
+      _slaCandidatas = _sc || [];
+    } catch (eSlaQ) { _slaCandidatas = []; }
+    const _slaCfgCache = {};      // _avisosConfig por ownerId
+    const _slaHorarioCache = {};  // horario_oficina por ownerId (undefined = no leido aun)
+    for (let i = 0; i < _slaCandidatas.length; i++) {
+      const conv = _slaCandidatas[i];
+      const ownerId = conv.user_id;
+      if (!ownerId) continue;
+      if (!(ownerId in _slaCfgCache)) _slaCfgCache[ownerId] = await _avisosConfig(ownerId);
+      const cfg = _slaCfgCache[ownerId];
+      if (!cfg.sla_humano || !cfg.sla_humano.on) continue;  // DEFAULT OFF
+      // Anchor: ULTIMO mensaje de la conv. Debe ser del LEAD (role='contact'); si hay un human/ai posterior, se saltea.
+      let _ult = null;
+      try {
+        const r = await supabase.from('messages').select('role, created_at')
+          .eq('conversation_id', conv.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+        _ult = r.data;
+      } catch (eUlt) { _ult = null; }
+      if (!_ult || _ult.role !== 'contact' || !_ult.created_at) continue; // ya respondieron (o sin datos)
+      const anchorMs = new Date(_ult.created_at).getTime();
+      if (!anchorMs) continue;
+      // Regla de horario evaluada SOBRE EL ANCHOR. Sin horario cargado => no filtra => se avisa siempre (decision dueno).
+      if (!(ownerId in _slaHorarioCache)) {
+        let _ho = null;
+        try { const { data: _bs } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', ownerId).maybeSingle(); _ho = _bs && _bs.horario_oficina ? _bs.horario_oficina : null; } catch (eHo) { _ho = null; }
+        _slaHorarioCache[ownerId] = _ho;
+      }
+      const _horario = _slaHorarioCache[ownerId];
+      if (_horario && !dentroHorarioOficinaEn(_horario, anchorMs)) continue; // la espera empezo fuera de horario
+      const esperaMin = Math.floor((ahoraMs - anchorMs) / 60000);
+      // Resolver el escalon MAS ALTO alcanzado (p3 > p2 > p1). Cada uno se dispara una sola vez.
+      const _p1 = cfg.sla_humano.paso1, _p2 = cfg.sla_humano.paso2, _p3 = cfg.sla_humano.paso3;
+      let _paso = 0;
+      if (esperaMin >= _p3) _paso = 3; else if (esperaMin >= _p2) _paso = 2; else if (esperaMin >= _p1) _paso = 1;
+      if (_paso === 0) continue; // todavia no llego al primer umbral
+      // Dedupe persistente (jsonb sla_avisos) + Set en memoria. Leemos el estado actual de los escalones.
+      let _slaPrev = {};
+      try { const { data: _cvS } = await supabase.from('conversations').select('sla_avisos').eq('id', conv.id).maybeSingle(); _slaPrev = (_cvS && _cvS.sla_avisos && typeof _cvS.sla_avisos === 'object') ? _cvS.sla_avisos : {}; } catch (eSlaR) { _slaPrev = {}; }
+      const _keyMem = function(n){ return conv.id + ':p' + n; };
+      const _yaEnviado = function(n){ return !!_slaPrev['p' + n] || _slaAvisoMem.has(_keyMem(n)); };
+      if (_yaEnviado(_paso)) continue; // ese escalon ya se disparo
+      // Datos para el texto FIJO (0 IA): nombre del lead, depto, usuario.
+      let leadRef = 'un lead';
+      try {
+        const { data: cv2 } = await supabase.from('conversations').select('contact_id').eq('id', conv.id).maybeSingle();
+        if (cv2 && cv2.contact_id) {
+          const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', cv2.contact_id).maybeSingle();
+          if (ct) {
+            const _n = (ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '';
+            const _t = (ct.phone && String(ct.phone).trim()) ? String(ct.phone).trim() : '';
+            leadRef = (_n || _t) ? (_n + (_t ? (_n ? ' (' + _t + ')' : _t) : '')) : 'un lead';
+          }
+        }
+      } catch (eL) {}
+      let deptoNombre = '';
+      if (conv.departamento_id) {
+        try { const { data: dp } = await supabase.from('departamentos').select('nombre').eq('id', conv.departamento_id).eq('user_id', ownerId).maybeSingle(); if (dp && dp.nombre) deptoNombre = String(dp.nombre); } catch (eD) {}
+      }
+      let aseNombre = '', aseAuth = null;
+      try { const { data: _ase } = await supabase.from('asesores').select('nombre, auth_user_id').eq('id', conv.asesor_id).eq('admin_id', ownerId).maybeSingle(); if (_ase) { aseNombre = _ase.nombre ? String(_ase.nombre) : ''; aseAuth = _ase.auth_user_id || null; } } catch (eAse) {}
+      const texto = 'Lead ' + leadRef + ' esperando respuesta ' + esperaMin + ' min, Departamento ' + (deptoNombre || 'sin asignar') + ', usuario ' + (aseNombre || 'sin asignar');
+      // Marcar en memoria YA (antes de enviar) para que ticks concurrentes no re-disparen este escalon.
+      _slaAvisoMem.add(_keyMem(_paso));
+      // TODOS los escalones postean en el canal "Todos".
+      try { await _postearAvisoInterno(ownerId, 'general', texto); } catch (eGen) {}
+      if (_paso === 1) {
+        // PASO 1: push al asesor asignado.
+        if (aseAuth) { try { await enviarPushAsesor(aseAuth, 'Lead esperando tu respuesta', '', texto.slice(0, 180)); } catch (eP1) {} }
+      } else if (_paso === 2) {
+        // PASO 2: aviso interno al depto Administracion (recibe_fallback) si existe; si no, a los admin/dueno.
+        let _fbId = null;
+        try { _fbId = await deptoFallbackDe(ownerId); } catch (eFb) { _fbId = null; }
+        if (_fbId) {
+          try { await _postearAvisoInterno(ownerId, _fbId, texto); } catch (eP2a) {}
+        } else {
+          // Sin depto Administracion: DM a cada usuario administrador del tenant (esAdministrador). Si no hay, DM al dueno.
+          let _admins = [];
+          try {
+            const { data: _ases } = await supabase.from('asesores').select('auth_user_id, rol, visibilidad').eq('admin_id', ownerId).eq('activo', true);
+            _admins = (_ases || []).filter(function(a){ return a && a.auth_user_id && esAdministrador(a); });
+          } catch (eAdm) { _admins = []; }
+          if (_admins.length) {
+            const _sender = await _avisoRemitente(ownerId);
+            for (let k = 0; k < _admins.length; k++) {
+              const _au = _admins[k].auth_user_id;
+              if (!_au || _au === _sender) continue;
+              try {
+                const _th = await _equipoThreadDm(ownerId, _sender, _au);
+                if (_th) { try { await supabase.from('team_messages').insert({ thread_id: _th.id, admin_id: ownerId, sender_auth_user_id: _sender, content: texto.slice(0, 4000), media_url: null, leido_por: [_sender] }); } catch (eIns) {} }
+              } catch (eDm) {}
+              try { await enviarPushAsesor(_au, 'Asistente', '', 'Aviso interno: ' + texto.slice(0, 120)); } catch (eP2p) {}
+            }
+          } else {
+            try { await _postearAvisoInterno(ownerId, null, texto); } catch (eP2b) {} // DM al dueno (comportamiento de _postearAvisoInterno sin depto)
+          }
+        }
+      } else if (_paso === 3) {
+        // PASO 3: WhatsApp al dueno (whatsapp_contacto). Plantilla FIJA. NO se repite (no hay re-escalado).
+        let _waContacto = null;
+        try { const { data: _bsW } = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', ownerId).maybeSingle(); _waContacto = _bsW && _bsW.whatsapp_contacto ? String(_bsW.whatsapp_contacto).trim() : null; } catch (eW) {}
+        if (_waContacto) {
+          const _txtWa = 'Lead ' + leadRef + ' esperando respuesta hace ' + esperaMin + ' min sin que ' + (aseNombre || 'el asesor') + ' (Departamento ' + (deptoNombre || 'sin asignar') + ') le conteste. Por favor revisalo.';
+          try { await enviarWhatsapp(nombreInstancia(ownerId), _waContacto, _txtWa); } catch (eWa) { console.error('SLA p3 WhatsApp:', eWa && eWa.message); }
+        }
+      }
+      // Dedupe persistente best-effort: setear el timestamp del escalon (merge con lo previo). Defensivo si falta la columna.
+      try {
+        const _nowIso = new Date(ahoraMs).toISOString();
+        const _merged = Object.assign({}, _slaPrev); _merged['p' + _paso] = _nowIso;
+        await supabase.from('conversations').update({ sla_avisos: _merged }).eq('id', conv.id);
+      } catch (eUpd) { /* columna ausente: el Set en memoria dedupea dentro del proceso */ }
     }
   } catch (e) { console.error('Error en revisarAvisosInternos:', e && e.message); }
   finally { _avisosInternosEnCurso = false; }
@@ -5306,8 +5622,10 @@ setTimeout(escalarLeadsEnColaVencidos, 80 * 1000); // primera corrida ~80s tras 
 // revisarInactividad): granularidad fina para el umbral chico (default 3 min, configurable por cuenta).
 setInterval(revisarRespaldoTimeout, 60 * 1000);
 setTimeout(revisarRespaldoTimeout, 65 * 1000); // primera corrida ~65s tras arrancar (cuando ya esta estable)
-// AVISOS INTERNOS (default OFF por cuenta): #2 lead caliente + #3 resumen diario. Texto fijo + SQL, SIN IA (0 tokens).
-// Cada 5 min: granularidad para el tope configurable del lead caliente (min 1 min) y la ventana del resumen diario.
+// AVISOS INTERNOS (default OFF por cuenta): #2 lead caliente + #3 resumen diario + #4 escalada SLA. Texto fijo + SQL,
+// SIN IA (0 tokens). FIX #4: vuelta a CADA 5 MIN (no 1 min). Los escalones SLA (p1/p2/p3, default 30/60/90) toleran
+// un jitter de +-5 min sin problema; correr cada minuto cargaba x5 a TODAS las cuentas sin beneficio real. El dedupe
+// por-escalon (jsonb sla_avisos + Set en memoria) evita reenviar. NO crear carga global.
 setInterval(revisarAvisosInternos, 5 * 60 * 1000);
 setTimeout(revisarAvisosInternos, 95 * 1000); // primera corrida ~95s tras arrancar
 setInterval(enviarReportesProgramados, 60 * 60 * 1000); // reportes programados: chequear cada hora
@@ -5717,6 +6035,37 @@ async function _equipoParticipantesDepto(ownerId, departamentoId) {
   return Object.keys(set);
 }
 
+// auth_user_id de TODOS los usuarios del tenant (canal "Todos"): el dueno + todos los asesores con login
+// (auth_user_id no nulo) que NO sean bots IA (es_ia !== true). Mismo aislamiento por tenant (admin_id=ownerId)
+// y misma defensa que _equipoParticipantesDepto (si la columna es_ia no existe, reintenta sin ella).
+async function _equipoParticipantesGeneral(ownerId) {
+  const set = {};
+  set[ownerId] = true; // el dueno siempre participa del canal general de su cuenta
+  let ases = null;
+  try {
+    const r = await supabase.from('asesores').select('auth_user_id, es_ia').eq('admin_id', ownerId);
+    if (r.error) throw r.error;
+    ases = r.data;
+  } catch (eIa) {
+    const r2 = await supabase.from('asesores').select('auth_user_id').eq('admin_id', ownerId);
+    ases = r2.data;
+  }
+  (ases || []).forEach(function(a){ if (a && a.auth_user_id && a.es_ia !== true) set[a.auth_user_id] = true; });
+  return Object.keys(set);
+}
+
+// Obtiene (o crea) el canal grupal "Todos" del tenant (uno por cuenta). Devuelve el thread o null.
+async function _equipoThreadGeneral(ownerId) {
+  const { data: ex } = await supabase.from('team_threads').select('*')
+    .eq('admin_id', ownerId).eq('tipo', 'general').maybeSingle();
+  if (ex) return ex;
+  const { data: nuevo, error } = await supabase.from('team_threads')
+    .insert({ admin_id: ownerId, tipo: 'general', departamento_id: null, participantes: null })
+    .select('*').single();
+  if (error) return null;
+  return nuevo;
+}
+
 // Obtiene (o crea) el canal grupal de un departamento. Devuelve el thread o null.
 async function _equipoThreadDepto(ownerId, departamentoId) {
   const { data: ex } = await supabase.from('team_threads').select('*')
@@ -5749,6 +6098,7 @@ async function _equipoThreadDm(ownerId, authA, authB) {
 // Verifica que `authUserId` participe del thread (autorizacion por mensaje). Devuelve bool.
 async function _equipoEsParticipante(ident, thread) {
   if (!thread || thread.admin_id !== ident.ownerId) return false; // aislamiento de tenant
+  if (thread.tipo === 'general') return true; // canal "Todos": cualquier usuario del tenant participa
   if (thread.tipo === 'dm') return (thread.participantes || []).indexOf(ident.authUserId) >= 0;
   if (thread.tipo === 'departamento') {
     if (ident.esDueno) return true;
@@ -5795,7 +6145,10 @@ app.get('/api/equipo/threads', async function(req, res) {
     const { data: dms } = await supabase.from('team_threads').select('*')
       .eq('admin_id', ident.ownerId).eq('tipo', 'dm').contains('participantes', [ident.authUserId]);
 
-    const threads = canales.concat(dms || []);
+    // Canal "Todos" del tenant (uno por cuenta, todos los usuarios participan). Va primero en la lista.
+    let general = null;
+    try { general = await _equipoThreadGeneral(ident.ownerId); } catch (eG) { general = null; }
+    const threads = (general ? [general] : []).concat(canales, dms || []);
     if (!threads.length) return res.json({ ok: true, threads: [], esDueno: ident.esDueno, sin_departamentos: sinDepartamentos });
 
     // 3) Resolver nombres de los "otros" en DMs (mapa auth_user_id -> nombre).
@@ -5828,7 +6181,9 @@ app.get('/api/equipo/threads', async function(req, res) {
         .neq('sender_auth_user_id', ident.authUserId)
         .not('leido_por', 'cs', '{' + ident.authUserId + '}');
       let nombre = '', otroAuth = null;
-      if (t.tipo === 'departamento') {
+      if (t.tipo === 'general') {
+        nombre = 'Todos';
+      } else if (t.tipo === 'departamento') {
         nombre = nombresDepto[t.departamento_id] || 'Departamento';
       } else {
         otroAuth = (t.participantes || []).find(function(p){ return p !== ident.authUserId; }) || null;
@@ -5950,14 +6305,24 @@ app.post('/api/equipo/avisos-config', async function(req, res) {
     const b = (req.body && req.body.config && typeof req.body.config === 'object') ? req.body.config : (req.body || {});
     const lc = (b.lead_caliente && typeof b.lead_caliente === 'object') ? b.lead_caliente : {};
     const rs = (b.resumen && typeof b.resumen === 'object') ? b.resumen : {};
+    const sh = (b.sla_humano && typeof b.sla_humano === 'object') ? b.sla_humano : {};
     let _min = Number(lc.minutos); if (!(_min > 0 && _min <= 240)) _min = 20;
     let _hora = (typeof rs.hora === 'string' && /^\d{1,2}:\d{2}$/.test(rs.hora.trim())) ? rs.hora.trim() : '20:00';
     // Normalizar la hora a HH:MM (2 digitos) por prolijidad.
     const _hp = _hora.split(':'); _hora = ('0' + (parseInt(_hp[0], 10) || 0)).slice(-2) + ':' + ('0' + (parseInt(_hp[1], 10) || 0)).slice(-2);
+    // SLA humano: 3 escalones en minutos (1..600). Defaults 30/60/90.
+    let _p1 = Number(sh.paso1); if (!(_p1 >= 1 && _p1 <= 600)) _p1 = 30;
+    let _p2 = Number(sh.paso2); if (!(_p2 >= 1 && _p2 <= 600)) _p2 = 60;
+    let _p3 = Number(sh.paso3); if (!(_p3 >= 1 && _p3 <= 600)) _p3 = 90;
+    // FIX #7: la escalada SLA (revisarAvisosInternos #4) ASUME orden ascendente: resuelve el escalon mas alto con
+    // if (espera>=p3) ... else if (>=p2) ... else if (>=p1). Si el dueno guarda p1/p2/p3 desordenados (ej. 90/60/30),
+    // p2/p3 nunca dispararian. NORMALIZAMOS reordenando ascendente para garantizar paso1<=paso2<=paso3.
+    { const _ord = [_p1, _p2, _p3].sort(function(a, b){ return a - b; }); _p1 = _ord[0]; _p2 = _ord[1]; _p3 = _ord[2]; }
     const config = {
       no_resuelve: b.no_resuelve === true,
       lead_caliente: { on: lc.on === true, minutos: _min },
-      resumen: { on: rs.on === true, hora: _hora }
+      resumen: { on: rs.on === true, hora: _hora },
+      sla_humano: { on: sh.on === true, paso1: _p1, paso2: _p2, paso3: _p3 }
     };
     const { error } = await supabase.from('business_settings').update({ avisos_internos: config }).eq('user_id', ident.ownerId);
     if (error) {
@@ -6111,7 +6476,7 @@ app.get('/api/equipo/mensajes', async function(req, res) {
 // Lee la config de avisos del tenant, SIEMPRE defensiva. Devuelve SIEMPRE un objeto
 // con la forma esperada y todo OFF si la columna/keys no existen.
 async function _avisosConfig(ownerId) {
-  const def = { no_resuelve: false, lead_caliente: { on: false, minutos: 20 }, resumen: { on: false, hora: '20:00' } };
+  const def = { no_resuelve: false, lead_caliente: { on: false, minutos: 20 }, resumen: { on: false, hora: '20:00' }, sla_humano: { on: false, paso1: 30, paso2: 60, paso3: 90 } };
   try {
     if (!ownerId) return def;
     let raw = null;
@@ -6122,12 +6487,18 @@ async function _avisosConfig(ownerId) {
     if (!raw || typeof raw !== 'object') return def;
     const lc = (raw.lead_caliente && typeof raw.lead_caliente === 'object') ? raw.lead_caliente : {};
     const rs = (raw.resumen && typeof raw.resumen === 'object') ? raw.resumen : {};
+    const sh = (raw.sla_humano && typeof raw.sla_humano === 'object') ? raw.sla_humano : {};
     let _min = Number(lc.minutos); if (!(_min > 0 && _min <= 240)) _min = 20;
     let _hora = (typeof rs.hora === 'string' && /^\d{1,2}:\d{2}$/.test(rs.hora.trim())) ? rs.hora.trim() : '20:00';
+    // SLA humano: 3 escalones en minutos (1..600). Defaults 30/60/90. Validacion defensiva por-escalon.
+    let _p1 = Number(sh.paso1); if (!(_p1 >= 1 && _p1 <= 600)) _p1 = 30;
+    let _p2 = Number(sh.paso2); if (!(_p2 >= 1 && _p2 <= 600)) _p2 = 60;
+    let _p3 = Number(sh.paso3); if (!(_p3 >= 1 && _p3 <= 600)) _p3 = 90;
     return {
       no_resuelve: raw.no_resuelve === true,
       lead_caliente: { on: lc.on === true, minutos: _min },
-      resumen: { on: rs.on === true, hora: _hora }
+      resumen: { on: rs.on === true, hora: _hora },
+      sla_humano: { on: sh.on === true, paso1: _p1, paso2: _p2, paso3: _p3 }
     };
   } catch (e) { return def; }
 }
@@ -6153,7 +6524,11 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto) {
     const senderId = await _avisoRemitente(ownerId);
     let thread = null;
     let destinatarios = [];
-    if (departamentoId) {
+    if (departamentoId === 'general') {
+      // Canal "Todos" del tenant (sentinela). Postea al thread general + push a TODOS los usuarios con login.
+      thread = await _equipoThreadGeneral(ownerId);
+      destinatarios = await _equipoParticipantesGeneral(ownerId); // dueno + todos los asesores humanos
+    } else if (departamentoId) {
       thread = await _equipoThreadDepto(ownerId, departamentoId);
       destinatarios = await _equipoParticipantesDepto(ownerId, departamentoId); // incluye al dueno; excluye bots es_ia
     }
@@ -6430,6 +6805,11 @@ app.post('/api/equipo/enviar', async function(req, res) {
       destinatarios = (thread.participantes || []).filter(function(p){ return p && p !== ident.authUserId; });
     } else if (thread.tipo === 'departamento') {
       destinatarios = await _equipoParticipantesDepto(ident.ownerId, thread.departamento_id);
+      destinatarios = destinatarios.filter(function(p){ return p && p !== ident.authUserId; });
+    } else if (thread.tipo === 'general') {
+      // FIX #6: canal "Todos". Antes los destinatarios quedaban vacios (no se pusheaba a nadie al postear en general).
+      // Participantes del canal general = dueno + todos los asesores humanos del tenant; excluimos al remitente.
+      destinatarios = await _equipoParticipantesGeneral(ident.ownerId);
       destinatarios = destinatarios.filter(function(p){ return p && p !== ident.authUserId; });
     }
     // Dedupe
@@ -11503,6 +11883,18 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
 
     // Tope de mensajes IA del plan (mismo gate que WA). Si no entra en el tope, no responde.
     try { if (!(await dentroDelTopeIA(tenantUserId))) return; } catch (e) {}
+
+    // FIX #5: TOPE NOCTURNO tambien en el canal Meta (Messenger/IG). Mismo gate e idempotencia que el webhook WA
+    // (~server.js:3850): solo aplica FUERA del horario de oficina y solo si el dueno configuro el cupo. Sin config
+    // => inerte. Frena la respuesta de la IA cuando la cuenta supero su cupo nocturno (acota gasto de las noches sin
+    // humanos). FAIL-OPEN: ante error no corta. 0 IA (solo lee/escribe DB). Mismo patron: avisar al lead + contar.
+    try {
+      if (!(await dentroDelTopeNocturno(tenantUserId))) {
+        try { await enviarMensajeMeta(creds.page_access_token, senderId, 'En este momento estamos fuera del horario de atencion. Un asesor te responde a la brevedad apenas se conecte. Gracias por escribirnos.'); } catch (eMn) {}
+        return;
+      }
+      try { await registrarMensajeNocturno(tenantUserId); } catch (eRn) {}
+    } catch (eTn) { console.error('tope nocturno meta:', eTn && eTn.message); }
 
     // 4) Generar la respuesta (agnostico al canal) y enviarla por la Send API de Meta.
     const resultado = await generarRespuestaAgente(tenantUserId, conv.id, texto);

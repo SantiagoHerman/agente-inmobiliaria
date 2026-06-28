@@ -10326,7 +10326,7 @@ app.post('/api/citas', async function(req, res) {
     // Tipos AMPLIADOS: ademas de visita/llamada/reunion, ahora alquiler y alquiler_temporal
     // (eventos con rango: fecha_hora = check-in, fecha_fin = check-out). ADITIVO: si b.tipo
     // no entra en la lista, cae a 'visita' (comportamiento conservador de siempre).
-    var TIPOS_CITA = ['visita','llamada','reunion','alquiler','alquiler_temporal'];
+    var TIPOS_CITA = ['visita','venta','llamada','reunion','alquiler','alquiler_temporal'];
     var tipoCita = (TIPOS_CITA.indexOf(b.tipo) >= 0) ? b.tipo : 'visita';
     var esAlquiler = (tipoCita === 'alquiler' || tipoCita === 'alquiler_temporal');
     var fila = { user_id: ownerId, fecha_hora: fh.toISOString(), tipo: tipoCita, titulo: (b.titulo ? String(b.titulo).slice(0,160) : 'Cita'), estado: 'agendada', notas: (b.notas ? String(b.notas).slice(0,500) : null), lead_nombre: (b.lead_nombre ? String(b.lead_nombre).slice(0,120) : null), lead_telefono: (b.lead_telefono ? String(b.lead_telefono).slice(0,40) : null), asesor_id: asesorCita, contact_id: b.contact_id || null, conversation_id: b.conversation_id || null, origen: 'manual' };
@@ -10381,7 +10381,7 @@ app.post('/api/citas/actualizar', async function(req, res) {
     if (b.fecha_fin) { var ff2 = new Date(b.fecha_fin); if (!isNaN(ff2.getTime())) upd.fecha_fin = ff2.toISOString(); }
     else if (b.fecha_fin === null) upd.fecha_fin = null;
     if (typeof b.unidad === 'string') upd.unidad = b.unidad.slice(0,120);
-    var TIPOS_UPD = ['visita','llamada','reunion','alquiler','alquiler_temporal'];
+    var TIPOS_UPD = ['visita','venta','llamada','reunion','alquiler','alquiler_temporal'];
     if (b.tipo && TIPOS_UPD.indexOf(b.tipo) >= 0) upd.tipo = b.tipo;
     if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
     upd.actualizado_en = new Date().toISOString();

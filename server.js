@@ -10341,6 +10341,10 @@ app.post('/api/citas', async function(req, res) {
     var r = await supabase.from('citas').insert(fila).select('id').single();
     if (r.error) return res.status(500).json({ error: r.error.message });
     var citaId = r.data && r.data.id;
+    // "Creado por": registra QUIEN agendo la cita (auth_user_id del creador). Best-effort
+    // post-insert: si la migracion de la columna aun no corrio, el update no-opea y la cita
+    // YA quedo creada igual (no rompe). Las citas de la IA quedan con creado_por=null + origen='agente'.
+    if (citaId) { try { await supabase.from('citas').update({ creado_por: userId }).eq('id', citaId); } catch (eCp) {} }
     // MOTOR DE TAREAS (cero IA): si es alquiler_temporal y tenemos check-out, generar las
     // tareas de limpieza pre/post y avisar al equipo. Best-effort: si falla, la cita YA
     // quedo creada (no se revierte) y no se devuelve error al usuario.

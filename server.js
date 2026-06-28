@@ -552,27 +552,31 @@ async function dentroDelTopeIA(user_id) {
 // ===== TOPE NOCTURNO (decision d): limite de mensajes IA por cuenta en la franja FUERA de horario de oficina =====
 // Motivo: con la IA atendiendo 24/7, las noches (sin humanos) pueden disparar gasto. Este tope SOLO aplica cuando
 // estamos FUERA del horario de oficina del tenant y SOLO si el dueno lo configuro. CONFIG (la escribe el front):
-//   - business_settings.tope_nocturno_msgs (int): cupo de mensajes IA por noche. 0 / ausente => SIN tope (generoso).
+//   - business_settings.tope_nocturno_msgs (int): cupo de mensajes IA por noche. null / ausente / 0 / invalido => 100 (FRENO por default).
 // El CONTADOR del dia lo maneja SOLO el backend en una jsonb aparte (business_settings.tope_nocturno_uso
-// = { dia: 'YYYY-MM-DD' local AR, usado: int }) para no pisar la config del front. DEFAULT GENEROSO/INERTE:
-// columnas ausentes o cup <= 0 => NO limita (comportamiento actual). 0 IA: solo lee/escribe DB.
+// = { dia: 'YYYY-MM-DD' local AR, usado: int }) para no pisar la config del front. DEFAULT 100 (FRENO):
+// columnas ausentes o cupo <= 0 => tope 100/noche (Diego 2026-06-27). 0 IA: solo lee/escribe DB.
 function _fechaLocalArg() {
   const arg = new Date(Date.now() - 3 * 60 * 60000); // hora AR (leido via getUTC*)
   return arg.toISOString().slice(0, 10);
 }
 async function _leerTopeNocturno(user_id) {
-  // Devuelve { max, dia, usado, horario } o null si no aplica (sin cupo / columnas ausentes).
+  // Devuelve { max, dia, usado, horario }. Diego (2026-06-27): DEFAULT 100 (FRENO de gasto nocturno).
+  // null / undefined / 0-invalido / columna ausente / sin fila -> tope = 100 (sigue frenando). El tope
+  // se APLICA igual que antes (cap fuera de horario); solo cambia el valor por defecto, no la logica.
+  const _DEF_TOPE = 100;
   try {
     let row = null;
     try {
       const { data } = await supabase.from('business_settings').select('tope_nocturno_msgs, tope_nocturno_uso, horario_oficina').eq('user_id', user_id).maybeSingle();
       row = data || null;
     } catch (eCol) {
-      // Columna nueva ausente: reintentar leyendo solo el horario (sin tope nocturno -> inerte).
-      return null;
+      // Columna nueva ausente: igual aplicamos el tope por defecto (sin horario -> dentroDelTopeNocturno fail-open).
+      return { max: _DEF_TOPE, dia: null, usado: 0, horario: null };
     }
-    if (!row) return null;
-    let _max = Number(row.tope_nocturno_msgs); if (!(_max > 0)) return null; // 0 / invalido -> sin limite (generoso)
+    if (!row) return { max: _DEF_TOPE, dia: null, usado: 0, horario: null };
+    const _raw = Number(row.tope_nocturno_msgs);
+    let _max = _raw > 0 ? _raw : _DEF_TOPE; // null / undefined / 0 / invalido -> 100 (default freno)
     const uso = row.tope_nocturno_uso && typeof row.tope_nocturno_uso === 'object' ? row.tope_nocturno_uso : {};
     const _dia = (typeof uso.dia === 'string') ? uso.dia : null;
     const _usado = Number(uso.usado);
@@ -1309,13 +1313,16 @@ async function repartoV2Activo(user_id, bs) {
 // Default OFF: false / ausente / null / columna inexistente -> comportamiento ANTERIOR (oferta de derivacion de la
 // etapa 9c). TRUE -> path nuevo (encolarHandoffFueraHorario). Ante cualquier error -> false (NUNCA romper).
 async function iaFueraHorarioActivo(user_id, bs) {
+  // Diego (2026-06-27): DEFAULT ON. null/undefined/ausente -> ON (path nuevo de fuera-de-horario).
+  // SOLO false explicito apaga (override por-cuenta). Misma forma "default ON" que cobrarTodoV2Activo.
+  // La logica interna del feature NO cambia: sigue agendando el pase para cuando reabre la oficina.
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_fuera_horario')) return bs.ia_fuera_horario === true;
-    if (!user_id) return false;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_fuera_horario')) return bs.ia_fuera_horario !== false;
+    if (!user_id) return true;
     const { data, error } = await supabase.from('business_settings').select('ia_fuera_horario').eq('user_id', user_id).maybeSingle();
-    if (error) return false; // columna ausente u otro error -> flag OFF (comportamiento anterior)
-    return !!(data && data.ia_fuera_horario === true);
-  } catch (e) { return false; }
+    if (error) return true; // columna ausente u otro error -> default ON
+    return data ? (data.ia_fuera_horario !== false) : true;
+  } catch (e) { return true; }
 }
 
 // ===== COBRO v2: FLAG POR-CUENTA cobrar_todo_v2 (mismo patrón defensivo que repartoV2Activo) =====

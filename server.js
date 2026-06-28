@@ -2874,7 +2874,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // Parte ESTATICA del system: identica para el tenant entre mensajes y leads -> se CACHEA con cache_control
   // (prompt caching de Anthropic, ~-90% en relecturas). Los datos del lead (dinamicos) van en un bloque aparte.
   const systemStatic = [
-    'Sos ' + agentName + (agentCargo ? (', ' + agentCargo) : ', asesor/a') + ' de ' + company + ' (rubro: ' + rubro + ').',
+    'Sos ' + agentName + (_vozV2 ? '' : (agentCargo ? (', ' + agentCargo) : ', asesor/a')) + ' de ' + company + ' (rubro: ' + rubro + ').',
         'IDENTIDAD: Sos una persona del equipo. NUNCA digas que sos una inteligencia artificial, un bot, un asistente virtual ni un programa. Si te preguntan que cargo ocupas, si sos una IA, o quien sos, responde con tu nombre (' + agentName + ')' + (agentCargo ? (" y tu cargo (" + agentCargo + ")") : '') + ' de forma natural, sin admitir que sos un sistema.',
         bloqueIAConocimiento, bloqueIANoHacer, bloqueIADatos,
         'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
@@ -2892,9 +2892,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     instruccionIdioma,
     'Respondes consultas de clientes por WhatsApp.',
     _vozV2
-      ? 'Si es el primer mensaje, presentate con naturalidad en el TONO configurado (tu nombre y la inmobiliaria) y engancha la charla desde la primera palabra. NO es obligatorio pedir el nombre del cliente de entrada: si surge solo lo usas, y si no, no pasa nada. Si ya lo dio antes, no lo vuelvas a pedir.'
+      ? 'Si es el primer mensaje, presentate con naturalidad y calidez (tu nombre y la inmobiliaria, sin anunciar tu cargo de forma tiesa) y engancha la charla desde la primera palabra, ESPEJANDO como te escribe el lead (si te escribe relajado y de vos, relajada y de vos; si te escribe formal y de usted, formal pero calida). NO es obligatorio pedir el nombre del cliente de entrada: si surge solo lo usas, y si no, no pasa nada. Si ya lo dio antes, no lo vuelvas a pedir.'
       : 'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Ese saludo y presentacion YA tienen que estar escritos en el TONO configurado (ver mas abajo), desde la primera palabra. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si el tono es cercano/relajado; Sr./Sra. y apellido si el tono es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
-    tono, autonomia, objetivo, largo,
+    (_vozV2 ? '' : tono), autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
     _bloquesInstr.internas,
     // PARTE B (punto 6 / regla 19): cuando NO sabes resolver algo, NO inventes. Si es info que el dueno podria

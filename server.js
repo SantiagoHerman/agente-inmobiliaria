@@ -688,6 +688,13 @@ async function registrarMensajeNocturno(user_id) {
 // En CUALQUIER otro caso (flag apagado, cortesia, grandfathered, trial, active, sin certeza) -> false.
 async function debeBloquearAcceso(user_id) {
   try {
+    // FIX (Anton, cortesia): si el que pide es un ASESOR (tiene fila en asesores), el estado de suscripcion/bloqueo
+    // es el del DUEÑO (admin_id), no el suyo — el asesor NO tiene suscripcion propia. Sin esto, el guardian global
+    // (~L130) y todas las rutas devolvian 403 y el asesor no podia enviar ni interactuar. Dueño = sin fila -> queda igual.
+    try {
+      const _yoB = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
+      if (_yoB && _yoB.data && _yoB.data.admin_id) user_id = _yoB.data.admin_id;
+    } catch (eAse) { /* sin fila -> es el dueño, user_id queda igual */ }
     // PAPELERA (aditivo, independiente de las suscripciones): si el cliente fue eliminado
     // (business_settings.eliminado_at NOT NULL) no puede usar la app, este la funcion de
     // suscripciones encendida o no. Degrada bien si la columna aun no existe (select falla -> no bloquea por esto).

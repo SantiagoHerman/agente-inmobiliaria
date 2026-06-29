@@ -6960,7 +6960,7 @@ app.post('/api/equipo/avisos-config', async function(req, res) {
       no_resuelve: b.no_resuelve === true,
       lead_caliente: { on: lc.on === true, minutos: _min },
       resumen: { on: rs.on === true, hora: _hora },
-      sla_humano: { on: sh.on === true, paso1: _p1, paso2: _p2, paso3: _p3 }
+      sla_humano: { on: sh.on !== false, paso1: _p1, paso2: _p2, paso3: _p3 }
     };
     const { error } = await supabase.from('business_settings').update({ avisos_internos: config }).eq('user_id', ident.ownerId);
     if (error) {
@@ -7114,7 +7114,7 @@ app.get('/api/equipo/mensajes', async function(req, res) {
 // Lee la config de avisos del tenant, SIEMPRE defensiva. Devuelve SIEMPRE un objeto
 // con la forma esperada y todo OFF si la columna/keys no existen.
 async function _avisosConfig(ownerId) {
-  const def = { no_resuelve: false, lead_caliente: { on: false, minutos: 20 }, resumen: { on: false, hora: '20:00' }, sla_humano: { on: false, paso1: 30, paso2: 60, paso3: 90 } };
+  const def = { no_resuelve: false, lead_caliente: { on: false, minutos: 20 }, resumen: { on: false, hora: '20:00' }, sla_humano: { on: true, paso1: 30, paso2: 60, paso3: 90 } };
   try {
     if (!ownerId) return def;
     let raw = null;
@@ -7136,7 +7136,7 @@ async function _avisosConfig(ownerId) {
       no_resuelve: raw.no_resuelve === true,
       lead_caliente: { on: lc.on === true, minutos: _min },
       resumen: { on: rs.on === true, hora: _hora },
-      sla_humano: { on: sh.on === true, paso1: _p1, paso2: _p2, paso3: _p3 }
+      sla_humano: { on: sh.on !== false, paso1: _p1, paso2: _p2, paso3: _p3 }
     };
   } catch (e) { return def; }
 }

@@ -6296,7 +6296,12 @@ setTimeout(hacerBackup, 90 * 1000);
 function _camposUsuarioNuevos(b) {
   const out = {};
   if (['conectado', 'pausa', 'no_recibe'].indexOf(b.disponibilidad) >= 0) out.disponibilidad = b.disponibilidad;
-  if (Array.isArray(b.visibilidad)) out.visibilidad = b.visibilidad.filter(function(v){ return ['propias', 'departamento', 'generales'].indexOf(v) >= 0; });
+  if (Array.isArray(b.visibilidad)) {
+    out.visibilidad = b.visibilidad.filter(function(v){ return ['propias', 'departamento', 'generales'].indexOf(v) >= 0; });
+    // Sincronizar el `rol` LEGACY con la visibilidad: admin = ve-todo ('generales'). Asi, sacar "Todos" desde el
+    // formulario efectivamente le quita la condicion de admin (varios checks del FRONT todavia miran rol==='administrador').
+    out.rol = (out.visibilidad.indexOf('generales') >= 0) ? 'administrador' : 'asesor';
+  }
   // PARTE A (correccion 8): aceptar tambien el modo '24-7' (siempre disponible) ademas de oficina/personalizado.
   if (['oficina', 'personalizado', '24-7'].indexOf(b.horario_modo) >= 0) out.horario_modo = b.horario_modo;
   if (b.horario_json && typeof b.horario_json === 'object') out.horario_json = b.horario_json;

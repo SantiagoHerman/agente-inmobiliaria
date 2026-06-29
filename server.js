@@ -6091,7 +6091,7 @@ async function _enviarRecontactosV2(ahoraMs) {
       // --- Candidatas de esta cuenta en estado recontacto ---
       const { data: convs } = await supabase
         .from('conversations')
-        .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido')
+        .select('id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido')
         .eq('user_id', uid)
         .eq('status', 'recontacto');
       if (!convs || convs.length === 0) continue;
@@ -6122,7 +6122,9 @@ async function _enviarRecontactosV2(ahoraMs) {
           .limit(1)
           .maybeSingle();
         if (ultimoRec && ultimoRec.enviado_at) {
-          if ((ahoraMs - new Date(ultimoRec.enviado_at).getTime()) < UN_DIA_MS) continue;
+          // Respeta la FRECUENCIA por-lead (semanal/cada10/cada15/mensual): no recontacta antes de ese gap (ademas del warm-up/goteo).
+          const _freqDias = ({ semanal: 7, cada10: 10, cada15: 15, mensual: 30 })[conv.recontacto_frecuencia] || 7;
+          if ((ahoraMs - new Date(ultimoRec.enviado_at).getTime()) < (_freqDias * UN_DIA_MS)) continue;
         }
         // GRACIA a contactos nuevos (sin recontacto previo): 48hs para frios, 24hs para viejos.
         if (!ultimoRec && conv.created_at) {

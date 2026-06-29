@@ -10981,6 +10981,14 @@ app.get('/api/suscripcion', async function(req, res) {
   try {
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // FIX (Anton, cortesia): si quien pide es un ASESOR (tiene fila en asesores), la suscripcion/estado es la del
+    // DUEÑO (admin_id), no la suya — el asesor NO tiene suscripcion propia. Sin esto, un asesor de una cuenta en
+    // cortesia/activa recibia bloqueado:true y el login lo frenaba con "El servicio no esta activo". El dueño no
+    // tiene fila en asesores -> user_id queda igual.
+    try {
+      var _yoSub = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
+      if (_yoSub && _yoSub.data && _yoSub.data.admin_id) user_id = _yoSub.data.admin_id;
+    } catch (e) { /* sin fila -> es el dueño, user_id queda igual */ }
     var sub = await getSubscription(user_id);
     var plan = await planActual(user_id);
     var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];

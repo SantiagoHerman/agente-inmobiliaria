@@ -12487,19 +12487,14 @@ app.post('/api/conversations/eliminar', async function(req, res){
     // 2) Resolver identidad + AISLAMIENTO POR TENANT + SOLO ADMINISTRADOR (mismo patron que /cerrar y esAdministrador).
     //    DUEÑO: auth_user_id === user_id del tenant y SIN fila en asesores -> es admin.
     //    ASESOR: debe ser de la MISMA cuenta (admin_id === tenant) Y tener visibilidad 'generales' (esAdministrador()).
+    // PERMISO (decision Diego 2026-06-29): borrar un lead = SOLO el DUEÑO de la cuenta (administrador UNICO).
+    // Un usuario con visibilidad 'generales' ("Todos") VE todo pero YA NO puede borrar. Dueño = auth_user_id === tenant Y SIN fila en asesores.
     var esAdmin = false;
     if (uid === tenantId) {
-      // Podria ser el dueño, o un asesor cuyo auth_user_id coincide. Chequeamos si hay fila de asesor.
-      var aSelf = await supabase.from('asesores').select('admin_id, rol, visibilidad').eq('auth_user_id', uid).maybeSingle();
-      if (!aSelf.data) { esAdmin = true; }                                  // dueño puro
-      else { esAdmin = (aSelf.data.admin_id === tenantId || !aSelf.data.admin_id) && esAdministrador(aSelf.data); }
-    } else {
-      var a = await supabase.from('asesores').select('admin_id, rol, visibilidad').eq('auth_user_id', uid).maybeSingle();
-      // Aislamiento: el asesor debe pertenecer a este tenant. Solo-admin: visibilidad 'generales'.
-      if (!a.data || a.data.admin_id !== tenantId) return res.status(403).json({ error: 'No autorizado' });
-      esAdmin = esAdministrador(a.data);
+      var aSelf = await supabase.from('asesores').select('id').eq('auth_user_id', uid).maybeSingle();
+      if (!aSelf.data) esAdmin = true; // dueño puro (sin fila en asesores)
     }
-    if (!esAdmin) return res.status(403).json({ error: 'Solo un administrador puede eliminar un lead' });
+    if (!esAdmin) return res.status(403).json({ error: 'Solo el administrador (dueño de la cuenta) puede eliminar un lead' });
 
     // 3) HARD DELETE respetando FKs, SCOPEADO a esta conversacion / contacto (nunca de mas).
     //    Hijas que referencian la conversacion (best-effort por tabla; messages es critica).

@@ -6366,10 +6366,10 @@ app.post('/api/asesores/crear', async (req, res) => {
       if (!usuario || !clave) return res.status(400).json({ error: 'Faltan datos' });
     }
     // PARTE A (punto 10 - migracion rol-administrador, defensivo): el front YA NO envia `rol`. Si llega
-    // (retrocompat) se respeta y valida; si NO llega, `rol` queda en null y la "capacidad administrador"
-    // se deriva de la visibilidad ('generales' = ver-todo). El rol queda como columna legacy de solo-lectura.
+    // (retrocompat) se respeta y valida; si NO llega, `rol` cae a 'asesor' (default legacy: la columna
+    // asesores.rol sigue siendo NOT NULL). La "capacidad administrador" se deriva de la visibilidad ('generales').
     if (rol && rol !== 'asesor' && rol !== 'administrador' && rol !== 'empleado') return res.status(400).json({ error: 'Rol invalido (debe ser asesor, administrador o empleado)' });
-    const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : (rol === 'asesor' ? 'asesor' : null));
+    const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : 'asesor');
     // Limite de usuarios por admin: sale del plan vigente (PLAN_LIMITS[plan].asesores), salvo override por cliente
     // (limits_override.asesores, seteable desde el Maestro) que MANDA si es un numero > 0. Soporta Infinity (no bloquea).
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);

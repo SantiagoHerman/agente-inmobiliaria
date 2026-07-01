@@ -7058,6 +7058,72 @@ app.post('/api/instrucciones-agente', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============ PERFILES DE INSTRUCCIONES (ADITIVO) ============
+// NO toca instrucciones_agente (= perfil "Agente principal", lo que el cliente ya cargo). Los perfiles EXTRA viven en
+// business_settings.instruccion_perfiles (jsonb array [{id,nombre,items,updated_at}]) + perfil_activo_id (null = Agente principal).
+// GET  /api/instrucciones-perfiles           -> { ok, perfiles:[{id,nombre,count,updated_at}], activo_id }
+// GET  /api/instrucciones-perfiles?id=XXX     -> { ok, items:[...], nombre }  (para editar ese perfil)
+// POST /api/instrucciones-perfiles { accion, ... }: guardar{id?,nombre,items} | renombrar{id,nombre} | eliminar{id} | activar{id|null}
+// Solo el dueño. Defensivo si falta migrar (columna ausente -> lista vacia, no rompe).
+app.get('/api/instrucciones-perfiles', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede ver esta configuración' });
+    const r = await supabase.from('business_settings').select('instruccion_perfiles, perfil_activo_id').eq('user_id', ident.ownerId).maybeSingle();
+    if (r.error) return res.json({ ok: true, perfiles: [], activo_id: null }); // sin migrar -> vacio (no rompe)
+    const arr = (r.data && Array.isArray(r.data.instruccion_perfiles)) ? r.data.instruccion_perfiles : [];
+    if (req.query && req.query.id) {
+      const p = arr.find(function(x){ return String(x.id) === String(req.query.id); });
+      return res.json({ ok: true, items: (p && Array.isArray(p.items)) ? p.items : [], nombre: p ? p.nombre : null });
+    }
+    const perfiles = arr.map(function(p){ return { id: String(p.id), nombre: String(p.nombre || 'Perfil'), count: (p.items && Array.isArray(p.items)) ? p.items.length : 0, updated_at: p.updated_at || null }; });
+    return res.json({ ok: true, perfiles: perfiles, activo_id: (r.data && r.data.perfil_activo_id) || null });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+app.post('/api/instrucciones-perfiles', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede cambiar esta configuración' });
+    const b = req.body || {};
+    const r0 = await supabase.from('business_settings').select('instruccion_perfiles, perfil_activo_id').eq('user_id', ident.ownerId).maybeSingle();
+    if (r0.error) return res.status(409).json({ error: 'Falta migrar (instruccion_perfiles). Corré la migración e intentá de nuevo.' });
+    let arr = (r0.data && Array.isArray(r0.data.instruccion_perfiles)) ? r0.data.instruccion_perfiles.slice() : [];
+    let activo = (r0.data && r0.data.perfil_activo_id) || null;
+    if (b.accion === 'guardar') {
+      const nombre = String(b.nombre || '').trim().slice(0, 80);
+      if (!nombre) return res.status(400).json({ error: 'Falta el nombre del perfil' });
+      const raw = Array.isArray(b.items) ? b.items : [];
+      const items = raw.slice(0, 200).map(function(it, i){ return { id: (it && it.id) ? String(it.id).slice(0,80) : ('it-'+i), categoria: (it && ['comportamiento','rubro','interna'].indexOf(it.categoria)>=0) ? it.categoria : 'interna', texto: (it && typeof it.texto==='string') ? it.texto.slice(0,4000) : '', activo: !(it && it.activo===false), es_sistema: !!(it && it.es_sistema===true), orden: (it && typeof it.orden==='number') ? it.orden : i }; }).filter(function(x){ return x.texto && x.texto.trim(); });
+      if (b.id) {
+        const idx = arr.findIndex(function(p){ return String(p.id) === String(b.id); });
+        const rec = { id: String(b.id), nombre: nombre, items: items, updated_at: new Date().toISOString() };
+        if (idx >= 0) arr[idx] = rec; else arr.push(rec);
+      } else {
+        if (arr.length >= 50) return res.status(400).json({ error: 'Máximo 50 perfiles' });
+        arr.push({ id: 'perf-' + Math.random().toString(36).slice(2, 10), nombre: nombre, items: items, updated_at: new Date().toISOString() });
+      }
+    } else if (b.accion === 'renombrar') {
+      const idx = arr.findIndex(function(p){ return String(p.id) === String(b.id); });
+      if (idx < 0) return res.status(404).json({ error: 'Perfil no encontrado' });
+      arr[idx].nombre = String(b.nombre || '').trim().slice(0, 80) || arr[idx].nombre;
+    } else if (b.accion === 'eliminar') {
+      arr = arr.filter(function(p){ return String(p.id) !== String(b.id); });
+      if (activo && String(activo) === String(b.id)) activo = null;
+    } else if (b.accion === 'activar') {
+      if (!b.id) activo = null;
+      else { if (!arr.some(function(p){ return String(p.id) === String(b.id); })) return res.status(404).json({ error: 'Perfil no encontrado' }); activo = String(b.id); }
+    } else {
+      return res.status(400).json({ error: 'accion invalida' });
+    }
+    const { error } = await supabase.from('business_settings').update({ instruccion_perfiles: arr, perfil_activo_id: activo }).eq('user_id', ident.ownerId);
+    if (error) return res.status(409).json({ error: 'No se pudo guardar: ' + (error.message || 'error de esquema') });
+    const perfiles = arr.map(function(p){ return { id: String(p.id), nombre: String(p.nombre||'Perfil'), count: (p.items&&Array.isArray(p.items))?p.items.length:0, updated_at: p.updated_at||null }; });
+    return res.json({ ok: true, perfiles: perfiles, activo_id: activo });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // GET /api/equipo/mensajes?thread_id=... -> mensajes de un hilo (solo si el usuario participa).
 app.get('/api/equipo/mensajes', async function(req, res) {
   try {

@@ -378,7 +378,17 @@ function _rubroKey(rubro) {
 // Si el cliente ya guardo su personalizacion (settings.instrucciones_agente.items) usa esa (garantizando protegidas
 // presentes + activas). Si no, devuelve los DEFAULTS (sembrando la interna desde el viejo settings.instructions).
 function instruccionesAgenteItems(settings, rubro) {
-  const stored = settings && settings.instrucciones_agente;
+  // PERFIL ACTIVO (Fase 3): si el cliente activó un perfil guardado (perfil_activo_id) y existe en instruccion_perfiles
+  // con items, la IA usa ESE set. Si no (null / no encontrado / sin migrar) -> comportamiento de SIEMPRE
+  // (instrucciones_agente = "Agente principal"). DEFENSIVO: con perfil_activo_id null NADA cambia para el cliente.
+  let stored = settings && settings.instrucciones_agente;
+  try {
+    const _pa = settings && settings.perfil_activo_id;
+    if (_pa && Array.isArray(settings.instruccion_perfiles)) {
+      const _perfil = settings.instruccion_perfiles.find(function(p){ return p && String(p.id) === String(_pa); });
+      if (_perfil && Array.isArray(_perfil.items) && _perfil.items.length) stored = { items: _perfil.items };
+    }
+  } catch (e) { /* fallback: Agente principal */ }
   if (stored && Array.isArray(stored.items) && stored.items.length) {
     const items = stored.items.map(function(it, i) {
       return {

@@ -1395,6 +1395,30 @@ async function repartoV2Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== FLAG POR-CUENTA consulta_dueno_activa (DESACOPLA el ciclo de aprendizaje de reparto_v2) =====
+// Mismo patron defensivo que repartoV2Activo. DEFAULT OFF: false / null / ausente / columna inexistente ->
+// false (comportamiento ACTUAL EXACTO). Habilita el ciclo "consultar_al_dueno" (tool + relay de respuesta al
+// lead + variante fuera-de-horario) SIN necesidad de encender reparto_v2. Ante cualquier error -> false.
+async function consultaDuenoActiva(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'consulta_dueno_activa')) return bs.consulta_dueno_activa === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('consulta_dueno_activa').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> flag OFF (actual)
+    return !!(data && data.consulta_dueno_activa === true);
+  } catch (e) { return false; }
+}
+
+// GATE UNICO del ciclo de aprendizaje/consulta-al-dueno: (consulta_dueno_activa OR reparto_v2). Con AMBOS OFF
+// devuelve false => NADA del ciclo corre (comportamiento ACTUAL EXACTO). Reusa un bs ya cargado si lo trae
+// (evita queries extra). Ante cualquier error -> false (NUNCA romper).
+async function cicloAprendizajeActivo(user_id, bs) {
+  try {
+    if (await consultaDuenoActiva(user_id, bs)) return true;
+    return await repartoV2Activo(user_id, bs);
+  } catch (e) { return false; }
+}
+
 // ===== FIX #1: FLAG POR-CUENTA ia_fuera_horario (mismo patron defensivo que repartoV2Activo) =====
 // GATE del comportamiento NUEVO de fuera-de-horario: cuando un lead necesita un humano y estamos FUERA del horario
 // de oficina, en vez de derivar a un asesor ausente (offline) la IA le avisa "te respondemos a la brevedad" y AGENDA
@@ -1520,7 +1544,7 @@ const _aprendizajePreguntado = new Set();
 async function registrarConsultaAprendizaje(user_id, conversation_id, pregunta) {
   try {
     if (!user_id || !pregunta || !String(pregunta).trim()) return false;
-    if (!(await repartoV2Activo(user_id))) return false; // GATING: flag OFF -> no corre (ACTUAL EXACTO)
+    if (!(await cicloAprendizajeActivo(user_id))) return false; // GATING: (consulta_dueno_activa || reparto_v2). AMBOS OFF -> no corre (ACTUAL EXACTO)
     const _key = String(conversation_id || '') + '::' + String(pregunta).trim().slice(0, 60).toLowerCase();
     if (_aprendizajePreguntado.has(_key)) return true; // ya preguntado en este proceso
     // Anti-spam persistente: si ya hay una consulta PENDIENTE identica para esta conv, no reabrir.
@@ -1553,6 +1577,33 @@ async function consultaAprendizajePendiente(user_id) {
   } catch (e) { return null; } // tabla ausente u otro error: no hay aprendizaje pendiente
 }
 
+// CONTINUAR LA CONVERSACION: cuando el dueno aclara la duda, ademas de guardar la regla en knowledge_base,
+// le RESPONDEMOS al lead que quedo esperando en la conversacion pendiente. Resolvemos convId -> contacto ->
+// telefono (mismo patron que enviarMensajeFueraHorario) y le mandamos por WhatsApp el texto ya redactado
+// natural, + dejamos un mensaje de SISTEMA en el chat para que se vea en la app. TODO best-effort/defensivo:
+// si falta convId, telefono, o falla el envio, NO rompe el flujo del dueno (la regla ya quedo guardada).
+// NO consume tokens de IA (el texto se arma con la respuesta del dueno + plantilla; 0 llamadas de IA aca).
+async function relayRespuestaAlLead(user_id, conversation_id, textoParaLead) {
+  try {
+    if (!user_id || !conversation_id || !textoParaLead || !String(textoParaLead).trim()) return false;
+    let _telefono = null;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).maybeSingle();
+      if (_cv && _cv.contact_id) {
+        const { data: _ct } = await supabase.from('contacts').select('phone').eq('id', _cv.contact_id).maybeSingle();
+        _telefono = _ct && _ct.phone ? String(_ct.phone).trim() : null;
+      }
+    } catch (eTel) {}
+    const _txt = String(textoParaLead).trim().slice(0, 900);
+    if (_telefono) {
+      try { await enviarWhatsapp(nombreInstancia(user_id), _telefono, _txt); } catch (eWa) { console.error('relay aprendizaje WhatsApp:', eWa && eWa.message); }
+    }
+    // Mensaje de SISTEMA en el chat (aparezca en la app aunque no haya telefono). Best-effort.
+    try { await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'ai', content: _txt, enviado_por: 'Sistema' }); } catch (eMsg) {}
+    return !!_telefono;
+  } catch (e) { console.error('relayRespuestaAlLead:', e && e.message); return false; }
+}
+
 // PASO 3+4: el dueno respondio. VALIDA con 1 llamada de IA (Haiku) si la respuesta es logica/aplicable como regla
 // general o si cruza/afecta datos; segun eso, GUARDA en knowledge_base (estado 'aplicada') o marca 'no_aplicable'.
 // AVISO ROJO: esta es la UNICA llamada de IA del ciclo, y es PUNTUAL (1 por respuesta del dueno, no por mensaje del
@@ -1560,7 +1611,7 @@ async function consultaAprendizajePendiente(user_id) {
 async function procesarRespuestaAprendizaje(user_id, respuestaDueno, instancia, telefono) {
   try {
     if (!user_id || !respuestaDueno || !String(respuestaDueno).trim()) return false;
-    if (!(await repartoV2Activo(user_id))) return false; // GATING
+    if (!(await cicloAprendizajeActivo(user_id))) return false; // GATING: (consulta_dueno_activa || reparto_v2)
     const pend = await consultaAprendizajePendiente(user_id);
     if (!pend) return false; // no hay nada pendiente -> el caller sigue con el flujo normal (reportes)
     // VALIDACION (1 llamada de IA puntual, Haiku barato): ¿es una regla general logica y aplicable, o cruza datos?
@@ -1586,7 +1637,16 @@ async function procesarRespuestaAprendizaje(user_id, respuestaDueno, instancia, 
         _kbId = _kb && _kb.id ? _kb.id : null;
       } catch (eKb) { console.error('aprendizaje guardar KB:', eKb && eKb.message); }
       try { await supabase.from('aprendizaje_ia').update({ respuesta_dueno: String(respuestaDueno).slice(0, 1000), estado: 'aplicada', motivo: null, kb_id: _kbId }).eq('id', pend.id); } catch (eUp) {}
-      try { if (instancia && telefono) await enviarWhatsapp(instancia, telefono, 'Listo, lo guarde como regla para toda la cuenta. El asistente ya lo va a usar. Lo podes ver y editar en la base de conocimiento.'); } catch (eW) {}
+      // CONTINUAR LA CONVERSACION: mandarle al lead que esperaba la respuesta ya redactada natural + mensaje de
+      // sistema en el chat. Best-effort (si no hay conv/telefono, no rompe). 0 tokens de IA (reusa la respuesta).
+      try {
+        const _respLead = String((obj.respuesta_regla || respuestaDueno) || '').trim().slice(0, 700);
+        if (pend.conversation_id && _respLead) {
+          const _textoLead = 'Hola! Ya pude confirmar lo que te habia quedado pendiente: ' + _respLead + ' Cualquier otra cosa que necesites, contame.';
+          await relayRespuestaAlLead(user_id, pend.conversation_id, _textoLead);
+        }
+      } catch (eRelay) { console.error('relay respuesta al lead:', eRelay && eRelay.message); }
+      try { if (instancia && telefono) await enviarWhatsapp(instancia, telefono, 'Listo, lo guarde como regla para toda la cuenta y ya le avise al cliente que estaba esperando. Lo podes ver y editar en la base de conocimiento.'); } catch (eW) {}
     } else {
       // NO aplicable: marcar y avisar el motivo / dar opciones (NO se escribe en knowledge_base).
       const _motivo = String(obj.motivo || 'depende del caso puntual, no sirve como regla general').slice(0, 500);
@@ -2644,7 +2704,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // la IA, en vez de inventar cuando NO sabe, pregunte al dueno. Con flag OFF -> false => la tool NO se ofrece y el
   // comportamiento es el ACTUAL EXACTO. En modoPrueba no aplica (no hay conv real ni dueno a quien preguntar).
   let aprendizajeActivo = false;
-  if (conversation_id && !modoPrueba) { try { aprendizajeActivo = await repartoV2Activo(user_id); } catch (eAp) { aprendizajeActivo = false; } }
+  if (conversation_id && !modoPrueba) { try { aprendizajeActivo = await cicloAprendizajeActivo(user_id); } catch (eAp) { aprendizajeActivo = false; } }
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images').eq('user_id', user_id).eq('activa', true);
@@ -3010,11 +3070,20 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _pregunta = (_toolDueno.input && _toolDueno.input.pregunta) ? String(_toolDueno.input.pregunta).trim() : '';
         // Registrar + avisar al dueno en segundo plano (no bloquea la respuesta al lead). user_id = TENANT (aislamiento).
         if (_pregunta) { registrarConsultaAprendizaje(user_id, conversation_id, _pregunta).catch(function(){}); }
+        // FUERA DE HORARIO: si estamos afuera del horario de oficina de la cuenta, el mensaje al lead cambia a la
+        // variante que pidio Diego (el dueno quizas esta durmiendo): "voy a ver si consigo a alguien del equipo,
+        // apenas lo tenga te confirmo, y si no, a primera hora del otro dia en horario de oficina". DEFENSIVO: solo
+        // si hay horario_oficina cargado y estamos afuera; si no hay horario o falla, se usa la guia normal (actual).
+        let _fueraHorarioD = false;
+        try { _fueraHorarioD = !!(settings && settings.horario_oficina && !dentroHorarioOficina(settings.horario_oficina)); } catch (eFH) { _fueraHorarioD = false; }
+        const _guiaTool = _fueraHorarioD
+          ? 'Consulta registrada y enviada al equipo. IMPORTANTE: estamos FUERA del horario de oficina. Decile al lead con naturalidad que vas a ver si consegues a alguien del equipo para conseguir ese dato, que apenas lo tengas se lo confirmas, y que si no llega a ser hoy, se lo respondes a primera hora del proximo dia habil en horario de oficina. Segui la conversacion normal con lo que si podes responder.'
+          : 'Consulta registrada y enviada al dueno. Decile al lead con naturalidad que estas averiguando ese dato y le confirmas enseguida; segui la conversacion normal con lo que si podes responder.';
         let _textoCierre = '';
         try {
           const _msgsT2 = mensajesParaIA.concat([
             { role: 'assistant', content: completion.content },
-            { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolDueno.id, content: 'Consulta registrada y enviada al dueno. Decile al lead con naturalidad que estas averiguando ese dato y le confirmas enseguida; segui la conversacion normal con lo que si podes responder.' }] }
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolDueno.id, content: _guiaTool }] }
           ]);
           const _c2 = await llamarIAConFailover({ model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsT2 }, 'generarRespuestaAgente:turno2-dueno');
           const _b2 = (_c2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
@@ -3029,7 +3098,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           }
         } catch (eT2) { console.error('segundo turno consultar_al_dueno:', eT2 && eT2.message); }
         const _textoPrevioD = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-        reply = _textoCierre || _textoPrevioD || 'Dejame que lo averiguo con el equipo y te confirmo enseguida.';
+        const _fallbackD = _fueraHorarioD
+          ? 'Justo estamos fuera del horario de atencion. Voy a ver si consigo a alguien del equipo para averiguarlo; apenas lo tenga te confirmo, y si no llega a ser hoy, te respondo a primera hora manana en horario de oficina.'
+          : 'Dejame que lo averiguo con el equipo y te confirmo enseguida.';
+        reply = _textoCierre || _textoPrevioD || _fallbackD;
         if (!usaEmojis) { const _l = quitarEmojis(reply); if (_l) reply = _l; }
         // Guardado/traduccion/persistencia: cae al bloque comun de mas abajo (reusa replyCliente/insert). Saltamos
         // toda la logica de foto. Marcamos que ya tenemos reply para no re-entrar al else.

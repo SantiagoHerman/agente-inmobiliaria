@@ -196,14 +196,39 @@ async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
 // Lee el token del header Authorization, lo valida contra Supabase y
 // devuelve el user_id REAL del token (o null si no hay token valido).
 // Capa 1: definido pero todavia NO aplicado a los endpoints.
+// RESILIENCIA (fix 2026-07-01): validar el JWT por FIRMA LOCAL con la llave publica de Supabase (JWKS, ES256/RS256),
+// en vez de llamar a supabase.auth.getUser() (round-trip al servicio de Auth) en CADA request. Motivo: cuando el Auth
+// (GoTrue) de Supabase se degrada, getUser rechaza tokens VALIDOS con 401 y se cae TODO lo que pasa por el backend
+// (departamentos, suscripcion, etc.). PostgREST nunca se cayo porque valida por firma local -> hacemos lo mismo.
+// jose cachea el JWKS tras la 1ra bajada y maneja rotacion. Fallback DEFENSIVO a getUser SOLO si la validacion local
+// no puede resolver -> nunca somos MENOS robustos que antes. La llave publica no lleva secretos (asimetrica).
+let _joseMod = null, _supaJwks = null;
+async function _getSupaJwks() {
+  if (!_joseMod) _joseMod = await import('jose');
+  if (!_supaJwks) {
+    const _u = (process.env.SUPABASE_URL || '').replace(/\/+$/, '') + '/auth/v1/.well-known/jwks.json';
+    _supaJwks = _joseMod.createRemoteJWKSet(new URL(_u));
+  }
+  return { jose: _joseMod, jwks: _supaJwks };
+}
+
 async function verificarUsuario(req) {
   try {
     const auth = req.headers.authorization || req.headers.Authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
     if (!token) return null;
-    const { data, error } = await supabase.auth.getUser(token);
-    if (error || !data || !data.user) return null;
-    return data.user.id;
+    // 1) Validacion LOCAL por firma (JWKS publico de Supabase, cacheado). NO depende del servicio de Auth.
+    try {
+      const { jose, jwks } = await _getSupaJwks();
+      const { payload } = await jose.jwtVerify(token, jwks, { algorithms: ['ES256', 'RS256'] });
+      if (payload && payload.sub) return payload.sub;
+    } catch (eLocal) { /* cae al fallback defensivo de abajo */ }
+    // 2) Fallback DEFENSIVO (por si el JWKS aun no cargo): getUser. Igual de robusto que el comportamiento previo.
+    try {
+      const { data, error } = await supabase.auth.getUser(token);
+      if (error || !data || !data.user) return null;
+      return data.user.id;
+    } catch (e2) { return null; }
   } catch (e) {
     return null;
   }

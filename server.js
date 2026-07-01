@@ -11504,6 +11504,7 @@ app.post('/api/recarga/checkout', async function(req, res) {
 app.post('/api/maestro/mp-crear-plan-enterprise', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado' });
     if (PLANES_MP.enterprise) return res.json({ ok: true, yaConfigurado: true, id: PLANES_MP.enterprise, aviso: 'Ya hay un plan Enterprise configurado (env MP_PLAN_ENTERPRISE). Para recrearlo, borra esa variable primero.' });
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
@@ -11666,7 +11667,93 @@ function _hashPass(p, salt){ return _cripto.scryptSync(String(p), String(salt), 
 // normal (un re-login cada ~3 meses). Los tokens YA emitidos siguen validos (el secreto no cambia).
 function _maestroToken(){ var _exp = _MAESTRO_SECRET_FROM_ENV ? (3600*24*365*10) : (3600*24*90); var payload=Buffer.from(JSON.stringify({ exp: Math.floor(Date.now()/1000) + _exp })).toString('base64'); var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(payload).digest('hex'); return payload+'.'+sig; }
 function _maestroTokenOk(tok){ try{ if(!tok) return false; var parts=String(tok).split('.'); if(parts.length!==2) return false; var sig=_cripto.createHmac('sha256',MAESTRO_SECRET).update(parts[0]).digest('hex'); if(sig!==parts[1]) return false; var p=JSON.parse(Buffer.from(parts[0],'base64').toString()); return p.exp > Math.floor(Date.now()/1000); }catch(e){ return false; } }
-function maestroAuth(req){ var auth=req.headers.authorization||req.headers.Authorization||''; var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null; return _maestroTokenOk(tok); }
+
+// ===== MAESTRO MULTI-USUARIO (F1) — TOKEN DE EMPLEADO =====
+// Helper NUEVO, NO toca _maestroToken/_maestroTokenOk (super-admin intacto). Firma HMAC con el MISMO MAESTRO_SECRET.
+// El token de empleado lleva t:'emp', el uid del empleado, el jti de la sesion (revocable), las secciones permitidas
+// (snapshot informativo; la AUTORIDAD real vive en la DB via requiereSeccion) y el tope ABSOLUTO como exp.
+function _maestroTokenEmp(uid, jti, secciones, topeAbsMin){
+  var now = Math.floor(Date.now()/1000);
+  var payload = Buffer.from(JSON.stringify({ t:'emp', uid: uid, jti: jti, sec: secciones, iat: now, exp: now + (topeAbsMin||480)*60 })).toString('base64');
+  var sig = _cripto.createHmac('sha256', MAESTRO_SECRET).update(payload).digest('hex');
+  return payload + '.' + sig;
+}
+// Valida firma + exp (tope absoluto) y devuelve el payload (o null). Sirve para tokens 'emp' y 'admin' (los del
+// super-admin actual no llevan .t -> se tratan como 'admin' aguas arriba). NO consulta la DB (eso lo hace requiereSeccion).
+function _maestroIdent(tok){
+  try{
+    if(!tok) return null;
+    var parts = String(tok).split('.'); if(parts.length!==2) return null;
+    var sig = _cripto.createHmac('sha256', MAESTRO_SECRET).update(parts[0]).digest('hex');
+    if(sig !== parts[1]) return null;
+    var p = JSON.parse(Buffer.from(parts[0],'base64').toString());
+    if(!(p.exp > Math.floor(Date.now()/1000))) return null;
+    return p;
+  }catch(e){ return null; }
+}
+
+// maestroAuth EXTENDIDO (Opcion A: minimo diff, sigue SINCRONO).
+// - Token del super-admin (sin .t o t==='admin') -> req._maestroTipo='admin', pasa TODO (comportamiento actual, sin cambios).
+// - Token de empleado (t==='emp') -> adjunta req._maestroEmpPayload y req._maestroTipo='emp'. El ENFORCE real
+//   (sesion viva + inactividad + tope + permiso de seccion) lo hace requiereSeccion() en cada endpoint gateado.
+function maestroAuth(req){
+  var auth=req.headers.authorization||req.headers.Authorization||'';
+  var tok=(auth.indexOf('Bearer ')===0) ? auth.slice(7) : null;
+  var p = _maestroIdent(tok);
+  if(!p) return false;
+  if(!p.t || p.t === 'admin'){ req._maestroTipo = 'admin'; return true; }   // super-admin intacto
+  if(p.t === 'emp'){ req._maestroEmpPayload = p; req._maestroTipo = 'emp'; return true; }
+  return false;
+}
+
+// ===== MAESTRO MULTI-USUARIO (F1) — ENFORCEMENT POR SECCION =====
+// Secciones habilitables. killswitch queda RESTRINGIDO por default (nunca en el preset del alta).
+var MAESTRO_SECCIONES = ['clientes','consumo','soporte','notificaciones','eliminados','claude','killswitch'];
+// Cierra una sesion de empleado (marca revocada). Best-effort: si la tabla no existe, no rompe nada.
+async function _cerrarSesion(jti, motivo){
+  try{ if(!jti) return; await supabase.from('maestro_sesiones').update({ revocada: true, revocada_por: motivo || 'self', revocada_at: new Date().toISOString() }).eq('jti', jti); }catch(e){}
+}
+// requiereSeccion(req, seccion): autoridad server-side. Devuelve NULL si el request puede seguir, o
+// { status, error } si hay que cortar. El super-admin (o req sin payload emp) pasa SIEMPRE (super-admin intacto).
+// Para empleados valida: (1) sesion viva en maestro_sesiones por jti (no revocada, no vencida por tope, no idle),
+// (2) permiso de la seccion leyendo maestro_usuarios.permisos (AUTORIDAD = DB, aplica al instante sin re-login).
+// Refresca last_activity con throttle de 60s. FAIL-SAFE: si faltan las tablas nuevas -> 401 (no da acceso al empleado).
+async function requiereSeccion(req, seccion){
+  try{
+    // Super-admin (token admin) o cualquier request que no sea de empleado: acceso total, sin tocar la DB.
+    if (req._maestroTipo !== 'emp' || !req._maestroEmpPayload) return null;
+    var pay = req._maestroEmpPayload;
+    var jti = pay.jti;
+    if (!jti) return { status: 401, error: 'Sesion invalida' };
+    // 1) Sesion viva.
+    var s = await supabase.from('maestro_sesiones').select('id, maestro_usuario_id, last_activity, expires_at, revocada, inactividad_min').eq('jti', jti).maybeSingle();
+    // FAIL-SAFE: si la tabla no existe (error) o no hay fila -> el empleado NO entra (super-admin no pasa por aca).
+    if (!s || s.error || !s.data) return { status: 401, error: 'Sesion no encontrada' };
+    var ses = s.data;
+    if (ses.revocada === true) return { status: 401, error: 'Sesion cerrada' };
+    var ahora = Date.now();
+    // Tope ABSOLUTO (nunca se refresca): expires_at de la sesion.
+    if (ses.expires_at && new Date(ses.expires_at).getTime() <= ahora) { await _cerrarSesion(jti, 'tope'); return { status: 401, error: 'Sesion expirada (tope)' }; }
+    // 2) Usuario (permisos + inactividad configurada + activo).
+    var u = await supabase.from('maestro_usuarios').select('id, permisos, activo, inactividad_min').eq('id', ses.maestro_usuario_id).maybeSingle();
+    if (!u || u.error || !u.data) return { status: 401, error: 'Usuario no encontrado' };
+    var usr = u.data;
+    if (usr.activo !== true) { await _cerrarSesion(jti, 'baja'); return { status: 401, error: 'Cuenta dada de baja' }; }
+    // Inactividad: last_activity + inactividad_min. Autoridad = el usuario (fallback a la sesion, luego 30).
+    var idleMin = (typeof usr.inactividad_min === 'number' && usr.inactividad_min > 0) ? usr.inactividad_min : ((typeof ses.inactividad_min === 'number' && ses.inactividad_min > 0) ? ses.inactividad_min : 30);
+    var lastAct = ses.last_activity ? new Date(ses.last_activity).getTime() : 0;
+    if (lastAct && (ahora - lastAct) > idleMin * 60 * 1000) { await _cerrarSesion(jti, 'idle'); return { status: 401, error: 'Sesion expirada (inactividad)' }; }
+    // 3) Permiso de seccion. 'base' (undefined/null) = cualquier sesion viva. '__admin__' = solo super-admin (empleado NO).
+    if (seccion === '__admin__') return { status: 403, error: 'Solo el super-admin' };
+    if (seccion) {
+      var permisos = Array.isArray(usr.permisos) ? usr.permisos : [];
+      if (permisos.indexOf(seccion) === -1) return { status: 403, error: 'Sin permiso para la seccion: ' + seccion };
+    }
+    // Refrescar last_activity (throttle 60s para no escribir en cada request).
+    if (!lastAct || (ahora - lastAct) > 60 * 1000) { try{ await supabase.from('maestro_sesiones').update({ last_activity: new Date(ahora).toISOString() }).eq('jti', jti); }catch(eR){} }
+    return null;
+  }catch(e){ return { status: 401, error: 'No autorizado' }; }
+}
 
 // ===== TERMINAL DE CLAUDE (Panel Maestro) — asistente conversacional sobre el FUNCIONAMIENTO del producto =====
 // SOLO el dueño/dev (mismo gate que el resto del Maestro). Reusa el CONOCIMIENTO del agente de soporte. NO ve código
@@ -11677,6 +11764,7 @@ var MAESTRO_OWNER_USER_ID = process.env.MAESTRO_OWNER_USER_ID || '';
 app.post('/api/maestro/claude', async function(req, res) {
   try {
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'claude'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var pregunta = (req.body && req.body.pregunta) ? String(req.body.pregunta).slice(0, 4000) : '';
     if (!pregunta.trim()) return res.status(400).json({ error: 'La consulta esta vacia' });
     var historial = Array.isArray(req.body && req.body.historial) ? req.body.historial : [];
@@ -11745,6 +11833,7 @@ app.get('/api/maestro/2fa/estado', async function(req, res){
 app.post('/api/maestro/2fa/setup', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var cual = _gate2fa(req.body && req.body.cual);
     if (!cual) return res.status(400).json({ error: "cual debe ser 'ingreso' o 'eliminar'" });
     // SEGURIDAD: una vez configurado un gate, NADIE (ni quien entre al Maestro) puede volver a ver ni regenerar
@@ -11776,6 +11865,7 @@ app.post('/api/maestro/2fa/verificar', async function(req, res){
 app.post('/api/maestro/cliente/eliminar', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'eliminados'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = (req.body && req.body.user_id) ? String(req.body.user_id) : '';
     var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
     if (!uid) return res.status(400).json({ error: 'Falta user_id' });
@@ -11791,6 +11881,7 @@ app.post('/api/maestro/cliente/eliminar', async function(req, res){
 app.post('/api/maestro/cliente/restaurar', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'eliminados'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = (req.body && req.body.user_id) ? String(req.body.user_id) : '';
     if (!uid) return res.status(400).json({ error: 'Falta user_id' });
     var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
@@ -11806,6 +11897,7 @@ app.post('/api/maestro/cliente/restaurar', async function(req, res){
 app.post('/api/maestro/cliente/borrar-definitivo', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'eliminados'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = (req.body && req.body.user_id) ? String(req.body.user_id) : '';
     var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
     if (!uid) return res.status(400).json({ error: 'Falta user_id' });
@@ -11868,6 +11960,7 @@ app.post('/api/maestro/login', async function(req, res){
 app.get('/api/maestro/clientes', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     // Pedimos eliminado_at para distinguir ACTIVOS (null) de ELIMINADOS (papelera). Si la columna aun no existe,
     // el select falla -> reintentamos sin ella (degradar bien: todos quedan como activos, eliminado_at=null).
     var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado, eliminado_at');
@@ -11890,6 +11983,7 @@ app.get('/api/maestro/clientes', async function(req, res){
 app.get('/api/maestro/cliente/:id', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.params.id;
     var bs = await supabase.from('business_settings').select('*').eq('user_id', uid).maybeSingle();
     var B = bs.data || {};
@@ -11927,6 +12021,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
 app.post('/api/maestro/cliente/:id/accion', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.params.id;
     var accion = (req.body && req.body.accion) ? String(req.body.accion) : '';
     if (accion === 'pausar' || accion === 'reactivar') {
@@ -12047,6 +12142,7 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
 app.post('/api/maestro/cliente/crear', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var b = req.body || {};
     var email = (b.email ? String(b.email) : '').trim().toLowerCase();
     var company = (b.company ? String(b.company) : '').trim();
@@ -12093,6 +12189,7 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
 app.get('/api/maestro/soporte', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'soporte'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var m = await supabase.from('support_messages').select('*').order('created_at', { ascending: false }).limit(200);
     return res.json({ ok: true, mensajes: m.data || [] });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -12116,6 +12213,7 @@ async function _datosTenant(uid) {
 app.get('/api/maestro/soporte/clientes', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'soporte'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var m = await supabase.from('support_messages').select('*').order('created_at', { ascending: false }).limit(1000);
     var filas = (m && m.data) ? m.data : [];
     // Conteo de respuestas por ticket (best-effort: si la tabla no existe aun, queda en 0).
@@ -12158,6 +12256,7 @@ app.get('/api/maestro/soporte/clientes', async function(req, res){
 app.get('/api/maestro/soporte/pendientes', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'soporte'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var m = await supabase.from('support_messages').select('estado').limit(2000);
     var filas = (m && m.data) ? m.data : [];
     var n = 0;
@@ -12170,6 +12269,7 @@ app.get('/api/maestro/soporte/pendientes', async function(req, res){
 app.get('/api/maestro/soporte/cliente/:uid', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'soporte'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.params.uid;
     var t = await supabase.from('support_messages').select('*').eq('user_id', uid).order('created_at', { ascending: false }).limit(500);
     var tickets = (t && t.data) ? t.data : [];
@@ -12196,6 +12296,7 @@ app.get('/api/maestro/soporte/cliente/:uid', async function(req, res){
 app.post('/api/maestro/soporte/:id/responder', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'soporte'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var resp = (req.body && req.body.respuesta) ? String(req.body.respuesta) : '';
     if (!resp.trim() && !(req.body && req.body.imagen)) return res.status(400).json({ error: 'La respuesta esta vacia' });
     // Leer la fila primero (para tener user_id/telefono/numero disponibles).
@@ -12230,6 +12331,7 @@ app.post('/api/maestro/soporte/:id/responder', async function(req, res){
 app.post('/api/maestro/soporte/respuesta/:rid/editar', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'soporte'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var cuerpo = (req.body && typeof req.body.respuesta === 'string') ? req.body.respuesta : '';
     if (!cuerpo.trim() && !(req.body && req.body.imagen)) return res.status(400).json({ error: 'La respuesta esta vacia' });
     var patch = { cuerpo: cuerpo, editado_at: new Date().toISOString() };
@@ -12245,6 +12347,7 @@ app.post('/api/maestro/soporte/respuesta/:rid/editar', async function(req, res){
 app.post('/api/maestro/cliente/:id/impersonar', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.params.id;
     var u = await supabase.auth.admin.getUserById(uid);
     var email = u && u.data && u.data.user && u.data.user.email;
@@ -12262,6 +12365,7 @@ app.post('/api/maestro/cliente/:id/impersonar', async function(req, res){
 app.post('/api/maestro/cliente/:id/nota', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var nota = (req.body && typeof req.body.nota === 'string') ? req.body.nota : '';
     await supabase.from('admin_notas').upsert({ user_id: req.params.id, nota: nota, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
     return res.json({ ok: true });
@@ -12275,6 +12379,7 @@ app.post('/api/maestro/cliente/:id/nota', async function(req, res){
 app.post('/api/maestro/cliente/:id/rubro', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.params.id;
     var rubroRaw = (req.body && req.body.rubro) ? String(req.body.rubro).trim().toLowerCase() : '';
     // Aceptamos los 3 canonicos + los legacy (compat hacia atras), pero SIEMPRE guardamos el canonico.
@@ -12300,6 +12405,7 @@ app.post('/api/maestro/cliente/:id/rubro', async function(req, res){
 app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.params.id;
     var cv = await supabase.from('conversations').select('id, contact_id, status, last_message, last_role, updated_at').eq('user_id', uid).order('updated_at', { ascending: false }).limit(20);
     var convs = cv.data || [];
@@ -12315,6 +12421,7 @@ app.get('/api/maestro/cliente/:id/conversaciones', async function(req, res){
 app.get('/api/maestro/consumo', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var TOPE_ALERTA_USD = 15;
     var periodo = String((req.query && req.query.periodo) || '30d');
     // 'mes' = ultimos 30 dias (igual que 30d, por simplicidad).
@@ -12367,6 +12474,7 @@ app.get('/api/maestro/consumo', async function(req, res){
 app.get('/api/maestro/notificaciones', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var incluirElim = String((req.query && req.query.incluir_eliminadas) || '0') === '1';
     var q = supabase.from('maestro_notificaciones').select('id, tipo, titulo, cuerpo, ref_user_id, ref_id, severidad, created_at, leida_at, eliminada_at');
     if (!incluirElim) q = q.is('eliminada_at', null);
@@ -12381,6 +12489,7 @@ app.get('/api/maestro/notificaciones', async function(req, res){
 app.post('/api/maestro/notificaciones/:id/leer', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
     await supabase.from('maestro_notificaciones').update({ leida_at: new Date().toISOString() }).eq('id', req.params.id);
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -12390,6 +12499,7 @@ app.post('/api/maestro/notificaciones/:id/leer', async function(req, res){
 app.post('/api/maestro/notificaciones/leer-todas', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
     await supabase.from('maestro_notificaciones').update({ leida_at: new Date().toISOString() }).is('leida_at', null).is('eliminada_at', null);
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -12399,6 +12509,7 @@ app.post('/api/maestro/notificaciones/leer-todas', async function(req, res){
 app.post('/api/maestro/notificaciones/:id/eliminar', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
     await supabase.from('maestro_notificaciones').update({ eliminada_at: new Date().toISOString() }).eq('id', req.params.id);
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -12420,6 +12531,7 @@ app.post('/api/maestro/device-token', async function(req, res){
 app.post('/api/maestro/saldo', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var monto = parseFloat(req.body && req.body.monto);
     if (isNaN(monto)) return res.status(400).json({ error: 'Monto invalido' });
     await supabase.from('superadmin_config').update({ saldo_cargado: monto, saldo_fecha: new Date().toISOString() }).eq('id', 1);
@@ -12434,6 +12546,7 @@ app.post('/api/maestro/saldo', async function(req, res){
 app.post('/api/maestro/pausa-global', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'killswitch'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var activar = !!(req.body && req.body.activar === true);
     var up = await supabase.from('superadmin_config').update({ pausa_global: activar }).eq('id', 1);
     if (up && up.error) return res.status(503).json({ error: 'No se pudo guardar la pausa global (revisa la columna pausa_global en superadmin_config): ' + up.error.message });
@@ -12450,6 +12563,211 @@ app.get('/api/maestro/pausa-global', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     return res.json({ ok: true, pausa_global: _pausaGlobal === true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============================================================================
+// ===== MAESTRO MULTI-USUARIO (F1) — LOGIN DE EMPLEADO + GESTION =============
+// ----------------------------------------------------------------------------
+// Cuentas de empleado con login propio, 2FA OBLIGATORIO (mismo TOTP _totpOk) y
+// permisos por seccion enforced server-side (requiereSeccion). El super-admin
+// (clave MAESTRO + 2FA) NO pasa por aca: sigue con /api/maestro/login intacto.
+// FAIL-SAFE: si faltan las tablas nuevas, todos estos endpoints degradan a error
+// (el empleado no entra) y el super-admin queda igual.
+// ============================================================================
+
+// Helper: normaliza y valida el array de permisos contra MAESTRO_SECCIONES.
+function _normalizarPermisos(arr){
+  if (!Array.isArray(arr)) return [];
+  var out = [];
+  for (var i = 0; i < arr.length; i++) { var s = String(arr[i] || '').trim().toLowerCase(); if (MAESTRO_SECCIONES.indexOf(s) !== -1 && out.indexOf(s) === -1) out.push(s); }
+  return out;
+}
+// Helper: genera una clave temporal fuerte (se muestra UNA sola vez).
+function _claveTemporal(){ return _cripto.randomBytes(12).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 14) + 'A9!'; }
+// Helper: busca un empleado ACTIVO por usuario (case-insensitive). Devuelve la fila o null. Best-effort ante tabla ausente.
+async function _empPorUsuario(usuario){
+  try{ var r = await supabase.from('maestro_usuarios').select('*').ilike('usuario', String(usuario || '')).eq('activo', true).maybeSingle(); if (r && r.error) return { _err: r.error }; return { data: (r && r.data) || null }; }
+  catch(e){ return { _err: e }; }
+}
+
+// ----- LOGIN DE EMPLEADO (3 estados): setup-2FA / pide-codigo / ok+token -----
+// Body: { usuario, clave, codigo? }. Flujo:
+//  1) usuario+clave OK y 2FA NO confirmado aun -> genera/persiste el secreto TOTP y devuelve { estado:'setup-2fa', secret, otpauth }.
+//  2) usuario+clave OK, 2FA confirmado, SIN codigo -> { estado:'pide-codigo' }.
+//  3) usuario+clave OK, 2FA confirmado, CON codigo valido -> crea sesion y devuelve { estado:'ok', token, perfil }.
+app.post('/api/maestro/emp/login', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED) return res.status(404).json({ error: 'no disponible' });
+    var usuario = (req.body && req.body.usuario) ? String(req.body.usuario).trim() : '';
+    var clave = (req.body && req.body.clave) ? String(req.body.clave) : '';
+    var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
+    if (!usuario || !clave) return res.status(400).json({ error: 'Faltan usuario y clave' });
+    var e = await _empPorUsuario(usuario);
+    // FAIL-SAFE: si la tabla no existe (o error) NO revelamos nada -> credenciales invalidas.
+    if (e._err || !e.data) return res.status(403).json({ error: 'Credenciales invalidas' });
+    var u = e.data;
+    if (_hashPass(clave, u.clave_salt) !== u.clave_hash) return res.status(403).json({ error: 'Credenciales invalidas' });
+    // Estado 1: 2FA no confirmado -> setup obligatorio (genera secreto si no hay).
+    if (u.totp_confirmado !== true) {
+      var secret = u.totp_secret;
+      if (!secret) {
+        secret = _secret2fa();
+        var upS = await supabase.from('maestro_usuarios').update({ totp_secret: secret }).eq('id', u.id);
+        if (upS && upS.error) return res.status(503).json({ error: 'No se pudo iniciar el 2FA: ' + upS.error.message });
+      }
+      var otpauth = 'otpauth://totp/RaicesCRM%20Maestro%20(' + encodeURIComponent(usuario) + ')?secret=' + secret + '&issuer=RaicesCRM&period=30&digits=6';
+      return res.json({ ok: true, estado: 'setup-2fa', secret: secret, otpauth: otpauth });
+    }
+    // Estado 2: sin codigo -> pedirlo.
+    if (!codigo) return res.json({ ok: true, estado: 'pide-codigo' });
+    // Estado 3: validar codigo -> crear sesion + token.
+    if (!_totpOk(u.totp_secret, codigo)) return res.status(403).json({ error: 'Codigo invalido' });
+    var jti = _cripto.randomBytes(16).toString('hex');
+    var topeAbs = (typeof u.tope_abs_min === 'number' && u.tope_abs_min > 0) ? u.tope_abs_min : 480;
+    var idle = (typeof u.inactividad_min === 'number' && u.inactividad_min > 0) ? u.inactividad_min : 30;
+    var ahora = new Date();
+    var expira = new Date(ahora.getTime() + topeAbs * 60 * 1000);
+    var permisos = _normalizarPermisos(u.permisos);
+    var insSes = await supabase.from('maestro_sesiones').insert({
+      maestro_usuario_id: u.id, jti: jti, created_at: ahora.toISOString(), last_activity: ahora.toISOString(),
+      expires_at: expira.toISOString(),
+      ip: (req.headers['x-forwarded-for'] || req.ip || '').toString().slice(0, 120),
+      user_agent: (req.headers['user-agent'] || '').toString().slice(0, 300)
+    });
+    if (insSes && insSes.error) return res.status(503).json({ error: 'No se pudo abrir la sesion: ' + insSes.error.message });
+    try { await supabase.from('maestro_usuarios').update({ last_login: ahora.toISOString() }).eq('id', u.id); } catch(eL){}
+    var token = _maestroTokenEmp(u.id, jti, permisos, topeAbs);
+    return res.json({ ok: true, estado: 'ok', token: token, perfil: { usuario: u.usuario, secciones: permisos, inactividad_min: idle, tope_abs_min: topeAbs } });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ----- CONFIRMAR 2FA del empleado (cierra el setup obligatorio) -----
+// Body: { usuario, clave, codigo }. Con el codigo correcto marca totp_confirmado=true. NO emite token
+// (el front vuelve a llamar a /emp/login para el estado 'pide-codigo' -> 'ok').
+app.post('/api/maestro/emp/2fa/confirmar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED) return res.status(404).json({ error: 'no disponible' });
+    var usuario = (req.body && req.body.usuario) ? String(req.body.usuario).trim() : '';
+    var clave = (req.body && req.body.clave) ? String(req.body.clave) : '';
+    var codigo = (req.body && req.body.codigo) ? String(req.body.codigo) : '';
+    if (!usuario || !clave || !codigo) return res.status(400).json({ error: 'Faltan usuario, clave y codigo' });
+    var e = await _empPorUsuario(usuario);
+    if (e._err || !e.data) return res.status(403).json({ error: 'Credenciales invalidas' });
+    var u = e.data;
+    if (_hashPass(clave, u.clave_salt) !== u.clave_hash) return res.status(403).json({ error: 'Credenciales invalidas' });
+    if (!u.totp_secret) return res.status(400).json({ error: 'El 2FA no esta iniciado; volve a iniciar sesion' });
+    if (!_totpOk(u.totp_secret, codigo)) return res.status(403).json({ error: 'Codigo invalido' });
+    var up = await supabase.from('maestro_usuarios').update({ totp_confirmado: true }).eq('id', u.id);
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo confirmar el 2FA: ' + up.error.message });
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ----- LOGOUT del empleado (cierra su propia sesion) -----
+// Requiere un token de empleado valido; marca la sesion revocada ('self'). El front tambien borra maestro_token.
+app.post('/api/maestro/emp/logout', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (req._maestroTipo === 'emp' && req._maestroEmpPayload && req._maestroEmpPayload.jti) {
+      await _cerrarSesion(req._maestroEmpPayload.jti, 'self');
+    }
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ----- GESTION DE EMPLEADOS (solo super-admin: __admin__) -----
+// Listado de empleados (sin exponer hashes ni el secreto TOTP).
+app.get('/api/maestro/empleados', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var r = await supabase.from('maestro_usuarios').select('id, usuario, permisos, activo, totp_confirmado, inactividad_min, tope_abs_min, creado_por, created_at, last_login').order('created_at', { ascending: false });
+    if (r && r.error) return res.status(503).json({ error: 'Falta la tabla maestro_usuarios (migracion pendiente?): ' + r.error.message });
+    return res.json({ ok: true, empleados: (r && r.data) || [] });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Crear un empleado. Body: { usuario, permisos[], inactividad_min?, tope_abs_min? }. Devuelve la clave temporal UNA vez.
+app.post('/api/maestro/empleados', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var usuario = (req.body && req.body.usuario) ? String(req.body.usuario).trim() : '';
+    if (!usuario) return res.status(400).json({ error: 'Falta el usuario' });
+    var permisos = _normalizarPermisos(req.body && req.body.permisos);
+    var idle = parseInt(req.body && req.body.inactividad_min, 10); if (isNaN(idle) || idle <= 0) idle = 30;
+    var tope = parseInt(req.body && req.body.tope_abs_min, 10); if (isNaN(tope) || tope <= 0) tope = 480;
+    // Unicidad case-insensitive (best-effort; el UNIQUE INDEX es la red final).
+    try { var ya = await supabase.from('maestro_usuarios').select('id').ilike('usuario', usuario).maybeSingle(); if (ya && ya.data) return res.status(409).json({ error: 'Ya existe un usuario con ese nombre' }); } catch(eY){}
+    var clave = _claveTemporal();
+    var salt = _cripto.randomBytes(16).toString('hex');
+    var ins = await supabase.from('maestro_usuarios').insert({
+      usuario: usuario, clave_hash: _hashPass(clave, salt), clave_salt: salt,
+      permisos: permisos, inactividad_min: idle, tope_abs_min: tope, creado_por: 'superadmin'
+    }).select('id, usuario, permisos, activo, totp_confirmado, inactividad_min, tope_abs_min, created_at').maybeSingle();
+    if (ins && ins.error) {
+      if (/duplicate|unique/i.test(String(ins.error.message || ''))) return res.status(409).json({ error: 'Ya existe un usuario con ese nombre' });
+      return res.status(503).json({ error: 'No se pudo crear (migracion pendiente?): ' + ins.error.message });
+    }
+    return res.json({ ok: true, empleado: ins.data, clave_temporal: clave });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Editar permisos / timeouts de un empleado. Body: { permisos?, inactividad_min?, tope_abs_min? }.
+app.patch('/api/maestro/empleados/:id', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var patch = {};
+    if (typeof (req.body && req.body.permisos) !== 'undefined') patch.permisos = _normalizarPermisos(req.body.permisos);
+    if (typeof (req.body && req.body.inactividad_min) !== 'undefined') { var idle = parseInt(req.body.inactividad_min, 10); if (!isNaN(idle) && idle > 0) patch.inactividad_min = idle; }
+    if (typeof (req.body && req.body.tope_abs_min) !== 'undefined') { var tope = parseInt(req.body.tope_abs_min, 10); if (!isNaN(tope) && tope > 0) patch.tope_abs_min = tope; }
+    if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
+    var up = await supabase.from('maestro_usuarios').update(patch).eq('id', req.params.id).select('id, usuario, permisos, activo, totp_confirmado, inactividad_min, tope_abs_min').maybeSingle();
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo actualizar: ' + up.error.message });
+    if (!up.data) return res.status(404).json({ error: 'Empleado no encontrado' });
+    return res.json({ ok: true, empleado: up.data });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Baja LOGICA de un empleado (activo=false) + revoca todas sus sesiones vivas. Nunca DELETE.
+app.post('/api/maestro/empleados/:id/baja', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var up = await supabase.from('maestro_usuarios').update({ activo: false }).eq('id', req.params.id);
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo dar de baja: ' + up.error.message });
+    try { await supabase.from('maestro_sesiones').update({ revocada: true, revocada_por: 'superadmin', revocada_at: new Date().toISOString() }).eq('maestro_usuario_id', req.params.id).eq('revocada', false); } catch(eR){}
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Reset de clave: genera una clave temporal nueva (se muestra UNA vez) + revoca sesiones vivas.
+app.post('/api/maestro/empleados/:id/reset-clave', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var clave = _claveTemporal();
+    var salt = _cripto.randomBytes(16).toString('hex');
+    var up = await supabase.from('maestro_usuarios').update({ clave_hash: _hashPass(clave, salt), clave_salt: salt }).eq('id', req.params.id).select('id').maybeSingle();
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo resetear la clave: ' + up.error.message });
+    if (!up.data) return res.status(404).json({ error: 'Empleado no encontrado' });
+    try { await supabase.from('maestro_sesiones').update({ revocada: true, revocada_por: 'superadmin', revocada_at: new Date().toISOString() }).eq('maestro_usuario_id', req.params.id).eq('revocada', false); } catch(eR){}
+    return res.json({ ok: true, clave_temporal: clave });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Reset de 2FA: borra el secreto y marca no-confirmado (el empleado re-hace el setup en el proximo login) + revoca sesiones.
+app.post('/api/maestro/empleados/:id/reset-2fa', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var up = await supabase.from('maestro_usuarios').update({ totp_secret: null, totp_confirmado: false }).eq('id', req.params.id).select('id').maybeSingle();
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo resetear el 2FA: ' + up.error.message });
+    if (!up.data) return res.status(404).json({ error: 'Empleado no encontrado' });
+    try { await supabase.from('maestro_sesiones').update({ revocada: true, revocada_por: 'superadmin', revocada_at: new Date().toISOString() }).eq('maestro_usuario_id', req.params.id).eq('revocada', false); } catch(eR){}
+    return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

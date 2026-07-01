@@ -377,13 +377,13 @@ function _rubroKey(rubro) {
 // Devuelve la lista COMPLETA de items (comportamiento + rubro + interna) para la UI y para armar el prompt.
 // Si el cliente ya guardo su personalizacion (settings.instrucciones_agente.items) usa esa (garantizando protegidas
 // presentes + activas). Si no, devuelve los DEFAULTS (sembrando la interna desde el viejo settings.instructions).
-function instruccionesAgenteItems(settings, rubro) {
+function instruccionesAgenteItems(settings, rubro, perfilOverride) {
   // PERFIL ACTIVO (Fase 3): si el cliente activó un perfil guardado (perfil_activo_id) y existe en instruccion_perfiles
   // con items, la IA usa ESE set. Si no (null / no encontrado / sin migrar) -> comportamiento de SIEMPRE
   // (instrucciones_agente = "Agente principal"). DEFENSIVO: con perfil_activo_id null NADA cambia para el cliente.
   let stored = settings && settings.instrucciones_agente;
   try {
-    const _pa = settings && settings.perfil_activo_id;
+    const _pa = perfilOverride || (settings && settings.perfil_activo_id); // override = perfil del usuario IA; si no, el activo de la cuenta
     if (_pa && Array.isArray(settings.instruccion_perfiles)) {
       const _perfil = settings.instruccion_perfiles.find(function(p){ return p && String(p.id) === String(_pa); });
       if (_perfil && Array.isArray(_perfil.items) && _perfil.items.length) stored = { items: _perfil.items };
@@ -424,8 +424,8 @@ function instruccionesAgenteItems(settings, rubro) {
 }
 // Arma los 3 bloques de texto que van al system prompt, respetando orden y activo. Con la columna en null devuelve
 // EXACTAMENTE: comportamiento = comportamientoSetter.join(' ') ; rubro = instruccionesRubro ; internas = (instructions ? 'Instrucciones internas...: '+instructions : '').
-function bloquesInstruccionesAgente(settings, rubro) {
-  const items = instruccionesAgenteItems(settings, rubro);
+function bloquesInstruccionesAgente(settings, rubro, perfilOverride) {
+  const items = instruccionesAgenteItems(settings, rubro, perfilOverride);
   const comportamiento = items.filter(function(i) { return i.categoria === 'comportamiento' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(Boolean).join(' ');
   const rub = items.filter(function(i) { return i.categoria === 'rubro' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(Boolean).join(' ');
   const internasTextos = items.filter(function(i) { return i.categoria === 'interna' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(function(s) { return s && String(s).length; });
@@ -1482,6 +1482,7 @@ function sanearAgenteConfig(cfg, nombreFallback) {
     conocimiento: _s(c.conocimiento),
     noHacer: _s(c.no_hacer) || _s(c.noHacer),
     datosQueUsa: _s(c.datos_que_usa) || _s(c.datosQueUsa),
+    perfilId: _s(c.perfil_id) || null, // perfil de instrucciones del usuario IA (null = el del agente principal / activo de la cuenta)
     // AGENTE PREMIUM por usuario IA: premium ON por default (igual al global). Solo OFF explicito apaga el playbook.
     // FIX clave: el frontend del Usuario IA escribe 'agente_premium_re' (no 'premium'). Aceptamos AMBAS claves:
     // prioriza agente_premium_re si viene definida (clave del form), si no cae a 'premium' (compat). Solo false explicito apaga.
@@ -2851,7 +2852,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
 
     // Comportamiento + rubro + internas: ahora salen del editor por cliente (business_settings.instrucciones_agente),
     // con fallback BYTE-IDENTICO a los defaults hardcodeados. Ver bloquesInstruccionesAgente / DEFAULT_COMPORTAMIENTO / DEFAULT_RUBRO.
-    const _bloquesInstr = bloquesInstruccionesAgente(settings, rubro);
+    const _bloquesInstr = bloquesInstruccionesAgente(settings, rubro, (agenteConfig && agenteConfig.perfilId) || null);
     const instruccionesRubro = _bloquesInstr.rubro;
     const comportamientoSetter = _bloquesInstr.comportamiento;
 

@@ -3588,6 +3588,95 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
   } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar('indeterminado'); return true; }
 }
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
+// ============================================================================
+// /health/deep - health check REAL de dependencias criticas (monitoreo externo)
+// ----------------------------------------------------------------------------
+// A diferencia de /health (que siempre devuelve ok), este endpoint chequea EN
+// VIVO cada dependencia critica y devuelve HTTP 503 si alguna esta caida, para
+// que BetterStack / healthchecks.io lo detecten. CERO tokens: el chequeo de
+// Anthropic pega a GET /v1/models (no factura), NO a messages.create.
+//
+// Criticas = supabase, anthropic, evolution. bedrock es SOLO informativo.
+// Proteccion: si HEALTH_KEY esta seteada, exige ?key=<HEALTH_KEY> (401 si no
+// coincide). Si NO esta seteada, deja pasar pero marca "protected": false.
+// Evolution: si HEALTH_INSTANCE esta seteada, chequea connectionState de esa
+// instancia (state 'open'/'connected'); si no, cae a /instance/fetchInstances
+// (alcance del server) porque las instancias son por-cliente (no hay una global).
+app.get('/health/deep', async (req, res) => {
+  const HEALTH_KEY = process.env.HEALTH_KEY || '';
+  const protegido = !!HEALTH_KEY;
+  if (protegido && req.query.key !== HEALTH_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const checks = {};
+
+  // Helper: fetch con timeout via AbortController (Node 18+, ya usado en el archivo)
+  async function fetchConTimeout(url, opts, ms) {
+    const ctrl = new AbortController();
+    const to = setTimeout(function(){ try { ctrl.abort(); } catch (e) {} }, ms || 4000);
+    try {
+      return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+    } finally { clearTimeout(to); }
+  }
+
+  // 1) Supabase: lectura trivial (ok = sin error)
+  {
+    const t0 = Date.now();
+    try {
+      const { error } = await supabase.from('departamentos').select('id').limit(1);
+      if (error) checks.supabase = { ok: false, ms: Date.now() - t0, detail: String(error.message || error).slice(0, 180) };
+      else checks.supabase = { ok: true, ms: Date.now() - t0 };
+    } catch (e) {
+      checks.supabase = { ok: false, ms: Date.now() - t0, detail: String((e && e.message) || e).slice(0, 180) };
+    }
+  }
+
+  // 2) Anthropic: GET /v1/models (ok = HTTP 200). CERO tokens (no es messages.create).
+  {
+    const t0 = Date.now();
+    try {
+      const r = await fetchConTimeout('https://api.anthropic.com/v1/models?limit=1', {
+        headers: { 'x-api-key': process.env.ANTHROPIC_KEY || '', 'anthropic-version': '2023-06-01' }
+      }, 4000);
+      checks.anthropic = r.status === 200
+        ? { ok: true, ms: Date.now() - t0 }
+        : { ok: false, ms: Date.now() - t0, detail: 'HTTP ' + r.status };
+    } catch (e) {
+      checks.anthropic = { ok: false, ms: Date.now() - t0, detail: String((e && e.message) || e).slice(0, 180) };
+    }
+  }
+
+  // 3) Evolution: connectionState de HEALTH_INSTANCE si esta; si no, fetchInstances (server up).
+  {
+    const t0 = Date.now();
+    const instancia = process.env.HEALTH_INSTANCE || '';
+    try {
+      if (!EVOLUTION_URL || !EVOLUTION_KEY) {
+        checks.evolution = { ok: false, ms: Date.now() - t0, detail: 'Faltan EVOLUTION_URL/EVOLUTION_KEY' };
+      } else if (instancia) {
+        const r = await fetchConTimeout(EVOLUTION_URL + '/instance/connectionState/' + instancia, { headers: { 'apikey': EVOLUTION_KEY } }, 4000);
+        let estado = null;
+        try { const j = await r.json(); estado = (j && j.instance && j.instance.state) ? j.instance.state : (j && j.state ? j.state : null); } catch (eJson) {}
+        const conectado = estado === 'open' || estado === 'connected';
+        checks.evolution = { ok: (r.status === 200 && conectado), ms: Date.now() - t0, state: estado, detail: 'HTTP ' + r.status + (instancia ? ' (instancia ' + instancia + ')' : '') };
+      } else {
+        // Sin instancia dedicada: verificar que el server de Evolution responde.
+        const r = await fetchConTimeout(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY } }, 4000);
+        checks.evolution = { ok: r.status === 200, ms: Date.now() - t0, state: 'server-reachable', detail: 'HTTP ' + r.status + ' (sin HEALTH_INSTANCE: solo alcance del server)' };
+      }
+    } catch (e) {
+      checks.evolution = { ok: false, ms: Date.now() - t0, detail: String((e && e.message) || e).slice(0, 180) };
+    }
+  }
+
+  // 4) Bedrock: SOLO informativo (nunca afecta el status HTTP). No invoca Bedrock.
+  checks.bedrock = { ready: !!_bedrockReady, enabled: process.env.BEDROCK_ENABLED === 'true' };
+
+  const criticas = [checks.supabase, checks.anthropic, checks.evolution];
+  const degradado = criticas.some(function(c){ return !c || !c.ok; });
+  const payload = { status: degradado ? 'degraded' : 'ok', ts: Date.now(), protected: protegido, checks: checks };
+  res.status(degradado ? 503 : 200).json(payload);
+});
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
 
 // Endpoint para probar el agente desde el CRM (escribir como cliente)

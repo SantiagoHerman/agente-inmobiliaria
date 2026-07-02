@@ -5130,11 +5130,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const ext = await extraerDatosLead(contentLead, datosPrevios, user_id);
           if (!ext) return;
           const updContacto = {};
-          // nombre: solo si el lead dio un nombre real Y el actual parece el pushName de WhatsApp
-          // (el pushName es el que vino de Evolution; si el name guardado coincide con el pushName, todavia no tenemos el nombre real que dio el lead)
-          if (ext.nombre && (!contacto.name || contacto.name === _pushName)) {
-            updContacto.name = ext.nombre;
-          }
+          // NOMBRE: NO se auto-cambia (decision del dueno 2026-07-02). El nombre queda el de WhatsApp
+          // (pushName); si hay que corregirlo, se hace A MANO (nombre_manual). La IA NO pisa el name con el
+          // nombre que "detecta" en la charla -> evita el caso Roman->Bruno (confundir al asesor con el lead).
+          // El nombre detectado igual se guarda como PISTA en notes mas abajo ("dice llamarse: X").
           // interest / budget: completar/actualizar si el lead aporto algo
           if (ext.interes) updContacto.interest = ext.interes;
           if (ext.presupuesto) updContacto.budget = ext.presupuesto;

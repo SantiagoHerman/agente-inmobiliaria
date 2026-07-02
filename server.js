@@ -7673,14 +7673,15 @@ app.post('/api/contactos/renombrar', async function(req, res) {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
 
-    // 2) Resolver el ASESOR (fila en `asesores` por auth_user_id) y el DUENO del tenant (admin_id).
-    let ase = null;
+    // 2) Resolver el DUENO del tenant. Por DEFAULT el que llama ES el dueño (su uid = user_id del tenant);
+    //    si es un asesor sub-cuenta, el dueño es su admin_id. (BUG anterior: exigiamos admin_id -> el DUENO
+    //    real / el admin quedaba 403 porque no tiene un admin "arriba". La seguridad de tenant del paso 4
+    //    igual limita a renombrar SOLO contactos del tenant resuelto.)
+    let ownerId = uid;
     try {
-      const r = await supabase.from('asesores').select('id, admin_id').eq('auth_user_id', uid).maybeSingle();
-      if (!r.error && r.data) ase = r.data;
+      const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (ase && ase.admin_id) ownerId = ase.admin_id;
     } catch (e1) {}
-    if (!ase || !ase.admin_id) return res.status(403).json({ error: 'No autorizado' });
-    const ownerId = ase.admin_id;   // el contacto es del DUENO (multi-tenant)
 
     // 3) BODY. contact_id obligatorio; nombre vacio => null (vuelve al nombre de WhatsApp).
     const b = req.body || {};

@@ -1340,22 +1340,29 @@ async function elegirAsesorActivo(admin_id) {
 // Devuelve { contacto, conv, convExistente }. contacto/conv pueden ser null/undefined si el insert no devolvio fila
 // (mismo caso que antes: el caller cortaba con `if (!contacto) return;` / `if (!conv) return;`).
 async function obtenerOcrearConvDeCanal(user_id, contactKey, canal, nombreNuevo, convSelectCols) {
-  // RACE #8 (TOCTOU): dos webhooks del MISMO lead casi simultaneos (un lead que manda 2-3 mensajes juntos) hacian
-  // SELECT->INSERT cada uno: ambos veian null y creaban DOS contacts / DOS conversations -> mensajes repartidos
-  // entre dos conversaciones (el asesor ve "mensajes perdidos"). Fix: UPSERT idempotente con onConflict sobre el
-  // UNIQUE (user_id, phone) / (user_id, contact_id). DEFENSIVO: si el indice unico aun NO existe en prod, el upsert
-  // puede fallar -> caemos al check-then-insert ACTUAL (no rompemos el webhook). Requiere, para dedupe real, los
-  // indices unicos contacts(user_id,phone) y conversations(user_id,contact_id) en la base.
-  // Contacto (proyeccion minima segura: solo 'id').
+  // RACE #8 (TOCTOU): dos webhooks del MISMO lead casi simultaneos (un lead que manda 2-3 mensajes juntos), o el
+  // cron reintentarFallidos corriendo a la par, hacian SELECT->INSERT cada uno: ambos veian null y creaban DOS (o mas)
+  // contacts / conversations -> mensajes repartidos entre varias conversaciones (el asesor ve "mensajes perdidos" y
+  // el lead aparece duplicado N veces). Caso real: telefono 5492255622878 con 4 contacts creados en rafagas de ~57ms.
+  // Fix: UPSERT idempotente con onConflict sobre el UNIQUE (user_id, phone, channel) / (user_id, contact_id).
+  // DEFENSIVO: si el indice unico aun NO existe en prod, el upsert puede fallar (o no deduplicar) -> caemos al
+  // check-then-insert ACTUAL (no rompemos el webhook). Para dedupe REAL en la base hacen falta los indices unicos
+  // contacts(user_id,phone,channel) y conversations(user_id,contact_id) -> ver migracion-contactos-unique.sql.
+  // ORDEN DE APLICACION: correr PRIMERO migracion-contactos-dedup.sql (limpia duplicados existentes), DESPUES
+  // migracion-contactos-unique.sql (crea el indice; falla si aun hay duplicados), y RECIEN AHI desplegar este codigo.
+  // Contacto (proyeccion minima segura: solo 'id'). El SELECT de busqueda se mantiene por (user_id, phone) SIN filtrar
+  // por channel: asi encuentra CUALQUIER contacto existente de ese telefono (aunque tenga channel null legacy u otro
+  // canal) y NO crea un duplicado. El channel solo entra en el conflict target del UPSERT (camino de insert atomico).
   let contacto;
   const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', contactKey).maybeSingle();
   if (existente) { contacto = existente; }
   else {
-    // UPSERT: si OTRO webhook concurrente ya inserto el contacto, onConflict devuelve esa misma fila (no duplica).
+    // UPSERT: si OTRO webhook concurrente ya inserto el contacto, onConflict (user_id,phone,channel) devuelve esa
+    // misma fila (no duplica). El conflict target DEBE coincidir con el indice unico de migracion-contactos-unique.sql.
     let _upOk = false;
     try {
       const { data: nuevo, error: eUp } = await supabase.from('contacts')
-        .upsert({ user_id: user_id, name: nombreNuevo, phone: contactKey, channel: canal }, { onConflict: 'user_id,phone' })
+        .upsert({ user_id: user_id, name: nombreNuevo, phone: contactKey, channel: canal }, { onConflict: 'user_id,phone,channel' })
         .select('id').single();
       if (!eUp && nuevo) { contacto = nuevo; _upOk = true; }
     } catch (eUpC) {}
@@ -9870,10 +9877,29 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
           yaExistian++;
         } else {
           const nombre = lead.nombre || telefono;
-          const { data: nuevo, error: errC } = await supabase.from('contacts').insert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }).select('id').single();
-          if (errC || !nuevo) { errores++; continue; }
-          contactoId = nuevo.id;
-          creados++;
+          // Igual que obtenerOcrearConvDeCanal: UPSERT idempotente (user_id,phone,channel) para no crear duplicados si
+          // dos importaciones o un webhook corren a la vez. DEFENSIVO: si el indice unico aun no existe, cae al INSERT
+          // ACTUAL EXACTO (re-lee primero por si otro lo creo). channel = 'whatsapp' (importacion de leads es WA).
+          let _nuevoId = null;
+          try {
+            const { data: nuevo, error: eUp } = await supabase.from('contacts')
+              .upsert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }, { onConflict: 'user_id,phone,channel' })
+              .select('id').single();
+            if (!eUp && nuevo) _nuevoId = nuevo.id;
+          } catch (eUpC) {}
+          if (!_nuevoId) {
+            const { data: _reC } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
+            if (_reC) { _nuevoId = _reC.id; yaExistian++; }
+            else {
+              const { data: nuevo, error: errC } = await supabase.from('contacts').insert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }).select('id').single();
+              if (errC || !nuevo) { errores++; continue; }
+              _nuevoId = nuevo.id;
+              creados++;
+            }
+          } else {
+            creados++;
+          }
+          contactoId = _nuevoId;
         }
         // crear conversacion solo si el contacto NO tiene una
         const { data: convExistente } = await supabase.from('conversations').select('id').eq('contact_id', contactoId).maybeSingle();

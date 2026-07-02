@@ -11310,6 +11310,206 @@ app.post('/api/scrape/universal', async function(req, res) {
 
 
 // ============================================================================
+// SCRAPER DESARROLLADORA  —  POST /api/scrape/desarrollo   (ADITIVO)
+// ----------------------------------------------------------------------------
+// Lee la pagina de UN proyecto de una desarrolladora (texto + fotos/planos/renders)
+// y con IA arma una ESTRUCTURA lista para PRE-CARGAR el form _FormDesarrollo.tsx
+// (NO guarda: el front revisa y guarda con /api/inventario/guardar).
+// Reusa el patron del scraper inmobiliaria: fetchScrape (fetch TLS-tolerante),
+// _htmlParaIA (limpia HTML->texto), Claude (MODELO_INTERNO = Haiku por costo),
+// registrarUsoTokens (panel de costos) y _parseJsonObjetoDefensivo (parser tolerante).
+// La IA se ADAPTA a cualquier estructura de pagina; NO hay formato fijo.
+// ============================================================================
+
+// MODELO del scraper de desarrollo. Por defecto MODELO_INTERNO (Haiku) para acotar
+// el costo (este scrapeo lo corre el dueño manualmente, no por cada lead). Si el dueño
+// pide mas precision, cambiar a MODELO_CLIENTE (Sonnet) — y su precio PRECIO_IA abajo.
+const MODELO_SCRAPE_DESARROLLO = MODELO_INTERNO;              // Haiku (barato). Alt: MODELO_CLIENTE (Sonnet)
+const PRECIO_SCRAPE_DESARROLLO = PRECIO_HAIKU;               // emparejar con el modelo de arriba (Haiku->PRECIO_HAIKU, Sonnet->PRECIO_IA)
+
+// Extrae URLs de IMAGENES y PDFs de un HTML, resolviendo relativas a absolutas.
+// General (NO WordPress-especifico como _extraerGaleriaHtml): mira src, data-src,
+// data-original, data-lazy, srcset y <a href> a .pdf. Devuelve el filename como pista
+// para que la IA clasifique (plano/render/foto). Dedup, cap para no inflar el prompt.
+function _extraerImagenesDesarrollo(html, baseUrl, cap) {
+  var out = [];
+  var visto = {};
+  var tope = cap || 60;
+  function _abs(u) { try { return new URL(u, (baseUrl || '') + '/').toString(); } catch (e) { return null; } }
+  function _push(raw) {
+    if (!raw) return;
+    var t = String(raw).trim();
+    if (!t || /^data:/i.test(t) || /^javascript:/i.test(t)) return;      // saltear data-uri inline / js
+    var abs = _abs(t);
+    if (!abs || !/^https?:/i.test(abs)) return;
+    var limpia = abs.split('#')[0];
+    if (visto[limpia]) return;
+    visto[limpia] = 1;
+    var archivo = '';
+    try { archivo = decodeURIComponent((limpia.split('?')[0].split('/').pop() || '')); } catch (e) { archivo = limpia.split('?')[0].split('/').pop() || ''; }
+    out.push({ url: limpia, filename: archivo });
+  }
+  if (!html) return out;
+  // 1) <img> con src / data-src / data-original / data-lazy / data-lazy-src
+  var rxImg = /<img\b[^>]*>/gi, mImg;
+  while ((mImg = rxImg.exec(html)) !== null && out.length < tope) {
+    var tag = mImg[0];
+    var mA = tag.match(/\b(?:data-src|data-original|data-lazy-src|data-lazy|src)\s*=\s*["']([^"']+)["']/i);
+    if (mA && mA[1]) _push(mA[1]);
+    // primera url del srcset (suele ser una variante util) — resolucion mayor primero si aparece
+    var mS = tag.match(/\bsrcset\s*=\s*["']([^"']+)["']/i);
+    if (mS && mS[1]) {
+      var cand = mS[1].split(',')[0].trim().split(/\s+/)[0];
+      if (cand) _push(cand);
+    }
+  }
+  // 2) <source srcset> (picture/gallery)
+  var rxSrc = /<source\b[^>]*\bsrcset\s*=\s*["']([^"']+)["'][^>]*>/gi, mSr;
+  while ((mSr = rxSrc.exec(html)) !== null && out.length < tope) {
+    var c2 = mSr[1].split(',')[0].trim().split(/\s+/)[0];
+    if (c2) _push(c2);
+  }
+  // 3) <a href> a PDF (planos / brochure) o a imagenes directas (lightbox)
+  var rxA = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi, mHref;
+  while ((mHref = rxA.exec(html)) !== null && out.length < tope) {
+    var h = mHref[1];
+    if (/\.(?:pdf|jpe?g|png|webp)(?:$|[?#])/i.test(h.split('?')[0]) || /\.pdf(?:$|[?#])/i.test(h)) _push(h);
+  }
+  return out.slice(0, tope);
+}
+
+app.post('/api/scrape/desarrollo', async function (req, res) {
+  try {
+    // ---- AUTH + owner (asesor -> admin_id, como el resto de endpoints) ----
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    try {
+      var _yo = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
+      if (_yo && _yo.data && _yo.data.admin_id) user_id = _yo.data.admin_id; // el owner del tenant (sin fila -> es el dueño)
+    } catch (eOwner) { /* sin fila -> user_id queda como esta */ }
+
+    // ---- Validar url ----
+    var url = ((req.body && req.body.url) || '').trim();
+    if (!url) return res.status(400).json({ error: 'Falta la url del proyecto' });
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    try { new URL(url); } catch (eUrl) { return res.status(400).json({ error: 'La url no es valida' }); }
+
+    // ---- Fetch de la pagina (fetch TLS-tolerante, mismo mecanismo que el scraper inmobiliaria) ----
+    var html = '';
+    try {
+      var r = await fetchScrape(url);
+      if (!r || !r.ok) return res.status(502).json({ error: 'No se pudo acceder a la pagina (status ' + (r ? r.status : 'sin respuesta') + ')' });
+      html = await r.text();
+    } catch (eFetch) {
+      return res.status(502).json({ error: 'No se pudo bajar la pagina: ' + (eFetch && eFetch.message ? eFetch.message : 'error de red/timeout') });
+    }
+    if (!html || html.length < 50) return res.status(502).json({ error: 'La pagina vino vacia o inaccesible' });
+
+    // ---- Texto visible para la IA (truncado ~14k chars para acotar tokens/costo) ----
+    var texto = _htmlParaIA(html, 14000);
+    // ---- Imagenes + PDFs (con filename como pista para clasificar) ----
+    var imgs = _extraerImagenesDesarrollo(html, url, 60);
+    var listaImgs = imgs.map(function (x, i) { return (i + 1) + '. ' + x.filename + ' -> ' + x.url; }).join('\n');
+
+    if ((!texto || texto.length < 60) && imgs.length === 0) {
+      return res.status(422).json({ error: 'La pagina no tiene texto ni imagenes utiles para analizar (¿render por JS?)' });
+    }
+
+    // ---- Extraccion con IA ----
+    if (!process.env.ANTHROPIC_KEY) return res.status(503).json({ error: 'IA no disponible (sin ANTHROPIC_KEY)' });
+    var sys = 'Sos un extractor de datos de un proyecto inmobiliario / desarrollo (desarrolladora). ' +
+      'Te paso el TEXTO visible de la pagina de UN emprendimiento y una lista de URLs de imagenes con su nombre de archivo. ' +
+      'Entende la pagina (se adapta a cualquier estructura) y arma la estructura. NO inventes datos que no esten: si no aparece, deja "" o null o [].\n' +
+      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor) con esta forma EXACTA:\n' +
+      '{\n' +
+      '  "emprendimiento": { "nombre":"", "ubicacion":"", "descripcion":"", "estado_obra":"", "fecha_entrega":"", "amenities":[], "financiacion":"", "contacto":"", "link":"' + url + '" },\n' +
+      '  "tipologias": [ { "tipo":"", "ambientes":null, "superficie_m2":null, "precio":null, "moneda":"", "disponibilidad":"", "notas":"" } ],\n' +
+      '  "imagenes": { "fotos":[], "planos":[], "renders":[] }\n' +
+      '}\n' +
+      'REGLAS:\n' +
+      '- "estado_obra": normaliza a "pozo", "en_construccion" o "terminado" si el texto lo permite; si no, deja el texto tal cual o "".\n' +
+      '- "amenities": lista de strings (Pileta, Gimnasio, SUM, Seguridad, Cochera, etc.).\n' +
+      '- "tipologias": una por cada tipo de unidad/depto/lote que ofrezca (Monoambiente, 2 ambientes, Lote, etc.). "ambientes" y "superficie_m2" y "precio" numericos (o null). "moneda" en USD/ARS/PYG si se sabe.\n' +
+      '- "imagenes": clasifica CADA URL de la lista en fotos (obra/entorno/reales), planos (planta/plano/layout) o renders (render/ilustracion/fachada 3D). Usa el nombre de archivo (plano, planta, render, fachada, amenities, brochure) y el contexto. Los PDF suelen ser planos o brochure -> ponelos en "planos". Devolve las URLs COMPLETAS tal cual te las paso. Si dudas, "fotos".';
+
+    var userMsg = 'TEXTO DE LA PAGINA:\n' + (texto || '(sin texto)') + '\n\n' +
+      'IMAGENES / PDF ENCONTRADOS (nombre -> url):\n' + (listaImgs || '(ninguna)');
+
+    var iaResp;
+    try {
+      iaResp = await anthropic.messages.create({
+        model: MODELO_SCRAPE_DESARROLLO,
+        max_tokens: 2500,
+        system: sys,
+        messages: [{ role: 'user', content: userMsg }]
+      });
+    } catch (eIA) {
+      return res.status(502).json({ error: 'La IA no pudo procesar la pagina: ' + (eIA && eIA.message ? eIA.message : 'error') });
+    }
+    // Costo -> panel (best-effort, con el precio del MODELO usado)
+    try { if (iaResp && iaResp.usage) await registrarUsoTokens(user_id, iaResp.usage, 'scraper_desarrollo', PRECIO_SCRAPE_DESARROLLO); } catch (eTok) {}
+
+    var txt = (iaResp && iaResp.content && iaResp.content[0] && iaResp.content[0].text) ? iaResp.content[0].text : '';
+    var parsed = _parseJsonObjetoDefensivo(txt);
+    if (!parsed || typeof parsed !== 'object') {
+      return res.status(422).json({ error: 'La IA no devolvio un JSON valido. Reintentá o cargá el emprendimiento a mano.' });
+    }
+
+    // ---- Normalizar la salida a la forma prometida (defensivo: nunca undefined) ----
+    var emp = parsed.emprendimiento || {};
+    var tipologias = Array.isArray(parsed.tipologias) ? parsed.tipologias : [];
+    var imagenes = parsed.imagenes || {};
+    function _arrStr(a) { return Array.isArray(a) ? a.filter(function (x) { return x != null && String(x).trim() !== ''; }).map(String) : []; }
+    var data = {
+      emprendimiento: {
+        nombre: emp.nombre != null ? String(emp.nombre) : '',
+        ubicacion: emp.ubicacion != null ? String(emp.ubicacion) : '',
+        descripcion: emp.descripcion != null ? String(emp.descripcion) : '',
+        estado_obra: emp.estado_obra != null ? String(emp.estado_obra) : '',
+        fecha_entrega: emp.fecha_entrega != null ? String(emp.fecha_entrega) : '',
+        amenities: _arrStr(emp.amenities),
+        financiacion: emp.financiacion != null ? String(emp.financiacion) : '',
+        contacto: emp.contacto != null ? String(emp.contacto) : '',
+        link: emp.link != null && String(emp.link).trim() ? String(emp.link) : url
+      },
+      tipologias: tipologias.map(function (t) {
+        t = t || {};
+        return {
+          tipo: t.tipo != null ? String(t.tipo) : '',
+          ambientes: (t.ambientes === null || t.ambientes === undefined || t.ambientes === '') ? null : (isNaN(Number(t.ambientes)) ? t.ambientes : Number(t.ambientes)),
+          superficie_m2: (t.superficie_m2 === null || t.superficie_m2 === undefined || t.superficie_m2 === '') ? null : (isNaN(Number(t.superficie_m2)) ? t.superficie_m2 : Number(t.superficie_m2)),
+          precio: (t.precio === null || t.precio === undefined || t.precio === '') ? null : (isNaN(Number(t.precio)) ? t.precio : Number(t.precio)),
+          moneda: t.moneda != null ? String(t.moneda) : '',
+          disponibilidad: t.disponibilidad != null ? String(t.disponibilidad) : '',
+          notas: t.notas != null ? String(t.notas) : ''
+        };
+      }),
+      imagenes: {
+        fotos: _arrStr(imagenes.fotos),
+        planos: _arrStr(imagenes.planos),
+        renders: _arrStr(imagenes.renders)
+      }
+    };
+
+    // aviso si la IA no clasifico ninguna imagen pero SI habia imagenes en la pagina
+    var clasificadas = data.imagenes.fotos.length + data.imagenes.planos.length + data.imagenes.renders.length;
+    var aviso = '';
+    if (imgs.length > 0 && clasificadas === 0) aviso = 'Se encontraron ' + imgs.length + ' imagenes pero la IA no las clasifico; revisalas manualmente.';
+    else if (!data.emprendimiento.nombre) aviso = 'No se detecto el nombre del emprendimiento; completalo a mano.';
+
+    return res.json({
+      ok: true,
+      data: data,
+      imagenes_encontradas: imgs.length,
+      aviso: aviso || undefined
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
+  }
+});
+
+
+// ============================================================================
 // INVENTARIO MULTI-RUBRO  (HOTEL/CABAÑAS + DESARROLLADORA)  — ADITIVO
 // ----------------------------------------------------------------------------
 // Persiste los forms _FormHotel.tsx y _FormDesarrollo.tsx.

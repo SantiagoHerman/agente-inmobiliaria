@@ -6924,24 +6924,37 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
     //    Proyeccion defensiva: intentamos leer `puede_cargar_contacto`; si la columna NO existe todavia
     //    (feature aun sin migrar), el select con esa columna falla -> reintentamos SIN ella y tratamos el
     //    permiso como false (=> 403). Asi la feature queda INERTE hasta correr migracion-cargar-contacto.sql.
+    //    Traemos tambien `rol` y `visibilidad` para poder derivar la capacidad de administrador con el helper
+    //    canonico esAdministrador() (rol legacy 'administrador' O visibilidad incluye 'generales').
     let ase = null;
     try {
-      const r = await supabase.from('asesores').select('id, admin_id, nombre, puede_cargar_contacto').eq('auth_user_id', uid).maybeSingle();
+      const r = await supabase.from('asesores').select('id, admin_id, nombre, rol, visibilidad, puede_cargar_contacto').eq('auth_user_id', uid).maybeSingle();
       if (!r.error && r.data) ase = r.data;
     } catch (e1) {}
     if (!ase) {
-      // Fallback: sin la columna nueva (o cualquier otro error del select de arriba). puede_cargar_contacto queda undefined -> 403.
+      // Fallback: sin la columna nueva (o cualquier otro error del select de arriba). puede_cargar_contacto queda undefined.
       try {
-        const r2 = await supabase.from('asesores').select('id, admin_id, nombre').eq('auth_user_id', uid).maybeSingle();
+        const r2 = await supabase.from('asesores').select('id, admin_id, nombre, rol, visibilidad').eq('auth_user_id', uid).maybeSingle();
         if (!r2.error && r2.data) ase = r2.data;
       } catch (e2) {}
     }
-    // Solo un ASESOR (fila en `asesores`) puede cargar contactos con este permiso. El dueno "puro" (sin fila de asesor)
-    // no pasa por aca; el permiso es explicito y por-usuario (decision de Diego).
+    if (!ase) {
+      // Fallback FINAL minimo: sin `visibilidad` (por si esa columna faltara en algun tenant). Solo rol legacy para el gate admin.
+      try {
+        const r3 = await supabase.from('asesores').select('id, admin_id, nombre, rol').eq('auth_user_id', uid).maybeSingle();
+        if (!r3.error && r3.data) ase = r3.data;
+      } catch (e3) {}
+    }
+    // Solo un ASESOR (fila en `asesores`) puede cargar contactos. El dueno "puro" (sin fila de asesor) no pasa por aca;
+    // en esta app el dueno se loguea como un asesor con capacidad de administrador (rol='administrador' o visibilidad
+    // 'generales'), asi que SI entra por el camino admin de abajo (decision de Diego).
     if (!ase || !ase.admin_id) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
 
-    // 3) PERMISO: exige el flag === true. Fail-safe: columna ausente / null / false -> 403.
-    if (ase.puede_cargar_contacto !== true) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+    // 3) PERMISO (refinamiento v2): el ADMINISTRADOR SIEMPRE puede; el asesor comun necesita puede_cargar_contacto===true.
+    //    esAdministrador() es el criterio unico y centralizado (rol legacy 'administrador' O visibilidad='generales').
+    //    Fail-safe para el asesor comun: columna ausente / null / false -> 403.
+    const _esAdmin = esAdministrador(ase);
+    if (!_esAdmin && ase.puede_cargar_contacto !== true) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
 
     const ownerId = ase.admin_id;        // el contacto/conversacion son del DUENO (multi-tenant)
     const asesorId = ase.id;             // asignado a ESTE asesor
@@ -6992,15 +7005,18 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
       } else if (contactoYaExistia === false) {
         // Si el upsert devolvio una fila preexistente (mismo conflict), no lo sabemos con certeza; lo dejamos como "nuevo".
       }
-    } else {
-      // Ya existia: refrescar name + nombre_manual con lo que cargo el asesor (best-effort, no critico).
-      try { await supabase.from('contacts').update({ name: nombre, nombre_manual: nombre }).eq('id', contacto.id); }
-      catch (eUpdN) { try { await supabase.from('contacts').update({ name: nombre }).eq('id', contacto.id); } catch (e) {} }
     }
+    // NOTA (refinamiento v2): si el contacto YA existia (contactoYaExistia===true) NO lo tocamos. Podria ser un lead
+    // real previo; sobreescribir su name/nombre_manual seria "pisarlo". El refresco de nombre solo se hace, mas abajo,
+    // cuando efectivamente creamos una conversacion NUEVA para un contacto sin thread previo.
     if (!contacto) return res.status(500).json({ error: 'No se pudo crear el contacto' });
 
-    // 6) CONVERSACION: buscar-o-crear por (owner user_id, contact_id). Si existe -> UPDATE a listo_humano + IA off +
-    //    asignada a este asesor. Si no -> INSERT con esos valores. departamento_id NO se toca (queda null / lo existente).
+    // 6) CONVERSACION: buscar-o-crear por (owner user_id, contact_id).
+    //    REFINAMIENTO v2 (NO PISAR): si el contacto YA existia O ya tiene una conversacion, es un lead real previo ->
+    //    NO tocamos status / ai_enabled / asesor_id. Solo devolvemos la conversacion existente (para que el front la abra).
+    //    SOLO cuando creamos una conversacion GENUINAMENTE NUEVA seteamos listo_humano + IA off + asignada al creador.
+    //    Caso borde (decision Diego): contacto preexistente PERO sin conversacion -> la conversacion es nueva, asi que
+    //    la creamos y la asignamos normalmente (no habia lead/thread previo que pisar).
     const _valores = { status: 'listo_humano', ai_enabled: false, asesor_id: asesorId, ultimo_asesor_id: asesorId, updated_at: new Date().toISOString() };
     let conv = null;
     let convYaExistia = false;
@@ -7008,10 +7024,13 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
       const { data: convEx } = await supabase.from('conversations').select('id').eq('user_id', ownerId).eq('contact_id', contacto.id).maybeSingle();
       if (convEx) { conv = convEx; convYaExistia = true; }
     } catch (eCv) {}
+    // Un lead "real previo" es: el contacto ya existia, O ya habia una conversacion para el.
+    const _yaExistia = (contactoYaExistia === true) || (convYaExistia === true);
     if (conv) {
-      const { error: eUpdC } = await supabase.from('conversations').update(_valores).eq('id', conv.id);
-      if (eUpdC) return res.status(500).json({ error: 'No se pudo actualizar la conversacion' });
+      // La conversacion YA existe -> NO la pisamos (ni status, ni ai_enabled, ni asesor_id). La dejamos intacta.
+      // (Solo la devolvemos para que el front la abra.)
     } else {
+      // Conversacion NUEVA -> la creamos con listo_humano + IA off + asignada a este creador.
       const _convPayload = Object.assign({ user_id: ownerId, contact_id: contacto.id, channel: canal }, _valores);
       let _okC = false;
       try {
@@ -7019,24 +7038,35 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
         if (!eUpV && convNueva) { conv = convNueva; _okC = true; }
       } catch (eUpV2) {}
       if (!_okC) {
-        // Fallback (indice unico ausente): re-leer por si un concurrente la creo (y actualizarla); si no, insert plano.
+        // Fallback (indice unico ausente): re-leer por si un concurrente la creo. Si aparece, es preexistente -> NO pisar.
         const { data: _reV } = await supabase.from('conversations').select('id').eq('user_id', ownerId).eq('contact_id', contacto.id).maybeSingle();
-        if (_reV) { conv = _reV; convYaExistia = true; await supabase.from('conversations').update(_valores).eq('id', conv.id); }
+        if (_reV) { conv = _reV; convYaExistia = true; }
         else {
           const { data: _insV } = await supabase.from('conversations').insert(_convPayload).select('id').single();
           conv = _insV;
         }
       }
+      // Solo si la conversacion es realmente NUEVA (y el contacto no venia de antes) refrescamos el nombre del contacto
+      // preexistente que aun no tenia thread. Si el contacto ya existia lo dejamos como estaba (no pisar).
+      if (conv && contactoYaExistia === true && convYaExistia !== true) {
+        try { await supabase.from('contacts').update({ name: nombre, nombre_manual: nombre }).eq('id', contacto.id); }
+        catch (eUpdN) { try { await supabase.from('contacts').update({ name: nombre }).eq('id', contacto.id); } catch (e) {} }
+      }
     }
     if (!conv) return res.status(500).json({ error: 'No se pudo crear la conversacion' });
 
-    // 7) Mensaje de SISTEMA (0 IA): deja traza en el chat de quien cargo el contacto. Best-effort (no rompe si falla).
-    try {
-      const _txtSis = 'Contacto cargado manualmente por ' + asesorNombre + ' — asignado y listo para humano';
-      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txtSis, enviado_por: 'Sistema' });
-    } catch (eSis) { console.error('cargar-manual mensaje sistema (best-effort):', eSis && eSis.message); }
+    // Recalcular "ya existia" incluyendo el caso de carrera detectado en el fallback (convYaExistia pudo cambiar arriba).
+    const _yaExistiaFinal = _yaExistia || (convYaExistia === true);
 
-    return res.json({ ok: true, conversation_id: conv.id, contact_id: contacto.id, ya_existia: (contactoYaExistia || convYaExistia) === true });
+    // 7) Mensaje de SISTEMA (0 IA): SOLO cuando creamos algo nuevo. Si el lead ya existia, NO dejamos traza (no tocar).
+    if (!_yaExistiaFinal) {
+      try {
+        const _txtSis = 'Contacto cargado manualmente por ' + asesorNombre + ' — asignado y listo para humano';
+        await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txtSis, enviado_por: 'Sistema' });
+      } catch (eSis) { console.error('cargar-manual mensaje sistema (best-effort):', eSis && eSis.message); }
+    }
+
+    return res.json({ ok: true, conversation_id: conv.id, contact_id: contacto.id, ya_existia: _yaExistiaFinal === true });
   } catch (e) {
     console.error('cargar-manual:', e && e.message);
     return res.status(500).json({ error: (e && e.message) || 'Error al cargar el contacto' });

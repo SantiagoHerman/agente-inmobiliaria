@@ -2234,17 +2234,25 @@ async function deptoFallbackDe(user_id) {
 //   'ultima_instancia'   => NINGUN paso logico resolvio la derivacion: se le pregunta al gerente como seguir / a quien derivar.
 // Plantilla FIJA (sin tokens de IA). Dedupe persistente best-effort por columna conversations.gerente_avisado + Set en memoria.
 const _gerenteAvisado = new Set();
-async function avisarGerenteWhatsApp(convId, user_id, motivo) {
+// BUG 1b (derivacion-v3-refinements): param opcional sinDedupePersistente (default false = comportamiento IDENTICO al
+// previo para todos los motivos existentes). Cuando es true (SOLO el aviso v3 'derivacion_v3_sin_asesor'), se SALTEA el
+// dedupe permanente (Set _gerenteAvisado + columna gerente_avisado): ni se chequea ni se escribe. Ese aviso ya tiene su
+// propio dedupe POR-STREAK via el CAS de conversations.derivacion_aviso_dueno (que se resetea al asignar a alguien), asi
+// que un segundo streak real sin nadie DEBE poder volver a avisar. El resto de los motivos (default false) conservan el
+// dedupe permanente exacto de antes.
+async function avisarGerenteWhatsApp(convId, user_id, motivo, sinDedupePersistente) {
   try {
     if (!convId || !user_id) return;
     const _key = String(convId) + ':' + (motivo || '');
-    if (_gerenteAvisado.has(_key)) return;
-    // Dedupe persistente best-effort: gerente_avisado guarda un texto con los motivos ya avisados.
-    try {
-      const { data: _f } = await supabase.from('conversations').select('gerente_avisado').eq('id', convId).maybeSingle();
-      if (_f && typeof _f.gerente_avisado === 'string' && _f.gerente_avisado.indexOf(motivo || '') >= 0) { _gerenteAvisado.add(_key); return; }
-    } catch (eF) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
-    _gerenteAvisado.add(_key);
+    if (!sinDedupePersistente) {
+      if (_gerenteAvisado.has(_key)) return;
+      // Dedupe persistente best-effort: gerente_avisado guarda un texto con los motivos ya avisados.
+      try {
+        const { data: _f } = await supabase.from('conversations').select('gerente_avisado').eq('id', convId).maybeSingle();
+        if (_f && typeof _f.gerente_avisado === 'string' && _f.gerente_avisado.indexOf(motivo || '') >= 0) { _gerenteAvisado.add(_key); return; }
+      } catch (eF) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
+      _gerenteAvisado.add(_key);
+    }
     let _waContacto = null;
     try {
       const { data: _bs } = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', user_id).maybeSingle();
@@ -2259,12 +2267,15 @@ async function avisarGerenteWhatsApp(convId, user_id, motivo) {
       : 'Hay un lead que no pude derivar por ningun camino automatico (sin asesores disponibles en su area ni en Administracion). Necesito que me indiques a quien derivarlo o que lo tomes a mano.';
     if (_waContacto) { try { await enviarWhatsapp(nombreInstancia(user_id), _waContacto, _texto); } catch (eWa) { console.error('aviso gerente WhatsApp:', eWa && eWa.message); } }
     try { await enviarPushAsesor(user_id, 'Lead sin derivacion', null, _texto); } catch (eP) {}
-    // Marca persistente best-effort: acumular el motivo en la columna (si existe).
-    try {
-      const { data: _cur } = await supabase.from('conversations').select('gerente_avisado').eq('id', convId).maybeSingle();
-      const _prev = (_cur && typeof _cur.gerente_avisado === 'string') ? _cur.gerente_avisado : '';
-      await supabase.from('conversations').update({ gerente_avisado: (_prev ? (_prev + ',') : '') + (motivo || '') }).eq('id', convId);
-    } catch (eMark) { /* columna ausente: el Set ya dedupea dentro del proceso */ }
+    // Marca persistente best-effort: acumular el motivo en la columna (si existe). BUG 1b: se SALTEA cuando
+    // sinDedupePersistente=true (aviso v3), para no marcar permanentemente ese motivo y permitir un aviso por streak.
+    if (!sinDedupePersistente) {
+      try {
+        const { data: _cur } = await supabase.from('conversations').select('gerente_avisado').eq('id', convId).maybeSingle();
+        const _prev = (_cur && typeof _cur.gerente_avisado === 'string') ? _cur.gerente_avisado : '';
+        await supabase.from('conversations').update({ gerente_avisado: (_prev ? (_prev + ',') : '') + (motivo || '') }).eq('id', convId);
+      } catch (eMark) { /* columna ausente: el Set ya dedupea dentro del proceso */ }
+    }
   } catch (e) { console.error('avisarGerenteWhatsApp:', e && e.message); }
 }
 
@@ -2669,10 +2680,11 @@ async function _limpiarRotacionV3(convId) {
   try {
     if (!convId) return;
     try { await supabase.from('conversations').update({ derivacion_rotando: false, derivacion_depto_id: null, derivacion_ultimo_intento: null }).eq('id', convId); } catch (eUp) { /* columnas ausentes: los Set cubren dentro del proceso */ }
-    // TAREA 3 (derivacion-v3-refinements): resetear el dedupe del aviso al dueno. UPDATE APARTE/best-effort: si la
-    // columna nueva derivacion_aviso_dueno no existe todavia, este catch lo traga SIN afectar el reset de arriba
-    // (que usa columnas viejas). Con el flag OFF esta funcion no se llama por leads reales.
-    try { await supabase.from('conversations').update({ derivacion_aviso_dueno: false }).eq('id', convId); } catch (eAd) {}
+    // TAREA 3 (derivacion-v3-refinements): resetear el dedupe del aviso al dueno Y el ancla del streak "sin nadie"
+    // (BUG 1a/BUG 2, defensivo). UPDATE APARTE/best-effort: si las columnas nuevas (derivacion_aviso_dueno /
+    // derivacion_sin_nadie_desde) no existen todavia, este catch lo traga SIN afectar el reset de arriba (que usa
+    // columnas viejas). Con el flag OFF esta funcion no se llama por leads reales.
+    try { await supabase.from('conversations').update({ derivacion_aviso_dueno: false, derivacion_sin_nadie_desde: null }).eq('id', convId); } catch (eAd) {}
     try { _rotacionV3AnuncioLead.delete(convId); } catch (eS) {}
   } catch (e) {}
 }
@@ -2695,6 +2707,13 @@ async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional
     derivacion_rotando: true, derivacion_depto_id: deptoId || null, derivacion_ultimo_intento: nowIso,
     updated_at: nowIso
   };
+  // BUG 1a (derivacion-v3-refinements): al asignar/rotar a un asesor REAL (asesorId no-null) se CIERRA el streak
+  // "sin nadie": derivacion_sin_nadie_desde=null (proxima ausencia arranca un ancla nueva) y derivacion_aviso_dueno=
+  // false (rearmar el aviso al dueno para un segundo streak real sin nadie). SOLO cuando asesorId es no-null: si fuera
+  // null (marcado "rotando sin nadie") NO tocamos estos campos aca — ese path usa un update crudo aparte, no _upd —
+  // asi no pisamos el ancla del streak en curso. Campos aditivos/best-effort: si faltan (migracion no corrida) el
+  // catch de mas abajo degrada al UPDATE minimo, identico al previo.
+  if (asesorId) { _upd.derivacion_sin_nadie_desde = null; _upd.derivacion_aviso_dueno = false; }
   // REASIGNACION POR ROTACION (FIX 1+4): UPDATE condicional sobre el pre-image del batch. Devuelve true SOLO si toco
   // una fila (nadie mas gano en el interin). Sin fallback degradado: si las columnas de rotacion faltan, el catch da
   // false (no reasignar) — comportamiento seguro (mejor no rotar que rotar a ciegas). Con el flag OFF esto no corre.
@@ -2862,7 +2881,7 @@ async function revisarRotacionDerivacionV3() {
     let rotando = [];
     try {
       const { data, error } = await supabase.from('conversations')
-        .select('id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, contact_id')
+        .select('id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, derivacion_sin_nadie_desde, contact_id')
         .eq('derivacion_rotando', true);
       if (error) return; // columna ausente (migracion no corrida) -> nada que hacer (comportamiento actual)
       rotando = data || [];
@@ -2937,16 +2956,30 @@ async function revisarRotacionDerivacionV3() {
           console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)'));
         } else {
           // Sigue sin nadie disponible. La IA sigue atendiendo. NO se toca asesor_id (puede seguir null o el anterior,
-          // que tampoco respondio). CAMBIO (TAREA 3): NO renovamos derivacion_ultimo_intento en esta rama; asi ese
-          // timestamp queda como ANCLA ESTABLE del "streak sin nadie" (arrancó cuando se derivo/rotó por ultima vez con
-          // alguien, o cuando arranco la rotacion sin nadie). Esto (a) hace que el cron REINTENTE el picker cada tick
-          // (~90s) mientras no haya nadie -> deriva mas rapido apenas alguien se libera (el objetivo "espera domingo->
-          // lunes"), y (b) da un elapsed MONOTONO para medir el aviso al dueno. Solo renovamos updated_at (orden UI).
-          try { await supabase.from('conversations').update({ updated_at: nowIso }).eq('id', conv.id); } catch (eR) {}
+          // que tampoco respondio). NO renovamos derivacion_ultimo_intento en esta rama: eso hace que el cron REINTENTE
+          // el picker cada tick (~90s) mientras no haya nadie -> deriva mas rapido apenas alguien se libera (el objetivo
+          // "espera domingo->lunes"). Solo renovamos updated_at (orden UI).
+          //
+          // BUG 2 (derivacion-v3-refinements): el ancla para el aviso al dueno es derivacion_sin_nadie_desde (INICIO del
+          // streak sin nadie), NO derivacion_ultimo_intento (que marca la ULTIMA asignacion CON asesor; podia estar mas
+          // atras y disparar el aviso ANTES de los N min reales sin nadie). Si el streak recien arranca (columna null),
+          // lo seteamos = ahora en el MISMO update. Se limpia (=null) al asignar/rotar a un asesor real (BUG 1a, en
+          // _asignarRotacionV3 / _limpiarRotacionV3), asi cada nuevo streak vuelve a medir desde cero. Best-effort: si la
+          // columna no existe (migracion parcial) el update degrada al de updated_at solo y el aviso cae al ancla vieja.
+          const _streakDesde = conv.derivacion_sin_nadie_desde || nowIso; // si null -> arranca ahora
+          try {
+            const _updNoNadie = { updated_at: nowIso };
+            if (!conv.derivacion_sin_nadie_desde) _updNoNadie.derivacion_sin_nadie_desde = nowIso; // arranque del streak
+            await supabase.from('conversations').update(_updNoNadie).eq('id', conv.id);
+          } catch (eR) {
+            // columna nueva ausente: degradar al update minimo previo (solo updated_at) para no romper el tick
+            try { await supabase.from('conversations').update({ updated_at: nowIso }).eq('id', conv.id); } catch (eR2) {}
+          }
           // TAREA 3 (derivacion-v3-refinements): si estamos EN HORARIO DE OFICINA y pasaron derivacion_aviso_dueno_min
-          // (default 30) minutos desde el ancla estable SIN encontrar a nadie -> avisar al DUEÑO UNA sola vez (dedupe
-          // por conversations.derivacion_aviso_dueno). La IA NO cambia de estado (sigue atendiendo). 0 tokens. Todo
-          // gateado por derivacion_v3 (ya validado arriba). Best-effort: cualquier fallo NO rompe el tick.
+          // (default 30) minutos DESDE EL INICIO DEL STREAK sin nadie (derivacion_sin_nadie_desde, BUG 2) -> avisar al
+          // DUEÑO UNA sola vez por streak (dedupe por conversations.derivacion_aviso_dueno, que se resetea al asignar a
+          // alguien). La IA NO cambia de estado (sigue atendiendo). 0 tokens. Todo gateado por derivacion_v3 (ya validado
+          // arriba). Best-effort: cualquier fallo NO rompe el tick.
           try {
             if (!(ownerId in _avisoDuenoMinCache)) _avisoDuenoMinCache[ownerId] = (await derivacionAvisoDuenoMin(ownerId)) * 60 * 1000;
             const _avisoMs = _avisoDuenoMinCache[ownerId];
@@ -2960,8 +2993,12 @@ async function revisarRotacionDerivacionV3() {
             // "En horario de oficina": si hay horario cargado, usamos dentroHorarioOficina; si NO hay horario cargado,
             // tratamos como EN horario (consistente con el resto del sistema: sin horario definido no hay "cerrado").
             const _enHorario = _hor ? dentroHorarioOficina(_hor) : true;
-            const _elapsedNoNadie = _ancla ? (ahoraMs - _ancla) : 0;
-            if (_enHorario && _ancla && _elapsedNoNadie >= _avisoMs) {
+            // BUG 2: medir el elapsed contra el INICIO del streak sin nadie (_streakDesde), NO contra _ancla
+            // (derivacion_ultimo_intento). _streakDesde nunca es falsy aca (= columna o nowIso), asi que el gate
+            // usa solo _enHorario + umbral (sin el viejo `_ancla &&`, que ahora seria redundante).
+            const _streakMs = new Date(_streakDesde).getTime();
+            const _elapsedNoNadie = _streakMs ? (ahoraMs - _streakMs) : 0;
+            if (_enHorario && _streakMs && _elapsedNoNadie >= _avisoMs) {
               // Dedupe: solo avisar si derivacion_aviso_dueno NO esta ya en true. UPDATE CONDICIONAL como compare-and-set
               // (.neq/.is) para que UN solo tick gane (evita doble aviso entre ticks/procesos). Si la columna no existe
               // (migracion no corrida), el catch degrada a "avisar igual" con el dedupe en memoria de avisarGerenteWhatsApp.
@@ -2976,7 +3013,7 @@ async function revisarRotacionDerivacionV3() {
                 // Reusa el mecanismo existente de aviso al dueno por WhatsApp (avisarGerenteWhatsApp): manda WhatsApp al
                 // whatsapp_contacto del negocio + push. Motivo propio 'derivacion_v3_sin_asesor' (su dedupe por-motivo
                 // no colisiona con los otros avisos). 0 tokens de IA.
-                try { await avisarGerenteWhatsApp(conv.id, ownerId, 'derivacion_v3_sin_asesor'); } catch (eAvG) {}
+                try { await avisarGerenteWhatsApp(conv.id, ownerId, 'derivacion_v3_sin_asesor', true); } catch (eAvG) {}
                 console.log('Derivacion v3: lead ' + conv.id + ' SIN asesor disponible > ' + Math.round(_avisoMs / 60000) + ' min en horario -> aviso al dueno');
               }
             }

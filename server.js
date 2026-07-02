@@ -6458,6 +6458,160 @@ async function reintentarFallidos() {
   } catch (e) { console.error('Error en reintentarFallidos:', e && e.message); }
 }
 
+// ============================================================================
+// WATCHDOG WhatsApp/Evolution — FASE 1: MONITOR + ALERTA (sin auto-reconexion)
+// ----------------------------------------------------------------------------
+// PROPOSITO: WhatsApp es el punto unico de falla del sistema. Si la instancia de
+// un cliente se desconecta de Evolution (cae la sesion, se cierra, queda colgada
+// en 'connecting'), los agentes dejan de recibir/responder mensajes y NADIE se
+// entera hasta que un lead se queja. Este watchdog DETECTA esa caida y AVISA al
+// dueno por canales que siguen vivos aunque WhatsApp este caido (push FCM + la
+// notificacion del panel Maestro). NUNCA avisa por WhatsApp (seria inutil: es
+// justo lo que esta caido).
+//
+// REGLAS DURAS DE ESTA FASE (defensivo — toca un sistema en produccion):
+//   * SOLO LECTURA contra Evolution: unicamente GET /instance/connectionState.
+//     NUNCA reconecta, reinicia, hace logout ni re-QR. Un reconnect mal hecho
+//     puede disparar un re-QR y desconectar el numero real de un cliente. Eso es
+//     FASE 2 y va detras de OTRO flag (WATCHDOG_RECONNECT), aca solo el placeholder.
+//   * CERO IA / CERO tokens: no llama a Anthropic/Claude ni a ningun LLM. Son
+//     puros chequeos de conexion (fetch a Evolution + lecturas a Supabase).
+//   * GATEADO OFF: todo el watchdog esta detras de WATCHDOG_ENABLED === 'true'.
+//     Con el flag apagado (default) la funcion retorna de inmediato y el interval
+//     ni siquiera se registra -> desplegar esto es INERTE hasta prender el env var.
+//   * DEDUPE: no re-avisa en cada tick por la misma instancia caida. Avisa en la
+//     transicion a caida y, como maximo, una vez por WATCHDOG_REALERT_MIN (default
+//     30 min) mientras siga caida. Estado SOLO en memoria (se pierde al reiniciar,
+//     y esta bien: tras un reboot re-evaluamos y re-avisamos si sigue caida).
+// ENV VARS:
+//   WATCHDOG_ENABLED     ('true' para prender; default OFF)
+//   WATCHDOG_INTERVAL_MIN (cada cuantos minutos corre; default 5)
+//   WATCHDOG_REALERT_MIN  (cada cuanto re-avisar una instancia aun caida; default 30)
+//   WATCHDOG_RECONNECT    (FASE 2, no implementado; placeholder abajo)
+// ============================================================================
+var _watchdogEnCurso = false;
+// Estado SOLO en memoria (como _saludDedup): por instancia guardamos el ultimo
+// estado visto ('open'/'caida') y el ts del ultimo aviso enviado, para el dedupe.
+//   _watchdogEstado[instancia] = { down: bool, ultimoAviso: ms }
+var _watchdogEstado = {};
+
+async function revisarWatchdogWhatsapp() {
+  // GATE: si no esta explicitamente prendido, no hace absolutamente nada.
+  if (process.env.WATCHDOG_ENABLED !== 'true') return;
+  // Guard de no-solapamiento (mismo patron que revisarInactividad / _inactividadEnCurso):
+  // si un tick anterior sigue corriendo (Evolution lento), este se saltea.
+  if (_watchdogEnCurso) return;
+  _watchdogEnCurso = true;
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) {
+      console.error('[WATCHDOG] Evolution no configurado (falta EVOLUTION_URL/EVOLUTION_KEY). Watchdog inactivo.');
+      return;
+    }
+    var REALERT_MS = (Number(process.env.WATCHDOG_REALERT_MIN) || 30) * 60 * 1000;
+
+    // 1) Enumerar las instancias a vigilar desde whatsapp_instancias (fuente de verdad
+    //    de que cuentas tienen WhatsApp). Nos quedamos con las que ALGUNA vez estuvieron
+    //    conectadas (estado 'conectado'): son las que "deberian" estar 'open'. Una instancia
+    //    'desconectado' (logout deliberado del dueno) o 'conectando' (aun no vinculo el QR)
+    //    NO es una caida que debamos alarmar -> evita falsos positivos.
+    var instRes = await supabase
+      .from('whatsapp_instancias')
+      .select('user_id, instancia_nombre, estado');
+    var instancias = (instRes && instRes.data) || [];
+    if (!instancias.length) return;
+
+    for (var i = 0; i < instancias.length; i++) {
+      var fila = instancias[i];
+      var userId = fila && fila.user_id;
+      // Usar SIEMPRE el nombre canonico (nombreInstancia) — misma fuente de verdad que
+      // /api/whatsapp/estado y el envio. instancia_nombre de la fila deberia coincidir.
+      var instancia = userId ? nombreInstancia(userId) : (fila && fila.instancia_nombre);
+      if (!instancia) continue;
+
+      // Solo vigilamos las que constan como 'conectado' en la base (las que se supone que
+      // estan 'open'). Asi el watchdog alarma una CAIDA real, no un estado esperado.
+      if (fila.estado !== 'conectado') continue;
+
+      // 2) Chequeo de estado en Evolution — SOLO LECTURA (GET connectionState). Timeout
+      //    con AbortController (~4s) para que un Evolution colgado NO frene el loop
+      //    (mismo patron que revisarSaludSistema, que usa 8s sobre fetchInstances).
+      var estado = 'desconocido';
+      var errFetch = null;
+      try {
+        var ctrl = new AbortController();
+        var to = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 4000);
+        var r = await fetch(EVOLUTION_URL + '/instance/connectionState/' + instancia, {
+          headers: { 'apikey': EVOLUTION_KEY },
+          signal: ctrl.signal
+        });
+        clearTimeout(to);
+        var data = await r.json().catch(function () { return null; });
+        estado = (data && data.instance && data.instance.state) || 'desconocido';
+      } catch (eFetch) {
+        errFetch = (eFetch && eFetch.message) || String(eFetch);
+        estado = 'inaccesible'; // Evolution no respondio / timeout / abort
+      }
+
+      var estaOpen = (estado === 'open');
+      var prev = _watchdogEstado[instancia] || { down: false, ultimoAviso: 0 };
+      var ahora = Date.now();
+
+      if (estaOpen) {
+        // Recuperada (o sigue sana): limpiar el estado de caida. NO avisamos "se recupero"
+        // en esta fase (scope = detectar caidas). Registramos que esta arriba.
+        if (prev.down) console.log('[WATCHDOG] Instancia ' + instancia + ' (user ' + userId + ') volvio a estar OPEN.');
+        _watchdogEstado[instancia] = { down: false, ultimoAviso: 0 };
+        continue;
+      }
+
+      // --- La instancia NO esta 'open': posible caida (close / connecting colgado / inaccesible) ---
+      // Dedupe: avisar en la TRANSICION a caida, o si ya paso REALERT_MS desde el ultimo aviso.
+      var esTransicion = !prev.down;
+      var toca = esTransicion || ((ahora - (prev.ultimoAviso || 0)) >= REALERT_MS);
+      _watchdogEstado[instancia] = { down: true, ultimoAviso: toca ? ahora : (prev.ultimoAviso || 0) };
+
+      if (!toca) continue; // ya avisamos hace poco por esta misma instancia caida: no spamear.
+
+      // 3) ALERTA por canales que SIGUEN VIVOS con WhatsApp caido:
+      //    (a) console.error para los logs de Railway.
+      var detalle = errFetch ? ('no accesible: ' + errFetch) : ('estado=' + estado);
+      console.error('[WATCHDOG] WhatsApp CAIDO — cuenta ' + userId + ' / instancia ' + instancia + ' (' + detalle + '). ' + (esTransicion ? 'Transicion a caida.' : 'Sigue caida (re-aviso).'));
+
+      //    (b) Push FCM al dueno de la cuenta (device_tokens del user) — texto en es-AR.
+      //        enviarPushAsesor es best-effort: si no hay FCM o no hay tokens, no rompe.
+      var _titulo = 'WhatsApp desconectado';
+      var _cuerpo = 'La conexion de WhatsApp de tu cuenta se cayo (' + detalle + '). Mientras este caida, el agente NO recibe ni responde mensajes. Revisa la conexion y volve a vincular el WhatsApp si hace falta.';
+      try { enviarPushAsesor(userId, _titulo, null, _cuerpo).catch(function () {}); } catch (ePush) {}
+
+      //    (c) Notificacion del panel Maestro + push al celular del dueno del sistema
+      //        (mismo canal que usa revisarSaludSistema via _notifSistema). Esto asegura
+      //        que el aviso llegue aunque la cuenta no tenga device_tokens propios.
+      //        crearNotifMaestro ya dispara enviarPushMaestro internamente.
+      try {
+        await crearNotifMaestro('sistema', 'WhatsApp caido (cuenta ' + String(userId).slice(0, 8) + ')',
+          'La instancia ' + instancia + ' de la cuenta ' + userId + ' no esta OPEN en Evolution (' + detalle + '). El agente de esa cuenta no atiende hasta reconectar.',
+          { ref_user_id: userId, ref_id: 'watchdog_' + instancia, severidad: 'critico' });
+      } catch (eNotif) {}
+
+      // ------------------------------------------------------------------
+      // FASE 2 (NO IMPLEMENTADO EN ESTA FASE — placeholder gateado aparte):
+      // Auto-reconexion detras de un flag SEPARADO WATCHDOG_RECONNECT === 'true'.
+      // Se deja apagado a proposito: reconectar mal (restart/logout/re-QR) puede
+      // desvincular el numero real de un cliente. Cuando se construya, ira aca,
+      // con su propio gate y probado en una instancia de prueba primero.
+      //
+      //   if (process.env.WATCHDOG_RECONNECT === 'true') {
+      //       // TODO Fase 2: intento de reconexion controlada (NO en esta fase).
+      //   }
+      // ------------------------------------------------------------------
+    }
+  } catch (e) {
+    console.error('[WATCHDOG] Error en revisarWatchdogWhatsapp:', e && e.message);
+  } finally {
+    _watchdogEnCurso = false; // liberar el guard siempre (nunca queda trabado)
+  }
+}
+
 // Revisar fallidos cada 60 segundos (reenvia apenas WhatsApp vuelve a estar conectado)
 setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
@@ -6493,6 +6647,18 @@ setTimeout(enviarAvisosTareas, 80 * 1000);
 // Backup automatico cada 30 minutos (foto completa de todos los datos por user)
 setInterval(hacerBackup, 30 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
+
+// WATCHDOG WhatsApp/Evolution (FASE 1: monitor+alerta). GATEADO OFF: el interval SOLO se
+// registra si WATCHDOG_ENABLED === 'true'. Con el flag apagado (default) no corre nada ->
+// desplegar es INERTE. Intervalo configurable por WATCHDOG_INTERVAL_MIN (default 5 min).
+// Primera corrida ~90s tras arrancar (cuando el proceso ya esta estable). Ver la funcion
+// revisarWatchdogWhatsapp para el detalle (solo-lectura contra Evolution, 0 IA, sin reconexion).
+if (process.env.WATCHDOG_ENABLED === 'true') {
+  var _watchdogIntervalMs = (Number(process.env.WATCHDOG_INTERVAL_MIN) || 5) * 60 * 1000;
+  setInterval(revisarWatchdogWhatsapp, _watchdogIntervalMs);
+  setTimeout(revisarWatchdogWhatsapp, 90 * 1000);
+  console.log('[WATCHDOG] Habilitado (monitor+alerta, fase1). Intervalo: ' + (_watchdogIntervalMs / 60000) + ' min.');
+}
 
 // ===== ASESORES (gestionados por el admin) =====
 // Crear un asesor: crea el usuario en Auth (con la service key) y la fila en asesores.

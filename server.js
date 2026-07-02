@@ -2560,13 +2560,39 @@ async function _limpiarRotacionV3(convId) {
 
 // Asigna un asesor concreto a la conv MANTENIENDO status='interesado' + ai_enabled=TRUE (la IA sigue atendiendo) y
 // marca/renueva la rotacion. UPDATE CONDICIONAL .is('asesor_id', null) para no pisar una toma concurrente (solo en el
-// arranque; en la rotacion el asesor cambia, ver _reasignarRotacionV3). Devuelve true si quedo asignado a ESTE asesor.
-async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional) {
+// arranque; en la rotacion ver el modo `preImage` mas abajo). Devuelve true si quedo asignado a ESTE asesor.
+//
+// MODOS:
+//  - `condicional === true` (ARRANQUE): agrega .is('asesor_id', null) para no robar una toma manual concurrente.
+//  - `preImage` objeto (REASIGNACION POR ROTACION DEL CRON, FIX 1+4): optimistic concurrency contra el snapshot que
+//    leyo el batch SELECT. Solo reasigna si la fila SIGUE rotando (derivacion_rotando=true), con la IA encendida y sin
+//    finalizar (ai_enabled=true, status != listo_humano/cerrado) y el asesor previo NO cambio (guard segun preImage.
+//    asesor_id: null -> .is('asesor_id', null); no-null -> .eq('asesor_id', <id>)). Si NO matchea ninguna fila, otro
+//    proceso gano (toma/asignacion/cancelacion/finalizacion manual): devuelve false y el cron NO renotifica ni loguea.
+//    Con `preImage` NO se usa el fallback degradado (los guards viven en columnas de rotacion; si no existen, no rota).
+async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional, preImage) {
   const _upd = {
     asesor_id: asesorId, ultimo_asesor_id: asesorId,
     derivacion_rotando: true, derivacion_depto_id: deptoId || null, derivacion_ultimo_intento: nowIso,
     updated_at: nowIso
   };
+  // REASIGNACION POR ROTACION (FIX 1+4): UPDATE condicional sobre el pre-image del batch. Devuelve true SOLO si toco
+  // una fila (nadie mas gano en el interin). Sin fallback degradado: si las columnas de rotacion faltan, el catch da
+  // false (no reasignar) — comportamiento seguro (mejor no rotar que rotar a ciegas). Con el flag OFF esto no corre.
+  if (preImage) {
+    try {
+      let qr = supabase.from('conversations').update(_upd).eq('id', convId)
+        .eq('derivacion_rotando', true)          // esencial: _limpiarRotacionV3 lo pone false al cancelar
+        .eq('ai_enabled', true)                  // un humano que apago la IA gana
+        .neq('status', 'listo_humano')           // un humano que finalizo gana
+        .neq('status', 'cerrado');
+      // Precondicion del asesor previo (PostgREST: .eq(col, null) NO matchea nulls -> usar .is para el caso null).
+      if (preImage.asesor_id === null || preImage.asesor_id === undefined) qr = qr.is('asesor_id', null);
+      else qr = qr.eq('asesor_id', preImage.asesor_id);
+      const { data: dr } = await qr.select('id');
+      return !!(dr && dr.length);
+    } catch (eRe) { return false; }
+  }
   try {
     let q = supabase.from('conversations').update(_upd).eq('id', convId);
     if (condicional) q = q.is('asesor_id', null); // arranque: no robar una toma manual concurrente
@@ -2598,22 +2624,30 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (!_cv) return { ok: false };
     if (_cv.asesor_id || _cv.admin_tomo === true) return { ok: false, yaTomado: true }; // ya hay humano a cargo
     if (_cv.ai_enabled === false) return { ok: false }; // IA apagada: un humano ya intervino
-    // Resolver el depto objetivo: (1) hint del agente (opts.deptoHint = nombre de la tool) -> id; (2) el de la conv;
-    // (3) el es_default. Sin ninguno -> sin depto (avanzamos igual: elegirAsesorActivo pool general como cobertura).
-    let _deptoId = _cv.departamento_id || null;
-    if (!_deptoId && opts.deptoHint) {
+    // Resolver el depto objetivo (FIX 3): PRECEDENCIA -> (1) hint del agente (opts.deptoHint = nombre de la tool) si
+    // resuelve a un depto ACTIVO valido del owner; (2) el de la conv (departamento_id, que el clasificador congela
+    // apenas deduce uno); (3) el es_default. El hint MANDA sobre el depto viejo de la conv porque el lead pudo pivotear
+    // (ej. de Ventas a Alquileres) y el agente llama derivar_a_humano({departamento:'Alquileres'}): rotar en el depto
+    // correcto. Sin ninguno -> sin depto (elegirAsesorActivo pool general como cobertura).
+    let _deptoId = null;
+    let _hintResolvio = false; // el hint matcheo un depto valido (para decidir si pisar el depto viejo de la conv)
+    if (opts.deptoHint) {
       try {
         const _hint = String(opts.deptoHint).trim().toLowerCase();
         const { data: _deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true);
         const _m = (_deps || []).find(function(d){ return d.nombre && String(d.nombre).trim().toLowerCase() === _hint; });
-        if (_m) _deptoId = _m.id;
-      } catch (eH) {}
+        if (_m) { _deptoId = _m.id; _hintResolvio = true; }
+      } catch (eH) { /* si falla la query de departamentos, caemos al depto de la conv abajo */ }
     }
+    if (!_deptoId) _deptoId = _cv.departamento_id || null; // sin hint valido -> depto de la conv
     if (!_deptoId) {
       try { const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); _deptoId = _dd && _dd.id ? _dd.id : null; } catch (eDD) {}
     }
-    // Si el agente sugirio un depto que resolvimos, persistirlo (mejora el reparto). Best-effort.
-    if (_deptoId && !_cv.departamento_id) { try { await supabase.from('conversations').update({ departamento_id: _deptoId, departamento_manual: false }).eq('id', convId); } catch (eUD) { try { await supabase.from('conversations').update({ departamento_id: _deptoId }).eq('id', convId); } catch (eUD2) {} } }
+    // Persistir el depto en la conv (mejora el reparto). Best-effort. Escribir cuando: la conv NO tenia depto, o el
+    // hint valido cambio el depto respecto al de la conv (pivot real: NO dejar el depto viejo). Solo si _deptoId difiere.
+    if (_deptoId && _deptoId !== (_cv.departamento_id || null) && (!_cv.departamento_id || _hintResolvio)) {
+      try { await supabase.from('conversations').update({ departamento_id: _deptoId, departamento_manual: false }).eq('id', convId); } catch (eUD) { try { await supabase.from('conversations').update({ departamento_id: _deptoId }).eq('id', convId); } catch (eUD2) {} }
+    }
     // Elegir un usuario DISPONIBLE. Con depto -> picker por departamento; sin depto -> pool general (cobertura).
     let _asesor = null;
     if (_deptoId) {
@@ -2661,12 +2695,31 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
 
 // FINALIZA la rotacion cuando un HUMANO escribio: status='listo_humano', ai_enabled=false (la IA se calla), limpia
 // marcadores y deja de rotar. Inserta un mensaje de sistema (0 tokens). El asesor que escribio ya esta asignado.
+// IDEMPOTENTE (FIX 2): los DOS disparadores (inline en /api/whatsapp/send y /api/enviar-media, y el cron) pueden entrar
+// ambos. El UPDATE es CONDICIONAL .eq('derivacion_rotando', true).select('id') (compare-and-set atomico): SOLO el
+// llamador que gana el clear (matchea la fila que aun estaba rotando) inserta el mensaje de sistema; el segundo ve 0
+// filas y NO inserta -> evita el mensaje duplicado. Si la columna no existe (migracion no corrida), el catch degrada
+// a un UPDATE simple + insert (comportamiento previo; sin duplicado en la practica porque la columna no existe).
 async function _finalizarRotacionV3(convId, ownerId) {
   try {
-    await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', convId);
+    let _gano = false;
+    try {
+      const { data: _fin } = await supabase.from('conversations')
+        .update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() })
+        .eq('id', convId).eq('derivacion_rotando', true).select('id');
+      _gano = !!(_fin && _fin.length);
+    } catch (eCas) {
+      // Columna derivacion_rotando ausente (migracion no corrida): degradar al UPDATE simple (sin CAS). Tratamos como
+      // ganador para preservar el comportamiento previo (status/IA off + mensaje de sistema).
+      await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', convId);
+      _gano = true;
+    }
     await _limpiarRotacionV3(convId);
-    try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: 'Un asesor tomo la conversacion. La IA deja de responder.', enviado_por: 'Sistema' }); } catch (eIns) {}
-    console.log('Derivacion v3: lead ' + convId + ' finalizado (un humano escribio) -> listo_humano, IA off');
+    // SOLO el ganador del clear inserta el mensaje de sistema (evita el duplicado del segundo disparador).
+    if (_gano) {
+      try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: 'Un asesor tomo la conversacion. La IA deja de responder.', enviado_por: 'Sistema' }); } catch (eIns) {}
+      console.log('Derivacion v3: lead ' + convId + ' finalizado (un humano escribio) -> listo_humano, IA off');
+    }
   } catch (e) { console.error('_finalizarRotacionV3:', e && e.message); }
 }
 
@@ -2696,14 +2749,23 @@ async function revisarRotacionDerivacionV3() {
         // GATE por-tenant: si el flag esta OFF (o se apago), limpiar la marca y no tocar mas (comportamiento actual).
         if (!(ownerId in _flagCache)) _flagCache[ownerId] = await derivacionV3Activo(ownerId);
         if (_flagCache[ownerId] !== true) { await _limpiarRotacionV3(conv.id); continue; }
-        // CANCELACION: si un humano ya tomo (admin_tomo) o la IA fue apagada por otra via, o el status ya paso a
-        // listo_humano/cerrado -> limpiar la marca y salir (una toma/asignacion manual gana siempre).
-        if (conv.admin_tomo === true || conv.ai_enabled === false || conv.status === 'listo_humano' || conv.status === 'cerrado') {
+        // ORDEN DE GUARDS (FIX 5B): chequear "humano escribio" ANTES de la cancelacion por ai_enabled===false. Cualquier
+        // via que apague ai_enabled tras un role='human' (enviar-media o cualquier endpoint futuro) debe FINALIZAR a
+        // 'listo_humano' (mensaje de sistema + temperatura), no solo limpiar la marca. Orden:
+        //  1) status ya listo_humano/cerrado -> limpiar + continue (nada que finalizar; ya esta cerrado);
+        //  2) un humano escribio -> _finalizarRotacionV3 + continue (el asesor tomo el lead, aunque haya sido por media/voz);
+        //  3) admin_tomo o ai_enabled===false SIN mensaje humano -> _limpiarRotacionV3 + continue (cancelacion pura).
+        if (conv.status === 'listo_humano' || conv.status === 'cerrado') {
           await _limpiarRotacionV3(conv.id); continue;
         }
-        // (a) ¿ESCRIBIO UN HUMANO desde el ultimo intento? -> FINALIZAR (el asesor tomo el lead).
+        // (a) ¿ESCRIBIO UN HUMANO desde el ultimo intento? -> FINALIZAR (el asesor tomo el lead, incluso via foto/voz).
         const _sinceIso = conv.derivacion_ultimo_intento || null;
         if (await _humanoEscribioDesde(conv.id, _sinceIso)) { await _finalizarRotacionV3(conv.id, ownerId); continue; }
+        // CANCELACION pura: un humano tomo (admin_tomo) o la IA fue apagada por otra via SIN dejar mensaje humano ->
+        // limpiar la marca y salir (una toma/asignacion manual gana siempre). Va DESPUES de "humano escribio".
+        if (conv.admin_tomo === true || conv.ai_enabled === false) {
+          await _limpiarRotacionV3(conv.id); continue;
+        }
         // (b) ¿VENCIO el timer? -> rotar / re-derivar.
         if (!(ownerId in _esperaCache)) _esperaCache[ownerId] = (await derivacionEsperaMin(ownerId)) * 60 * 1000;
         const _esperaMs = _esperaCache[ownerId];
@@ -2722,9 +2784,12 @@ async function revisarRotacionDerivacionV3() {
         }
         const nowIso = new Date().toISOString();
         if (_siguiente) {
-          // Reasignar (NO condicional a null: en rotacion el asesor cambia; ya validamos que no hay toma humana arriba).
-          const _esRotacionReal = !!(conv.asesor_id && _siguiente !== conv.asesor_id) || !conv.asesor_id;
-          await _asignarRotacionV3(conv.id, _siguiente, _deptoId, nowIso, false);
+          // Reasignar CONDICIONAL (FIX 1+4): optimistic concurrency contra el snapshot del batch (preImage). Si otro
+          // proceso gano en el interin (toma/asignacion manual que puso asesor_id + _limpiarRotacionV3 -> rotando=false;
+          // o un humano que finalizo -> ai_enabled=false/status listo_humano), el UPDATE NO matchea -> NO reasignar, NO
+          // renotificar, NO loguear: tratar como skip (respetar al humano). Solo notificamos si tocamos una fila.
+          const _reOk = await _asignarRotacionV3(conv.id, _siguiente, _deptoId, nowIso, false, { asesor_id: (conv.asesor_id || null) });
+          if (!_reOk) { continue; } // otro proceso gano (toma/asignacion/cancelacion/finalizacion manual): skip
           await _notificarRotacionV3(ownerId, conv.id, _siguiente, _leadRef, !!conv.asesor_id);
           console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)'));
         } else {
@@ -3017,6 +3082,18 @@ app.post('/api/enviar-media', async (req, res) => {
         if (_ca && !_ca.asesor_id) { try { await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id); } catch (e) {} }
       }
     }
+    // DERIVACION v3 (gated derivacion_v3, FIX 5A): "EL QUE ESCRIBE = LA SEÑAL" tambien con FOTO/VOZ. Este endpoint
+    // inserta role='human' y apaga ai_enabled=false, pero (a diferencia de /api/whatsapp/send) NO finalizaba la
+    // rotacion inline -> el lead quedaba en 'interesado' hasta que el cron lo barria por la rama de cancelacion (que
+    // NO finaliza a listo_humano). Si la conv estaba rotando, finalizamos YA (status='listo_humano', IA off, mensaje de
+    // sistema, temperatura). El flag se chequea PRIMERO (short-circuit): con el flag OFF NO hay query extra -> BYTE-
+    // IDENTICO al actual. Best-effort/defensivo (columna ausente / flag off = no-op). _finalizarRotacionV3 es idempotente.
+    try {
+      if (await derivacionV3Activo(conv.user_id)) {
+        const { data: _cvRot } = await supabase.from('conversations').select('derivacion_rotando').eq('id', conversation_id).maybeSingle();
+        if (_cvRot && _cvRot.derivacion_rotando === true) await _finalizarRotacionV3(conversation_id, conv.user_id);
+      }
+    } catch (eRotMedia) { /* columna ausente / flag off: no-op */ }
     // Responder YA: el mensaje quedo guardado. El envio a WhatsApp sigue en segundo plano.
     res.json({ ok: true });
     // Envio a Evolution en segundo plano (no bloquea la respuesta)

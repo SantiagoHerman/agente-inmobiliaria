@@ -6914,6 +6914,53 @@ app.post('/api/asesores/config', async (req, res) => {
 // asesor_id = el id del asesor que lo carga. Reusa el MISMO patron de upsert idempotente que obtenerOcrearConvDeCanal
 // (onConflict 'user_id,phone,channel' para contacts, 'user_id,contact_id' para conversations), con los mismos
 // fallbacks defensivos por si los indices unicos aun no existen en la base.
+// ── Renombrar contacto (nombre de display) ──────────────────────────────────────────────────────
+// El front NO puede escribir contacts.nombre_manual directo: la RLS de `contacts` solo deja al DUENO
+// (policy own_contacts: auth.uid()=user_id) hacer UPDATE; los asesores tienen SOLO SELECT (asesor_ve_sus_
+// contacts) -> el UPDATE se bloqueaba SIN error (0 filas) y el nombre revertia al recargar. Por eso el
+// renombrado va por aca con el cliente service-key (saltea RLS) + chequeo de tenant. Cualquier miembro del
+// tenant (dueno o asesor) puede renombrar (es solo el nombre visible); NO requiere puede_cargar_contacto.
+app.post('/api/contactos/renombrar', async function(req, res) {
+  try {
+    // 1) AUTH: identidad por token (mismo verificarUsuario que el resto).
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+
+    // 2) Resolver el ASESOR (fila en `asesores` por auth_user_id) y el DUENO del tenant (admin_id).
+    let ase = null;
+    try {
+      const r = await supabase.from('asesores').select('id, admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (!r.error && r.data) ase = r.data;
+    } catch (e1) {}
+    if (!ase || !ase.admin_id) return res.status(403).json({ error: 'No autorizado' });
+    const ownerId = ase.admin_id;   // el contacto es del DUENO (multi-tenant)
+
+    // 3) BODY. contact_id obligatorio; nombre vacio => null (vuelve al nombre de WhatsApp).
+    const b = req.body || {};
+    const contactId = (b.contact_id != null) ? String(b.contact_id) : '';
+    if (!contactId) return res.status(400).json({ error: 'Falta contact_id' });
+    const valor = (b.nombre != null) ? String(b.nombre).trim() : '';
+    const nombreFinal = (valor === '') ? null : valor;
+
+    // 4) SEGURIDAD DE TENANT: el contacto debe pertenecer al DUENO del que llama (no renombrar cross-tenant).
+    let cont = null;
+    try {
+      const { data } = await supabase.from('contacts').select('id, user_id').eq('id', contactId).maybeSingle();
+      cont = data || null;
+    } catch (eC) {}
+    if (!cont) return res.status(404).json({ error: 'Contacto no encontrado' });
+    if (cont.user_id !== ownerId) return res.status(403).json({ error: 'No autorizado' });
+
+    // 5) UPDATE con service key (saltea RLS). Scoped por id + user_id del tenant.
+    const { error: eUp } = await supabase.from('contacts').update({ nombre_manual: nombreFinal }).eq('id', contactId).eq('user_id', ownerId);
+    if (eUp) return res.status(500).json({ error: 'No se pudo guardar el nombre' });
+
+    return res.json({ ok: true, nombre_manual: nombreFinal });
+  } catch (e) {
+    return res.status(500).json({ error: 'Error interno' });
+  }
+});
+
 app.post('/api/contactos/cargar-manual', async function(req, res) {
   try {
     // 1) AUTH: identidad por token (validacion local por firma; mismo verificarUsuario que el resto).

@@ -4299,6 +4299,29 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (!inst) { console.error('Instancia sin user_id:', instanciaNombre); return; }
     const user_id = inst.user_id;
 
+    // === IDEMPOTENCIA DEL WEBHOOK ENTRANTE (FIX: "la IA se presenta 2 veces") ===
+    // Evolution puede RE-ENTREGAR el mismo messages.upsert (reintento >6s, o multi-instancia). El debounce en memoria
+    // (_debounceConv/_genEnCurso, 6s, por-proceso) NO cubre esos casos -> el mismo mensaje del lead se procesaba dos
+    // veces y el agente generaba/saludaba dos veces. Guard DURABLE por key.id (wa_message_id) igual que el saliente
+    // (guardarMensajeSaliente): si ya guardamos un mensaje con este wa_message_id para este tenant, esta entrega es un
+    // duplicado -> cortamos ANTES de gastar cualquier token (traduccion/clasificacion/generacion). El res.json({received})
+    // ya se envio arriba. DEFENSIVO: si la columna wa_message_id no existiera todavia, el select falla y caemos al
+    // comportamiento ACTUAL (no dedupe durable, sigue el debounce en memoria). El insert de mas abajo persiste key.id;
+    // con el indice UNIQUE parcial de la migracion, dos entregas concurrentes ademas fallan atomicamente en la DB. 0 IA.
+    const _waMsgId = key.id || null;
+    if (_waMsgId) {
+      try {
+        const { data: _yaEntrante, error: _errIdem } = await supabase
+          .from('messages').select('id').eq('user_id', user_id).eq('wa_message_id', _waMsgId).limit(1).maybeSingle();
+        // Solo cortamos si el SELECT anduvo y encontro el mensaje. Si _errIdem existe (p.ej. columna faltante), NO cortamos:
+        // fallback al comportamiento actual (el catch tambien lo cubre) para no perder mensajes por un error de schema.
+        if (!_errIdem && _yaEntrante) {
+          console.log('Webhook WA: entrega duplicada ignorada (wa_message_id ' + _waMsgId + ', conv/tenant ' + user_id + ')');
+          return;
+        }
+      } catch (eIdem) { /* defensivo: ante cualquier fallo del guard, seguimos con el flujo actual (no dedupe durable) */ }
+    }
+
     // === REPORTE AL ADMIN: si quien escribe es el numero de reportes del dueno y pide reporte ===
     try {
       const { data: bsRep } = await supabase.from('business_settings').select('reportes_config, crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
@@ -4393,7 +4416,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       let _mU = null, _mT = null;
       if (tipoMediaEntrante) { try { const _ms = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, true); if (_ms) { _mU = _ms.url; _mT = _ms.tipo; } } catch (e) {} }
       try {
-        await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto, media_url: _mU, media_tipo: _mT });
+        await supabase.from('messages').insert(Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto, media_url: _mU, media_tipo: _mT }, _waMsgId ? { wa_message_id: _waMsgId } : {}));
         await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
       } catch (e) { console.error('guardar msg (pausa total/papelera):', e && e.message); }
       if (_enPausaTotal) {
@@ -4444,7 +4467,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
     let mediaUrlLead = null; let mediaTipoLead = null;
     if (mediaSubido) { mediaUrlLead = mediaSubido.url; mediaTipoLead = mediaSubido.tipo; }
-    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead });
+    // IDEMPOTENCIA: persistimos wa_message_id (key.id) para que una RE-ENTREGA del webhook sea detectada por el guard
+    // de arriba y no se re-procese. Si la columna no existiera aun, el insert no debe romper -> _waMsgId cae a null via
+    // el spread condicional (no se manda la columna) y todo funciona como hoy. El indice UNIQUE parcial de la migracion
+    // hace que dos entregas concurrentes fallen atomicamente en la DB (el catch de abajo lo absorbe sin perder el flujo).
+    await supabase.from('messages').insert(Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead }, _waMsgId ? { wa_message_id: _waMsgId } : {}));
     // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
     if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
@@ -6220,7 +6247,9 @@ async function enviarRecontactosPendientes() {
       console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
       enviados++;
       if (enviados >= RECONTACTO_CAP) break; // tope por tanda: el resto sale en las proximas corridas (cada 15 min)
-      await new Promise(function(r){ setTimeout(r, 8000 + Math.floor(Math.random() * 12000)); }); // espaciar 8-20s entre envios (anti-baneo)
+      // FIX recontacto ("enviados muy pegados"): subimos el gap de 8-20s a 45-120s (mas natural/humano, anti-baneo),
+      // consistente con el motor v2. Solo timing, 0 IA.
+      await new Promise(function(r){ setTimeout(r, 45000 + Math.floor(Math.random() * 75000)); }); // espaciar 45-120s entre envios (anti-baneo)
     }
     // MOTOR NUEVO (gateado): procesa SOLO las cuentas con recontacto_v2 = true. Las cuentas legacy ya
     // se procesaron arriba. Si falla, no afecta al camino legacy (todo dentro de su propio try/catch).
@@ -6307,7 +6336,10 @@ function _minutosRestantesFranja(horario) {
 
 async function _enviarRecontactosV2(ahoraMs) {
   const UN_DIA_MS = 24 * 60 * 60 * 1000;
-  const CAP_TANDA_CUENTA = 8; // tope DURO de envios por tanda por cuenta (anti-baneo): el resto va en proximas corridas
+  // FIX recontacto ("enviados muy pegados"): bajamos el CAP de 8 a 4 por tanda. Con 8 y un gap corto, una tanda entera
+  // salia en ~1-2 min ("segundos de diferencia"). Con 4 por tanda + el gap mas largo de abajo, los envios quedan mucho
+  // mas espaciados y naturales; el resto gotea en las proximas corridas (el cron corre cada 15 min). Anti-baneo. 0 IA.
+  const CAP_TANDA_CUENTA = 4; // tope DURO de envios por tanda por cuenta (anti-baneo): el resto va en proximas corridas
   const FRANJA_INTERVALO_MIN = 15; // el cron corre cada 15 min: usamos esta ventana para el goteo
   const hoyStr = (function(){ const a = new Date(); const u = a.getTime() + a.getTimezoneOffset()*60000; const arg = new Date(u - 3*60*60000); return arg.toISOString().slice(0,10); })();
 
@@ -6457,8 +6489,9 @@ async function _enviarRecontactosV2(ahoraMs) {
         enviadosHoy++;
         try { await supabase.from('business_settings').update({ recontacto_enviados_hoy: enviadosHoy, recontacto_enviados_fecha: hoyStr }).eq('user_id', uid); } catch (eInc) {}
         console.log('Recontacto v2 ENVIADO conv ' + conv.id + ' (cat ' + categoria + ', intento ' + (countRec+1) + ', cuenta ' + uid + ')');
-        // Espaciar 8-20s entre envios (anti-baneo), igual que legacy.
-        await new Promise(function(r){ setTimeout(r, 8000 + Math.floor(Math.random() * 12000)); });
+        // FIX recontacto ("enviados muy pegados"): el gap previo (8-20s) hacia que los envios cayeran con segundos de
+        // diferencia. Lo subimos a 45-120s (mas natural/humano, anti-baneo), igual que legacy. Solo timing, 0 IA.
+        await new Promise(function(r){ setTimeout(r, 45000 + Math.floor(Math.random() * 75000)); });
       }
     } catch (eCuenta) { console.error('Error recontacto v2 cuenta ' + (bs && bs.user_id) + ':', eCuenta && eCuenta.message); }
   }

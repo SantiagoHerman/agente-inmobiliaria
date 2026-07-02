@@ -1216,7 +1216,16 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
       const { data: reciente } = await supabase.from('messages').select('id').eq('conversation_id', conv.id).eq('content', texto).gte('created_at', hace2min).limit(1).maybeSingle();
       if (reciente) return;
     }
-    await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null });
+    // TAREA F (derivacion-v3-refinements, NO gated / aditiva): el eco del celular lo escribio el DUEÑO desde su telefono.
+    // Atribuimos autor_nombre='Dueño' (o el nombre del negocio si lo tenemos facil) y autor_asesor_id=null (no aplica).
+    // _resolverAutorMensaje(ownerId, ownerId) devuelve exactamente eso. Defensivo: si las columnas no existen, el insert
+    // reintenta sin ellas (no rompe el guardado del eco). 0 tokens.
+    const _autorEco = await _resolverAutorMensaje(conv.user_id, conv.user_id);
+    await _insertMensajeConAutor(
+      { conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null },
+      _autorEco,
+      null
+    );
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conv.id);
     // FIX #2: el humano respondio DESDE EL CELULAR (la respuesta entra por el webhook como saliente). Igual que el
     // envio por la app, esto resuelve la espera -> reseteamos la escalada SLA (jsonb sla_avisos + Set _slaAvisoMem)
@@ -1460,6 +1469,106 @@ async function derivacionEsperaMin(user_id, bs) {
     if (_n && _n >= 1 && _n <= 240) return _n;
     return _DEF;
   } catch (e) { return _DEF; }
+}
+
+// TAREA 1 (derivacion-v3-refinements): ¿postear al canal interno "Todos" cuando la rotacion asigna/rota? Config
+// por-cuenta business_settings.derivacion_avisar_equipo. DEFAULT TRUE (comportamiento actual). El push individual
+// al asesor asignado se manda SIEMPRE (esto solo togglea el post al canal). Mismo patron defensivo que
+// derivacionEsperaMin: ausente/null/columna inexistente/cualquier error -> true. Solo se consulta con el flag ON.
+async function derivacionAvisarEquipo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_avisar_equipo')) return bs.derivacion_avisar_equipo !== false;
+    if (!user_id) return true;
+    const { data, error } = await supabase.from('business_settings').select('derivacion_avisar_equipo').eq('user_id', user_id).maybeSingle();
+    if (error) return true; // columna ausente u otro error -> default (avisar)
+    return data ? (data.derivacion_avisar_equipo !== false) : true;
+  } catch (e) { return true; }
+}
+
+// TAREA 3 (derivacion-v3-refinements): minutos EN HORARIO DE OFICINA sin nadie disponible del depto antes de avisar
+// al dueno (business_settings.derivacion_aviso_dueno_min). DEFAULT 30. Validado 1..1440. Mismo patron defensivo que
+// derivacionEsperaMin: fuera de rango/ausente/error -> 30. Solo se consulta con el flag ON.
+async function derivacionAvisoDuenoMin(user_id, bs) {
+  const _DEF = 30;
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_aviso_dueno_min')) { _raw = bs.derivacion_aviso_dueno_min; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('derivacion_aviso_dueno_min').eq('user_id', user_id).maybeSingle();
+      if (!error && data) _raw = data.derivacion_aviso_dueno_min;
+    }
+    const _n = Number(_raw);
+    if (_n && _n >= 1 && _n <= 1440) return _n;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+
+// TAREA F (derivacion-v3-refinements, NO gated / aditiva): resuelve QUIEN escribio un mensaje humano a partir del
+// auth_user_id autenticado (verificarUsuario) y el tenant dueno de la conv. Devuelve { asesorId, nombre }:
+//   - Si el que escribe es el DUENO de la cuenta (uid === ownerId): { asesorId: null, nombre: <agent-off? nombre del
+//     negocio> } -> etiquetamos como 'Dueño' (o el nombre del negocio si lo tenemos facil).
+//   - Si es un ASESOR de la cuenta (fila en asesores con auth_user_id=uid, admin_id=ownerId): { asesorId, nombre }.
+//   - Ante cualquier error / no encontrado: { asesorId: null, nombre: null } (los inserts caen a su default).
+// 0 tokens. Nunca tira (best-effort): la atribucion es cosmetica, no debe romper el envio.
+async function _resolverAutorMensaje(ownerId, uid) {
+  try {
+    if (!uid) return { asesorId: null, nombre: null };
+    if (ownerId && uid === ownerId) {
+      // El dueno escribiendo desde la app. Intentar un nombre lindo (business_settings.company_name) sin romper.
+      let _nom = 'Dueño';
+      try {
+        const { data: _bs } = await supabase.from('business_settings').select('company_name').eq('user_id', ownerId).maybeSingle();
+        if (_bs && _bs.company_name && String(_bs.company_name).trim()) _nom = String(_bs.company_name).trim();
+      } catch (eN) {}
+      return { asesorId: null, nombre: _nom };
+    }
+    const { data: _ase } = await supabase.from('asesores').select('id, nombre').eq('auth_user_id', uid).eq('admin_id', ownerId).maybeSingle();
+    if (_ase && _ase.id) return { asesorId: _ase.id, nombre: (_ase.nombre && String(_ase.nombre).trim()) ? String(_ase.nombre).trim() : null };
+    return { asesorId: null, nombre: null };
+  } catch (e) { return { asesorId: null, nombre: null }; }
+}
+
+// TAREA F (derivacion-v3-refinements, NO gated / aditiva / DEFENSIVA): inserta un mensaje agregando la atribucion de
+// autor (autor_asesor_id, autor_nombre) SIN romper si esas columnas todavia no existen en prod. Patron reintento-sin-
+// columna (como otros inserts del codigo): primero intenta con los campos de autor; si PostgREST rechaza por columna
+// inexistente (PGRST204 u otro), reintenta con el payload base (sin los campos de autor). Devuelve el resultado del
+// insert (con .select(...) si se pide via opts.select). NO gated: aplica siempre. 0 tokens.
+async function _insertMensajeConAutor(baseRow, autor, opts) {
+  opts = opts || {};
+  const _selCols = opts.select || null;
+  const _single = opts.single === true; // true -> .single(); default -> .maybeSingle() cuando hay select
+  const _autorRow = Object.assign({}, baseRow, {
+    autor_asesor_id: (autor && autor.asesorId) ? autor.asesorId : null,
+    autor_nombre: (autor && autor.nombre) ? autor.nombre : null
+  });
+  async function _run(row) {
+    let q = supabase.from('messages').insert(row);
+    if (_selCols) { q = q.select(_selCols); q = _single ? q.single() : q.maybeSingle(); }
+    return await q;
+  }
+  // El reintento sin columnas de autor SOLO debe dispararse cuando el error es por columna inexistente (migracion no
+  // corrida): PGRST204, o el mensaje menciona autor_asesor_id/autor_nombre / "column". Para CUALQUIER otro error
+  // (ej. FK, RLS) NO reintentamos -> evita el riesgo de insert DUPLICADO (el primer insert que falla por columna NO
+  // escribe nada, asi que el reintento es seguro; pero un error no-columna podria haber escrito y duplicariamos).
+  function _esErrorDeColumna(err) {
+    if (!err) return false;
+    const _code = err.code || '';
+    const _msg = String(err.message || err.details || err.hint || '').toLowerCase();
+    return _code === 'PGRST204'
+      || _msg.indexOf('autor_asesor_id') >= 0
+      || _msg.indexOf('autor_nombre') >= 0
+      || (_msg.indexOf('column') >= 0 && (_msg.indexOf('does not exist') >= 0 || _msg.indexOf('schema cache') >= 0 || _msg.indexOf('could not find') >= 0));
+  }
+  let _rowErr = null;
+  try {
+    const r = await _run(_autorRow);
+    if (r && r.error) { _rowErr = r.error; } else { return r; } // sin error -> listo
+  } catch (eAutor) { _rowErr = eAutor; }
+  // Hubo error con las columnas de autor. Reintentar SIN ellas SOLO si es error de columna; si no, devolver el error.
+  if (_esErrorDeColumna(_rowErr)) {
+    try { return await _run(baseRow); } catch (eBase) { return { data: null, error: eBase }; }
+  }
+  return { data: null, error: _rowErr };
 }
 
 // ===== FLAG POR-CUENTA consulta_dueno_activa (DESACOPLA el ciclo de aprendizaje de reparto_v2) =====
@@ -2143,6 +2252,10 @@ async function avisarGerenteWhatsApp(convId, user_id, motivo) {
     } catch (eBs) {}
     const _texto = (motivo === 'gerencia_no_recibe')
       ? 'Un lead necesita atencion de Gerencia y esa area esta configurada para NO recibir derivaciones automaticas. Te aviso para que decidas como seguir.'
+      : (motivo === 'derivacion_v3_sin_asesor')
+      // TAREA 3 (derivacion-v3-refinements): aviso cuando la IA lleva un rato buscando a alguien de un depto y NO hay
+      // nadie disponible (en horario de oficina). La IA SIGUE atendiendo al lead; esto es solo para que el dueno actue.
+      ? 'Hay un lead esperando a un asesor de un area y no hay NADIE disponible en este momento. La IA lo sigue atendiendo, pero conviene que conectes o asignes a alguien, o que lo tomes vos.'
       : 'Hay un lead que no pude derivar por ningun camino automatico (sin asesores disponibles en su area ni en Administracion). Necesito que me indiques a quien derivarlo o que lo tomes a mano.';
     if (_waContacto) { try { await enviarWhatsapp(nombreInstancia(user_id), _waContacto, _texto); } catch (eWa) { console.error('aviso gerente WhatsApp:', eWa && eWa.message); } }
     try { await enviarPushAsesor(user_id, 'Lead sin derivacion', null, _texto); } catch (eP) {}
@@ -2541,10 +2654,12 @@ async function _notificarRotacionV3(ownerId, convId, asesorId, leadRef, esRotaci
     const _txt = esRotacion
       ? ('La IA reasigno un lead (' + (leadRef || 'sin nombre') + ') a ' + _quien + ' porque el anterior no respondio a tiempo. Atendelo cuando puedas.')
       : ('La IA te asigno un lead (' + (leadRef || 'sin nombre') + ') para que lo atiendas. La IA sigue respondiendo hasta que le escribas.');
-    // Push al asesor asignado (si tiene login/tokens).
+    // Push al asesor asignado (si tiene login/tokens). SIEMPRE (asi sabe que le toco), NO togglea (TAREA 1).
     if (_aseAuth) { try { await enviarPushAsesor(_aseAuth, 'Lead asignado por la IA', '', _txt.slice(0, 180)); } catch (eP) {} }
-    // Post al canal "Todos" del equipo (0 tokens). Reusa el helper del SLA/avisos internos.
-    try { await _postearAvisoInterno(ownerId, 'general', _txt); } catch (eG) {}
+    // TAREA 1 (derivacion-v3-refinements): el post al canal "Todos" es TOGGLEABLE por business_settings.
+    // derivacion_avisar_equipo (default TRUE = comportamiento actual). Solo postear si esta en true. Este bloque solo
+    // corre con el flag derivacion_v3 ON (el llamador ya gatea), asi que con el flag OFF nada de esto se ejecuta.
+    try { if (await derivacionAvisarEquipo(ownerId)) await _postearAvisoInterno(ownerId, 'general', _txt); } catch (eG) {}
   } catch (e) { console.error('_notificarRotacionV3:', e && e.message); }
 }
 
@@ -2554,6 +2669,10 @@ async function _limpiarRotacionV3(convId) {
   try {
     if (!convId) return;
     try { await supabase.from('conversations').update({ derivacion_rotando: false, derivacion_depto_id: null, derivacion_ultimo_intento: null }).eq('id', convId); } catch (eUp) { /* columnas ausentes: los Set cubren dentro del proceso */ }
+    // TAREA 3 (derivacion-v3-refinements): resetear el dedupe del aviso al dueno. UPDATE APARTE/best-effort: si la
+    // columna nueva derivacion_aviso_dueno no existe todavia, este catch lo traga SIN afectar el reset de arriba
+    // (que usa columnas viejas). Con el flag OFF esta funcion no se llama por leads reales.
+    try { await supabase.from('conversations').update({ derivacion_aviso_dueno: false }).eq('id', convId); } catch (eAd) {}
     try { _rotacionV3AnuncioLead.delete(convId); } catch (eS) {}
   } catch (e) {}
 }
@@ -2700,18 +2819,27 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
 // llamador que gana el clear (matchea la fila que aun estaba rotando) inserta el mensaje de sistema; el segundo ve 0
 // filas y NO inserta -> evita el mensaje duplicado. Si la columna no existe (migracion no corrida), el catch degrada
 // a un UPDATE simple + insert (comportamiento previo; sin duplicado en la practica porque la columna no existe).
-async function _finalizarRotacionV3(convId, ownerId) {
+//
+// TAREA 2 (derivacion-v3-refinements) "el que escribe se lo queda": param opcional writerAsesorId. Cuando viene (id
+// de la fila en asesores del que ESCRIBIO), el UPDATE ADEMAS setea asesor_id=writerAsesorId + ultimo_asesor_id: el
+// lead queda ASIGNADO al que escribio (no al asesor que la rotacion habia puesto). Sin writerAsesorId el comportamiento
+// es EXACTO al previo (no toca asesor_id). El compare-and-set .eq('derivacion_rotando', true) se mantiene (idempotencia).
+async function _finalizarRotacionV3(convId, ownerId, writerAsesorId) {
   try {
+    // Base del UPDATE de finalizacion (identico al previo). Si vino writerAsesorId, agregamos la reasignacion.
+    const _updFin = { status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() };
+    if (writerAsesorId) { _updFin.asesor_id = writerAsesorId; _updFin.ultimo_asesor_id = writerAsesorId; }
     let _gano = false;
     try {
       const { data: _fin } = await supabase.from('conversations')
-        .update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() })
+        .update(_updFin)
         .eq('id', convId).eq('derivacion_rotando', true).select('id');
       _gano = !!(_fin && _fin.length);
     } catch (eCas) {
       // Columna derivacion_rotando ausente (migracion no corrida): degradar al UPDATE simple (sin CAS). Tratamos como
-      // ganador para preservar el comportamiento previo (status/IA off + mensaje de sistema).
-      await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', convId);
+      // ganador para preservar el comportamiento previo (status/IA off + mensaje de sistema). La reasignacion (asesor_id/
+      // ultimo_asesor_id) viaja igual en _updFin: son columnas viejas, no dependen de la migracion nueva.
+      await supabase.from('conversations').update(_updFin).eq('id', convId);
       _gano = true;
     }
     await _limpiarRotacionV3(convId);
@@ -2742,6 +2870,9 @@ async function revisarRotacionDerivacionV3() {
     if (!rotando.length) return;
     const _flagCache = {};   // derivacion_v3 ON? por tenant
     const _esperaCache = {}; // derivacion_espera_min (ms) por tenant
+    // TAREA 3 (derivacion-v3-refinements): caches por-tenant para el aviso al dueno cuando NO hay nadie disponible.
+    const _avisoDuenoMinCache = {}; // derivacion_aviso_dueno_min (ms) por tenant
+    const _horarioCache = {};       // { horario } (horario_oficina) por tenant para saber si estamos EN horario
     for (const conv of rotando) {
       try {
         const ownerId = conv.user_id;
@@ -2759,8 +2890,20 @@ async function revisarRotacionDerivacionV3() {
           await _limpiarRotacionV3(conv.id); continue;
         }
         // (a) ¿ESCRIBIO UN HUMANO desde el ultimo intento? -> FINALIZAR (el asesor tomo el lead, incluso via foto/voz).
+        // TAREA 2 (cron path): "el que escribe se lo queda". El cron no sabe quien exacto escribio; lo resolvemos
+        // leyendo el autor_asesor_id del mensaje humano MAS RECIENTE (columna aditiva de la TAREA F). Si no hay (columna
+        // ausente o el mensaje vino sin atribucion, ej. eco del celular = dueno), pasamos undefined -> _finalizarRotacionV3
+        // NO toca asesor_id (deja el de la rotacion, comportamiento previo). 0 tokens; best-effort (nunca rompe).
         const _sinceIso = conv.derivacion_ultimo_intento || null;
-        if (await _humanoEscribioDesde(conv.id, _sinceIso)) { await _finalizarRotacionV3(conv.id, ownerId); continue; }
+        if (await _humanoEscribioDesde(conv.id, _sinceIso)) {
+          let _writerId = undefined;
+          try {
+            let _qw = supabase.from('messages').select('autor_asesor_id').eq('conversation_id', conv.id).eq('role', 'human').order('created_at', { ascending: false }).limit(1);
+            const { data: _wm, error: _we } = await _qw;
+            if (!_we && _wm && _wm.length && _wm[0].autor_asesor_id) _writerId = _wm[0].autor_asesor_id;
+          } catch (eW) { /* columna autor_asesor_id ausente u otro error: dejar el asesor actual */ }
+          await _finalizarRotacionV3(conv.id, ownerId, _writerId); continue;
+        }
         // CANCELACION pura: un humano tomo (admin_tomo) o la IA fue apagada por otra via SIN dejar mensaje humano ->
         // limpiar la marca y salir (una toma/asignacion manual gana siempre). Va DESPUES de "humano escribio".
         if (conv.admin_tomo === true || conv.ai_enabled === false) {
@@ -2793,9 +2936,51 @@ async function revisarRotacionDerivacionV3() {
           await _notificarRotacionV3(ownerId, conv.id, _siguiente, _leadRef, !!conv.asesor_id);
           console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)'));
         } else {
-          // Sigue sin nadie disponible: renovar SOLO el timestamp (para no rotar en loop cada tick) y esperar.
-          // La IA sigue atendiendo. NO se toca asesor_id (puede seguir null o el anterior, que tampoco respondio).
-          try { await supabase.from('conversations').update({ derivacion_ultimo_intento: nowIso, updated_at: nowIso }).eq('id', conv.id); } catch (eR) {}
+          // Sigue sin nadie disponible. La IA sigue atendiendo. NO se toca asesor_id (puede seguir null o el anterior,
+          // que tampoco respondio). CAMBIO (TAREA 3): NO renovamos derivacion_ultimo_intento en esta rama; asi ese
+          // timestamp queda como ANCLA ESTABLE del "streak sin nadie" (arrancó cuando se derivo/rotó por ultima vez con
+          // alguien, o cuando arranco la rotacion sin nadie). Esto (a) hace que el cron REINTENTE el picker cada tick
+          // (~90s) mientras no haya nadie -> deriva mas rapido apenas alguien se libera (el objetivo "espera domingo->
+          // lunes"), y (b) da un elapsed MONOTONO para medir el aviso al dueno. Solo renovamos updated_at (orden UI).
+          try { await supabase.from('conversations').update({ updated_at: nowIso }).eq('id', conv.id); } catch (eR) {}
+          // TAREA 3 (derivacion-v3-refinements): si estamos EN HORARIO DE OFICINA y pasaron derivacion_aviso_dueno_min
+          // (default 30) minutos desde el ancla estable SIN encontrar a nadie -> avisar al DUEÑO UNA sola vez (dedupe
+          // por conversations.derivacion_aviso_dueno). La IA NO cambia de estado (sigue atendiendo). 0 tokens. Todo
+          // gateado por derivacion_v3 (ya validado arriba). Best-effort: cualquier fallo NO rompe el tick.
+          try {
+            if (!(ownerId in _avisoDuenoMinCache)) _avisoDuenoMinCache[ownerId] = (await derivacionAvisoDuenoMin(ownerId)) * 60 * 1000;
+            const _avisoMs = _avisoDuenoMinCache[ownerId];
+            // Cargar el horario de oficina del tenant (una vez). Reusa el helper existente dentroHorarioOficina.
+            if (!(ownerId in _horarioCache)) {
+              let _hor = null;
+              try { const { data: _bsH } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', ownerId).maybeSingle(); _hor = (_bsH && _bsH.horario_oficina) || null; } catch (eHo) { _hor = null; }
+              _horarioCache[ownerId] = { horario: _hor };
+            }
+            const _hor = _horarioCache[ownerId].horario;
+            // "En horario de oficina": si hay horario cargado, usamos dentroHorarioOficina; si NO hay horario cargado,
+            // tratamos como EN horario (consistente con el resto del sistema: sin horario definido no hay "cerrado").
+            const _enHorario = _hor ? dentroHorarioOficina(_hor) : true;
+            const _elapsedNoNadie = _ancla ? (ahoraMs - _ancla) : 0;
+            if (_enHorario && _ancla && _elapsedNoNadie >= _avisoMs) {
+              // Dedupe: solo avisar si derivacion_aviso_dueno NO esta ya en true. UPDATE CONDICIONAL como compare-and-set
+              // (.neq/.is) para que UN solo tick gane (evita doble aviso entre ticks/procesos). Si la columna no existe
+              // (migracion no corrida), el catch degrada a "avisar igual" con el dedupe en memoria de avisarGerenteWhatsApp.
+              let _debeAvisar = false;
+              try {
+                const { data: _mk } = await supabase.from('conversations')
+                  .update({ derivacion_aviso_dueno: true })
+                  .eq('id', conv.id).or('derivacion_aviso_dueno.is.null,derivacion_aviso_dueno.eq.false').select('id');
+                _debeAvisar = !!(_mk && _mk.length);
+              } catch (eMkAd) { _debeAvisar = true; /* columna ausente: dejamos que avisarGerenteWhatsApp dedupee en memoria */ }
+              if (_debeAvisar) {
+                // Reusa el mecanismo existente de aviso al dueno por WhatsApp (avisarGerenteWhatsApp): manda WhatsApp al
+                // whatsapp_contacto del negocio + push. Motivo propio 'derivacion_v3_sin_asesor' (su dedupe por-motivo
+                // no colisiona con los otros avisos). 0 tokens de IA.
+                try { await avisarGerenteWhatsApp(conv.id, ownerId, 'derivacion_v3_sin_asesor'); } catch (eAvG) {}
+                console.log('Derivacion v3: lead ' + conv.id + ' SIN asesor disponible > ' + Math.round(_avisoMs / 60000) + ' min en horario -> aviso al dueno');
+              }
+            }
+          } catch (eAdBloque) { /* no romper el tick por el aviso al dueno */ }
         }
       } catch (eConv) { console.error('revisarRotacionDerivacionV3 conv:', eConv && eConv.message); }
     }
@@ -3065,7 +3250,14 @@ app.post('/api/enviar-media', async (req, res) => {
     if (!contacto) return res.status(404).json({ error: 'Contacto no encontrado' });
     const instanciaNombre = nombreInstancia(conv.user_id);
     const contenidoCartelito = caption || ('[' + media_tipo + ']');
-    const { data: msgIns } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: contenidoCartelito, enviado_por: enviado_por || 'Asesor', media_url: media_url, media_tipo: media_tipo, estado_envio: 'enviando' }).select('id').maybeSingle();
+    // TAREA F (derivacion-v3-refinements, NO gated / aditiva): atribucion de autor tambien en el "cartelito" (media/voz).
+    // Defensivo (_insertMensajeConAutor reintenta sin las columnas nuevas si no existen). 0 tokens.
+    const _autorMedia = await _resolverAutorMensaje(conv.user_id, _uid);
+    const { data: msgIns } = await _insertMensajeConAutor(
+      { conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: contenidoCartelito, enviado_por: enviado_por || 'Asesor', media_url: media_url, media_tipo: media_tipo, estado_envio: 'enviando' },
+      _autorMedia,
+      { select: 'id', single: false }
+    );
     await supabase.from('conversations').update({ last_message: contenidoCartelito, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
     // RACE #1 (IA-vs-humano) — "Tomar conversacion" AUTOMATICO tambien al enviar MEDIA/VOZ (no solo texto). Si un
     // humano manda una nota de voz / foto con la IA encendida, la IA queda sin posibilidad de responder (igual que el
@@ -3091,7 +3283,8 @@ app.post('/api/enviar-media', async (req, res) => {
     try {
       if (await derivacionV3Activo(conv.user_id)) {
         const { data: _cvRot } = await supabase.from('conversations').select('derivacion_rotando').eq('id', conversation_id).maybeSingle();
-        if (_cvRot && _cvRot.derivacion_rotando === true) await _finalizarRotacionV3(conversation_id, conv.user_id);
+        // TAREA 2 "el que escribe se lo queda": reasignar al que mando la foto/voz (si es un asesor). Dueno -> null -> no reasigna.
+        if (_cvRot && _cvRot.derivacion_rotando === true) await _finalizarRotacionV3(conversation_id, conv.user_id, (_autorMedia && _autorMedia.asesorId) || undefined);
       }
     } catch (eRotMedia) { /* columna ausente / flag off: no-op */ }
     // Responder YA: el mensaje quedo guardado. El envio a WhatsApp sigue en segundo plano.
@@ -3458,7 +3651,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (_derivacionV3On) {
     toolsAgente.push({
       name: 'derivar_a_humano',
-      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. Si la usas, NO prometas tiempos ni des un nombre: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Indica el motivo y, si lo sabes, el departamento/area (usa el nombre exacto del area de la empresa).',
+      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y, si lo sabes, el departamento/area (usa el nombre exacto del area de la empresa).',
       input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre del area/departamento al que corresponde el lead (ej: Ventas, Alquileres), si lo sabes. Opcional.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
     });
   }
@@ -5421,7 +5614,15 @@ app.post('/api/whatsapp/send', async (req, res) => {
       textoEnviar = await traducir(texto, conv.idioma_lead, user_id);
       idiomaMsg = conv.idioma_lead;
     }
-    const { data: msgInsertado } = await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, content_original: (textoEnviar !== texto ? textoEnviar : null), idioma: idiomaMsg, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' }).select('id').single();
+    // TAREA F (derivacion-v3-refinements, NO gated / aditiva): resolver QUIEN escribe (el asesor autenticado o el
+    // dueno) para guardar la atribucion (autor_asesor_id/autor_nombre). _insertMensajeConAutor es DEFENSIVO: si esas
+    // columnas todavia no existen, reintenta el insert SIN ellas (no rompe el envio). 0 tokens.
+    const _autor = await _resolverAutorMensaje(conv.user_id, _uidToken);
+    const { data: msgInsertado } = await _insertMensajeConAutor(
+      { conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: texto, content_original: (textoEnviar !== texto ? textoEnviar : null), idioma: idiomaMsg, enviado_por: enviado_por || 'Humano', estado_envio: 'enviando' },
+      _autor,
+      { select: 'id', single: true }
+    );
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
     // FIX #2: RESET de la escalada SLA cuando un HUMANO responde. El escalado (revisarAvisosInternos #4) dedupea por
     // escalon con conversations.sla_avisos (jsonb persistente) + el Set en memoria _slaAvisoMem. Si nunca se limpian,
@@ -5453,7 +5654,10 @@ app.post('/api/whatsapp/send', async (req, res) => {
     try {
       if (await derivacionV3Activo(conv.user_id)) {
         const { data: _cvRot } = await supabase.from('conversations').select('derivacion_rotando').eq('id', conversation_id).maybeSingle();
-        if (_cvRot && _cvRot.derivacion_rotando === true) await _finalizarRotacionV3(conversation_id, conv.user_id);
+        // TAREA 2 "el que escribe se lo queda": pasamos el id de la fila en asesores del que ESCRIBIO (_autor.asesorId)
+        // para que _finalizarRotacionV3 reasigne asesor_id a esa persona. Si el que escribe es el DUEÑO (sin fila en
+        // asesores) -> asesorId null -> no se reasigna (queda el asesor de la rotacion): comportamiento seguro.
+        if (_cvRot && _cvRot.derivacion_rotando === true) await _finalizarRotacionV3(conversation_id, conv.user_id, (_autor && _autor.asesorId) || undefined);
       }
     } catch (eRotSend) { /* columna ausente / flag off: no-op */ }
     // Si escribe el Administrador en un lead sin asignar, lo congela (admin_tomo) para que el bucle no lo reasigne

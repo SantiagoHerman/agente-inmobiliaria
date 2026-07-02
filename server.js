@@ -11327,6 +11327,16 @@ app.post('/api/scrape/universal', async function(req, res) {
 const MODELO_SCRAPE_DESARROLLO = MODELO_INTERNO;              // Haiku (barato). Alt: MODELO_CLIENTE (Sonnet)
 const PRECIO_SCRAPE_DESARROLLO = PRECIO_HAIKU;               // emparejar con el modelo de arriba (Haiku->PRECIO_HAIKU, Sonnet->PRECIO_IA)
 
+// MODELO del paso de VISION (leer el/los PLANOS/MASTERPLAN y sacar los LOTES + su estado
+// codificado por color). Default a MODELO_CLIENTE (Sonnet) porque leer un plano con colores
+// y una leyenda exige mas precision visual que la extraccion de texto. Se puede BAJAR a
+// MODELO_INTERNO (Haiku) para abaratar si el dueño acepta menos exactitud — recordar emparejar
+// el PRECIO de abajo (Sonnet->PRECIO_IA, Haiku->PRECIO_HAIKU). El costo de vision SOLO se paga
+// si la pagina trae al menos un plano para mirar (ver _MAX_PLANOS_VISION mas abajo).
+const MODELO_SCRAPE_VISION = MODELO_CLIENTE;                 // Sonnet (precision). Alt: MODELO_INTERNO (Haiku, mas barato)
+const PRECIO_SCRAPE_VISION = PRECIO_IA;                      // emparejar con el modelo de arriba (Sonnet->PRECIO_IA, Haiku->PRECIO_HAIKU)
+const _MAX_PLANOS_VISION = 2;                               // tope de imagenes a mirar por scrapeo (acota costo)
+
 // Extrae URLs de IMAGENES y PDFs de un HTML, resolviendo relativas a absolutas.
 // General (NO WordPress-especifico como _extraerGaleriaHtml): mira src, data-src,
 // data-original, data-lazy, srcset y <a href> a .pdf. Devuelve el filename como pista
@@ -11376,6 +11386,74 @@ function _extraerImagenesDesarrollo(html, baseUrl, cap) {
     if (/\.(?:pdf|jpe?g|png|webp)(?:$|[?#])/i.test(h.split('?')[0]) || /\.pdf(?:$|[?#])/i.test(h)) _push(h);
   }
   return out.slice(0, tope);
+}
+
+// ---- VISION DE PLANOS (lotes + estado por color) ----------------------------
+// Elige de las imagenes clasificadas cuales conviene MIRAR con vision para sacar
+// los lotes. Prioriza URLs cuyo nombre/URL sugiera masterplan/loteo/plano/planta.
+// Fuente: primero imagenes.planos (lo que la IA clasifico como plano); si esta vacio,
+// cae a fotos+renders (por si el masterplan quedo mal clasificado). Devuelve HASTA
+// _MAX_PLANOS_VISION URLs (acota costo). NO mira nada si no hay ninguna imagen.
+function _elegirPlanosParaVision(imagenes) {
+  var planos = (imagenes && Array.isArray(imagenes.planos)) ? imagenes.planos.slice() : [];
+  var fotos = (imagenes && Array.isArray(imagenes.fotos)) ? imagenes.fotos.slice() : [];
+  var renders = (imagenes && Array.isArray(imagenes.renders)) ? imagenes.renders.slice() : [];
+  // pool de candidatos: planos primero (mas probable que sean el masterplan), luego el resto
+  var pool = planos.concat(fotos, renders).filter(function (u) { return typeof u === 'string' && u.trim(); });
+  if (!pool.length) return [];
+  // dedup preservando orden
+  var visto = {}, uniq = [];
+  pool.forEach(function (u) { var k = u.split('#')[0]; if (!visto[k]) { visto[k] = 1; uniq.push(u); } });
+  // score por pistas de masterplan/loteo en la URL (mas alto = mira antes)
+  var RX_FUERTE = /(master\s*plan|masterplan|loteo|lotes?|parcel|manzana|amanzana)/i;
+  var RX_MEDIO = /(plano|planta|layout|plan\b)/i;
+  function _score(u) {
+    var s = String(u).toLowerCase();
+    var sc = 0;
+    if (RX_FUERTE.test(s)) sc += 100;
+    if (RX_MEDIO.test(s)) sc += 40;
+    // un plano ya clasificado como "plano" vale mas que uno que vino de fotos/renders
+    if (planos.indexOf(u) >= 0) sc += 20;
+    return sc;
+  }
+  // orden estable por score desc; si empatan, respeta el orden original (planos primero)
+  var conIdx = uniq.map(function (u, i) { return { u: u, i: i, sc: _score(u) }; });
+  conIdx.sort(function (a, b) { return (b.sc - a.sc) || (a.i - b.i); });
+  return conIdx.slice(0, _MAX_PLANOS_VISION).map(function (x) { return x.u; });
+}
+
+// Baja UNA imagen de plano y le pide a Claude (VISION) los lotes + estado por color.
+// Reusa EXACTAMENTE el patron del clasificador de fotos (clasificarFotoBase64):
+// baja la imagen, la manda como base64 en content type:'image', registra tokens con
+// registrarUsoTokens. Usa base64 (no source.type:'url') para maxima compatibilidad con
+// CDNs que bloquean el fetch del lado de Anthropic. Devuelve el OBJETO parseado
+// { lotes:[], leyenda, confianza } o null si algo falla (el caller es defensivo).
+async function _leerLotesDePlano(url, user_id) {
+  var resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  var mediaType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  // La API de vision solo acepta estos tipos; default a jpeg si viene algo raro (ej PDF/octet-stream).
+  if (['image/jpeg', 'image/png', 'image/gif', 'image/webp'].indexOf(mediaType) < 0) mediaType = 'image/jpeg';
+  var buf = Buffer.from(await resp.arrayBuffer());
+  var promptVision = 'Este es el plano/masterplan de un loteo o desarrollo inmobiliario. ' +
+    'Identifica los LOTES visibles y su ESTADO. Los estados suelen estar codificados por COLOR ' +
+    '(ej. verde=disponible/libre, rojo=vendido, amarillo=reservado); si hay una referencia/leyenda ' +
+    'de colores en la imagen, usala. Devolve SOLO un JSON (sin markdown, sin texto alrededor): ' +
+    '{ "lotes": [ { "etiqueta":"", "estado":"disponible|reservado|vendido|libre|desconocido", ' +
+    '"superficie_m2": null, "notas":"" } ], "leyenda":"", "confianza":"alta|media|baja" }. ' +
+    'Si no podes leerlo con confianza, devolve los que puedas y el resto marcalos "desconocido". ' +
+    'No inventes lotes que no ves. "superficie_m2" numerico o null.';
+  var r = await anthropic.messages.create({
+    model: MODELO_SCRAPE_VISION,
+    max_tokens: 2000,                                       // acotado: un plano de loteo no deberia exceder esto
+    messages: [{ role: 'user', content: [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: buf.toString('base64') } },
+      { type: 'text', text: promptVision }
+    ] }]
+  });
+  try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'scraper_vision', PRECIO_SCRAPE_VISION); } catch (e) {}
+  var t = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+  return _parseJsonObjetoDefensivo(t);
 }
 
 app.post('/api/scrape/desarrollo', async function (req, res) {
@@ -11497,10 +11575,88 @@ app.post('/api/scrape/desarrollo', async function (req, res) {
     if (imgs.length > 0 && clasificadas === 0) aviso = 'Se encontraron ' + imgs.length + ' imagenes pero la IA no las clasifico; revisalas manualmente.';
     else if (!data.emprendimiento.nombre) aviso = 'No se detecto el nombre del emprendimiento; completalo a mano.';
 
+    // ---- PASO DE VISION: leer LOTES + estado del/los PLANO(S) --------------------
+    // El texto de la pagina NO trae el estado de los lotes (esta EN LA IMAGEN, por color).
+    // Aca miramos HASTA _MAX_PLANOS_VISION planos y fusionamos los lotes que la vision lea.
+    // 100% DEFENSIVO: si no hay plano, o no se puede bajar, o la vision falla/parsea mal,
+    // NO rompemos el scrape -> devolvemos data:{...,lotes:[]} con un aviso. El costo de
+    // vision SOLO se paga si hay al menos un plano para mirar.
+    data.lotes = [];
+    var _normEstadoLote = function (e) {
+      var n = (e == null ? '' : String(e)).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+      if (['disponible', 'reservado', 'vendido', 'libre'].indexOf(n) >= 0) return n;
+      return 'desconocido';
+    };
+    var _numONull = function (v) {
+      if (v === null || v === undefined || v === '') return null;
+      var num = Number(v);
+      return isNaN(num) ? null : num;
+    };
+    var planosParaMirar = _elegirPlanosParaVision(data.imagenes);
+    var resumen_lotes = { total: 0, disponibles: 0, reservados: 0, vendidos: 0, leyenda: '', confianza: '' };
+    if (planosParaMirar.length === 0) {
+      // no hay nada que mirar -> no se cobra vision; aviso claro (sin pisar un aviso previo mas importante)
+      if (!aviso) aviso = 'No se encontro un plano/masterplan para leer los lotes; cargalos a mano.';
+    } else {
+      var lotesFusion = [];
+      var vistoLote = {};                                   // dedup por etiqueta normalizada
+      var leyendas = [];
+      var confianzas = [];
+      var algunoOk = false;
+      for (var pi = 0; pi < planosParaMirar.length; pi++) {
+        var urlPlano = planosParaMirar[pi];
+        try {
+          var visionOut = await _leerLotesDePlano(urlPlano, user_id);
+          if (visionOut && typeof visionOut === 'object') {
+            algunoOk = true;
+            if (visionOut.leyenda != null && String(visionOut.leyenda).trim()) leyendas.push(String(visionOut.leyenda).trim());
+            if (visionOut.confianza != null && String(visionOut.confianza).trim()) confianzas.push(String(visionOut.confianza).trim().toLowerCase());
+            var lotesArr = Array.isArray(visionOut.lotes) ? visionOut.lotes : [];
+            for (var li = 0; li < lotesArr.length; li++) {
+              var lo = lotesArr[li] || {};
+              var etiqueta = lo.etiqueta != null ? String(lo.etiqueta).trim() : '';
+              var estado = _normEstadoLote(lo.estado);
+              // dedup: misma etiqueta (no vacia) de dos planos -> no duplicar. Etiqueta vacia siempre entra.
+              var claveDedup = etiqueta ? ('e:' + etiqueta.toLowerCase()) : null;
+              if (claveDedup && vistoLote[claveDedup]) continue;
+              if (claveDedup) vistoLote[claveDedup] = 1;
+              lotesFusion.push({
+                etiqueta: etiqueta,
+                estado: estado,
+                superficie_m2: _numONull(lo.superficie_m2),
+                notas: lo.notas != null ? String(lo.notas) : ''
+              });
+            }
+          }
+        } catch (eVis) {
+          // un plano fallo (fetch/base64/vision) -> seguimos con el proximo, no rompemos
+          console.log('scrape/desarrollo vision plano fallo:', urlPlano, '-', (eVis && eVis.message) ? eVis.message : eVis);
+        }
+      }
+      data.lotes = lotesFusion;
+      // resumen agregado
+      resumen_lotes.total = lotesFusion.length;
+      lotesFusion.forEach(function (l) {
+        if (l.estado === 'disponible' || l.estado === 'libre') resumen_lotes.disponibles++;
+        else if (l.estado === 'reservado') resumen_lotes.reservados++;
+        else if (l.estado === 'vendido') resumen_lotes.vendidos++;
+      });
+      resumen_lotes.leyenda = leyendas.join(' | ');
+      // confianza global = la MAS BAJA de las lecturas (conservador); si no hubo, ''
+      if (confianzas.indexOf('baja') >= 0) resumen_lotes.confianza = 'baja';
+      else if (confianzas.indexOf('media') >= 0) resumen_lotes.confianza = 'media';
+      else if (confianzas.indexOf('alta') >= 0) resumen_lotes.confianza = 'alta';
+      // avisos especificos de vision (sin pisar un aviso previo mas importante)
+      if (!algunoOk && !aviso) aviso = 'Se encontro un plano pero no se pudieron leer los lotes; revisalos manualmente.';
+      else if (algunoOk && lotesFusion.length === 0 && !aviso) aviso = 'Se leyo el plano pero no se identificaron lotes; revisalo manualmente.';
+    }
+    data.resumen_lotes = resumen_lotes;
+
     return res.json({
       ok: true,
       data: data,
       imagenes_encontradas: imgs.length,
+      planos_analizados: planosParaMirar.length,
       aviso: aviso || undefined
     });
   } catch (e) {

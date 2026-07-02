@@ -6745,6 +6745,10 @@ function _camposUsuarioNuevos(b) {
   if (['oficina', 'personalizado', '24-7'].indexOf(b.horario_modo) >= 0) out.horario_modo = b.horario_modo;
   if (b.horario_json && typeof b.horario_json === 'object') out.horario_json = b.horario_json;
   if (typeof b.es_ia === 'boolean') out.es_ia = b.es_ia;
+  // PERMISO por-usuario: "Cargar contacto manual" desde Conversaciones. Default false (la feature queda inerte).
+  // DEFENSIVO: solo lo seteamos si llega un boolean; si la columna aun no existe en la base, el .update lo ignora/falla
+  // en su propio bloque (no rompe el resto de la config) hasta que corra migracion-cargar-contacto.sql.
+  if (typeof b.puede_cargar_contacto === 'boolean') out.puede_cargar_contacto = b.puede_cargar_contacto;
   // PARTE A (punto 9): config del agente IA (jsonb). Acepta objeto (config) o null (limpiar al pasar a Humano).
   if (b.agente_config && typeof b.agente_config === 'object') out.agente_config = b.agente_config;
   else if (b.agente_config === null) out.agente_config = null;
@@ -6868,6 +6872,142 @@ app.post('/api/asesores/config', async (req, res) => {
     if (Array.isArray(b.departamentos)) await _setDepartamentosUsuario(b.asesor_id, b.admin_id, b.departamentos);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== CARGAR CONTACTO MANUAL (desde Conversaciones) =====
+// Un asesor con el permiso `puede_cargar_contacto` da de alta un contacto/conversacion a mano. La conversacion
+// entra directo en status='listo_humano', IA OFF (ai_enabled=false), asignada a ESE asesor. CERO IA (0 tokens).
+// MULTI-TENANT: el contacto y la conversacion pertenecen al DUENO de la cuenta (owner user_id = asesor.admin_id);
+// asesor_id = el id del asesor que lo carga. Reusa el MISMO patron de upsert idempotente que obtenerOcrearConvDeCanal
+// (onConflict 'user_id,phone,channel' para contacts, 'user_id,contact_id' para conversations), con los mismos
+// fallbacks defensivos por si los indices unicos aun no existen en la base.
+app.post('/api/contactos/cargar-manual', async function(req, res) {
+  try {
+    // 1) AUTH: identidad por token (validacion local por firma; mismo verificarUsuario que el resto).
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+
+    // 2) Resolver el ASESOR (fila en `asesores` por auth_user_id) y el DUENO del tenant (admin_id).
+    //    Proyeccion defensiva: intentamos leer `puede_cargar_contacto`; si la columna NO existe todavia
+    //    (feature aun sin migrar), el select con esa columna falla -> reintentamos SIN ella y tratamos el
+    //    permiso como false (=> 403). Asi la feature queda INERTE hasta correr migracion-cargar-contacto.sql.
+    let ase = null;
+    try {
+      const r = await supabase.from('asesores').select('id, admin_id, nombre, puede_cargar_contacto').eq('auth_user_id', uid).maybeSingle();
+      if (!r.error && r.data) ase = r.data;
+    } catch (e1) {}
+    if (!ase) {
+      // Fallback: sin la columna nueva (o cualquier otro error del select de arriba). puede_cargar_contacto queda undefined -> 403.
+      try {
+        const r2 = await supabase.from('asesores').select('id, admin_id, nombre').eq('auth_user_id', uid).maybeSingle();
+        if (!r2.error && r2.data) ase = r2.data;
+      } catch (e2) {}
+    }
+    // Solo un ASESOR (fila en `asesores`) puede cargar contactos con este permiso. El dueno "puro" (sin fila de asesor)
+    // no pasa por aca; el permiso es explicito y por-usuario (decision de Diego).
+    if (!ase || !ase.admin_id) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+
+    // 3) PERMISO: exige el flag === true. Fail-safe: columna ausente / null / false -> 403.
+    if (ase.puede_cargar_contacto !== true) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+
+    const ownerId = ase.admin_id;        // el contacto/conversacion son del DUENO (multi-tenant)
+    const asesorId = ase.id;             // asignado a ESTE asesor
+    const asesorNombre = (ase.nombre ? String(ase.nombre) : 'un asesor');
+
+    // 4) BODY + validacion. nombre y telefono obligatorios.
+    const b = req.body || {};
+    const nombre = (b.nombre != null) ? String(b.nombre).trim() : '';
+    // Normalizar el telefono IGUAL que el resto del codigo: solo digitos (la columna `phone` guarda digitos).
+    const telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+
+    const canal = 'whatsapp';
+
+    // 5) UPSERT del CONTACTO por (owner user_id, phone, channel). Mismo patron atomico que obtenerOcrearConvDeCanal.
+    //    Seteamos name=nombre y nombre_manual=nombre (el front usa nombre_manual como nombre visible del lead).
+    //    DEFENSIVO con nombre_manual: si esa columna faltara, el upsert falla -> reintentamos SIN ella.
+    let contacto = null;
+    let contactoYaExistia = false;
+    // Primero: buscar un contacto existente de ese telefono (sin filtrar por channel, para no duplicar legacy).
+    try {
+      const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', ownerId).eq('phone', telefono).maybeSingle();
+      if (existente) { contacto = existente; contactoYaExistia = true; }
+    } catch (eEx) {}
+    if (!contacto) {
+      const _payloadFull = { user_id: ownerId, name: nombre, nombre_manual: nombre, phone: telefono, channel: canal };
+      let _ok = false;
+      try {
+        const { data: nuevo, error: eUp } = await supabase.from('contacts').upsert(_payloadFull, { onConflict: 'user_id,phone,channel' }).select('id').single();
+        if (!eUp && nuevo) { contacto = nuevo; _ok = true; }
+      } catch (eUpC) {}
+      if (!_ok) {
+        // Reintento SIN nombre_manual (por si esa columna no existe) usando el mismo upsert idempotente.
+        try {
+          const { data: nuevo2, error: eUp2 } = await supabase.from('contacts').upsert({ user_id: ownerId, name: nombre, phone: telefono, channel: canal }, { onConflict: 'user_id,phone,channel' }).select('id').single();
+          if (!eUp2 && nuevo2) { contacto = nuevo2; _ok = true; }
+        } catch (eUp2C) {}
+      }
+      if (!_ok) {
+        // Fallback FINAL (indice unico ausente u otro error): re-leer por si un concurrente lo creo; si no, insert plano.
+        const { data: _reC } = await supabase.from('contacts').select('id').eq('user_id', ownerId).eq('phone', telefono).maybeSingle();
+        if (_reC) { contacto = _reC; contactoYaExistia = true; }
+        else {
+          const { data: _ins } = await supabase.from('contacts').insert({ user_id: ownerId, name: nombre, phone: telefono, channel: canal }).select('id').single();
+          contacto = _ins;
+        }
+      } else if (contactoYaExistia === false) {
+        // Si el upsert devolvio una fila preexistente (mismo conflict), no lo sabemos con certeza; lo dejamos como "nuevo".
+      }
+    } else {
+      // Ya existia: refrescar name + nombre_manual con lo que cargo el asesor (best-effort, no critico).
+      try { await supabase.from('contacts').update({ name: nombre, nombre_manual: nombre }).eq('id', contacto.id); }
+      catch (eUpdN) { try { await supabase.from('contacts').update({ name: nombre }).eq('id', contacto.id); } catch (e) {} }
+    }
+    if (!contacto) return res.status(500).json({ error: 'No se pudo crear el contacto' });
+
+    // 6) CONVERSACION: buscar-o-crear por (owner user_id, contact_id). Si existe -> UPDATE a listo_humano + IA off +
+    //    asignada a este asesor. Si no -> INSERT con esos valores. departamento_id NO se toca (queda null / lo existente).
+    const _valores = { status: 'listo_humano', ai_enabled: false, asesor_id: asesorId, ultimo_asesor_id: asesorId, updated_at: new Date().toISOString() };
+    let conv = null;
+    let convYaExistia = false;
+    try {
+      const { data: convEx } = await supabase.from('conversations').select('id').eq('user_id', ownerId).eq('contact_id', contacto.id).maybeSingle();
+      if (convEx) { conv = convEx; convYaExistia = true; }
+    } catch (eCv) {}
+    if (conv) {
+      const { error: eUpdC } = await supabase.from('conversations').update(_valores).eq('id', conv.id);
+      if (eUpdC) return res.status(500).json({ error: 'No se pudo actualizar la conversacion' });
+    } else {
+      const _convPayload = Object.assign({ user_id: ownerId, contact_id: contacto.id, channel: canal }, _valores);
+      let _okC = false;
+      try {
+        const { data: convNueva, error: eUpV } = await supabase.from('conversations').upsert(_convPayload, { onConflict: 'user_id,contact_id' }).select('id').single();
+        if (!eUpV && convNueva) { conv = convNueva; _okC = true; }
+      } catch (eUpV2) {}
+      if (!_okC) {
+        // Fallback (indice unico ausente): re-leer por si un concurrente la creo (y actualizarla); si no, insert plano.
+        const { data: _reV } = await supabase.from('conversations').select('id').eq('user_id', ownerId).eq('contact_id', contacto.id).maybeSingle();
+        if (_reV) { conv = _reV; convYaExistia = true; await supabase.from('conversations').update(_valores).eq('id', conv.id); }
+        else {
+          const { data: _insV } = await supabase.from('conversations').insert(_convPayload).select('id').single();
+          conv = _insV;
+        }
+      }
+    }
+    if (!conv) return res.status(500).json({ error: 'No se pudo crear la conversacion' });
+
+    // 7) Mensaje de SISTEMA (0 IA): deja traza en el chat de quien cargo el contacto. Best-effort (no rompe si falla).
+    try {
+      const _txtSis = 'Contacto cargado manualmente por ' + asesorNombre + ' — asignado y listo para humano';
+      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txtSis, enviado_por: 'Sistema' });
+    } catch (eSis) { console.error('cargar-manual mensaje sistema (best-effort):', eSis && eSis.message); }
+
+    return res.json({ ok: true, conversation_id: conv.id, contact_id: contacto.id, ya_existia: (contactoYaExistia || convYaExistia) === true });
+  } catch (e) {
+    console.error('cargar-manual:', e && e.message);
+    return res.status(500).json({ error: (e && e.message) || 'Error al cargar el contacto' });
+  }
 });
 
 // Membresias de departamentos de todos los usuarios de la cuenta: { asesor_id: [departamento_id, ...] }. La tabla tiene RLS service-key, por eso pasa por aca.

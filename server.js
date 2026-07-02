@@ -4983,6 +4983,10 @@ app.post('/api/whatsapp/send', async (req, res) => {
       const { data: convActual } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).single();
       if (convActual && !convActual.asesor_id) {
         await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id);
+        // R1 (recontacto_reglas_v2, gated, default OFF): la TOMA MANUAL (admin_tomo) es una derivacion a mano ->
+        // CANCELA el reloj de recontacto. Write APARTE best-effort (si la columna no existe, el catch lo traga y el
+        // envio NO se rompe). Con el flag OFF no se toca la columna -> comportamiento BYTE-IDENTICO al actual.
+        try { if (await _reglasRecontactoV2(conv.user_id)) await supabase.from('conversations').update({ recontacto_congelado: true }).eq('id', conversation_id); } catch (eCongTake) {}
       }
     }
 
@@ -5059,6 +5063,15 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
     const upd = { asesor_id: val };
     if (val) { upd.ultimo_asesor_id = val; upd.admin_tomo = false; }
     if (deptoVal !== undefined) upd.departamento_id = deptoVal;
+    // R1 (recontacto_reglas_v2, gated, default OFF): la DERIVACION/asignacion MANUAL de un humano CANCELA el reloj de
+    // recontacto -> congelamos la conv para que ni el cron de inactividad ni el sender de recontacto la agarren. Si el
+    // humano DESASIGNA (val===null) descongelamos: el lead vuelve al flujo normal. Se agrega al `upd` SOLO si el flag
+    // esta ON (fail-safe: si la columna recontacto_congelado no existe, el write de abajo cae en su propio catch y la
+    // asignacion NO se rompe). Con el flag OFF no se toca la columna -> comportamiento BYTE-IDENTICO al actual.
+    let _congelarR1 = null; // null = no tocar; true = congelar (asignar); false = descongelar (desasignar)
+    try {
+      if (await _reglasRecontactoV2(ownerId)) _congelarR1 = (val !== null);
+    } catch (eR1) { _congelarR1 = null; }
 
     // R4 (DESASIGNAR INTELIGENTE): clave del depto/flag final tras este cambio.
     let depFinal = (deptoVal !== undefined) ? deptoVal : depPrev;
@@ -5089,6 +5102,10 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
 
     // Write APARTE best-effort del flag departamento_manual=true (no romper la asignacion si la columna no existe).
     if (wantManualTrue) { manualFinal = true; try { await supabase.from('conversations').update({ departamento_manual: true }).eq('id', conversation_id); } catch (eDm) {} }
+
+    // R1 (gated): write APARTE best-effort de recontacto_congelado. Congelar al asignar / descongelar al desasignar.
+    // Si la columna no existe, el catch traga el error y la asignacion queda intacta (no rompe nada).
+    if (_congelarR1 !== null) { try { await supabase.from('conversations').update({ recontacto_congelado: _congelarR1 }).eq('id', conversation_id); } catch (eCong) {} }
 
     // 6) R3 (HISTORIAL DE PASES): mensaje de SISTEMA con TEXTO FIJO (0 IA/tokens). Mismo wording que el front.
     let mensajeSistema = null;
@@ -5296,6 +5313,26 @@ app.get('/api/whatsapp/estado', async (req, res) => {
 // ============ CRON: pasar a Recontacto las conversaciones inactivas (3 dias sin respuesta) ============
 // ---- Helpers de recontacto ----
 
+// GATE recontacto_reglas_v2 (default OFF). Dos reglas de Diego (2026-07-02), ambas 0 IA:
+//   R1: la DERIVACION/asignacion MANUAL de un humano CANCELA el reloj de recontacto -> el lead se "congela"
+//       (recontacto_congelado=true) y NI el cron de inactividad (revisarInactividad) NI el sender de recontacto
+//       lo vuelven a agarrar. Queda donde lo mando el humano.
+//   R2: el reloj de 72hs de inactividad corre SOLO con la IA ENCENDIDA. Si la IA esta pausada AHORA (conv
+//       ai_enabled=false, o cuenta crm_pausado/agente_pausado, o _pausaGlobal) NO se barre a recontacto.
+// Con el flag OFF (o sin la columna) el comportamiento es BYTE-IDENTICO al actual (fail-safe -> OFF).
+// Lectura cacheada por user_id (1 sola query por cuenta y por corrida del cron; el cache es efimero por-tick).
+async function _reglasRecontactoV2(uid, _cache) {
+  if (!uid) return false;
+  if (_cache && Object.prototype.hasOwnProperty.call(_cache, uid)) return _cache[uid];
+  let on = false;
+  try {
+    const { data: bsR } = await supabase.from('business_settings').select('recontacto_reglas_v2').eq('user_id', uid).maybeSingle();
+    on = !!(bsR && bsR.recontacto_reglas_v2 === true);
+  } catch (eR) { on = false; } // fail-safe: sin columna / error -> OFF (comportamiento actual)
+  if (_cache) _cache[uid] = on;
+  return on;
+}
+
 // Devuelve true si en el instante `tsMs` (epoch ms) estamos dentro del horario de oficina del user.
 // Fail-safe: si no hay config o falla, devuelve false (no enviar). Variante con timestamp explicito:
 // la usa la escalada SLA para evaluar el horario SOBRE EL ANCHOR (el momento en que arranco la espera),
@@ -5442,14 +5479,36 @@ async function revisarInactividad() {
   try {
     const TRES_DIAS_MS = 3 * 24 * 60 * 60 * 1000;
     const ahoraMs = Date.now();
+    // recontacto_reglas_v2 (R1/R2): caches efimeros por corrida del cron. _reglasCache = flag por cuenta;
+    // _pausaCache = settings de pausa por cuenta (crm_pausado/agente_pausado) para R2 (evitar re-querear por conv).
+    const _reglasCache = {};
+    const _pausaCache = {};
     // Conversaciones activas que podrian estar inactivas
     const { data: activas } = await supabase
       .from('conversations')
       // B7: traemos tambien asesor_id, admin_tomo y ai_enabled para NO forzar ai_enabled=true al pasar a recontacto.
-      .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled')
+      // recontacto_congelado (R1, gated): si un humano derivo/asigno a mano, el cron NO debe barrer esta conv.
+      .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado')
       .in('status', ['en_conversacion', 'interesado']);
     if (!activas || activas.length === 0) return;
     for (const conv of activas) {
+      // === reglas_v2 (gated, default OFF): con el flag OFF nada de esto corre y el barrido es IDENTICO al actual. ===
+      const _reglasOn = await _reglasRecontactoV2(conv.user_id, _reglasCache);
+      if (_reglasOn) {
+        // R1: humano congelo esta conv (derivacion/toma manual) -> NO barrer a recontacto (queda donde la mando).
+        if (conv.recontacto_congelado === true) continue;
+        // R2: el reloj corre SOLO con la IA encendida. Si la IA esta pausada AHORA -> NO barrer (reloj congelado).
+        // Pausa por-conversacion (ai_enabled=false) O pausa de cuenta (crm_pausado/agente_pausado) O global (_pausaGlobal).
+        if (_pausaGlobal === true) continue;
+        if (conv.ai_enabled === false) continue;
+        let _ps = _pausaCache[conv.user_id];
+        if (_ps === undefined) {
+          try { const { data: _bsP } = await supabase.from('business_settings').select('crm_pausado, agente_pausado, eliminado_at').eq('user_id', conv.user_id).maybeSingle(); _ps = _bsP || null; }
+          catch (eP) { _ps = null; }
+          _pausaCache[conv.user_id] = _ps;
+        }
+        if (_ps && (_ps.crm_pausado === true || _ps.agente_pausado === true || _ps.eliminado_at)) continue;
+      }
       // Buscar el ULTIMO mensaje de la IA en esta conversacion
       const { data: ultimoAi } = await supabase
         .from('messages')
@@ -6072,9 +6131,11 @@ async function enviarRecontactosPendientes() {
     // Conversaciones en recontacto
     const { data: enRecontacto } = await supabase
       .from('conversations')
-      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at')
+      // recontacto_congelado (R1, gated): si un humano congelo la conv, el sender NO debe mandarle recontacto.
+      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at, recontacto_congelado')
       .eq('status', 'recontacto');
     if (!enRecontacto || enRecontacto.length === 0) return;
+    const _reglasCacheSender = {}; // cache efimero del flag reglas_v2 por cuenta para esta corrida del sender
     // GATE recontacto_v2 (default OFF): una cuenta con el flag ON usa el motor NUEVO (paulatino/aleatorio/seguro)
     // y se EXCLUYE de este loop legacy. Con el flag OFF (o sin columna) el comportamiento es IDENTICO al actual.
     // Cacheamos el flag por user_id (1 sola lectura por cuenta) para no multiplicar queries.
@@ -6090,6 +6151,9 @@ async function enviarRecontactosPendientes() {
       return v2;
     }
     for (const conv of enRecontacto) {
+      // R1 (gated, default OFF): si un humano congelo el lead (derivacion/toma manual), NO enviar recontacto.
+      // Con reglas_v2 OFF (o sin columna) esto no aplica y el comportamiento es IDENTICO al actual.
+      if (conv.recontacto_congelado === true && await _reglasRecontactoV2(conv.user_id, _reglasCacheSender)) continue;
       // Si la cuenta tiene recontacto_v2 ON, NO la procesa el loop legacy: la atiende el motor nuevo mas abajo.
       if (await _esCuentaV2(conv.user_id)) continue;
       // SALVAGUARDA 1: respetar el maximo de recontactos
@@ -6302,10 +6366,13 @@ async function _enviarRecontactosV2(ahoraMs) {
       // --- Candidatas de esta cuenta en estado recontacto ---
       const { data: convs } = await supabase
         .from('conversations')
-        .select('id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido')
+        // recontacto_congelado (R1, gated): humano congelo la conv -> el motor v2 tampoco debe recontactarla.
+        .select('id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido, recontacto_congelado')
         .eq('user_id', uid)
         .eq('status', 'recontacto');
       if (!convs || convs.length === 0) continue;
+      // R1 (gated, default OFF): resolver el flag reglas_v2 UNA vez por cuenta v2 (la cuenta ya esta cargada aca).
+      const _reglasOnCuenta = await _reglasRecontactoV2(uid);
 
       const empresaRec = bs.company_name ? bs.company_name : '';
       const agentNameRec = bs.agent_name ? bs.agent_name : '';
@@ -6316,6 +6383,8 @@ async function _enviarRecontactosV2(ahoraMs) {
 
       for (const conv of convs) {
         if (enviadosCuenta >= nReal) break; // alcanzamos el objetivo de la tanda
+        // R1 (gated, default OFF): humano congelo el lead -> NO recontactar (queda donde lo mando el humano).
+        if (_reglasOnCuenta && conv.recontacto_congelado === true) continue;
         // Exclusiones / pausas por conversacion
         if (conv.recontacto_excluido === true || conv.recontacto_pausado_lead === true) continue;
         // Maximo de recontactos por conversacion

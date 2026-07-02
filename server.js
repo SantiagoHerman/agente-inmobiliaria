@@ -1427,6 +1427,41 @@ async function repartoV2Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== DERIVACION v3: FLAG POR-CUENTA derivacion_v3 (mismo patron defensivo que repartoV2Activo) =====
+// GATE del comportamiento NUEVO de derivacion "Sonnet decide + rotacion + el que escribe atiende". Con el flag
+// OFF (default: false / ausente / null / columna inexistente / cualquier error) -> comportamiento ACTUAL EXACTO:
+// la tool derivar_a_humano NO se ofrece al agente, el webhook NO evalua pidioDerivar, el cron de rotacion hace
+// early-return, y el camino clasificador(Haiku) -> derivarAHumano queda BYTE-IDENTICO al de hoy. TRUE -> se ofrece
+// la tool + se activa la rotacion. FAIL-SAFE: si la columna todavia no existe en prod, el .select devuelve error
+// -> tratamos como OFF. Reusa un bs ya cargado si trae la propiedad (evita una query extra por mensaje).
+async function derivacionV3Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_v3')) return bs.derivacion_v3 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('derivacion_v3').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.derivacion_v3 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// Minutos de espera por-cuenta antes de ROTAR al siguiente usuario disponible del depto (business_settings.
+// derivacion_espera_min). DEFAULT 10. Validado 1..240 (fuera de rango o ausente -> 10). Reusa un bs ya cargado si
+// lo trae. Ante cualquier error -> 10 (nunca romper). Solo se consulta cuando derivacion_v3 esta ON.
+async function derivacionEsperaMin(user_id, bs) {
+  const _DEF = 10;
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_espera_min')) { _raw = bs.derivacion_espera_min; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('derivacion_espera_min').eq('user_id', user_id).maybeSingle();
+      if (!error && data) _raw = data.derivacion_espera_min;
+    }
+    const _n = Number(_raw);
+    if (_n && _n >= 1 && _n <= 240) return _n;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+
 // ===== FLAG POR-CUENTA consulta_dueno_activa (DESACOPLA el ciclo de aprendizaje de reparto_v2) =====
 // Mismo patron defensivo que repartoV2Activo. DEFAULT OFF: false / null / ausente / columna inexistente ->
 // false (comportamiento ACTUAL EXACTO). Habilita el ciclo "consultar_al_dueno" (tool + relay de respuesta al
@@ -2455,6 +2490,271 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
   } catch (e) { console.error('Error derivarAHumano (' + (motivo || '') + '):', e && e.message); return null; }
 }
 
+// ============================================================================
+// ===== DERIVACION v3: ROTACION + "EL QUE ESCRIBE = LA SEÑAL" (gated derivacion_v3) =====
+// ============================================================================
+// TODO este bloque corre SOLO con derivacion_v3 ON por-tenant. Con el flag OFF (default) NADA de esto se ejecuta
+// (los llamadores gatean con derivacionV3Activo ANTES de entrar aca) y el sistema se comporta BYTE-IDENTICO a hoy.
+//
+// FLUJO (flag ON): la IA (Sonnet) decide derivar via la tool derivar_a_humano -> iniciarRotacionDerivacionV3:
+//   - elige un usuario DISPONIBLE del depto (reusa estadoDeptoParaReparto/elegirAsesorParaDepartamento);
+//   - asigna asesor_id PERO mantiene status='interesado' + ai_enabled=TRUE (la IA SIGUE atendiendo: "nunca solo");
+//   - le avisa al lead SIN nombre (plantilla fija, 0 tokens) porque puede rotar;
+//   - notifica al asesor (push) + postea en el canal "Todos" (0 tokens);
+//   - marca la conv como ROTANDO (derivacion_rotando=true, derivacion_depto_id, derivacion_ultimo_intento=now).
+// El cron revisarRotacionDerivacionV3 (cada ~90s) reevalua cada conv rotando:
+//   - si un HUMANO ESCRIBIO en la conv desde el ultimo intento -> FINALIZA: status='listo_humano', ai_enabled=false,
+//     limpia los marcadores y DEJA de rotar (el humano tomo el lead);
+//   - si NO escribio y VENCIO el timer (derivacion_espera_min, default 10) -> ROTA al SIGUIENTE disponible del depto,
+//     re-notifica y resetea el timer. Sin tope (el lead es prioridad, nunca queda solo);
+//   - si NO hay NADIE disponible (todos fuera de horario / en pausa) -> mantiene rotando con asesor_id=null y la IA
+//     sigue atendiendo; el cron reintenta y deriva cuando alguien se libera (espera domingo->lunes).
+// COSTO IA: anuncio + rotacion + cron = 0 tokens (plantillas fijas + SQL). La IA que atiende durante la espera SI
+// gasta Sonnet por cada mensaje del lead (Diego lo acepta, SIN tope) -> marcado [ROJO] donde corresponde.
+const _rotacionV3EnCurso = { v: false };            // guard de no-solapamiento del cron (patron _escalarEnCurso)
+const _rotacionV3AnuncioLead = new Set();           // dedupe del anuncio al LEAD (una vez por conv rotando)
+
+// "EL QUE ESCRIBE = LA SEÑAL": true si un HUMANO (asesor/admin/dueno-desde-celular) escribio en la conv DESPUES de
+// `sinceIso`. Todos los envios humanos guardan messages.role='human' (via /api/whatsapp/send, el endpoint del
+// cartelito y el echo del celular) -> detectamos cualquiera de ellos. 0 tokens (solo SQL). Defensivo: ante error
+// devuelve false (no finalizar por las dudas; el cron reintenta).
+async function _humanoEscribioDesde(convId, sinceIso) {
+  try {
+    if (!convId) return false;
+    let q = supabase.from('messages').select('id', { count: 'exact', head: true }).eq('conversation_id', convId).eq('role', 'human');
+    if (sinceIso) q = q.gt('created_at', sinceIso);
+    const { count } = await q;
+    return (count || 0) > 0;
+  } catch (e) { return false; }
+}
+
+// Notifica una asignacion/rotacion: push al asesor asignado (enviarPushAsesor) + post al canal "Todos" del equipo
+// (_postearAvisoInterno). 0 tokens de IA. Defensivo: nunca tira. `esRotacion` solo cambia el texto.
+async function _notificarRotacionV3(ownerId, convId, asesorId, leadRef, esRotacion) {
+  try {
+    let _aseNombre = null, _aseAuth = null;
+    try {
+      const { data: _ase } = await supabase.from('asesores').select('nombre, auth_user_id').eq('id', asesorId).eq('admin_id', ownerId).maybeSingle();
+      if (_ase) { _aseNombre = _ase.nombre || null; _aseAuth = _ase.auth_user_id || null; }
+    } catch (eAse) {}
+    const _quien = _aseNombre || 'un asesor';
+    const _txt = esRotacion
+      ? ('La IA reasigno un lead (' + (leadRef || 'sin nombre') + ') a ' + _quien + ' porque el anterior no respondio a tiempo. Atendelo cuando puedas.')
+      : ('La IA te asigno un lead (' + (leadRef || 'sin nombre') + ') para que lo atiendas. La IA sigue respondiendo hasta que le escribas.');
+    // Push al asesor asignado (si tiene login/tokens).
+    if (_aseAuth) { try { await enviarPushAsesor(_aseAuth, 'Lead asignado por la IA', '', _txt.slice(0, 180)); } catch (eP) {} }
+    // Post al canal "Todos" del equipo (0 tokens). Reusa el helper del SLA/avisos internos.
+    try { await _postearAvisoInterno(ownerId, 'general', _txt); } catch (eG) {}
+  } catch (e) { console.error('_notificarRotacionV3:', e && e.message); }
+}
+
+// Limpia los marcadores de rotacion de una conv (best-effort/defensivo; si las columnas no existen el catch lo
+// traga). Tambien purga los Set en memoria. Se llama al FINALIZAR y al CANCELAR (toma/asignacion manual).
+async function _limpiarRotacionV3(convId) {
+  try {
+    if (!convId) return;
+    try { await supabase.from('conversations').update({ derivacion_rotando: false, derivacion_depto_id: null, derivacion_ultimo_intento: null }).eq('id', convId); } catch (eUp) { /* columnas ausentes: los Set cubren dentro del proceso */ }
+    try { _rotacionV3AnuncioLead.delete(convId); } catch (eS) {}
+  } catch (e) {}
+}
+
+// Asigna un asesor concreto a la conv MANTENIENDO status='interesado' + ai_enabled=TRUE (la IA sigue atendiendo) y
+// marca/renueva la rotacion. UPDATE CONDICIONAL .is('asesor_id', null) para no pisar una toma concurrente (solo en el
+// arranque; en la rotacion el asesor cambia, ver _reasignarRotacionV3). Devuelve true si quedo asignado a ESTE asesor.
+async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional) {
+  const _upd = {
+    asesor_id: asesorId, ultimo_asesor_id: asesorId,
+    derivacion_rotando: true, derivacion_depto_id: deptoId || null, derivacion_ultimo_intento: nowIso,
+    updated_at: nowIso
+  };
+  try {
+    let q = supabase.from('conversations').update(_upd).eq('id', convId);
+    if (condicional) q = q.is('asesor_id', null); // arranque: no robar una toma manual concurrente
+    const { data } = await q.select('id');
+    return !!(data && data.length);
+  } catch (eFull) {
+    // Alguna columna de rotacion no existe (migracion no corrida): degradar a lo minimo (asesor + updated_at)
+    // para no romper. La rotacion no persistira, pero el arranque no falla y la IA sigue atendiendo.
+    try {
+      let q2 = supabase.from('conversations').update({ asesor_id: asesorId, ultimo_asesor_id: asesorId, updated_at: nowIso }).eq('id', convId);
+      if (condicional) q2 = q2.is('asesor_id', null);
+      const { data: d2 } = await q2.select('id');
+      return !!(d2 && d2.length);
+    } catch (eMin) { return false; }
+  }
+}
+
+// ARRANQUE de la rotacion (lo llama el webhook cuando la IA uso la tool derivar_a_humano y el flag esta ON).
+// Elige un usuario disponible del depto, lo asigna (IA sigue), anuncia al lead SIN nombre, notifica y marca rotando.
+// Si NO hay nadie disponible: marca rotando con asesor_id=null (la IA sigue; el cron deriva cuando alguien se libere).
+// Devuelve { ok, asesorId, esperando }. NO llama IA (0 tokens). Defensivo: ante error, la IA sigue como estaba.
+async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
+  opts = opts || {};
+  try {
+    if (!convId || !ownerId) return { ok: false };
+    const nowIso = new Date().toISOString();
+    // Releer estado: no arrancar si ya la tomo un humano (asesor_id/admin_tomo) o la IA esta apagada.
+    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, ai_enabled, departamento_id, status, contact_id').eq('id', convId).maybeSingle();
+    if (!_cv) return { ok: false };
+    if (_cv.asesor_id || _cv.admin_tomo === true) return { ok: false, yaTomado: true }; // ya hay humano a cargo
+    if (_cv.ai_enabled === false) return { ok: false }; // IA apagada: un humano ya intervino
+    // Resolver el depto objetivo: (1) hint del agente (opts.deptoHint = nombre de la tool) -> id; (2) el de la conv;
+    // (3) el es_default. Sin ninguno -> sin depto (avanzamos igual: elegirAsesorActivo pool general como cobertura).
+    let _deptoId = _cv.departamento_id || null;
+    if (!_deptoId && opts.deptoHint) {
+      try {
+        const _hint = String(opts.deptoHint).trim().toLowerCase();
+        const { data: _deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true);
+        const _m = (_deps || []).find(function(d){ return d.nombre && String(d.nombre).trim().toLowerCase() === _hint; });
+        if (_m) _deptoId = _m.id;
+      } catch (eH) {}
+    }
+    if (!_deptoId) {
+      try { const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); _deptoId = _dd && _dd.id ? _dd.id : null; } catch (eDD) {}
+    }
+    // Si el agente sugirio un depto que resolvimos, persistirlo (mejora el reparto). Best-effort.
+    if (_deptoId && !_cv.departamento_id) { try { await supabase.from('conversations').update({ departamento_id: _deptoId, departamento_manual: false }).eq('id', convId); } catch (eUD) { try { await supabase.from('conversations').update({ departamento_id: _deptoId }).eq('id', convId); } catch (eUD2) {} } }
+    // Elegir un usuario DISPONIBLE. Con depto -> picker por departamento; sin depto -> pool general (cobertura).
+    let _asesor = null;
+    if (_deptoId) {
+      try { const _est = await estadoDeptoParaReparto(ownerId, _deptoId); if (_est && _est.estado === 'asignable') _asesor = _est.asesor; } catch (eE) {}
+    } else {
+      try { _asesor = await elegirAsesorActivo(ownerId); } catch (ePa) { _asesor = null; }
+    }
+    // Referencia del lead para los avisos (nombre del contacto o telefono; 0 tokens).
+    let _leadRef = opts.leadRef || null;
+    // Anuncio al LEAD (plantilla FIJA, SIN nombre porque puede rotar). SOLO si el caller lo pide (opts.anunciarLead).
+    // Desde el WEBHOOK NO se pide: el agente ya le mando su propia respuesta (el texto de la tool o el fallback
+    // 'busco un asesor disponible...'), asi que NO duplicamos el mensaje al lead. Dedupe: una vez por conv rotando.
+    async function _anunciarLead() {
+      if (!opts.anunciarLead) return; // por defecto NO anunciar (el reply del agente ya salio)
+      if (_rotacionV3AnuncioLead.has(convId)) return;
+      _rotacionV3AnuncioLead.add(convId);
+      try {
+        const _msg = 'Perfecto, busco un asesor disponible para que te atienda, aguardame un momento.';
+        if (opts.instancia && opts.telefono) {
+          try { await enviarWhatsapp(opts.instancia, opts.telefono, _msg); } catch (eWa) {}
+          try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'ai', content: _msg, enviado_por: 'Agente IA' }); } catch (eIns) {}
+          try { await supabase.from('conversations').update({ last_message: _msg, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', convId); } catch (eLm) {}
+        }
+      } catch (eAnun) {}
+    }
+    if (_asesor) {
+      // Asignar (condicional: no pisar una toma manual que haya entrado en el interin). IA sigue atendiendo.
+      const _ok = await _asignarRotacionV3(convId, _asesor, _deptoId, nowIso, true);
+      if (!_ok) return { ok: false, yaTomado: true }; // otro proceso tomo el lead: respetar
+      await _anunciarLead();
+      await _notificarRotacionV3(ownerId, convId, _asesor, _leadRef, false);
+      console.log('Derivacion v3: lead ' + convId + ' asignado a ' + _asesor + ' (rotando, IA sigue atendiendo)');
+      return { ok: true, asesorId: _asesor, esperando: false };
+    }
+    // NADIE disponible ahora: marcar rotando SIN asesor (la IA sigue). El cron deriva cuando alguien se libere.
+    // No robamos toma manual: condicional .is('asesor_id', null) via update abajo (asesor_id se deja null).
+    try {
+      await supabase.from('conversations').update({ derivacion_rotando: true, derivacion_depto_id: _deptoId || null, derivacion_ultimo_intento: nowIso, updated_at: nowIso }).eq('id', convId).is('asesor_id', null);
+    } catch (eMk) { /* columnas ausentes: sin persistencia de rotacion, pero la IA sigue (no rompe) */ }
+    await _anunciarLead();
+    console.log('Derivacion v3: lead ' + convId + ' SIN asesor disponible -> queda rotando (IA sigue); el cron deriva al liberarse alguien');
+    return { ok: true, asesorId: null, esperando: true };
+  } catch (e) { console.error('iniciarRotacionDerivacionV3:', e && e.message); return { ok: false }; }
+}
+
+// FINALIZA la rotacion cuando un HUMANO escribio: status='listo_humano', ai_enabled=false (la IA se calla), limpia
+// marcadores y deja de rotar. Inserta un mensaje de sistema (0 tokens). El asesor que escribio ya esta asignado.
+async function _finalizarRotacionV3(convId, ownerId) {
+  try {
+    await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', convId);
+    await _limpiarRotacionV3(convId);
+    try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: 'Un asesor tomo la conversacion. La IA deja de responder.', enviado_por: 'Sistema' }); } catch (eIns) {}
+    console.log('Derivacion v3: lead ' + convId + ' finalizado (un humano escribio) -> listo_humano, IA off');
+  } catch (e) { console.error('_finalizarRotacionV3:', e && e.message); }
+}
+
+// CRON de rotacion (gated derivacion_v3, cada ~90s, guard de no-solapamiento). 0 tokens de IA (solo SQL + plantillas).
+// Para cada conv rotando: (a) si un humano escribio desde el ultimo intento -> finalizar; (b) si vencio el timer ->
+// rotar al siguiente disponible (o re-derivar si estaba sin asesor); (c) si no, esperar.
+async function revisarRotacionDerivacionV3() {
+  if (_rotacionV3EnCurso.v) return; // evitar solapamiento entre ticks
+  _rotacionV3EnCurso.v = true;
+  try {
+    const ahoraMs = Date.now();
+    let rotando = [];
+    try {
+      const { data, error } = await supabase.from('conversations')
+        .select('id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, contact_id')
+        .eq('derivacion_rotando', true);
+      if (error) return; // columna ausente (migracion no corrida) -> nada que hacer (comportamiento actual)
+      rotando = data || [];
+    } catch (eSel) { return; }
+    if (!rotando.length) return;
+    const _flagCache = {};   // derivacion_v3 ON? por tenant
+    const _esperaCache = {}; // derivacion_espera_min (ms) por tenant
+    for (const conv of rotando) {
+      try {
+        const ownerId = conv.user_id;
+        if (!ownerId) continue;
+        // GATE por-tenant: si el flag esta OFF (o se apago), limpiar la marca y no tocar mas (comportamiento actual).
+        if (!(ownerId in _flagCache)) _flagCache[ownerId] = await derivacionV3Activo(ownerId);
+        if (_flagCache[ownerId] !== true) { await _limpiarRotacionV3(conv.id); continue; }
+        // CANCELACION: si un humano ya tomo (admin_tomo) o la IA fue apagada por otra via, o el status ya paso a
+        // listo_humano/cerrado -> limpiar la marca y salir (una toma/asignacion manual gana siempre).
+        if (conv.admin_tomo === true || conv.ai_enabled === false || conv.status === 'listo_humano' || conv.status === 'cerrado') {
+          await _limpiarRotacionV3(conv.id); continue;
+        }
+        // (a) ¿ESCRIBIO UN HUMANO desde el ultimo intento? -> FINALIZAR (el asesor tomo el lead).
+        const _sinceIso = conv.derivacion_ultimo_intento || null;
+        if (await _humanoEscribioDesde(conv.id, _sinceIso)) { await _finalizarRotacionV3(conv.id, ownerId); continue; }
+        // (b) ¿VENCIO el timer? -> rotar / re-derivar.
+        if (!(ownerId in _esperaCache)) _esperaCache[ownerId] = (await derivacionEsperaMin(ownerId)) * 60 * 1000;
+        const _esperaMs = _esperaCache[ownerId];
+        const _ancla = conv.derivacion_ultimo_intento ? new Date(conv.derivacion_ultimo_intento).getTime() : 0;
+        if (_ancla && (ahoraMs - _ancla) < _esperaMs) continue; // todavia dentro del timer: esperar
+        // Timer vencido (o sin ancla): buscar el SIGUIENTE disponible del depto (equitativo; evita repetir al actual
+        // si hay mas de uno). Referencia del lead para los avisos.
+        let _leadRef = null;
+        try { if (conv.contact_id) { const { data: _c } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle(); _leadRef = (_c && (_c.name || _c.phone)) || null; } } catch (eLr) {}
+        const _deptoId = conv.derivacion_depto_id || conv.departamento_id || null;
+        let _siguiente = null;
+        if (_deptoId) {
+          try { _siguiente = await _elegirSiguienteRotacionV3(ownerId, _deptoId, conv.asesor_id); } catch (eSig) { _siguiente = null; }
+        } else {
+          try { _siguiente = await elegirAsesorActivo(ownerId); } catch (ePa) { _siguiente = null; }
+        }
+        const nowIso = new Date().toISOString();
+        if (_siguiente) {
+          // Reasignar (NO condicional a null: en rotacion el asesor cambia; ya validamos que no hay toma humana arriba).
+          const _esRotacionReal = !!(conv.asesor_id && _siguiente !== conv.asesor_id) || !conv.asesor_id;
+          await _asignarRotacionV3(conv.id, _siguiente, _deptoId, nowIso, false);
+          await _notificarRotacionV3(ownerId, conv.id, _siguiente, _leadRef, !!conv.asesor_id);
+          console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)'));
+        } else {
+          // Sigue sin nadie disponible: renovar SOLO el timestamp (para no rotar en loop cada tick) y esperar.
+          // La IA sigue atendiendo. NO se toca asesor_id (puede seguir null o el anterior, que tampoco respondio).
+          try { await supabase.from('conversations').update({ derivacion_ultimo_intento: nowIso, updated_at: nowIso }).eq('id', conv.id); } catch (eR) {}
+        }
+      } catch (eConv) { console.error('revisarRotacionDerivacionV3 conv:', eConv && eConv.message); }
+    }
+  } catch (e) { console.error('Error en revisarRotacionDerivacionV3:', e && e.message); }
+  finally { _rotacionV3EnCurso.v = false; }
+}
+
+// Elige el SIGUIENTE usuario disponible del depto para rotar, intentando NO repetir al actual si hay alternativa.
+// Reusa el picker equitativo (elegirAsesorParaDepartamento) y, si devuelve el mismo que ya estaba y hay otros
+// disponibles, elige uno distinto. Si el unico disponible es el actual, lo devuelve igual (mejor que dejarlo solo).
+// 0 tokens de IA (solo SQL). Defensivo: ante error, null.
+async function _elegirSiguienteRotacionV3(ownerId, deptoId, actualAsesorId) {
+  try {
+    const _pick = await elegirAsesorParaDepartamento(ownerId, deptoId);
+    if (!_pick) return null;
+    if (!actualAsesorId || _pick !== actualAsesorId) return _pick;
+    // El picker devolvio al mismo de antes: intentar encontrar OTRO disponible del depto (reusa el estado del depto).
+    // Como elegirAsesorParaDepartamento ya aplica disponibilidad+horario+equitativo, un segundo llamado puede devolver
+    // otro por el desempate aleatorio; si no, nos quedamos con el actual (no dejar al lead sin nadie).
+    const _pick2 = await elegirAsesorParaDepartamento(ownerId, deptoId);
+    return _pick2 || _pick;
+  } catch (e) { return null; }
+}
+
 // ===== TRANSCRIPCION DE AUDIO con Groq Whisper (multilenguaje, autodetect) =====
 async function transcribirAudioGroq(base64, mime) {
   try {
@@ -2738,6 +3038,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   let aprendizajeActivo = false;
   if (conversation_id && !modoPrueba) { try { aprendizajeActivo = await cicloAprendizajeActivo(user_id); } catch (eAp) { aprendizajeActivo = false; } }
   const { data: settings } = await supabase.from('business_settings').select('*').eq('user_id', user_id).maybeSingle();
+  // DERIVACION v3 (gated): ¿ofrecer la tool derivar_a_humano? SOLO con derivacion_v3 ON y en conv REAL (no modoPrueba).
+  // Con flag OFF -> false => la tool NO se agrega a toolsAgente y el prompt/flujo es BYTE-IDENTICO al actual. Reusa el
+  // `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
+  let _derivacionV3On = false;
+  if (conversation_id && !modoPrueba) { try { _derivacionV3On = await derivacionV3Activo(user_id, settings || undefined); } catch (eDv3) { _derivacionV3On = false; } }
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images').eq('user_id', user_id).eq('activa', true);
 
@@ -3068,6 +3373,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       input_schema: { type: 'object', properties: { pregunta: { type: 'string', description: 'La pregunta concreta y autocontenida para el dueno (que necesitas saber para poder responderle al lead).' } }, required: ['pregunta'] }
     });
   }
+  // DERIVACION v3 (gated derivacion_v3): tool derivar_a_humano. ADITIVO: con el flag OFF NO se agrega -> el prompt y
+  // el flujo son BYTE-IDENTICOS al actual. Cuando el agente decide pasar el lead a un asesor humano (el lead coordina
+  // una visita/compra/alquiler, pide hablar con una persona, o el agente iba a decir "te derivo con un asesor"), llama
+  // esta tool en vez de solo prometerlo por texto. El sistema hace la rotacion (asigna, avisa, y la IA sigue hasta que
+  // un humano escriba). NO agrega una llamada de IA extra: la tool viaja en el turno que el agente ya hace hoy.
+  if (_derivacionV3On) {
+    toolsAgente.push({
+      name: 'derivar_a_humano',
+      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. Si la usas, NO prometas tiempos ni des un nombre: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Indica el motivo y, si lo sabes, el departamento/area (usa el nombre exacto del area de la empresa).',
+      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre del area/departamento al que corresponde el lead (ej: Ventas, Alquileres), si lo sabes. Opcional.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
+    });
+  }
 
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
@@ -3091,11 +3408,29 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // mediaAEnviar: fotos que el webhook debera mandar DESPUES del texto. Vacio si la IA no pidio foto.
   let mediaAEnviar = [];
   let reply;
+  // DERIVACION v3 (gated): flags de salida para que el WEBHOOK dispare la rotacion. Con flag OFF quedan false (la tool
+  // no existe) -> el return es identico al actual. 0 tokens: NO hacemos 2do turno de cortesia; reusamos el texto que
+  // el agente ya escribio junto a la tool (o un fallback fijo) como reply.
+  let _pidioDerivarV3 = false, _derivarMotivoV3 = null, _derivarDeptoV3 = null;
   // PARTE B (punto 6 / regla 19): ¿la IA pidio consultar_al_dueno? Lo manejamos ANTES de la tool de foto. Registra
   // la duda + avisa al dueno (registrarConsultaAprendizaje, sin tokens de IA en ese paso) y hace un SEGUNDO turno
   // para que la IA cierre con un mensaje natural al lead ("lo consulto y te confirmo"). Gateado: la tool solo existe
   // con reparto_v2 ON, asi que esta rama nunca se entra con flag OFF (ACTUAL EXACTO).
   if (completion && completion.stop_reason === 'tool_use') {
+    // DERIVACION v3 (gated): ¿la IA pidio derivar_a_humano? Se maneja ANTES que las otras tools. NO hace 2do turno
+    // (0 tokens): usa el texto que el agente ya escribio junto a la tool, o un fallback fijo. El disparo real de la
+    // rotacion lo hace el WEBHOOK con estos flags (el modoPrueba nunca ofrece la tool, asi que aca conv es real).
+    const _toolDerivar = _derivacionV3On ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'derivar_a_humano'; }) : null;
+    if (_toolDerivar) {
+      _pidioDerivarV3 = true;
+      try {
+        _derivarMotivoV3 = (_toolDerivar.input && _toolDerivar.input.motivo) ? String(_toolDerivar.input.motivo).trim() : null;
+        _derivarDeptoV3 = (_toolDerivar.input && _toolDerivar.input.departamento) ? String(_toolDerivar.input.departamento).trim() : null;
+      } catch (eInDv) {}
+      const _textoPrevioDv = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      reply = _textoPrevioDv || 'Perfecto, busco un asesor disponible para que te atienda, aguardame un momento.';
+      if (!usaEmojis) { const _lDv = quitarEmojis(reply); if (_lDv) reply = _lDv; }
+    } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
       try {
@@ -3222,6 +3557,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       reply = _txt || 'Disculpa, ahora mismo no puedo mandarte la foto, pero seguimos por aca.';
     }
     } // cierra el else de _toolDueno (rama tool de foto / otras tools)
+    } // DERIVACION v3: cierra el else de _toolDerivar (rama tools existentes)
   } else {
     const block = (completion && completion.content) ? completion.content[0] : null;
     reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';
@@ -3252,7 +3588,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }
 
   // COBRO v2: flags para que el caller cobre +1 si hubo traducción saliente y +1 si la IA usó una tool (foto/consultar).
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') };
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use'), pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3 };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -4752,12 +5088,40 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             } catch (eMedia) { console.error('loop fotos propiedad:', eMedia && eMedia.message); }
           }
 
+          // ===== DERIVACION v3 (gated derivacion_v3): la IA (Sonnet) uso la tool derivar_a_humano =====
+          // Con el flag OFF, resultado.pidioDerivar es SIEMPRE false (la tool no se ofrece) -> este bloque es un no-op
+          // y el flujo (clasificador -> derivarAHumano) es BYTE-IDENTICO al actual. Con el flag ON y la tool usada:
+          // arrancamos la ROTACION (asigna un asesor disponible del depto, avisa al lead SIN nombre, notifica al asesor
+          // + canal "Todos", y la IA SIGUE atendiendo). El cron rota/finaliza segun "el que escribe = la señal".
+          // 0 tokens: la rotacion es SQL + plantillas; la tool ya viajo en el turno del agente (sin llamada extra).
+          let _rotacionV3Iniciada = false;
+          try {
+            if (resultado && resultado.pidioDerivar && await derivacionV3Activo(user_id)) {
+              // No arrancar si un humano ya intervino (iniciarRotacionDerivacionV3 revalida por dentro igual).
+              const { data: _cvDv } = await supabase.from('conversations').select('asesor_id, admin_tomo, ai_enabled, status').eq('id', _convId).maybeSingle();
+              const _humanoYa = !!(_cvDv && (_cvDv.asesor_id || _cvDv.admin_tomo === true || _cvDv.ai_enabled === false));
+              const _estadoYa = _cvDv && (_cvDv.status === 'listo_humano' || _cvDv.status === 'cerrado');
+              if (!_humanoYa && !_estadoYa) {
+                const _rr = await iniciarRotacionDerivacionV3(_convId, user_id, {
+                  deptoHint: resultado.derivarDepto || null,
+                  // anunciarLead:false (default) -> NO duplicar: el agente ya envio su reply (texto de la tool o el
+                  // fallback 'busco un asesor disponible...'). La rotacion solo asigna + notifica al equipo.
+                  leadRef: (data.pushName || telefono) || null
+                });
+                if (_rr && _rr.ok) _rotacionV3Iniciada = true;
+              }
+            }
+          } catch (eDv3) { console.error('derivacion v3 webhook:', eDv3 && eDv3.message); }
+
           // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
           // Leer el estado actual ANTES de clasificar
           const { data: convActual } = await supabase.from('conversations').select('status').eq('id', _convId).maybeSingle();
           const estadoActual = (convActual && convActual.status) || 'en_conversacion';
+          // DERIVACION v3: si ACABAMOS de arrancar la rotacion por la tool del agente, NO reclasificar en este mensaje.
+          // La derivacion ya se decidio (la IA la pidio y el sistema esta rotando); dejar que el clasificador suba a
+          // listo_humano aca dispararia derivarAHumano y romperia la rotacion (doble derivacion). Ademas ahorra 1 Haiku.
           // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
-          if (estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
+          if (!_rotacionV3Iniciada && estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
             // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId, pidioArea, deducido, fueraAlcance }.
             const _clasif = await clasificarEstado(texto, user_id);
             const nuevoEstado = _clasif && _clasif.estado;
@@ -5005,6 +5369,16 @@ app.post('/api/whatsapp/send', async (req, res) => {
         await supabase.from('conversations').update({ ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
       }
     }
+    // DERIVACION v3 (gated derivacion_v3): "EL QUE ESCRIBE = LA SEÑAL". Si esta conv estaba EN ROTACION y un humano
+    // acaba de escribir, ese humano TOMO el lead -> finalizamos la rotacion YA (status='listo_humano', IA off, limpiar
+    // marcadores) sin esperar al cron. El flag se chequea PRIMERO (short-circuit): con el flag OFF NO se hace ninguna
+    // query extra ni se toca nada -> comportamiento BYTE-IDENTICO al actual. Best-effort/defensivo (columna ausente).
+    try {
+      if (await derivacionV3Activo(conv.user_id)) {
+        const { data: _cvRot } = await supabase.from('conversations').select('derivacion_rotando').eq('id', conversation_id).maybeSingle();
+        if (_cvRot && _cvRot.derivacion_rotando === true) await _finalizarRotacionV3(conversation_id, conv.user_id);
+      }
+    } catch (eRotSend) { /* columna ausente / flag off: no-op */ }
     // Si escribe el Administrador en un lead sin asignar, lo congela (admin_tomo) para que el bucle no lo reasigne
     if (enviado_por === 'Administrador') {
       const { data: convActual } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).single();
@@ -5133,6 +5507,12 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
     // R1 (gated): write APARTE best-effort de recontacto_congelado. Congelar al asignar / descongelar al desasignar.
     // Si la columna no existe, el catch traga el error y la asignacion queda intacta (no rompe nada).
     if (_congelarR1 !== null) { try { await supabase.from('conversations').update({ recontacto_congelado: _congelarR1 }).eq('id', conversation_id); } catch (eCong) {} }
+
+    // DERIVACION v3 (gated derivacion_v3): una asignacion/reasignacion/desasignacion MANUAL CANCELA la rotacion (el
+    // humano decide quien toma el lead; la rotacion automatica ya no aplica). Limpiamos los marcadores best-effort.
+    // Con el flag OFF NO se toca la columna -> comportamiento BYTE-IDENTICO al actual. Si la columna no existe, el
+    // catch dentro de _limpiarRotacionV3 lo traga. 0 tokens.
+    try { if (await derivacionV3Activo(ownerId)) await _limpiarRotacionV3(conversation_id); } catch (eRotAsig) {}
 
     // 6) R3 (HISTORIAL DE PASES): mensaje de SISTEMA con TEXTO FIJO (0 IA/tokens). Mismo wording que el front.
     let mensajeSistema = null;
@@ -5511,14 +5891,29 @@ async function revisarInactividad() {
     const _reglasCache = {};
     const _pausaCache = {};
     // Conversaciones activas que podrian estar inactivas
-    const { data: activas } = await supabase
-      .from('conversations')
-      // B7: traemos tambien asesor_id, admin_tomo y ai_enabled para NO forzar ai_enabled=true al pasar a recontacto.
-      // recontacto_congelado (R1, gated): si un humano derivo/asigno a mano, el cron NO debe barrer esta conv.
-      .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado')
-      .in('status', ['en_conversacion', 'interesado']);
+    // DERIVACION v3 (gated): traemos derivacion_rotando para EXCLUIR del barrido las convs en rotacion (la IA sigue
+    // atendiendo a proposito; no deben caer a recontacto). DEFENSIVO: si la columna no existe (migracion no corrida),
+    // el select falla y reintentamos SIN ella -> comportamiento BYTE-IDENTICO al actual (el guard queda en no-op).
+    let activas = null;
+    try {
+      const r = await supabase.from('conversations')
+        .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado, derivacion_rotando')
+        .in('status', ['en_conversacion', 'interesado']);
+      if (r.error) throw r.error;
+      activas = r.data;
+    } catch (eRot) {
+      const r2 = await supabase.from('conversations')
+        // B7: traemos tambien asesor_id, admin_tomo y ai_enabled para NO forzar ai_enabled=true al pasar a recontacto.
+        // recontacto_congelado (R1, gated): si un humano derivo/asigno a mano, el cron NO debe barrer esta conv.
+        .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado')
+        .in('status', ['en_conversacion', 'interesado']);
+      activas = r2.data;
+    }
     if (!activas || activas.length === 0) return;
     for (const conv of activas) {
+      // DERIVACION v3 (gated): conv en ROTACION -> la IA sigue atendiendo hasta que un humano escriba; NO barrer a
+      // recontacto. Con la columna ausente, conv.derivacion_rotando es undefined -> no-op (comportamiento actual).
+      if (conv.derivacion_rotando === true) continue;
       // === reglas_v2 (gated, default OFF): con el flag OFF nada de esto corre y el barrido es IDENTICO al actual. ===
       const _reglasOn = await _reglasRecontactoV2(conv.user_id, _reglasCache);
       if (_reglasOn) {
@@ -5621,12 +6016,22 @@ async function escalarLeadsEnColaVencidos() {
     const ahoraMs = Date.now();
     // Conversaciones EN COLA: en atencion humana, sin asesor y no tomadas por el admin.
     // Traemos los tenants distintos para chequear el flag UNA vez por cuenta (no por conversacion).
-    const { data: enCola } = await supabase
-      .from('conversations')
-      .select('id, user_id, departamento_id, updated_at')
-      .eq('status', 'listo_humano')
-      .is('asesor_id', null)
-      .eq('admin_tomo', false);
+    // DERIVACION v3 (gated, defensa en profundidad): la rotacion vive en 'interesado' (NO en cola listo_humano), asi
+    // que naturalmente NO entra a este set; igual traemos derivacion_rotando y la excluimos por si algun write la
+    // dejara en cola. DEFENSIVO: si la columna no existe, reintentamos SIN ella -> comportamiento BYTE-IDENTICO.
+    let enCola = null;
+    try {
+      const r = await supabase.from('conversations')
+        .select('id, user_id, departamento_id, updated_at, derivacion_rotando')
+        .eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+      if (r.error) throw r.error;
+      enCola = r.data;
+    } catch (eRot) {
+      const r2 = await supabase.from('conversations')
+        .select('id, user_id, departamento_id, updated_at')
+        .eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+      enCola = r2.data;
+    }
     if (!enCola || enCola.length === 0) return;
     // Cache del flag reparto_v2 por tenant (una query chica por cuenta como mucho).
     const _flagCache = {};
@@ -5634,6 +6039,8 @@ async function escalarLeadsEnColaVencidos() {
     const _horarioCache = {}; // FIX (2): cache del horario_oficina por tenant (para diferir pases agendados off-hours).
     for (const conv of enCola) {
       if (_escaladoFallback.has(conv.id)) continue; // ya escalado en este proceso
+      // DERIVACION v3 (gated): si por alguna via quedo rotando, NO escalar (la maneja el cron de rotacion).
+      if (conv.derivacion_rotando === true) continue;
       const ownerId = conv.user_id;
       if (!ownerId) continue;
       // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO escalar (comportamiento actual).
@@ -5758,11 +6165,24 @@ async function revisarRespaldoTimeout() {
     // Candidatas: conversaciones donde el lead escribio ultimo (last_role='contact') y la IA todavia atiende
     // (status NO es 'listo_humano' -> no esta ya en la cola humana). Pre-filtro barato con columnas de la conv;
     // luego confirmamos contra messages que de verdad no hubo respuesta posterior.
-    const { data: candidatas } = await supabase
-      .from('conversations')
-      .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at')
-      .eq('last_role', 'contact')
-      .in('status', ['en_conversacion', 'interesado']); // (e) 'recontacto' fuera: redundante (no es atencion activa de la IA)
+    // DERIVACION v3 (gated): traemos derivacion_rotando para EXCLUIR las convs en rotacion (la IA sigue atendiendo a
+    // proposito mientras rota/espera un asesor; el respaldo NO debe derivarla por su cuenta). DEFENSIVO: si la columna
+    // no existe, reintentamos SIN ella -> comportamiento BYTE-IDENTICO al actual (el guard queda en no-op).
+    let candidatas = null;
+    try {
+      const r = await supabase.from('conversations')
+        .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at, derivacion_rotando')
+        .eq('last_role', 'contact')
+        .in('status', ['en_conversacion', 'interesado']);
+      if (r.error) throw r.error;
+      candidatas = r.data;
+    } catch (eRot) {
+      const r2 = await supabase.from('conversations')
+        .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at')
+        .eq('last_role', 'contact')
+        .in('status', ['en_conversacion', 'interesado']); // (e) 'recontacto' fuera: redundante (no es atencion activa de la IA)
+      candidatas = r2.data;
+    }
     if (!candidatas || candidatas.length === 0) return;
     // Caches por tenant (una query chica como mucho por cuenta y por tick).
     const _flagCache = {};   // respaldo_v2 ON?
@@ -5773,6 +6193,9 @@ async function revisarRespaldoTimeout() {
       if (_respaldoDerivado.has(conv.id)) continue; // ya derivado por respaldo en este proceso
       const ownerId = conv.user_id;
       if (!ownerId) continue;
+      // DERIVACION v3 (gated): conv en ROTACION -> la IA la esta atendiendo a proposito; NO derivar por respaldo.
+      // Con la columna ausente, conv.derivacion_rotando es undefined -> no-op (comportamiento actual).
+      if (conv.derivacion_rotando === true) continue;
       // REGLA Diego: el respaldo SOLO actua si la IA esta ACTIVA en el lead (ai_enabled !== false). Si un humano la apago, no se mete.
       if (conv.ai_enabled === false) continue;
       // Doble-derivacion defensiva: si la conv ya tiene asesor HUMANO o el admin la tomo, saltar (no pisar atencion humana).
@@ -6725,6 +7148,12 @@ setTimeout(escalarLeadsEnColaVencidos, 80 * 1000); // primera corrida ~80s tras 
 // revisarInactividad): granularidad fina para el umbral chico (default 3 min, configurable por cuenta).
 setInterval(revisarRespaldoTimeout, 60 * 1000);
 setTimeout(revisarRespaldoTimeout, 65 * 1000); // primera corrida ~65s tras arrancar (cuando ya esta estable)
+// DERIVACION v3 (gated por derivacion_v3 por-tenant): rotacion de leads derivados por la IA (la tool derivar_a_humano).
+// Reevalua las convs EN ROTACION: si un humano escribio -> finaliza (listo_humano + IA off); si vencio el timer
+// (derivacion_espera_min, default 10) -> rota al siguiente disponible; si no, espera. Con el flag OFF (o columna
+// derivacion_rotando ausente) hace early-return -> NO hace nada por cuenta. 0 tokens (SQL + plantillas fijas).
+setInterval(revisarRotacionDerivacionV3, 90 * 1000); // cada 90s: granularidad fina para el timer configurable (default 10 min)
+setTimeout(revisarRotacionDerivacionV3, 75 * 1000); // primera corrida ~75s tras arrancar (cuando ya esta estable)
 // AVISOS INTERNOS (default OFF por cuenta): #2 lead caliente + #3 resumen diario + #4 escalada SLA. Texto fijo + SQL,
 // SIN IA (0 tokens). FIX #4: vuelta a CADA 5 MIN (no 1 min). Los escalones SLA (p1/p2/p3, default 30/60/90) toleran
 // un jitter de +-5 min sin problema; correr cada minuto cargaba x5 a TODAS las cuentas sin beneficio real. El dedupe
@@ -13885,6 +14314,17 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
       // Registrar uso (best-effort), igual que el webhook WA.
       try { await registrarUsoTokens(tenantUserId, resultado.usage); } catch (e) {}
       try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
+      // DERIVACION v3 (gated derivacion_v3): si la IA uso la tool derivar_a_humano en este canal, arrancar la
+      // rotacion igual que en WhatsApp (asigna + notifica; la IA sigue). Con el flag OFF resultado.pidioDerivar es
+      // false (la tool no se ofrece) -> no-op. NO anunciamos al lead aca (el reply ya salio por la Send API).
+      try {
+        if (resultado.pidioDerivar && await derivacionV3Activo(tenantUserId)) {
+          const { data: _cvDv } = await supabase.from('conversations').select('asesor_id, admin_tomo, ai_enabled, status').eq('id', conv.id).maybeSingle();
+          const _humanoYa = !!(_cvDv && (_cvDv.asesor_id || _cvDv.admin_tomo === true || _cvDv.ai_enabled === false));
+          const _estadoYa = _cvDv && (_cvDv.status === 'listo_humano' || _cvDv.status === 'cerrado');
+          if (!_humanoYa && !_estadoYa) { await iniciarRotacionDerivacionV3(conv.id, tenantUserId, { deptoHint: resultado.derivarDepto || null, leadRef: (typeof senderId !== 'undefined' ? String(senderId) : null) }); }
+        }
+      } catch (eDv3Meta) { console.error('derivacion v3 meta:', eDv3Meta && eDv3Meta.message); }
       // NOTA: NO re-insertamos el mensaje 'ai' ni actualizamos la conversation aca.
       // generarRespuestaAgente() YA persiste la fila role='ai' y actualiza last_message/last_role
       // internamente (cuando hay conversation_id y no es modoPrueba). Igual que el webhook WA, que

@@ -12272,6 +12272,258 @@ setTimeout(revisarScrapingsDesarrollo, 120 * 1000);
 
 
 // ============================================================================
+// SCRAPE JOBS  —  TRABAJOS DE SCRAPING EN SEGUNDO PLANO (server-side)  — ADITIVO
+// ----------------------------------------------------------------------------
+// El scrape de DESARROLLO corre como TRABAJO EN SEGUNDO PLANO del server: el
+// usuario lo dispara (POST .../job), sale de la pagina, vuelve, y sigue corriendo
+// (no depende del navegador). Los jobs viven en la tabla scrape_jobs -> sobreviven
+// a que el usuario cierre el navegador Y a reinicios del server (los 'pendiente'
+// se retoman en el proximo tick del runner). El runner (cron procesarScrapeJobs)
+// toma DE A UNO el job 'pendiente' mas viejo, lo marca 'corriendo', lo procesa
+// segun `tipo` y va actualizando estado/progreso/mensaje/resultado.
+//
+// 🔴 COSTO: cada job de scrape corre Sonnet + vision (~10-40s). El runner procesa
+//    DE A UNO (no en paralelo) para no disparar el gasto/carga.
+//
+// GATEADO DEFENSIVO: si la tabla scrape_jobs no existe todavia (migracion no
+// corrida), los endpoints devuelven un error claro (_invTablaFaltante) y el runner
+// sale en silencio -> no rompe el server.
+// ============================================================================
+
+// Resuelve el OWNER del tenant a partir del uid del token (asesor -> admin_id).
+// Mismo patron que /api/scrape/desarrollo y el resto de endpoints.
+async function _resolverOwner(uid) {
+  try {
+    var _yo = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (_yo && _yo.data && _yo.data.admin_id) return _yo.data.admin_id; // owner del tenant
+  } catch (eOwner) { /* sin fila -> es el dueño; queda el uid */ }
+  return uid;
+}
+
+// Setea progreso/mensaje (y campos opcionales) de un job. Best-effort: si falla
+// el UPDATE (p.ej. tabla ausente en medio de un deploy), NO tira: el runner sigue.
+async function _scrapeJobUpdate(jobId, patch) {
+  try {
+    patch = patch || {};
+    patch.updated_at = new Date().toISOString();
+    await supabase.from('scrape_jobs').update(patch).eq('id', jobId);
+  } catch (e) { /* best-effort */ }
+}
+
+// ---- POST /api/scrape/desarrollo/job ---------------------------------------
+// Body: { url } (nuevo) o { development_id } (update; lee su source_url).
+// Crea una fila 'pendiente' en scrape_jobs y DEVUELVE AL INSTANTE { ok, job_id }.
+// NO ejecuta el scrape aca -> lo hace el runner (procesarScrapeJobs) en segundo plano.
+app.post('/api/scrape/desarrollo/job', async function (req, res) {
+  try {
+    // AUTH + owner (asesor -> admin_id).
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var user_id = await _resolverOwner(uid);
+
+    var url = ((req.body && req.body.url) || '').trim();
+    var devId = _invStr((req.body && (req.body.development_id || req.body.id)));
+
+    var tipo, input, devIdCol = null;
+    if (devId) {
+      // UPDATE: leer la source_url del emprendimiento + verificar tenant.
+      var dRow = await supabase.from('developments').select('user_id, source_url').eq('id', devId).maybeSingle();
+      if (dRow.error) {
+        if (_invTablaFaltante(dRow.error)) return res.status(503).json({ error: 'La tabla developments o su columna source_url no existe todavia. Corré migracion-scraper-desarrollo-v2.sql.', tabla: 'developments' });
+        return res.status(500).json({ error: 'Error leyendo el emprendimiento: ' + dRow.error.message });
+      }
+      if (!dRow.data) return res.status(404).json({ error: 'El emprendimiento no existe', development_id: devId });
+      if (dRow.data.user_id !== user_id) return res.status(403).json({ error: 'El emprendimiento no pertenece a tu cuenta' });
+      var sourceUrl = (dRow.data.source_url || '').trim();
+      if (!sourceUrl) return res.status(400).json({ error: 'Este emprendimiento no tiene URL de origen guardada. Guardá la source_url antes de actualizar por scraping.' });
+      tipo = 'desarrollo_update';
+      input = { development_id: devId, source_url: sourceUrl };
+      devIdCol = devId;
+    } else if (url) {
+      tipo = 'desarrollo_nuevo';
+      input = { url: url };
+    } else {
+      return res.status(400).json({ error: 'Falta la url del proyecto (o development_id para actualizar)' });
+    }
+
+    var ins = await supabase.from('scrape_jobs').insert({
+      user_id: user_id,
+      tipo: tipo,
+      input: input,
+      estado: 'pendiente',
+      progreso: 0,
+      mensaje: 'En cola…',
+      development_id: devIdCol
+    }).select('id').single();
+
+    if (ins.error) {
+      if (_invTablaFaltante(ins.error)) return res.status(503).json({ error: 'La tabla scrape_jobs no existe todavia. Corré migracion-scrape-jobs.sql.', tabla: 'scrape_jobs' });
+      return res.status(500).json({ error: 'No se pudo encolar el trabajo: ' + ins.error.message });
+    }
+
+    return res.json({ ok: true, job_id: ins.data.id });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
+  }
+});
+
+// ---- GET /api/scrape/jobs --------------------------------------------------
+// Lista los ultimos ~10 jobs del usuario (aislado por user_id). El front puede
+// pollear esto para el estado de sus trabajos activos + los recien terminados.
+app.get('/api/scrape/jobs', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var user_id = await _resolverOwner(uid);
+
+    var q = await supabase.from('scrape_jobs')
+      .select('id, tipo, estado, progreso, mensaje, development_id, error, created_at, updated_at')
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (q.error) {
+      if (_invTablaFaltante(q.error)) return res.status(503).json({ error: 'La tabla scrape_jobs no existe todavia. Corré migracion-scrape-jobs.sql.', tabla: 'scrape_jobs' });
+      return res.status(500).json({ error: 'Error listando trabajos: ' + q.error.message });
+    }
+    return res.json({ ok: true, jobs: q.data || [] });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
+  }
+});
+
+// ---- GET /api/scrape/job/:id  (o ?id=) -------------------------------------
+// Devuelve UN job (estado/progreso/mensaje/resultado/error). Verifica que sea
+// del user (aislamiento por user_id). El front usa esto para leer el resultado
+// cuando estado='listo' (y cargarlo en el form) o mostrar el error.
+app.get('/api/scrape/job/:id?', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var user_id = await _resolverOwner(uid);
+
+    var jobId = _invStr((req.params && req.params.id)) || _invStr((req.query && req.query.id));
+    if (!jobId) return res.status(400).json({ error: 'Falta el id del trabajo' });
+
+    var q = await supabase.from('scrape_jobs')
+      .select('id, user_id, tipo, input, estado, progreso, mensaje, resultado, development_id, error, created_at, updated_at')
+      .eq('id', jobId)
+      .maybeSingle();
+
+    if (q.error) {
+      if (_invTablaFaltante(q.error)) return res.status(503).json({ error: 'La tabla scrape_jobs no existe todavia. Corré migracion-scrape-jobs.sql.', tabla: 'scrape_jobs' });
+      return res.status(500).json({ error: 'Error leyendo el trabajo: ' + q.error.message });
+    }
+    if (!q.data) return res.status(404).json({ error: 'El trabajo no existe', job_id: jobId });
+    if (q.data.user_id !== user_id) return res.status(403).json({ error: 'El trabajo no pertenece a tu cuenta' });
+
+    return res.json({ ok: true, job: q.data });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
+  }
+});
+
+// ---- RUNNER (cron): procesarScrapeJobs -------------------------------------
+// Corre en el SERVER (no en el navegador) -> cumple "trabajo en segundo plano".
+// Cada ~25s toma el job 'pendiente' mas viejo (DE A UNO, para no disparar el
+// gasto/carga en paralelo), lo marca 'corriendo' y lo procesa segun `tipo`,
+// actualizando progreso/mensaje en etapas. Guard anti-solape (_scrapeJobsEnCurso).
+// Gateado defensivo: si la tabla no existe, sale en silencio. try/catch por job:
+// NUNCA deja un job colgado en 'corriendo' -> ante cualquier fallo lo pasa a 'error'.
+var _scrapeJobsEnCurso = false;
+async function procesarScrapeJobs() {
+  if (_scrapeJobsEnCurso) return;              // anti-solape entre ticks
+  _scrapeJobsEnCurso = true;
+  try {
+    // Tomar el 'pendiente' mas viejo (DE A UNO). Si la tabla no existe -> salir en silencio.
+    var q = await supabase.from('scrape_jobs')
+      .select('id, user_id, tipo, input')
+      .eq('estado', 'pendiente')
+      .order('created_at', { ascending: true })
+      .limit(1);
+    if (q.error) {
+      if (!_invTablaFaltante(q.error)) console.log('[scrape-jobs runner] query fallo:', q.error.message);
+      return; // tabla ausente o error -> no corre nada
+    }
+    var jobs = q.data || [];
+    if (!jobs.length) return;                  // nada pendiente
+    var job = jobs[0];
+
+    // Marcar 'corriendo' (best-effort). Nota: no hay lock atomico; el guard
+    // _scrapeJobsEnCurso + un unico proceso alcanzan para el volumen esperado.
+    await _scrapeJobUpdate(job.id, { estado: 'corriendo', progreso: 5, mensaje: 'Arrancando…', error: null });
+
+    var input = job.input || {};
+    try {
+      if (job.tipo === 'desarrollo_update') {
+        // ---- ACTUALIZAR un emprendimiento existente ----
+        var devId = _invStr(input.development_id);
+        var sourceUrl = (input.source_url || '').trim();
+        if (!devId || !sourceUrl) throw new Error('Job de update sin development_id o source_url');
+        await _scrapeJobUpdate(job.id, { progreso: 20, mensaje: 'Bajando la página…' });
+        // actualizarDevelopment orquesta scrape + map + guardar (reemplaza sectores/unidades).
+        var r = await actualizarDevelopment(devId, job.user_id, sourceUrl);
+        if (!r.ok) throw new Error(r.error || 'No se pudo actualizar el emprendimiento');
+        await _scrapeJobUpdate(job.id, {
+          estado: 'listo',
+          progreso: 100,
+          mensaje: 'Emprendimiento actualizado',
+          development_id: r.development_id || devId,
+          resultado: {
+            development_id: r.development_id || devId,
+            sectores_guardados: r.sectores_guardados,
+            unidades_guardadas: r.unidades_guardadas,
+            unidades_con_error: r.unidades_con_error,
+            actualizado: true,
+            scrape: r.scrape || null
+          },
+          error: null
+        });
+        console.log('[scrape-jobs runner] job', job.id, 'update OK dev', (r.development_id || devId));
+      } else {
+        // ---- NUEVO: scrape profundo -> guarda el PREVIEW en resultado ----
+        // (default; cubre tipo 'desarrollo_nuevo'). El usuario despues revisa y
+        // guarda desde el form usando este resultado.
+        var url = (input.url || '').trim();
+        if (!url) throw new Error('Job nuevo sin url');
+        await _scrapeJobUpdate(job.id, { progreso: 20, mensaje: 'Bajando la página…' });
+        await _scrapeJobUpdate(job.id, { progreso: 50, mensaje: 'Leyendo e interpretando…' });
+        var out = await _scrapeDesarrolloProfundo(url, job.user_id);
+        if (!out.ok) throw new Error(out.error || 'No se pudo scrapear la página');
+        await _scrapeJobUpdate(job.id, { progreso: 80, mensaje: 'Analizando planos…' });
+        await _scrapeJobUpdate(job.id, {
+          estado: 'listo',
+          progreso: 100,
+          mensaje: 'Listo para revisar',
+          resultado: {
+            data: out.data,
+            imagenes_encontradas: out.imagenes_encontradas,
+            planos_analizados: out.planos_analizados,
+            aviso: out.aviso
+          },
+          error: null
+        });
+        console.log('[scrape-jobs runner] job', job.id, 'nuevo OK (' + url + ')');
+      }
+    } catch (eJob) {
+      // NUNCA dejar el job colgado en 'corriendo': cualquier fallo -> 'error'.
+      var msg = (eJob && eJob.message) ? eJob.message : String(eJob);
+      await _scrapeJobUpdate(job.id, { estado: 'error', mensaje: 'Falló', error: msg });
+      console.log('[scrape-jobs runner] job', job.id, 'FALLO:', msg);
+    }
+  } catch (e) {
+    console.log('[scrape-jobs runner] error general:', (e && e.message) ? e.message : e);
+  } finally {
+    _scrapeJobsEnCurso = false;
+  }
+}
+// Correr cada 25s, con un arranque a los 30s del deploy. Al reiniciar el server,
+// los jobs que quedaron 'pendiente' se retoman solos en el proximo tick.
+setInterval(procesarScrapeJobs, 25 * 1000);
+setTimeout(procesarScrapeJobs, 30 * 1000);
+
+
+// ============================================================================
 // INVENTARIO MULTI-RUBRO  (HOTEL/CABAÑAS + DESARROLLADORA)  — ADITIVO
 // ----------------------------------------------------------------------------
 // Persiste los forms _FormHotel.tsx y _FormDesarrollo.tsx.

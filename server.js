@@ -14582,6 +14582,60 @@ app.post('/api/maestro/device-token', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// Registrar el token FCM del dispositivo de un ASESOR (o del dueno) para recibir push (enviarPushAsesor ~L167).
+// Sin este endpoint la tabla device_tokens queda vacia y el push a asesores nunca llega. Base para iOS PWA (web push),
+// app nativa y web: los tres obtienen un token FCM y lo registran aca. Auth por token de Supabase (verificarUsuario):
+// el user_id se DERIVA del token (NO se confia en el body) -> nadie puede registrar tokens a nombre de otro usuario.
+// device_tokens confirmado en codigo: columnas token + user_id (ver enviarPushAsesor ~L170/188). La columna plataforma
+// NO esta confirmada en el esquema desde el codigo, por eso el upsert es DEFENSIVO: primero intenta con plataforma +
+// ultimo_uso (como maestro_device_tokens) y, si esas columnas no existen (PGRST204/columna), reintenta con lo minimo
+// (user_id + token). onConflict por 'token' (mismo criterio con que enviarPushAsesor borra por token); si no hubiera
+// unique por token, se cae al camino buscar-o-insertar para no duplicar.
+app.post('/api/push/registrar-token', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    var token = (req.body && req.body.token) ? String(req.body.token).slice(0, 4000) : '';
+    var plataforma = (req.body && req.body.plataforma) ? String(req.body.plataforma).slice(0, 40) : 'web';
+    if (!token) return res.status(400).json({ error: 'Falta token' });
+
+    // Intento 1: upsert con plataforma + ultimo_uso (si la tabla las tiene). onConflict por token.
+    var up = await supabase.from('device_tokens').upsert(
+      { user_id: uid, token: token, plataforma: plataforma, ultimo_uso: new Date().toISOString() },
+      { onConflict: 'token' }
+    );
+    if (up && up.error) {
+      // Intento 2 (DEFENSIVO): la tabla no tiene plataforma/ultimo_uso -> upsert minimo user_id + token.
+      var up2 = await supabase.from('device_tokens').upsert(
+        { user_id: uid, token: token },
+        { onConflict: 'token' }
+      );
+      if (up2 && up2.error) {
+        // Intento 3 (DEFENSIVO): no hay unique por token para el onConflict -> buscar-o-insertar (no duplicar).
+        var ya = await supabase.from('device_tokens').select('token').eq('token', token).maybeSingle();
+        if (!ya || !ya.data) {
+          var ins = await supabase.from('device_tokens').insert({ user_id: uid, token: token });
+          if (ins && ins.error) return res.status(500).json({ error: ins.error.message || 'No se pudo registrar el token' });
+        }
+      }
+    }
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.
+// Borra el token del usuario autenticado. Se filtra por user_id + token para que nadie borre tokens ajenos.
+app.post('/api/push/baja-token', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    var token = (req.body && req.body.token) ? String(req.body.token).slice(0, 4000) : '';
+    if (!token) return res.status(400).json({ error: 'Falta token' });
+    await supabase.from('device_tokens').delete().eq('user_id', uid).eq('token', token);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
 // Cargar saldo manual de Anthropic (la API no expone el saldo; el dueno lo ingresa al recargar)
 app.post('/api/maestro/saldo', async function(req, res){
   try{

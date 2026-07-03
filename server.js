@@ -12066,7 +12066,7 @@ app.post('/api/inventario/guardar', async function (req, res) {
 
       if (!_invStr(dev.nombre)) return res.status(400).json({ error: 'Falta el nombre del emprendimiento' });
 
-      // 1) Emprendimiento -> developments (lo extra a dev_data jsonb)
+      // Campos comunes del emprendimiento (mismo mapeo para INSERT nuevo y UPDATE de edicion).
       var filaDev = {
         user_id: user_id,
         nombre: _invStr(dev.nombre),
@@ -12084,12 +12084,62 @@ app.post('/api/inventario/guardar', async function (req, res) {
           material: devData.material || {}
         }
       };
-      var dIns = await supabase.from('developments').insert(filaDev).select('id').maybeSingle();
-      if (dIns.error) {
-        if (_invTablaFaltante(dIns.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
-        return res.status(500).json({ error: 'Error guardando el emprendimiento: ' + dIns.error.message });
+
+      // ¿Edicion? Si el body trae development_id => UPDATE del emprendimiento existente
+      // y reemplazo de sus sectores/unidades. Sin development_id => INSERT nuevo (comportamiento actual intacto).
+      var devEditId = _invStr(b.development_id) || _invStr(dev.id);
+      var esEdicion = !!devEditId;
+      var development_id;
+
+      if (esEdicion) {
+        // 1a) Tenant safety: el emprendimiento debe pertenecer al user del token.
+        var dOwn = await supabase.from('developments').select('user_id').eq('id', devEditId).maybeSingle();
+        if (dOwn.error) {
+          if (_invTablaFaltante(dOwn.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+          return res.status(500).json({ error: 'Error verificando el emprendimiento: ' + dOwn.error.message });
+        }
+        if (!dOwn.data) return res.status(404).json({ error: 'El emprendimiento a editar no existe', development_id: devEditId });
+        if (dOwn.data.user_id !== user_id) return res.status(403).json({ error: 'El emprendimiento no pertenece a tu cuenta' });
+
+        // 1b) UPDATE del emprendimiento (no tocamos user_id: se mantiene el dueño original).
+        var filaDevUpd = {
+          nombre: filaDev.nombre,
+          tipo: filaDev.tipo,
+          zona: filaDev.zona,
+          descripcion: filaDev.descripcion,
+          link: filaDev.link,
+          estado_obra: filaDev.estado_obra,
+          avance_pct: filaDev.avance_pct,
+          fecha_entrega: filaDev.fecha_entrega,
+          dev_data: filaDev.dev_data
+        };
+        var dUpd = await supabase.from('developments').update(filaDevUpd).eq('id', devEditId).eq('user_id', user_id).select('id').maybeSingle();
+        if (dUpd.error) {
+          if (_invTablaFaltante(dUpd.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+          return res.status(500).json({ error: 'Error actualizando el emprendimiento: ' + dUpd.error.message });
+        }
+        development_id = (dUpd.data && dUpd.data.id) || devEditId;
+
+        // 1c) Reemplazo: borramos sectores y unidades actuales para reescribir exactamente lo que mando el form.
+        var uDel = await supabase.from('development_units').delete().eq('development_id', development_id).eq('user_id', user_id);
+        if (uDel.error && !_invTablaFaltante(uDel.error)) {
+          return res.status(500).json({ error: 'Error limpiando unidades previas: ' + uDel.error.message, development_id: development_id });
+        }
+        if (uDel.error && _invTablaFaltante(uDel.error)) return res.status(503).json({ error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id });
+        var sDel = await supabase.from('development_sectors').delete().eq('development_id', development_id).eq('user_id', user_id);
+        if (sDel.error && !_invTablaFaltante(sDel.error)) {
+          return res.status(500).json({ error: 'Error limpiando sectores previos: ' + sDel.error.message, development_id: development_id });
+        }
+        if (sDel.error && _invTablaFaltante(sDel.error)) return res.status(503).json({ error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id });
+      } else {
+        // 1) Emprendimiento -> developments (lo extra a dev_data jsonb)
+        var dIns = await supabase.from('developments').insert(filaDev).select('id').maybeSingle();
+        if (dIns.error) {
+          if (_invTablaFaltante(dIns.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+          return res.status(500).json({ error: 'Error guardando el emprendimiento: ' + dIns.error.message });
+        }
+        development_id = dIns.data && dIns.data.id;
       }
-      var development_id = dIns.data && dIns.data.id;
 
       // 2) Sectores -> development_sectors. Guardamos el orden del form (idx) para mapear
       //    cada unidad a su sector. El form NO liga aun unidad->sector explicitamente
@@ -12152,7 +12202,8 @@ app.post('/api/inventario/guardar', async function (req, res) {
         development_id: development_id,
         sectores_guardados: sectoresOk,
         unidades_guardadas: unidadesOk,
-        unidades_con_error: unidadesErr
+        unidades_con_error: unidadesErr,
+        actualizado: esEdicion
       });
     }
 

@@ -1504,6 +1504,95 @@ async function derivacionAvisoDuenoMin(user_id, bs) {
   } catch (e) { return _DEF; }
 }
 
+// ===== TEMPERATURA POR TIEMPO: FLAG POR-CUENTA temp_decay_v2 (mismo patron defensivo que repartoV2Activo) =====
+// Desacopla la temperatura del status: los eventos calientes la SUBEN (via nuevaTemperaturaConDecay, que solo sube)
+// y un cron aparte (revisarDecaimientoTemperatura) la BAJA sola por inactividad (caliente->tibio->frio). Con el flag
+// OFF (default: false / ausente / null / columna inexistente / cualquier error) -> comportamiento ACTUAL EXACTO:
+// nuevaTemperaturaConDecay devuelve la propuesta por estado tal cual, y el cron hace early-return. TRUE -> el helper
+// solo sube y el cron enfria por tiempo. FAIL-SAFE: si la columna no existe, el .select devuelve error -> OFF.
+// Reusa un bs ya cargado si trae la propiedad (evita una query extra por mensaje).
+async function tempDecayActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'temp_decay_v2')) return bs.temp_decay_v2 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('temp_decay_v2').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.temp_decay_v2 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// Horas de inactividad para que un lead CALIENTE baje a TIBIO (business_settings.temp_horas_caliente_a_tibio).
+// DEFAULT 48. Validado 1..8760 (fuera de rango/ausente/error -> 48). Reusa un bs ya cargado si lo trae. Ante cualquier
+// error -> 48 (nunca romper). Solo se consulta cuando temp_decay_v2 esta ON.
+async function tempHorasCalienteATibio(user_id, bs) {
+  const _DEF = 48;
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'temp_horas_caliente_a_tibio')) { _raw = bs.temp_horas_caliente_a_tibio; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('temp_horas_caliente_a_tibio').eq('user_id', user_id).maybeSingle();
+      if (!error && data) _raw = data.temp_horas_caliente_a_tibio;
+    }
+    const _n = Number(_raw);
+    if (_n && _n >= 1 && _n <= 8760) return _n;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+
+// Horas de inactividad ADICIONALES (despues de tibio) para que un lead TIBIO baje a FRIO
+// (business_settings.temp_horas_tibio_a_frio). DEFAULT 120. Validado 1..8760 (fuera de rango/ausente/error -> 120).
+// CRITERIO: la inactividad se mide SIEMPRE desde la ultima actividad del lead, y el umbral tibio->frio es
+// ACUMULATIVO = temp_horas_caliente_a_tibio + temp_horas_tibio_a_frio (asi la secuencia natural es
+// caliente -> [48h] -> tibio -> [+120h] -> frio). Solo se consulta cuando temp_decay_v2 esta ON.
+async function tempHorasTibioAFrio(user_id, bs) {
+  const _DEF = 120;
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'temp_horas_tibio_a_frio')) { _raw = bs.temp_horas_tibio_a_frio; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('temp_horas_tibio_a_frio').eq('user_id', user_id).maybeSingle();
+      if (!error && data) _raw = data.temp_horas_tibio_a_frio;
+    }
+    const _n = Number(_raw);
+    if (_n && _n >= 1 && _n <= 8760) return _n;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+
+// Nivel numerico de una temperatura para comparar "cual es mas caliente": frio(0) < tibio(1) < caliente(2).
+// Cualquier valor desconocido/null -> 0 (lo mas frio), asi nunca "sube" por error a algo no reconocido.
+function _nivelTemperatura(t) {
+  if (t === 'caliente') return 2;
+  if (t === 'tibio') return 1;
+  return 0; // 'frio', null, undefined o cualquier otro
+}
+
+// HELPER CENTRAL (temp-decay): decide que temperatura escribir cuando un CAMBIO DE ESTADO propone una temperatura.
+//   - flagOn=false (default OFF / comportamiento ACTUAL EXACTO): devuelve la propuesta por estado TAL CUAL.
+//   - flagOn=true: devuelve el MAXIMO (mas caliente) entre la actual y la propuesta -> un cambio de estado SOLO PUEDE
+//     SUBIR la temperatura, nunca bajarla. El enfriamiento lo hace el cron por TIEMPO, no el cambio de estado.
+// 'actual' puede venir null/undefined (conv sin temperatura previa): con flag ON eso cuenta como 0 (frio) y la
+// propuesta gana; con flag OFF se ignora y se devuelve la propuesta igual. Puramente en memoria, 0 IA, 0 queries.
+function nuevaTemperaturaConDecay(actual, propuestaPorEstado, flagOn) {
+  if (!flagOn) return propuestaPorEstado; // OFF: byte-identico a hoy
+  return _nivelTemperatura(actual) > _nivelTemperatura(propuestaPorEstado) ? actual : propuestaPorEstado;
+}
+
+// Version que RESUELVE la temperatura actual sola cuando hace falta. Pensada para los call sites donde NO tenemos
+// la temperatura vigente cargada en memoria (webhook / clasificacion). Con el flag OFF (o sin user_id) hace
+// early-return devolviendo la propuesta TAL CUAL, SIN ninguna query -> comportamiento ACTUAL EXACTO / byte-identico
+// (cero costo por mensaje). Solo con el flag ON hace UNA query chica .select('temperatura') de esa conv y aplica el
+// MAXIMO (nunca baja). Ante cualquier error de lectura -> devuelve la propuesta (fail-open al comportamiento actual).
+async function _tempConDecayParaConv(convId, propuestaPorEstado, userId, bs) {
+  try {
+    if (!(await tempDecayActivo(userId, bs))) return propuestaPorEstado; // OFF: sin query, byte-identico a hoy
+    if (!convId) return propuestaPorEstado;
+    const { data, error } = await supabase.from('conversations').select('temperatura').eq('id', convId).maybeSingle();
+    if (error || !data) return propuestaPorEstado; // fail-open
+    return nuevaTemperaturaConDecay(data.temperatura, propuestaPorEstado, true);
+  } catch (e) { return propuestaPorEstado; } // nunca romper: caer al comportamiento actual
+}
+
 // TAREA F (derivacion-v3-refinements, NO gated / aditiva): resuelve QUIEN escribio un mensaje humano a partir del
 // auth_user_id autenticado (verificarUsuario) y el tenant dueno de la conv. Devuelve { asesorId, nombre }:
 //   - Si el que escribe es el DUENO de la cuenta (uid === ownerId): { asesorId: null, nombre: <agent-off? nombre del
@@ -5173,9 +5262,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       // DETERMINISTICO / CERO IA: al volver de recontacto, restauramos el estado previo y la temperatura
       // SIGUE a ese estado (temperaturaPorEstado), sin ninguna llamada a Haiku/IA.
       let volverA = convExistente.estado_previo || 'en_conversacion';
+      // temp-decay (gated): con temp_decay_v2 ON, este cambio de estado SOLO puede SUBIR la temperatura, nunca bajar.
+      // Es el caso exacto de Diego: un lead que estaba CALIENTE y cayo a recontacto/interesado -> al volver, SIGUE
+      // caliente (el enfriamiento lo hace el cron por tiempo, no este cambio de estado). Con el flag OFF: sin query,
+      // devuelve temperaturaPorEstado(volverA) tal cual -> byte-identico a hoy.
+      const _tempVolver = await _tempConDecayParaConv(conv.id, temperaturaPorEstado(volverA), user_id);
       await supabase.from('conversations').update({
         status: volverA,
-        temperatura: temperaturaPorEstado(volverA),
+        temperatura: _tempVolver,
         estado_previo: null,
         recontacto_count: 0,
         updated_at: new Date().toISOString()
@@ -5198,9 +5292,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (convExistente && convExistente.status === 'cerrado' && conv.ai_enabled !== false) {
       try {
         if (await repartoV2Activo(user_id, _bsGate)) {
+          // temp-decay (gated): al revivir un caso cerrado, el cambio a en_conversacion NO debe ENFRIAR un lead que
+          // seguia caliente/tibio. Con flag ON aplica el maximo (solo sube); con flag OFF -> 'frio' tal cual (byte-identico).
+          const _tempRevive = await _tempConDecayParaConv(conv.id, temperaturaPorEstado('en_conversacion'), user_id, _bsGate);
           await supabase.from('conversations').update({
             status: 'en_conversacion',
-            temperatura: temperaturaPorEstado('en_conversacion'),
+            temperatura: _tempRevive,
             updated_at: new Date().toISOString()
           }).eq('id', conv.id);
           conv.status = 'en_conversacion'; // sincronizar el objeto en memoria: el ciclo de abajo lo trata como conv viva
@@ -5550,7 +5647,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   // Pedir confirmacion: NO subir status ni asignar asesor. La conv sigue en su estado actual con IA ON.
                   await pedirConfirmacionDerivacion(_convId, user_id, _departamentoId, telefono, instanciaNombre);
                 } else {
-                  const update = { status: nuevoEstado, temperatura: temperaturaPorEstado(nuevoEstado), updated_at: new Date().toISOString() };
+                  // temp-decay (gated): este cambio de estado (p.ej. en_conversacion->interesado, que propondria 'tibio')
+                  // NO debe ENFRIAR un lead que ya estaba caliente. Con flag ON aplica el maximo (solo sube); con flag OFF
+                  // -> temperaturaPorEstado(nuevoEstado) tal cual (sin query) -> byte-identico a hoy.
+                  const _tempCls = await _tempConDecayParaConv(_convId, temperaturaPorEstado(nuevoEstado), user_id);
+                  const update = { status: nuevoEstado, temperatura: _tempCls, updated_at: new Date().toISOString() };
                   // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
                   if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
                   await supabase.from('conversations').update(update).eq('id', _convId);
@@ -6278,6 +6379,11 @@ async function revisarInactividad() {
       // asesor. Ahora PRESERVAMOS ai_enabled tal cual estaba; SOLO la reactivamos si la conv esta libre de humano
       // (sin asesor_id y admin_tomo=false). Si hay humano a cargo, ai_enabled queda como estaba (no se toca).
       const _libreDeHumano = (!conv.asesor_id && conv.admin_tomo !== true);
+      // temp-decay (gated): el paso a recontacto por inactividad HOY fuerza 'frio'. Con temp_decay_v2 ON, un cambio de
+      // estado NO baja la temperatura (el enfriamiento lo maneja el cron revisarDecaimientoTemperatura por sus umbrales:
+      // 48h->tibio, 168h->frio). Es el caso de Diego: "aparece un recontacto ... y estaba caliente, sigue en caliente".
+      // Con flag OFF -> _tempConDecayParaConv devuelve 'frio' SIN query -> BYTE-IDENTICO a hoy.
+      const _tempRecontacto = await _tempConDecayParaConv(conv.id, 'frio', conv.user_id);
       if (_libreDeHumano) {
         // RACE #6 (anti-stale, PATRON CANONICO server.js:1866): el snapshot conv.asesor_id/admin_tomo se leyo arriba;
         // si entre esa lectura y este write un HUMANO tomo el lead (/api/whatsapp/send setea asesor_id/admin_tomo),
@@ -6285,7 +6391,7 @@ async function revisarInactividad() {
         // .eq('admin_tomo', false). Si 0 filas -> un humano tomo en el interin: pasamos a recontacto SIN tocar ai_enabled.
         const { data: _u } = await supabase.from('conversations').update({
           status: 'recontacto',
-          temperatura: 'frio', // Inactividad (72hs sin respuesta) -> el lead se enfria. DETERMINISTICO / CERO IA.
+          temperatura: _tempRecontacto, // OFF: 'frio' (72hs de inactividad enfrian). ON: solo baja si el decay ya lo hizo.
           estado_previo: conv.status,
           ai_enabled: true,
           updated_at: new Date().toISOString()
@@ -6293,7 +6399,7 @@ async function revisarInactividad() {
         if (!_u || !_u.length) {
           // Perdimos la carrera: un humano tomo el lead durante el tick. Pasar a recontacto SIN re-encender la IA.
           await supabase.from('conversations').update({
-            status: 'recontacto', temperatura: 'frio', estado_previo: conv.status, updated_at: new Date().toISOString()
+            status: 'recontacto', temperatura: _tempRecontacto, estado_previo: conv.status, updated_at: new Date().toISOString()
           }).eq('id', conv.id);
           console.log('Recontacto: conversacion ' + conv.id + ' paso a recontacto SIN re-encender IA (humano tomo durante el tick)');
         } else {
@@ -6302,7 +6408,7 @@ async function revisarInactividad() {
       } else {
         // Hay humano a cargo (asesor_id seteado o admin_tomo=true): PRESERVAR ai_enabled tal cual estaba (no re-encender).
         await supabase.from('conversations').update({
-          status: 'recontacto', temperatura: 'frio', estado_previo: conv.status,
+          status: 'recontacto', temperatura: _tempRecontacto, estado_previo: conv.status,
           ai_enabled: (conv.ai_enabled === true), updated_at: new Date().toISOString()
         }).eq('id', conv.id);
         console.log('Recontacto: conversacion ' + conv.id + ' paso a recontacto (72hs sin respuesta); ai_enabled=' + (conv.ai_enabled === true) + ' (preservado: hay humano a cargo)');
@@ -6310,6 +6416,97 @@ async function revisarInactividad() {
     }
   } catch (e) { console.error('Error en revisarInactividad:', e && e.message); }
   finally { _inactividadEnCurso = false; } // RACE #6: liberar el guard siempre (nunca queda trabado)
+}
+
+// ===== TEMPERATURA POR TIEMPO: CRON DE DECAIMIENTO (gated por temp_decay_v2, 0 IA / 0 tokens) =====
+// Baja la temperatura SOLA por INACTIVIDAD: caliente -> tibio -> frio, con umbrales configurables por cuenta.
+// SOLO BAJA (nunca sube: eso lo hacen los eventos calientes via nuevaTemperaturaConDecay). Puro tiempo + SQL.
+//
+// "ACTIVIDAD" del lead = created_at del ULTIMO mensaje ENTRANTE (role='contact') de la conv. Motivo: conversations.
+// updated_at se pisa con MUCHOS writes que no son actividad real del lead (cambios de status, escritura de depto,
+// asignacion de asesor, el propio decay, etc.) -> mantendria el lead "recien activo" por error. El created_at del
+// ultimo mensaje del contacto es la senal LIMPIA de cuando el lead interactuo por ultima vez. FALLBACK defensivo:
+// si la conv no tiene ningun mensaje entrante, usamos updated_at (mejor que nada; caso raro).
+//
+// UMBRALES (inactividad medida SIEMPRE desde la ultima actividad):
+//   caliente -> tibio : inactividad >= temp_horas_caliente_a_tibio            (default 48h)
+//   tibio    -> frio  : inactividad >= temp_horas_caliente_a_tibio + temp_horas_tibio_a_frio  (default 48+120 = 168h)
+// (asi la secuencia natural es caliente -[48h]-> tibio -[+120h]-> frio; el segundo umbral es ACUMULATIVO).
+//
+// GATED por tenant (tempDecayActivo). Con el flag OFF (o columna temp_decay_v2 ausente) NO toca NADA de esa cuenta.
+// Si la propia columna temperatura/consulta base falla (esquema viejo) -> early-return global. Guard anti-solape.
+var _tempDecayEnCurso = false;
+async function revisarDecaimientoTemperatura() {
+  if (_tempDecayEnCurso) return; // no solapar ticks (mismo patron que _inactividadEnCurso)
+  _tempDecayEnCurso = true;
+  try {
+    const ahoraMs = Date.now();
+    const HORA_MS = 60 * 60 * 1000;
+    // Solo nos interesan las convs que PUEDEN enfriarse: temperatura caliente o tibia. 'frio' ya es el piso.
+    // DEFENSIVO: si la tabla/columna base fallara, early-return global (no rompemos nada).
+    let candidatas = null;
+    try {
+      const r = await supabase.from('conversations')
+        .select('id, user_id, temperatura, updated_at')
+        .in('temperatura', ['caliente', 'tibio']);
+      if (r.error) throw r.error;
+      candidatas = r.data;
+    } catch (eSel) { return; } // esquema no listo -> 0 efecto
+    if (!candidatas || candidatas.length === 0) return;
+    // Caches por corrida: flag on/off + horas, por cuenta (evita re-querear business_settings por cada conv).
+    const _flagCache = {};   // user_id -> bool (temp_decay_v2)
+    const _horasCache = {};  // user_id -> { calienteATibio, tibioAFrio }
+    for (const conv of candidatas) {
+      const uid = conv.user_id;
+      if (!uid) continue;
+      // Gate por cuenta (cacheado). Con el flag OFF -> esta cuenta no se toca (comportamiento actual EXACTO).
+      let _on = _flagCache[uid];
+      if (_on === undefined) { _on = await tempDecayActivo(uid); _flagCache[uid] = _on; }
+      if (!_on) continue;
+      // Horas configurables (cacheadas). Fallbacks defensivos ya viven en los getters.
+      let _h = _horasCache[uid];
+      if (_h === undefined) {
+        _h = { calienteATibio: await tempHorasCalienteATibio(uid), tibioAFrio: await tempHorasTibioAFrio(uid) };
+        _horasCache[uid] = _h;
+      }
+      // ACTIVIDAD: created_at del ultimo mensaje entrante (role='contact'); fallback a updated_at si no hay.
+      let _actividadMs = null;
+      try {
+        const { data: _ultIn } = await supabase.from('messages')
+          .select('created_at')
+          .eq('conversation_id', conv.id)
+          .eq('role', 'contact')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (_ultIn && _ultIn.created_at) _actividadMs = new Date(_ultIn.created_at).getTime();
+      } catch (eMsg) {}
+      if (_actividadMs === null && conv.updated_at) _actividadMs = new Date(conv.updated_at).getTime();
+      if (_actividadMs === null || isNaN(_actividadMs)) continue; // sin ancla de tiempo -> no tocar
+      const _inactivaHoras = (ahoraMs - _actividadMs) / HORA_MS;
+      if (_inactivaHoras < 0) continue; // reloj raro -> no tocar
+      // Decidir el destino SOLO hacia abajo. Guardamos la temperatura esperada en el WHERE para no pisar un
+      // evento caliente que la haya SUBIDO entre el select y el write (anti-stale, mismo espiritu que RACE #6).
+      if (conv.temperatura === 'caliente') {
+        if (_inactivaHoras >= _h.calienteATibio) {
+          try {
+            await supabase.from('conversations')
+              .update({ temperatura: 'tibio', updated_at: new Date().toISOString() })
+              .eq('id', conv.id).eq('temperatura', 'caliente');
+          } catch (eUpd) {}
+        }
+      } else if (conv.temperatura === 'tibio') {
+        if (_inactivaHoras >= (_h.calienteATibio + _h.tibioAFrio)) {
+          try {
+            await supabase.from('conversations')
+              .update({ temperatura: 'frio', updated_at: new Date().toISOString() })
+              .eq('id', conv.id).eq('temperatura', 'tibio');
+          } catch (eUpd) {}
+        }
+      }
+    }
+  } catch (e) { console.error('Error en revisarDecaimientoTemperatura:', e && e.message); }
+  finally { _tempDecayEnCurso = false; } // liberar el guard siempre
 }
 
 // ===== ETAPA 8: FALLBACK ESCALONADO (solo con reparto_v2 ON) =====
@@ -7472,6 +7669,12 @@ setTimeout(revisarRespaldoTimeout, 65 * 1000); // primera corrida ~65s tras arra
 // derivacion_rotando ausente) hace early-return -> NO hace nada por cuenta. 0 tokens (SQL + plantillas fijas).
 setInterval(revisarRotacionDerivacionV3, 90 * 1000); // cada 90s: granularidad fina para el timer configurable (default 10 min)
 setTimeout(revisarRotacionDerivacionV3, 75 * 1000); // primera corrida ~75s tras arrancar (cuando ya esta estable)
+// TEMPERATURA POR TIEMPO (gated por temp_decay_v2 por-tenant): baja la temperatura sola por inactividad
+// (caliente->tibio->frio, umbrales configurables). Con el flag OFF (o columna temp_decay_v2 ausente) hace
+// early-return por cuenta -> NO toca nada. 0 IA / 0 tokens (puro tiempo + SQL). Cada 30 min: los umbrales son
+// de HORAS (default 48h/168h), no hace falta granularidad fina; correr seguido solo agrega carga sin beneficio.
+setInterval(revisarDecaimientoTemperatura, 30 * 60 * 1000);
+setTimeout(revisarDecaimientoTemperatura, 100 * 1000); // primera corrida ~100s tras arrancar (cuando ya esta estable)
 // AVISOS INTERNOS (default OFF por cuenta): #2 lead caliente + #3 resumen diario + #4 escalada SLA. Texto fijo + SQL,
 // SIN IA (0 tokens). FIX #4: vuelta a CADA 5 MIN (no 1 min). Los escalones SLA (p1/p2/p3, default 30/60/90) toleran
 // un jitter de +-5 min sin problema; correr cada minuto cargaba x5 a TODAS las cuentas sin beneficio real. El dedupe
@@ -14660,12 +14863,15 @@ app.post('/api/conversations/cerrar', async function(req, res){
     if (!(await repartoV2Activo(c.data.user_id))) {
       return res.status(409).json({ ok: false, gated: true, error: 'reparto_v2 desactivado: cerrar-caso no disponible' });
     }
+    // temp-decay (gated): cerrar el caso propone 'tibio', que ENFRIARIA un lead que estaba caliente. Con temp_decay_v2
+    // ON, un cambio de estado NO baja la temperatura (solo el cron por tiempo). Con flag OFF -> 'tibio' tal cual (byte-identico).
+    var _tempCerrar = await _tempConDecayParaConv(conversation_id, temperaturaPorEstado('cerrado'), c.data.user_id);
     // Los 3 efectos del cierre, en un solo update (defensivo: si fallara, 409 sin romper).
     var upd = await supabase.from('conversations').update({
       status: 'cerrado',
       asesor_id: null,
       ai_enabled: true,
-      temperatura: temperaturaPorEstado('cerrado'),
+      temperatura: _tempCerrar,
       updated_at: new Date().toISOString()
     }).eq('id', conversation_id);
     if (upd && upd.error) return res.status(409).json({ ok: false, error: 'No se pudo cerrar: ' + (upd.error.message || 'error de esquema') });

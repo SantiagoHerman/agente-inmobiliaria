@@ -12340,6 +12340,79 @@ app.post('/api/inventario/guardar', async function (req, res) {
   }
 });
 
+// ---- POST /api/inventario/desarrollo/eliminar -----------------------------
+// Elimina un emprendimiento de desarrollo COMPLETO (sus unidades + sectores + la fila
+// del emprendimiento). Feature aditiva: hoy no se puede borrar y quedan duplicados basura.
+// Body: { development_id }. Auth con verificarUsuario (mismo que el resto).
+// Tenant safety: el emprendimiento debe pertenecer al DUENO del tenant que llama.
+app.post('/api/inventario/desarrollo/eliminar', async function (req, res) {
+  try {
+    // 1) AUTH: identidad por token (mismo verificarUsuario que el resto).
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+
+    // 2) Resolver el DUENO del tenant. Por DEFAULT el que llama ES el dueño (su uid = user_id
+    //    del tenant); si es un asesor sub-cuenta, el dueño es su admin_id (patron estandar,
+    //    igual que /api/contactos/renombrar). El paso 4 igual limita a SOLO el tenant resuelto.
+    var ownerId = uid;
+    try {
+      var ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (ase && ase.data && ase.data.admin_id) ownerId = ase.data.admin_id;
+    } catch (e1) {}
+
+    // 3) BODY. development_id obligatorio.
+    var b = req.body || {};
+    var development_id = (b.development_id != null) ? String(b.development_id) : '';
+    if (!development_id) return res.status(400).json({ error: 'Falta development_id' });
+
+    // 4) SEGURIDAD DE TENANT: el emprendimiento debe pertenecer al DUENO del que llama.
+    var dOwn;
+    try {
+      dOwn = await supabase.from('developments').select('user_id').eq('id', development_id).maybeSingle();
+    } catch (eSel) {
+      return res.status(500).json({ error: 'Error verificando el emprendimiento' });
+    }
+    if (dOwn && dOwn.error) {
+      if (_invTablaFaltante(dOwn.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+      return res.status(500).json({ error: 'Error verificando el emprendimiento: ' + dOwn.error.message });
+    }
+    if (!dOwn || !dOwn.data) return res.status(404).json({ error: 'El emprendimiento no existe', development_id: development_id });
+    if (dOwn.data.user_id !== ownerId) return res.status(403).json({ error: 'El emprendimiento no pertenece a tu cuenta' });
+
+    // 5) BORRADO en orden (hijos -> padre). Defensivo: si una tabla no existe todavia, seguimos;
+    //    cualquier otro error corta con 500 para no dejar un borrado a medias silencioso.
+    //    Todo scoped por development_id + user_id del tenant (nunca cross-tenant).
+    try {
+      var uDel = await supabase.from('development_units').delete().eq('development_id', development_id).eq('user_id', ownerId);
+      if (uDel.error && !_invTablaFaltante(uDel.error)) {
+        return res.status(500).json({ error: 'Error borrando unidades: ' + uDel.error.message, development_id: development_id });
+      }
+    } catch (eU) {}
+
+    try {
+      var sDel = await supabase.from('development_sectors').delete().eq('development_id', development_id).eq('user_id', ownerId);
+      if (sDel.error && !_invTablaFaltante(sDel.error)) {
+        return res.status(500).json({ error: 'Error borrando etapas: ' + sDel.error.message, development_id: development_id });
+      }
+    } catch (eS) {}
+
+    var dDel;
+    try {
+      dDel = await supabase.from('developments').delete().eq('id', development_id).eq('user_id', ownerId);
+    } catch (eD) {
+      return res.status(500).json({ error: 'Error borrando el emprendimiento' });
+    }
+    if (dDel && dDel.error) {
+      if (_invTablaFaltante(dDel.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+      return res.status(500).json({ error: 'Error borrando el emprendimiento: ' + dDel.error.message, development_id: development_id });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message });
+  }
+});
+
 // ---- GET /api/inventario/cargar -------------------------------------------
 // Devuelve el inventario del rubro del usuario (filtrado por user_id, via RLS y
 // filtro explicito) para que el form pueda precargar.

@@ -448,8 +448,11 @@ function instruccionesAgenteItems(settings, rubro, perfilOverride) {
   if (instr) out.push({ id: 'int-legacy', categoria: 'interna', texto: String(instr), activo: true, es_sistema: false, orden: 200 });
   return out;
 }
-// Arma los 3 bloques de texto que van al system prompt, respetando orden y activo. Con la columna en null devuelve
+// Arma los bloques de texto que van al system prompt, respetando orden y activo. Con la columna en null devuelve
 // EXACTAMENTE: comportamiento = comportamientoSetter.join(' ') ; rubro = instruccionesRubro ; internas = (instructions ? 'Instrucciones internas...: '+instructions : '').
+// CORRECCIONES IA (categoria 'correccion', APRENDIZAJE_V2): se devuelven en un bloque SEPARADO (`correcciones`). El
+// caller SOLO lo inyecta en el prompt cuando el flag aprendizaje_v2 esta ON; con el flag OFF ese bloque se descarta y
+// el prompt queda BYTE-IDENTICO (ademas, una cuenta sin items 'correccion' -> correcciones === '' de todas formas).
 function bloquesInstruccionesAgente(settings, rubro, perfilOverride) {
   const items = instruccionesAgenteItems(settings, rubro, perfilOverride);
   const comportamiento = items.filter(function(i) { return i.categoria === 'comportamiento' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(Boolean).join(' ');
@@ -457,7 +460,11 @@ function bloquesInstruccionesAgente(settings, rubro, perfilOverride) {
   const internasTextos = items.filter(function(i) { return i.categoria === 'interna' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(function(s) { return s && String(s).length; });
   const internasJoin = internasTextos.join(' ');
   const internas = internasJoin ? ('Instrucciones internas que SIEMPRE debes seguir: ' + internasJoin) : '';
-  return { comportamiento: comportamiento, rubro: rub, internas: internas };
+  // CORRECCIONES IA: correcciones que el dueno le hizo a la IA (ej. "no se dice X, se dice Y"). Alta prioridad.
+  const correccionesTextos = items.filter(function(i) { return i.categoria === 'correccion' && i.activo !== false; }).map(function(i) { return i.texto; }).filter(function(s) { return s && String(s).length; });
+  const correccionesJoin = correccionesTextos.join(' ');
+  const correcciones = correccionesJoin ? ('CORRECCIONES DEL DUENO (tienen PRIORIDAD ALTA: son ajustes que el dueno del negocio te hizo sobre como responder; respetalas SIEMPRE por encima de tu estilo general): ' + correccionesJoin) : '';
+  return { comportamiento: comportamiento, rubro: rub, internas: internas, correcciones: correcciones };
 }
 
 // ============ SUSCRIPCIONES Y PLANES (MercadoPago) — FASE 1 ============
@@ -1682,6 +1689,22 @@ async function cicloAprendizajeActivo(user_id, bs) {
   try {
     if (await consultaDuenoActiva(user_id, bs)) return true;
     return await repartoV2Activo(user_id, bs);
+  } catch (e) { return false; }
+}
+
+// ===== FLAG POR-CUENTA aprendizaje_v2 (SECCION "CORRECCIONES IA" en el prompt del agente) =====
+// Mismo patron defensivo que repartoV2Activo. DEFAULT OFF: false / null / ausente / columna inexistente ->
+// false (el prompt NO incluye el bloque de CORRECCIONES IA => BYTE-IDENTICO al actual). TRUE -> las correcciones
+// del dueno (items categoria='correccion' del set ACTIVO) se inyectan como instrucciones de alta prioridad.
+// Ojo: los endpoints de correccion pueden AGREGAR items igual con el flag OFF (append al jsonb); lo unico gateado
+// es su EFECTO en el prompt. Reusa un bs ya cargado si trae la propiedad. Ante cualquier error -> false.
+async function aprendizajeV2Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'aprendizaje_v2')) return bs.aprendizaje_v2 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('aprendizaje_v2').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> flag OFF (prompt actual)
+    return !!(data && data.aprendizaje_v2 === true);
   } catch (e) { return false; }
 }
 
@@ -3649,6 +3672,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     const _bloquesInstr = bloquesInstruccionesAgente(settings, rubro, (agenteConfig && agenteConfig.perfilId) || null);
     const instruccionesRubro = _bloquesInstr.rubro;
     const comportamientoSetter = _bloquesInstr.comportamiento;
+    // CORRECCIONES IA (APRENDIZAJE_V2, default OFF): bloque de correcciones del dueno del set ACTIVO. Se inyecta en el
+    // prompt SOLO con el flag aprendizaje_v2 ON. Con OFF (o sin items 'correccion') queda '' => .filter(Boolean) lo
+    // descarta y el prompt es BYTE-IDENTICO al actual. Reusa `settings` ya cargado (sin query extra). Defensivo.
+    let _correccionesIA = '';
+    try { if (await aprendizajeV2Activo(user_id, settings)) _correccionesIA = _bloquesInstr.correcciones || ''; } catch (eCorr) { _correccionesIA = ''; }
 
     const idiomaBase = (settings && settings.idioma) || 'es';
   const NOMBRE_IDIOMA = { es: 'espanol', en: 'ingles', pt: 'portugues', fr: 'frances', it: 'italiano', de: 'aleman', nl: 'holandes', ru: 'ruso', zh: 'chino mandarin', ja: 'japones', ko: 'coreano', ar: 'arabe', hi: 'hindi', tr: 'turco', pl: 'polaco' };
@@ -3729,6 +3757,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
     _bloquesInstr.internas,
+    // CORRECCIONES IA (APRENDIZAJE_V2, gated): correcciones de alta prioridad que el dueno le hizo a la IA. Con el
+    // flag aprendizaje_v2 OFF (o sin correcciones cargadas) _correccionesIA === '' => .filter(Boolean) lo descarta
+    // y el prompt es el ACTUAL EXACTO (byte-identico).
+    _correccionesIA,
     // PARTE B (punto 6 / regla 19): cuando NO sabes resolver algo, NO inventes. Si es info que el dueno podria
     // aclararte (una politica, un dato del negocio que no tenes), usa la herramienta consultar_al_dueno para
     // preguntarle, y mientras tanto decile al lead con naturalidad que lo averiguas y le confirmas. NO la uses para
@@ -8671,7 +8703,7 @@ app.post('/api/instrucciones-agente', async function(req, res) {
     // Rubro del tenant (para re-inyectar el item de rubro si faltara).
     const { data: bsR } = await supabase.from('business_settings').select('rubro').eq('user_id', ident.ownerId).maybeSingle();
     const kP = _rubroKey((bsR && bsR.rubro) || 'inmobiliaria');
-    const CATS = { comportamiento: 1, rubro: 1, interna: 1 }; // 'sistema' no se persiste: cae a 'interna' (las reglas de sistema son fijas, no items).
+    const CATS = { comportamiento: 1, rubro: 1, interna: 1, correccion: 1 }; // 'correccion' = CORRECCIONES IA (aprendizaje). 'sistema' no se persiste: cae a 'interna' (las reglas de sistema son fijas, no items).
     let items = rawItems.slice(0, 200).map(function(it, i) {
       return {
         id: (it && it.id) ? String(it.id).slice(0, 80) : ('it-' + i),
@@ -8735,7 +8767,7 @@ app.post('/api/instrucciones-perfiles', async function(req, res) {
       const nombre = String(b.nombre || '').trim().slice(0, 80);
       if (!nombre) return res.status(400).json({ error: 'Falta el nombre del perfil' });
       const raw = Array.isArray(b.items) ? b.items : [];
-      const items = raw.slice(0, 200).map(function(it, i){ return { id: (it && it.id) ? String(it.id).slice(0,80) : ('it-'+i), categoria: (it && ['comportamiento','rubro','interna'].indexOf(it.categoria)>=0) ? it.categoria : 'interna', texto: (it && typeof it.texto==='string') ? it.texto.slice(0,4000) : '', activo: !(it && it.activo===false), es_sistema: !!(it && it.es_sistema===true), orden: (it && typeof it.orden==='number') ? it.orden : i }; }).filter(function(x){ return x.texto && x.texto.trim(); });
+      const items = raw.slice(0, 200).map(function(it, i){ return { id: (it && it.id) ? String(it.id).slice(0,80) : ('it-'+i), categoria: (it && ['comportamiento','rubro','interna','correccion'].indexOf(it.categoria)>=0) ? it.categoria : 'interna', texto: (it && typeof it.texto==='string') ? it.texto.slice(0,4000) : '', activo: !(it && it.activo===false), es_sistema: !!(it && it.es_sistema===true), orden: (it && typeof it.orden==='number') ? it.orden : i }; }).filter(function(x){ return x.texto && x.texto.trim(); });
       if (b.id) {
         const idx = arr.findIndex(function(p){ return String(p.id) === String(b.id); });
         const rec = { id: String(b.id), nombre: nombre, items: items, updated_at: new Date().toISOString() };
@@ -8761,6 +8793,100 @@ app.post('/api/instrucciones-perfiles', async function(req, res) {
     if (error) return res.status(409).json({ error: 'No se pudo guardar: ' + (error.message || 'error de esquema') });
     const perfiles = arr.map(function(p){ return { id: String(p.id), nombre: String(p.nombre||'Perfil'), count: (p.items&&Array.isArray(p.items))?p.items.length:0, updated_at: p.updated_at||null }; });
     return res.json({ ok: true, perfiles: perfiles, activo_id: activo });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============ APRENDIZAJE IA (APRENDIZAJE_V2) ============
+// LOOP 1 — CORRECCIONES EN LA VENTANA DE PRUEBA. Cuando el dueno corrige a la IA ("no se dice asi, se dice asi"),
+// esa correccion se guarda como un item de instruccion { categoria:'correccion', ... } en el set de instrucciones
+// ACTIVO cuando ocurrio (la Default o el PERFIL indicado por perfil_id), NUNCA siempre la Default.
+//
+// POST /api/agente/correccion  { correccion: string, perfil_id?: uuid }
+//   -> APPEND (aditivo, NO borra ni pisa items existentes) de un item correccion al set ACTIVO.
+//      - perfil_id presente Y existe en instruccion_perfiles -> se agrega a ESE perfil.
+//      - si no -> a business_settings.instrucciones_agente (Default "Agente principal").
+//   Resuelve el OWNER (admin_id si el que llama es asesor) via _equipoIdentidad -> escribe siempre en el tenant.
+//   ATOMICO/DEFENSIVO: lee items actuales -> append -> escribe; guarda backup del valor previo (log) por seguridad.
+//   NOTA: el EFECTO en el prompt esta gateado por aprendizaje_v2 (ver aprendizajeV2Activo); este endpoint agrega el
+//   item igual con el flag OFF (para no perder la correccion), pero solo se INYECTA al prompt con el flag ON.
+app.post('/api/agente/correccion', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const correccion = (req.body && typeof req.body.correccion === 'string') ? req.body.correccion.trim().slice(0, 4000) : '';
+    if (!correccion) return res.status(400).json({ error: 'Falta correccion (texto)' });
+    const perfilId = (req.body && req.body.perfil_id) ? String(req.body.perfil_id).slice(0, 80) : null;
+
+    // Leer el estado ACTUAL del set de instrucciones del tenant (Default + perfiles). DEFENSIVO ante columnas sin migrar.
+    let bs = null;
+    {
+      const r = await supabase.from('business_settings').select('rubro, instructions, instrucciones_agente, instruccion_perfiles').eq('user_id', ident.ownerId).maybeSingle();
+      if (r.error) {
+        // Sin la columna jsonb no se puede persistir la correccion como item -> avisar que falta migrar (no romper).
+        return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar instrucciones_agente?): ' + (r.error.message || 'error de esquema') });
+      }
+      bs = r.data || {};
+    }
+    const rubro = (bs && bs.rubro) || 'inmobiliaria';
+    const nuevoItem = { id: 'corr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), categoria: 'correccion', texto: correccion, activo: true, es_sistema: false, orden: 300 };
+
+    // ¿A que set ACTIVO va? Perfil indicado (si existe) o Default.
+    let arrPerfiles = (bs && Array.isArray(bs.instruccion_perfiles)) ? bs.instruccion_perfiles.slice() : [];
+    const idxPerfil = perfilId ? arrPerfiles.findIndex(function(p){ return p && String(p.id) === String(perfilId); }) : -1;
+
+    if (perfilId && idxPerfil >= 0) {
+      // -> APPEND al PERFIL indicado (no toca sus items existentes).
+      const _backupPerfil = JSON.stringify(arrPerfiles[idxPerfil] || {}); // backup defensivo (log) del valor previo
+      const p = arrPerfiles[idxPerfil];
+      const itemsPrev = Array.isArray(p.items) ? p.items.slice() : [];
+      itemsPrev.push(nuevoItem);
+      arrPerfiles[idxPerfil] = { id: String(p.id), nombre: String(p.nombre || 'Perfil'), items: itemsPrev, updated_at: new Date().toISOString() };
+      const { error } = await supabase.from('business_settings').update({ instruccion_perfiles: arrPerfiles }).eq('user_id', ident.ownerId);
+      if (error) { console.error('correccion perfil (backup previo): ' + _backupPerfil); return res.status(409).json({ error: 'No se pudo guardar la correccion en el perfil: ' + (error.message || 'error de esquema') }); }
+      return res.json({ ok: true, destino: 'perfil', perfil_id: String(p.id), item: nuevoItem });
+    }
+
+    // -> APPEND al set DEFAULT (business_settings.instrucciones_agente). Sembramos el set COMPLETO actual (mismos items
+    //    que ya ve el dueno en el editor, con protegidas garantizadas) y le agregamos la correccion. ADITIVO: no se
+    //    pierde ni cambia ningun item existente.
+    const _backupDefault = (bs && bs.instrucciones_agente) ? JSON.stringify(bs.instrucciones_agente) : 'null';
+    // IMPORTANTE: sembrar SIEMPRE el set DEFAULT ("Agente principal"), NUNCA el perfil activo. Por eso pasamos un
+    // settings SIN perfil_activo_id / instruccion_perfiles, para que instruccionesAgenteItems resuelva la Default y
+    // no contamine business_settings.instrucciones_agente con items de un perfil.
+    const _bsDefault = { instrucciones_agente: (bs && bs.instrucciones_agente) || null, instructions: (bs && bs.instructions) || '' };
+    const itemsActuales = instruccionesAgenteItems(_bsDefault, rubro).map(function(it){
+      return { id: it.id, categoria: it.categoria, texto: it.texto, activo: it.activo !== false, es_sistema: !!it.es_sistema, orden: (typeof it.orden === 'number') ? it.orden : 0 };
+    });
+    itemsActuales.push(nuevoItem);
+    const payload = { items: itemsActuales, updated_at: new Date().toISOString() };
+    const { error } = await supabase.from('business_settings').update({ instrucciones_agente: payload }).eq('user_id', ident.ownerId);
+    if (error) { console.error('correccion default (backup previo): ' + _backupDefault); return res.status(409).json({ error: 'No se pudo guardar la correccion: ' + (error.message || 'error de esquema') }); }
+    return res.json({ ok: true, destino: 'default', item: nuevoItem });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// LOOP 2 — CONSULTA AL DUENO -> KNOWLEDGE_BASE. Nota: YA existe un flujo completo de "la IA le pregunta al dueno"
+// (tool consultar_al_dueno -> registrarConsultaAprendizaje -> procesarRespuestaAprendizaje), y cuando el dueno
+// responde por WhatsApp, la respuesta VALIDADA se guarda sola en knowledge_base (category:'aprendido'). Este endpoint
+// es un camino MANUAL/directo para guardar una entrada de conocimiento a partir de una respuesta del dueno (por si se
+// captura desde la UI y no por el canal de WhatsApp), usando el MISMO patron de columnas de knowledge_base.
+//
+// POST /api/agente/conocimiento-desde-consulta  { pregunta: string, respuesta: string }
+//   -> INSERT en knowledge_base { user_id: OWNER, category:'aprendido', question, answer }. Aislado por tenant.
+app.post('/api/agente/conocimiento-desde-consulta', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const pregunta = (req.body && typeof req.body.pregunta === 'string') ? req.body.pregunta.trim().slice(0, 300) : '';
+    const respuesta = (req.body && typeof req.body.respuesta === 'string') ? req.body.respuesta.trim().slice(0, 2000) : '';
+    if (!respuesta) return res.status(400).json({ error: 'Falta respuesta (texto)' });
+    let kbId = null;
+    try {
+      const { data: kb, error } = await supabase.from('knowledge_base').insert({ user_id: ident.ownerId, category: 'aprendido', question: pregunta, answer: respuesta }).select('id').maybeSingle();
+      if (error) return res.status(409).json({ error: 'No se pudo guardar en la base de conocimiento: ' + (error.message || 'error de esquema') });
+      kbId = kb && kb.id ? kb.id : null;
+    } catch (eKb) { return res.status(500).json({ error: eKb && eKb.message }); }
+    return res.json({ ok: true, kb_id: kbId });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

@@ -14725,9 +14725,10 @@ app.post('/api/push/registrar-token', async function(req, res){
     var plataforma = (req.body && req.body.plataforma) ? String(req.body.plataforma).slice(0, 40) : 'web';
     if (!token) return res.status(400).json({ error: 'Falta token' });
 
-    // Intento 1: upsert con plataforma + ultimo_uso (si la tabla las tiene). onConflict por token.
+    // Intento 1: upsert con la columna REAL `platform` (device_tokens = id, user_id, token, platform, created_at).
+    // onConflict por token (requiere unique en token; si no, cae a los intentos defensivos de abajo).
     var up = await supabase.from('device_tokens').upsert(
-      { user_id: uid, token: token, plataforma: plataforma, ultimo_uso: new Date().toISOString() },
+      { user_id: uid, token: token, platform: plataforma },
       { onConflict: 'token' }
     );
     if (up && up.error) {

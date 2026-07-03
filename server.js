@@ -11673,7 +11673,41 @@ const _MAX_TEXTO_DESARROLLO = 40000;
 // si la pagina trae al menos un plano para mirar (ver _MAX_PLANOS_VISION mas abajo).
 const MODELO_SCRAPE_VISION = MODELO_CLIENTE;                 // Sonnet (precision). Alt: MODELO_INTERNO (Haiku, mas barato)
 const PRECIO_SCRAPE_VISION = PRECIO_IA;                      // emparejar con el modelo de arriba (Sonnet->PRECIO_IA, Haiku->PRECIO_HAIKU)
-const _MAX_PLANOS_VISION = 5;                               // tope de imagenes a mirar por scrapeo (subido 2->5 para capturar los planos por etapa/vision; acota costo)
+const _MAX_PLANOS_VISION = 5;                               // tope de imagenes a mirar por scrapeo en modo NORMAL (base historica; acota costo)
+const _MAX_TOKENS_VISION = 2000;                            // max_tokens de la llamada de vision en modo NORMAL (base historica)
+
+// ---- 🔴 GATE DE COSTO: modo "plano PROFUNDO" (OFF por default) ---------------
+// El dueño NO quiere que un scrapeo suba el gasto en silencio. Por eso TODO el comportamiento
+// "profundo" (mas imagenes de plano + max_tokens de vision mas alto) vive detras de un gate.
+//   - GATE OFF (default): identico al comportamiento historico -> _MAX_PLANOS_VISION (5) imagenes
+//     y _MAX_TOKENS_VISION (2000) tokens de salida por imagen. CERO gasto extra.
+//   - GATE ON: procesa hasta PLANO_MAX_IMAGENES planos y pide hasta PLANO_MAX_TOKENS por imagen.
+// Se prende por ENV global (PLANO_DEEP='true') O por-scrapeo desde el body del endpoint
+// (opts.plano_deep === true). El helper _planoDeepCfg(opts) resuelve el modo efectivo y
+// devuelve { deep, maxImagenes, maxTokens } para que el resto del codigo no repita la logica.
+//
+// 💲 COSTO EN MODO PROFUNDO (por scrapeo, aprox, PEOR CASO):
+//   Cada imagen de plano = 1 llamada de vision a Sonnet (MODELO_SCRAPE_VISION).
+//   Input por imagen ≈ imagen (~1.6k tokens una imagen tipica ~1.15MP) + prompt (~0.3k) ≈ 1.9k in.
+//   Output por imagen = hasta PLANO_MAX_TOKENS (default 6000) out.
+//   Precio Sonnet: $3/1M in, $15/1M out.
+//   Por imagen ≈ 1.9k*($3/1M) + 6k*($15/1M) = $0.0057 + $0.090 = ~$0.096.
+//   Con PLANO_MAX_IMAGENES=12 (tope profundo default) => 12 * $0.096 ≈ $1.15 por scrapeo (TOPE).
+//   El output real casi nunca llega al tope; suele salir bastante menos. Es el peor caso.
+//   En modo NORMAL (gate OFF): 5 img * (1.9k in + hasta 2k out) ≈ 5 * ($0.0057 + $0.030) = ~$0.18 tope.
+const PLANO_DEEP_ENV = (process.env.PLANO_DEEP === 'true');  // gate GLOBAL por env (OFF si no esta seteado)
+const _PLANO_MAX_IMAGENES_DEEP = (function () { var n = parseInt(process.env.PLANO_MAX_IMAGENES, 10); return (n && n >= 1 && n <= 40) ? n : 12; })();  // tope de imagenes en modo profundo (default 12, cap duro 40)
+const _PLANO_MAX_TOKENS_DEEP = (function () { var n = parseInt(process.env.PLANO_MAX_TOKENS, 10); return (n && n >= 2000 && n <= 16000) ? n : 6000; })();  // max_tokens de vision en modo profundo (default 6000, cap 16000)
+
+// Resuelve el modo efectivo. `opts` puede traer { plano_deep:true } para prender el modo profundo
+// SOLO en ese scrapeo (sin tocar el env). El env PLANO_DEEP='true' lo prende globalmente.
+// Con ambos OFF -> modo NORMAL byte-equivalente al historico (5 imagenes / 2000 tokens).
+function _planoDeepCfg(opts) {
+  var deep = PLANO_DEEP_ENV || !!(opts && opts.plano_deep === true);
+  return deep
+    ? { deep: true, maxImagenes: _PLANO_MAX_IMAGENES_DEEP, maxTokens: _PLANO_MAX_TOKENS_DEEP }
+    : { deep: false, maxImagenes: _MAX_PLANOS_VISION, maxTokens: _MAX_TOKENS_VISION };
+}
 
 // Extrae URLs de IMAGENES y PDFs de un HTML, resolviendo relativas a absolutas.
 // General (NO WordPress-especifico como _extraerGaleriaHtml): mira src, data-src,
@@ -11731,19 +11765,23 @@ function _extraerImagenesDesarrollo(html, baseUrl, cap) {
 // los lotes. Prioriza URLs cuyo nombre/URL sugiera masterplan/loteo/plano/planta.
 // Fuente: primero imagenes.planos (lo que la IA clasifico como plano); si esta vacio,
 // cae a fotos+renders (por si el masterplan quedo mal clasificado). Devuelve HASTA
-// _MAX_PLANOS_VISION URLs (acota costo). NO mira nada si no hay ninguna imagen.
-function _elegirPlanosParaVision(imagenes) {
+// `topeMax` URLs (acota costo). Si `topeMax` no viene -> _MAX_PLANOS_VISION (byte-compat
+// con el comportamiento historico). NO mira nada si no hay ninguna imagen.
+function _elegirPlanosParaVision(imagenes, topeMax) {
+  var tope = (typeof topeMax === 'number' && topeMax >= 1) ? topeMax : _MAX_PLANOS_VISION;
   var planos = (imagenes && Array.isArray(imagenes.planos)) ? imagenes.planos.slice() : [];
   var fotos = (imagenes && Array.isArray(imagenes.fotos)) ? imagenes.fotos.slice() : [];
   var renders = (imagenes && Array.isArray(imagenes.renders)) ? imagenes.renders.slice() : [];
   // pool de candidatos: planos primero (mas probable que sean el masterplan), luego el resto
+  // (defensivo: si el masterplan quedo mal clasificado como foto/render, igual entra al pool
+  //  y el scoring por keywords lo levanta si la URL lo delata).
   var pool = planos.concat(fotos, renders).filter(function (u) { return typeof u === 'string' && u.trim(); });
   if (!pool.length) return [];
   // dedup preservando orden
   var visto = {}, uniq = [];
   pool.forEach(function (u) { var k = u.split('#')[0]; if (!visto[k]) { visto[k] = 1; uniq.push(u); } });
   // score por pistas de masterplan/loteo en la URL (mas alto = mira antes)
-  var RX_FUERTE = /(master\s*plan|masterplan|loteo|lotes?|parcel|manzana|amanzana)/i;
+  var RX_FUERTE = /(master\s*plan|masterplan|loteo|lotes?|parcel|manzana|amanzana|etapa|sector|fase)/i;
   var RX_MEDIO = /(plano|planta|layout|plan\b)/i;
   function _score(u) {
     var s = String(u).toLowerCase();
@@ -11757,7 +11795,83 @@ function _elegirPlanosParaVision(imagenes) {
   // orden estable por score desc; si empatan, respeta el orden original (planos primero)
   var conIdx = uniq.map(function (u, i) { return { u: u, i: i, sc: _score(u) }; });
   conIdx.sort(function (a, b) { return (b.sc - a.sc) || (a.i - b.i); });
-  return conIdx.slice(0, _MAX_PLANOS_VISION).map(function (x) { return x.u; });
+  return conIdx.slice(0, tope).map(function (x) { return x.u; });
+}
+
+// ---- STRUCTURAL-FIRST: intenta parsear un plano SVG sin vision (gratis) -------
+// Si el "plano" es en realidad un SVG (o trae SVG embebido), los numeros de lote suelen
+// venir como <text>...</text> y el estado como color de relleno (fill / style="fill:..").
+// Parsear eso es GRATIS (cero tokens) y suele ser MAS exacto que la vision. Es 100%
+// defensivo: si no es SVG, o no se puede parsear, o no hay <text>, devuelve null y el
+// caller cae a la vision normal. Heuristica simple por regex (no DOM): asocia cada <text>
+// con etiqueta tipo lote a un color cercano si el <text> trae fill/style propio; si no,
+// deja el estado 'desconocido' (mejor no inventar). NO reemplaza a la vision cuando el
+// SVG no codifica el color en el <text> (caso comun: el color esta en el <path>/<rect>).
+function _parsearLotesDeSvg(svgText) {
+  try {
+    if (!svgText || typeof svgText !== 'string') return null;
+    if (!/<svg[\s>]/i.test(svgText)) return null;
+    // color -> estado (heuristica: primero por nombre; si es HEX, por dominancia de canal RGB).
+    // verde -> disponible/libre ; rojo -> vendido ; amarillo/naranja -> reservado ; resto -> desconocido.
+    function _estadoDeColor(col) {
+      if (!col) return 'desconocido';
+      var c = String(col).toLowerCase().trim();
+      // 1) nombres CSS explicitos
+      if (/\b(green|verde|lime|forestgreen|seagreen)\b/.test(c)) return 'disponible';
+      if (/\b(red|rojo|crimson|firebrick|darkred)\b/.test(c)) return 'vendido';
+      if (/\b(yellow|amarillo|orange|naranja|amber|gold|goldenrod)\b/.test(c)) return 'reservado';
+      if (/\b(gray|grey|gris|black|white|blanco|negro)\b/.test(c)) return 'desconocido';
+      // 2) HEX (#rgb o #rrggbb) -> RGB -> dominancia de canal
+      var mHex = c.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/);
+      if (mHex) {
+        var h = mHex[1];
+        if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+        var R = parseInt(h.slice(0, 2), 16), G = parseInt(h.slice(2, 4), 16), B = parseInt(h.slice(4, 6), 16);
+        // amarillo/naranja: R y G altos, B bajo (R+G dominan sobre B con margen)
+        if (R >= 150 && G >= 120 && B <= Math.min(R, G) - 60) return 'reservado';
+        // verde: G claramente el canal dominante
+        if (G >= 100 && G >= R + 40 && G >= B + 40) return 'disponible';
+        // rojo: R claramente el canal dominante
+        if (R >= 100 && R >= G + 40 && R >= B + 40) return 'vendido';
+        return 'desconocido';
+      }
+      // 3) rgb(...) -> misma logica de dominancia
+      var mRgb = c.match(/rgb[a]?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+      if (mRgb) {
+        var r2 = +mRgb[1], g2 = +mRgb[2], b2 = +mRgb[3];
+        if (r2 >= 150 && g2 >= 120 && b2 <= Math.min(r2, g2) - 60) return 'reservado';
+        if (g2 >= 100 && g2 >= r2 + 40 && g2 >= b2 + 40) return 'disponible';
+        if (r2 >= 100 && r2 >= g2 + 40 && r2 >= b2 + 40) return 'vendido';
+        return 'desconocido';
+      }
+      return 'desconocido';
+    }
+    var lotes = [];
+    var rxText = /<text\b([^>]*)>([\s\S]*?)<\/text>/gi, m;
+    var vistos = {};
+    while ((m = rxText.exec(svgText)) !== null && lotes.length < 2000) {
+      var attrs = m[1] || '';
+      // contenido: sacar tags anidados (<tspan>) y espacios
+      var contenido = (m[2] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!contenido) continue;
+      // etiqueta de lote: numero suelto, "Lote 12", "L-12", "12A", etc. (defensivo: cualquier token corto)
+      var mm = contenido.match(/(?:lote\s*)?([A-Za-z]?\s*\d{1,4}[A-Za-z]?)/i);
+      if (!mm) continue;
+      var etiqueta = mm[1].replace(/\s+/g, '').trim();
+      if (!etiqueta) continue;
+      var clave = etiqueta.toLowerCase();
+      if (vistos[clave]) continue;
+      vistos[clave] = 1;
+      // color: fill="..." o style="fill:.." en el propio <text> (si esta; muchas veces NO esta)
+      var col = '';
+      var mf = attrs.match(/\bfill\s*=\s*["']([^"']+)["']/i);
+      if (mf && mf[1]) col = mf[1];
+      if (!col) { var ms = attrs.match(/style\s*=\s*["'][^"']*fill\s*:\s*([^;"']+)/i); if (ms && ms[1]) col = ms[1]; }
+      lotes.push({ etiqueta: etiqueta, estado: _estadoDeColor(col), superficie_m2: null, notas: '', etapa: '' });
+    }
+    if (!lotes.length) return null;   // no habia <text> util -> caer a vision
+    return { lotes: lotes, leyenda: '', confianza: 'media', _fuente: 'svg' };
+  } catch (e) { return null; }
 }
 
 // Baja UNA imagen de plano y le pide a Claude (VISION) los lotes + estado por color.
@@ -11766,24 +11880,59 @@ function _elegirPlanosParaVision(imagenes) {
 // registrarUsoTokens. Usa base64 (no source.type:'url') para maxima compatibilidad con
 // CDNs que bloquean el fetch del lado de Anthropic. Devuelve el OBJETO parseado
 // { lotes:[], leyenda, confianza } o null si algo falla (el caller es defensivo).
-async function _leerLotesDePlano(url, user_id) {
+// `maxTokens` = tope de salida de la llamada de vision (viene del modo NORMAL/PROFUNDO);
+// si no viene -> _MAX_TOKENS_VISION (2000), byte-compat con el comportamiento historico.
+// `deep` = modo profundo (bool). En OFF, el request a la API es IDENTICO al historico
+// (mismo prompt sin "etapa", mismos 2000 tokens, SIN structural-first SVG). En ON, usa el
+// prompt etapa-aware, mas tokens, y STRUCTURAL-FIRST (parsea SVG GRATIS antes de gastar vision).
+async function _leerLotesDePlano(url, user_id, maxTokens, deep) {
+  var topeTokens = (typeof maxTokens === 'number' && maxTokens >= 1) ? maxTokens : _MAX_TOKENS_VISION;
   var resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
   var mediaType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  var buf = Buffer.from(await resp.arrayBuffer());
+  // ---- STRUCTURAL-FIRST (solo modo PROFUNDO): SVG? -> parsear <text>/fill sin gastar tokens ----
+  // Gateado por `deep` para que el modo NORMAL quede byte-identico (un SVG en NORMAL sigue yendo
+  // a vision con media_type coercionado a jpeg, como antes).
+  if (deep) {
+    var esSvg = /(^|;)\s*image\/svg\+xml/i.test(mediaType) || /\.svg(?:$|[?#])/i.test(String(url).split('?')[0]);
+    if (esSvg || mediaType === 'text/xml' || mediaType === 'application/xml') {
+      try {
+        var svgTxt = buf.toString('utf8');
+        var parsedSvg = _parsearLotesDeSvg(svgTxt);
+        if (parsedSvg && Array.isArray(parsedSvg.lotes) && parsedSvg.lotes.length) return parsedSvg;  // GRATIS: 0 tokens
+      } catch (eSvg) { /* svg raro -> caer a vision */ }
+      // Si el SVG no dio lotes utiles, no podemos mandarlo como imagen (la API no acepta svg+xml).
+      // Devolvemos null (el caller es defensivo: cuenta como "no leido" y sigue).
+      if (esSvg) return null;
+    }
+  }
   // La API de vision solo acepta estos tipos; default a jpeg si viene algo raro (ej PDF/octet-stream).
   if (['image/jpeg', 'image/png', 'image/gif', 'image/webp'].indexOf(mediaType) < 0) mediaType = 'image/jpeg';
-  var buf = Buffer.from(await resp.arrayBuffer());
-  var promptVision = 'Este es el plano/masterplan de un loteo o desarrollo inmobiliario. ' +
-    'Identifica los LOTES visibles y su ESTADO. Los estados suelen estar codificados por COLOR ' +
-    '(ej. verde=disponible/libre, rojo=vendido, amarillo=reservado); si hay una referencia/leyenda ' +
-    'de colores en la imagen, usala. Devolve SOLO un JSON (sin markdown, sin texto alrededor): ' +
-    '{ "lotes": [ { "etiqueta":"", "estado":"disponible|reservado|vendido|libre|desconocido", ' +
-    '"superficie_m2": null, "notas":"" } ], "leyenda":"", "confianza":"alta|media|baja" }. ' +
-    'Si no podes leerlo con confianza, devolve los que puedas y el resto marcalos "desconocido". ' +
-    'No inventes lotes que no ves. "superficie_m2" numerico o null.';
+  // Prompt: en NORMAL, el prompt HISTORICO exacto (byte-compat). En PROFUNDO, el prompt
+  // etapa-aware que pide TODOS los lotes + el grupo etapa/sector (para no pisar "Lote 1" entre etapas).
+  var promptVision = deep
+    ? ('Este es el plano/masterplan de un loteo o desarrollo inmobiliario. ' +
+      'Identifica TODOS los LOTES visibles (no solo algunos) y su ESTADO. Los estados suelen estar codificados por COLOR ' +
+      '(ej. verde=disponible/libre, rojo=vendido, amarillo=reservado); si hay una referencia/leyenda ' +
+      'de colores en la imagen, usala. Si la imagen agrupa lotes por ETAPA/SECTOR/FASE/MANZANA (ej. "Etapa 1", "Sector B"), ' +
+      'poné ese grupo en el campo "etapa" de cada lote (asi dos etapas distintas pueden repetir "Lote 1" sin pisarse). ' +
+      'Devolve SOLO un JSON (sin markdown, sin texto alrededor): ' +
+      '{ "lotes": [ { "etiqueta":"", "etapa":"", "estado":"disponible|reservado|vendido|libre|desconocido", ' +
+      '"superficie_m2": null, "notas":"" } ], "leyenda":"", "confianza":"alta|media|baja" }. ' +
+      'Si no podes leerlo con confianza, devolve los que puedas y el resto marcalos "desconocido". ' +
+      'No inventes lotes que no ves. "etapa" vacio si no es visible. "superficie_m2" numerico o null.')
+    : ('Este es el plano/masterplan de un loteo o desarrollo inmobiliario. ' +
+      'Identifica los LOTES visibles y su ESTADO. Los estados suelen estar codificados por COLOR ' +
+      '(ej. verde=disponible/libre, rojo=vendido, amarillo=reservado); si hay una referencia/leyenda ' +
+      'de colores en la imagen, usala. Devolve SOLO un JSON (sin markdown, sin texto alrededor): ' +
+      '{ "lotes": [ { "etiqueta":"", "estado":"disponible|reservado|vendido|libre|desconocido", ' +
+      '"superficie_m2": null, "notas":"" } ], "leyenda":"", "confianza":"alta|media|baja" }. ' +
+      'Si no podes leerlo con confianza, devolve los que puedas y el resto marcalos "desconocido". ' +
+      'No inventes lotes que no ves. "superficie_m2" numerico o null.');
   var r = await anthropic.messages.create({
     model: MODELO_SCRAPE_VISION,
-    max_tokens: 2000,                                       // acotado: un plano de loteo no deberia exceder esto
+    max_tokens: topeTokens,                                 // NORMAL=2000 / PROFUNDO=hasta PLANO_MAX_TOKENS (mas lotes por imagen)
     messages: [{ role: 'user', content: [
       { type: 'image', source: { type: 'base64', media_type: mediaType, data: buf.toString('base64') } },
       { type: 'text', text: promptVision }
@@ -11802,7 +11951,11 @@ async function _leerLotesDePlano(url, user_id) {
 //   { ok:false, status, error }   (status = codigo HTTP sugerido para el endpoint)
 // NO usa req/res: es reutilizable desde un cron. NO tira excepciones esperables
 // (las convierte en { ok:false, ... }); solo bugs inesperados suben.
-async function _scrapeDesarrolloProfundo(url, user_id) {
+// `opts` (opcional): { plano_deep:true } prende el modo PROFUNDO SOLO en este scrapeo
+// (mas imagenes de plano + max_tokens de vision mas alto). Sin opts -> modo NORMAL
+// (byte-compat: 5 imagenes / 2000 tokens), salvo que el ENV PLANO_DEEP='true' lo prenda global.
+async function _scrapeDesarrolloProfundo(url, user_id, opts) {
+  var _deepCfg = _planoDeepCfg(opts);   // { deep, maxImagenes, maxTokens } — gate de costo resuelto
   // ---- Validar url ----
   url = (url || '').trim();
   if (!url) return { ok: false, status: 400, error: 'Falta la url del proyecto' };
@@ -11955,7 +12108,8 @@ async function _scrapeDesarrolloProfundo(url, user_id) {
 
   // ---- PASO DE VISION: leer LOTES + estado del/los PLANO(S) --------------------
   // El texto de la pagina NO trae el estado de los lotes uno-por-uno (esta EN LA IMAGEN, por color).
-  // Aca miramos HASTA _MAX_PLANOS_VISION planos (subido a 5) y fusionamos los lotes que la vision lea.
+  // Aca miramos HASTA _deepCfg.maxImagenes planos (NORMAL=5 / PROFUNDO=hasta PLANO_MAX_IMAGENES)
+  // con hasta _deepCfg.maxTokens de salida por imagen, y fusionamos los lotes que la vision lea.
   // 100% DEFENSIVO: si no hay plano, o no se puede bajar, o la vision falla/parsea mal,
   // NO rompemos el scrape -> devolvemos data:{...,lotes:[]} con un aviso. El costo de
   // vision SOLO se paga si hay al menos un plano para mirar.
@@ -11970,21 +12124,21 @@ async function _scrapeDesarrolloProfundo(url, user_id) {
     var num = Number(v);
     return isNaN(num) ? null : num;
   };
-  var planosParaMirar = _elegirPlanosParaVision(data.imagenes);
-  var resumen_lotes = { total: 0, disponibles: 0, reservados: 0, vendidos: 0, leyenda: '', confianza: '' };
+  var planosParaMirar = _elegirPlanosParaVision(data.imagenes, _deepCfg.maxImagenes);
+  var resumen_lotes = { total: 0, disponibles: 0, reservados: 0, vendidos: 0, leyenda: '', confianza: '', modo: _deepCfg.deep ? 'profundo' : 'normal' };
   if (planosParaMirar.length === 0) {
     // no hay nada que mirar -> no se cobra vision; aviso claro (sin pisar un aviso previo mas importante)
     if (!aviso) aviso = 'No se encontro un plano/masterplan para leer los lotes; cargalos a mano.';
   } else {
     var lotesFusion = [];
-    var vistoLote = {};                                   // dedup por etiqueta normalizada
+    var vistoLote = {};                                   // dedup por (etapa/sector + etiqueta) normalizada
     var leyendas = [];
     var confianzas = [];
     var algunoOk = false;
     for (var pi = 0; pi < planosParaMirar.length; pi++) {
       var urlPlano = planosParaMirar[pi];
       try {
-        var visionOut = await _leerLotesDePlano(urlPlano, user_id);
+        var visionOut = await _leerLotesDePlano(urlPlano, user_id, _deepCfg.maxTokens, _deepCfg.deep);
         if (visionOut && typeof visionOut === 'object') {
           algunoOk = true;
           if (visionOut.leyenda != null && String(visionOut.leyenda).trim()) leyendas.push(String(visionOut.leyenda).trim());
@@ -11993,13 +12147,19 @@ async function _scrapeDesarrolloProfundo(url, user_id) {
           for (var li = 0; li < lotesArr.length; li++) {
             var lo = lotesArr[li] || {};
             var etiqueta = lo.etiqueta != null ? String(lo.etiqueta).trim() : '';
+            // etapa/sector: si el modelo (o el SVG) la trae, la usamos para NO pisar "Lote 1" entre etapas.
+            var etapaLote = (lo.etapa != null && String(lo.etapa).trim()) ? String(lo.etapa).trim()
+              : (lo.sector != null && String(lo.sector).trim() ? String(lo.sector).trim() : '');
             var estado = _normEstadoLote(lo.estado);
-            // dedup: misma etiqueta (no vacia) de dos planos -> no duplicar. Etiqueta vacia siempre entra.
-            var claveDedup = etiqueta ? ('e:' + etiqueta.toLowerCase()) : null;
+            // dedup por (etapa + etiqueta): dos etapas distintas pueden repetir "Lote 1" sin pisarse.
+            // Etiqueta vacia SIEMPRE entra (no hay clave). Cuando no hay etapa, el key cae a solo-etiqueta
+            // (comportamiento historico dentro de un mismo plano/etapa).
+            var claveDedup = etiqueta ? ('e:' + etapaLote.toLowerCase() + '|' + etiqueta.toLowerCase()) : null;
             if (claveDedup && vistoLote[claveDedup]) continue;
             if (claveDedup) vistoLote[claveDedup] = 1;
             lotesFusion.push({
               etiqueta: etiqueta,
+              etapa: etapaLote,
               estado: estado,
               superficie_m2: _numONull(lo.superficie_m2),
               notas: lo.notas != null ? String(lo.notas) : ''
@@ -12052,7 +12212,10 @@ app.post('/api/scrape/desarrollo', async function (req, res) {
     var url = ((req.body && req.body.url) || '').trim();
     if (!url) return res.status(400).json({ error: 'Falta la url del proyecto' });
 
-    var out = await _scrapeDesarrolloProfundo(url, user_id);
+    // 🔴 Gate de costo por-scrapeo: el body puede pedir modo PROFUNDO (mas imagenes/tokens de vision).
+    // Con plano_deep ausente/false -> modo NORMAL (salvo que el ENV PLANO_DEEP lo prenda global).
+    var _opts = { plano_deep: !!(req.body && (req.body.plano_deep === true || req.body.plano_deep === 'true')) };
+    var out = await _scrapeDesarrolloProfundo(url, user_id, _opts);
     if (!out.ok) return res.status(out.status || 500).json({ error: out.error || 'Error interno' });
     return res.json({
       ok: true,
@@ -12085,12 +12248,20 @@ app.post('/api/scrape/desarrollo', async function (req, res) {
 //   - etapas del resumen -> sectores (nombre = etapa, para que queden como filas)
 //   - lotes leidos por vision -> unidades (tipo_producto 'lote', numero=etiqueta, estado)
 // development_id se inyecta aparte (en actualizarDevelopment) para forzar el UPDATE.
-function _mapScrapeAGuardar(data) {
+// `sourceUrl` (opcional): la URL que se scrapeo. Se persiste en development.source_url para
+// que el emprendimiento creado por scrape quede RE-ACTUALIZABLE (guardarDesarrolladora la
+// escribe si dev.source_url !== undefined). Si no viene, cae a emp.link (que el scraper ya
+// rellena con la url scrapeada como fallback).
+function _mapScrapeAGuardar(data, sourceUrl) {
   data = data || {};
   var emp = data.emprendimiento || {};
   var resumen = data.resumen || {};
   var etapas = Array.isArray(resumen.etapas) ? resumen.etapas : [];
   var lotes = Array.isArray(data.lotes) ? data.lotes : [];
+  // URL de origen: la explicita (la que se paso a _scrapeDesarrolloProfundo) o, en su defecto,
+  // el link que el scraper dejo en emprendimiento.link. '' si no hay ninguna (no rompe el guardado).
+  var _srcUrl = (sourceUrl != null && String(sourceUrl).trim()) ? String(sourceUrl).trim()
+    : (emp.link != null && String(emp.link).trim() ? String(emp.link).trim() : '');
 
   var development = {
     nombre: emp.nombre || '',
@@ -12099,6 +12270,9 @@ function _mapScrapeAGuardar(data) {
     zona: emp.ubicacion || '',
     descripcion: emp.descripcion || '',
     link: emp.link || '',
+    // source_url: URL scrapeada -> guardarDesarrolladora la persiste (v2). Sin esto, un emprendimiento
+    // creado por scrape quedaba SIN URL de origen y NO se podia re-actualizar por scraping.
+    source_url: _srcUrl,
     estado_obra: emp.estado_obra || '',
     // avance_pct no viene del scraper -> null.
     avance_pct: null,
@@ -12151,16 +12325,18 @@ function _mapScrapeAGuardar(data) {
 // development_id forzado (UPDATE + reemplazo de sectores/unidades) -> setea ultimo_scrape.
 // NO usa req/res: reusable desde el endpoint manual y desde el cron. Devuelve
 // { ok:true, ...resultadoGuardar, scrape:{...} } o { ok:false, status, error }.
-async function actualizarDevelopment(devId, ownerId, sourceUrl) {
+// `opts` (opcional): { plano_deep:true } prende el modo PROFUNDO de vision en este scrapeo.
+async function actualizarDevelopment(devId, ownerId, sourceUrl, opts) {
   if (!sourceUrl || !String(sourceUrl).trim()) {
     return { ok: false, status: 400, error: 'El emprendimiento no tiene URL de origen (source_url) para actualizar.' };
   }
   // 1) Scrape profundo de la source_url (reusa la funcion de A; registra tokens con ownerId).
-  var scr = await _scrapeDesarrolloProfundo(sourceUrl, ownerId);
+  var scr = await _scrapeDesarrolloProfundo(sourceUrl, ownerId, opts);
   if (!scr.ok) return { ok: false, status: scr.status || 502, error: scr.error || 'No se pudo scrapear la pagina' };
 
   // 2) Map -> body de guardarDesarrolladora + inyectar development_id para FORZAR el UPDATE.
-  var body = _mapScrapeAGuardar(scr.data);
+  //    Pasamos sourceUrl al mapper -> se persiste source_url (el dev sigue siendo re-actualizable).
+  var body = _mapScrapeAGuardar(scr.data, sourceUrl);
   body.development_id = devId;
 
   // 3) UPDATE + reemplazo de sectores/unidades (misma logica que /api/inventario/guardar).
@@ -12187,8 +12363,9 @@ async function actualizarDevelopment(devId, ownerId, sourceUrl) {
 }
 
 // ---- POST /api/scrape/desarrollo/actualizar --------------------------------
-// Body: { development_id }. Lee developments.source_url de ese dev (verifica tenant),
-// re-scrapea esa URL y REEMPLAZA la ficha. 🔴 COSTO: corre Sonnet + hasta 5 imagenes por corrida.
+// Body: { development_id, plano_deep? }. Lee developments.source_url de ese dev (verifica
+// tenant), re-scrapea esa URL y REEMPLAZA la ficha. 🔴 COSTO: corre Sonnet + hasta 5 imagenes
+// (NORMAL) por corrida; con plano_deep=true (o ENV PLANO_DEEP) sube a modo PROFUNDO (mas caro).
 app.post('/api/scrape/desarrollo/actualizar', async function (req, res) {
   try {
     // AUTH + owner (asesor -> admin_id, como el resto de endpoints)
@@ -12213,7 +12390,9 @@ app.post('/api/scrape/desarrollo/actualizar', async function (req, res) {
     var sourceUrl = (dRow.data.source_url || '').trim();
     if (!sourceUrl) return res.status(400).json({ error: 'Este emprendimiento no tiene URL de origen guardada. Guardá la source_url antes de actualizar por scraping.' });
 
-    var r = await actualizarDevelopment(devId, user_id, sourceUrl);
+    // 🔴 Gate de costo por-scrapeo (opt-in): body.plano_deep=true -> modo PROFUNDO en esta corrida.
+    var _opts = { plano_deep: !!(req.body && (req.body.plano_deep === true || req.body.plano_deep === 'true')) };
+    var r = await actualizarDevelopment(devId, user_id, sourceUrl, _opts);
     if (!r.ok) return res.status(r.status || 500).json(r);
     delete r.status;
     return res.json(r);

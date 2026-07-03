@@ -11651,11 +11651,19 @@ app.post('/api/scrape/universal', async function(req, res) {
 // La IA se ADAPTA a cualquier estructura de pagina; NO hay formato fijo.
 // ============================================================================
 
-// MODELO del scraper de desarrollo. Por defecto MODELO_INTERNO (Haiku) para acotar
-// el costo (este scrapeo lo corre el dueño manualmente, no por cada lead). Si el dueño
-// pide mas precision, cambiar a MODELO_CLIENTE (Sonnet) — y su precio PRECIO_IA abajo.
-const MODELO_SCRAPE_DESARROLLO = MODELO_INTERNO;              // Haiku (barato). Alt: MODELO_CLIENTE (Sonnet)
-const PRECIO_SCRAPE_DESARROLLO = PRECIO_HAIKU;               // emparejar con el modelo de arriba (Haiku->PRECIO_HAIKU, Sonnet->PRECIO_IA)
+// MODELO del scraper de desarrollo. El dueño quiere "TODO, no parte": priorizamos CALIDAD de
+// extraccion sobre costo -> MODELO_CLIENTE (Sonnet). Este scrapeo lo corre el dueño manualmente
+// (o el auto-update opt-in, default OFF), NO por cada lead, asi que el costo por corrida es acotado.
+// Para ABARATAR (volver a Haiku): descomentar las dos lineas Haiku y comentar las dos Sonnet.
+const MODELO_SCRAPE_DESARROLLO = MODELO_CLIENTE;              // Sonnet (calidad, "todo"). Alt: MODELO_INTERNO (Haiku, barato)
+const PRECIO_SCRAPE_DESARROLLO = PRECIO_IA;                  // emparejar: Sonnet->PRECIO_IA. (Haiku->PRECIO_HAIKU)
+// --- Alternativa BARATA (Haiku): comentar las 2 lineas de arriba y usar estas 2 ---
+// const MODELO_SCRAPE_DESARROLLO = MODELO_INTERNO;           // Haiku (barato, menos exacto)
+// const PRECIO_SCRAPE_DESARROLLO = PRECIO_HAIKU;             // emparejar: Haiku->PRECIO_HAIKU
+// Tope de chars del texto limpio que se manda a la IA. Subido de 14k -> 40k para capturar
+// TODAS las secciones de una pagina de desarrolladora (server-rendered: el fetch plano ya trae
+// descripcion, amenities, master plan, etapas, equipo, ubicacion). 40k acota el costo de input.
+const _MAX_TEXTO_DESARROLLO = 40000;
 
 // MODELO del paso de VISION (leer el/los PLANOS/MASTERPLAN y sacar los LOTES + su estado
 // codificado por color). Default a MODELO_CLIENTE (Sonnet) porque leer un plano con colores
@@ -11665,7 +11673,7 @@ const PRECIO_SCRAPE_DESARROLLO = PRECIO_HAIKU;               // emparejar con el
 // si la pagina trae al menos un plano para mirar (ver _MAX_PLANOS_VISION mas abajo).
 const MODELO_SCRAPE_VISION = MODELO_CLIENTE;                 // Sonnet (precision). Alt: MODELO_INTERNO (Haiku, mas barato)
 const PRECIO_SCRAPE_VISION = PRECIO_IA;                      // emparejar con el modelo de arriba (Sonnet->PRECIO_IA, Haiku->PRECIO_HAIKU)
-const _MAX_PLANOS_VISION = 2;                               // tope de imagenes a mirar por scrapeo (acota costo)
+const _MAX_PLANOS_VISION = 5;                               // tope de imagenes a mirar por scrapeo (subido 2->5 para capturar los planos por etapa/vision; acota costo)
 
 // Extrae URLs de IMAGENES y PDFs de un HTML, resolviendo relativas a absolutas.
 // General (NO WordPress-especifico como _extraerGaleriaHtml): mira src, data-src,
@@ -11786,6 +11794,251 @@ async function _leerLotesDePlano(url, user_id) {
   return _parseJsonObjetoDefensivo(t);
 }
 
+// ---- FUNCION COMPARTIDA: scrape PROFUNDO de un emprendimiento -----------------
+// La usa el endpoint /api/scrape/desarrollo (precarga del form), el endpoint de
+// ACTUALIZAR (/api/scrape/desarrollo/actualizar) y el cron de auto-update. Recibe la
+// URL + el owner (para registrar tokens) y devuelve un objeto de resultado uniforme:
+//   { ok:true, data:{...}, imagenes_encontradas, planos_analizados, aviso }
+//   { ok:false, status, error }   (status = codigo HTTP sugerido para el endpoint)
+// NO usa req/res: es reutilizable desde un cron. NO tira excepciones esperables
+// (las convierte en { ok:false, ... }); solo bugs inesperados suben.
+async function _scrapeDesarrolloProfundo(url, user_id) {
+  // ---- Validar url ----
+  url = (url || '').trim();
+  if (!url) return { ok: false, status: 400, error: 'Falta la url del proyecto' };
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  try { new URL(url); } catch (eUrl) { return { ok: false, status: 400, error: 'La url no es valida' }; }
+
+  // ---- Fetch de la pagina (fetch TLS-tolerante, mismo mecanismo que el scraper inmobiliaria) ----
+  // Las paginas de desarrolladoras son SERVER-RENDERED: el fetch plano ya trae TODO el texto
+  // (descripcion, amenities, master plan, etapas, equipo, ubicacion). NO hace falta headless.
+  var html = '';
+  try {
+    var r = await fetchScrape(url);
+    if (!r || !r.ok) return { ok: false, status: 502, error: 'No se pudo acceder a la pagina (status ' + (r ? r.status : 'sin respuesta') + ')' };
+    html = await r.text();
+  } catch (eFetch) {
+    return { ok: false, status: 502, error: 'No se pudo bajar la pagina: ' + (eFetch && eFetch.message ? eFetch.message : 'error de red/timeout') };
+  }
+  if (!html || html.length < 50) return { ok: false, status: 502, error: 'La pagina vino vacia o inaccesible' };
+
+  // ---- Texto visible para la IA (truncado a _MAX_TEXTO_DESARROLLO ~40k para capturar TODA la pagina) ----
+  var texto = _htmlParaIA(html, _MAX_TEXTO_DESARROLLO);
+  // ---- Imagenes + PDFs (con filename como pista para clasificar) ----
+  var imgs = _extraerImagenesDesarrollo(html, url, 60);
+  var listaImgs = imgs.map(function (x, i) { return (i + 1) + '. ' + x.filename + ' -> ' + x.url; }).join('\n');
+
+  if ((!texto || texto.length < 60) && imgs.length === 0) {
+    return { ok: false, status: 422, error: 'La pagina no tiene texto ni imagenes utiles para analizar (¿render por JS?)' };
+  }
+
+  // ---- Extraccion con IA (Sonnet por default; ver MODELO_SCRAPE_DESARROLLO) ----
+  if (!process.env.ANTHROPIC_KEY) return { ok: false, status: 503, error: 'IA no disponible (sin ANTHROPIC_KEY)' };
+  // Prompt AMPLIADO: capturar TODAS las secciones (el dueño quiere "todo, no parte").
+  var sys = 'Sos un extractor EXHAUSTIVO de datos de un proyecto inmobiliario / desarrollo (desarrolladora). ' +
+    'Te paso el TEXTO visible COMPLETO de la pagina de UN emprendimiento y una lista de URLs de imagenes con su nombre de archivo. ' +
+    'Entende la pagina (se adapta a cualquier estructura) y captura TODO lo relevante. NO inventes datos que no esten: si no aparece, deja "" o null o [].\n' +
+    'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor) con esta forma EXACTA:\n' +
+    '{\n' +
+    '  "emprendimiento": { "nombre":"", "ubicacion":"", "descripcion":"", "estado_obra":"", "fecha_entrega":"", "amenities":[], "financiacion":"", "contacto":"", "link":"' + url + '" },\n' +
+    '  "resumen": { "superficie_total":"", "lotes_total":null, "lotes_vendidos":null, "lotes_disponibles":null, "tamanos_lotes":"", "etapas":[ { "nombre":"", "anio":"", "lotes":null, "estado":"" } ] },\n' +
+    '  "master_plan": [ { "etapa":"", "anio":"", "descripcion":"", "estado":"" } ],\n' +
+    '  "equipo": [ { "nombre":"", "rol":"" } ],\n' +
+    '  "ubicacion_detalle": { "direccion":"", "coordenadas":"", "distancias":[ { "referencia":"", "distancia":"" } ] },\n' +
+    '  "tipologias": [ { "tipo":"", "ambientes":null, "superficie_m2":null, "precio":null, "moneda":"", "disponibilidad":"", "notas":"" } ],\n' +
+    '  "imagenes": { "fotos":[], "planos":[], "renders":[] }\n' +
+    '}\n' +
+    'REGLAS:\n' +
+    '- "descripcion": el texto descriptivo COMPLETO del emprendimiento (concepto, propuesta, entorno). NO lo resumas de mas; captura los parrafos relevantes.\n' +
+    '- "estado_obra": normaliza a "pozo", "en_construccion" o "terminado" si el texto lo permite; si no, deja el texto tal cual o "".\n' +
+    '- "amenities": lista de strings con TODOS los que aparezcan (Pileta, Gimnasio, SUM, Seguridad 24hs, Cochera, Club House, Cancha, Laguna, etc.).\n' +
+    '- "resumen": superficie total del predio, cantidad total de lotes/unidades, cuantos vendidos y disponibles si el TEXTO lo dice (esto es el OVERVIEW, no el estado lote-por-lote), rango de tamaños, y las ETAPAS con su año y cantidad de lotes/estado. Numeros como numero o null.\n' +
+    '- "master_plan": las etapas/fases del proyecto en el tiempo (etapa 1/2/3, por año), con su descripcion y estado. Si no hay, [].\n' +
+    '- "equipo": desarrolladora/estudio/arquitectos/comercializadora mencionados, con su rol. Si no hay, [].\n' +
+    '- "ubicacion_detalle": direccion exacta, coordenadas si estan, y distancias a puntos de referencia (centro, aeropuerto, ruta, ciudad). Si no hay, dejar vacio/[].\n' +
+    '- "tipologias": una por cada tipo de unidad/depto/lote que ofrezca (Monoambiente, 2 ambientes, Lote, etc.). "ambientes"/"superficie_m2"/"precio" numericos (o null). "moneda" en USD/ARS/PYG si se sabe.\n' +
+    '- "imagenes": clasifica CADA URL de la lista en fotos (obra/entorno/reales), planos (planta/plano/layout/masterplan/loteo) o renders (render/ilustracion/fachada 3D). Usa el nombre de archivo (plano, planta, masterplan, render, fachada, amenities, brochure) y el contexto. Los PDF suelen ser planos o brochure -> ponelos en "planos". Devolve las URLs COMPLETAS tal cual te las paso. Si dudas, "fotos".';
+
+  var userMsg = 'TEXTO DE LA PAGINA:\n' + (texto || '(sin texto)') + '\n\n' +
+    'IMAGENES / PDF ENCONTRADOS (nombre -> url):\n' + (listaImgs || '(ninguna)');
+
+  var iaResp;
+  try {
+    iaResp = await anthropic.messages.create({
+      model: MODELO_SCRAPE_DESARROLLO,
+      max_tokens: 4000,                                     // subido de 2500 -> 4000 por las secciones nuevas (resumen/masterplan/equipo/ubicacion)
+      system: sys,
+      messages: [{ role: 'user', content: userMsg }]
+    });
+  } catch (eIA) {
+    return { ok: false, status: 502, error: 'La IA no pudo procesar la pagina: ' + (eIA && eIA.message ? eIA.message : 'error') };
+  }
+  // Costo -> panel (best-effort, con el precio del MODELO usado)
+  try { if (iaResp && iaResp.usage) await registrarUsoTokens(user_id, iaResp.usage, 'scraper_desarrollo', PRECIO_SCRAPE_DESARROLLO); } catch (eTok) {}
+
+  var txt = (iaResp && iaResp.content && iaResp.content[0] && iaResp.content[0].text) ? iaResp.content[0].text : '';
+  var parsed = _parseJsonObjetoDefensivo(txt);
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, status: 422, error: 'La IA no devolvio un JSON valido. Reintentá o cargá el emprendimiento a mano.' };
+  }
+
+  // ---- Normalizar la salida a la forma prometida (defensivo: nunca undefined) ----
+  var emp = parsed.emprendimiento || {};
+  var tipologias = Array.isArray(parsed.tipologias) ? parsed.tipologias : [];
+  var imagenes = parsed.imagenes || {};
+  function _arrStr(a) { return Array.isArray(a) ? a.filter(function (x) { return x != null && String(x).trim() !== ''; }).map(String) : []; }
+  function _numONull2(v) { if (v === null || v === undefined || v === '') return null; var n = Number(v); return isNaN(n) ? null : n; }
+  function _s(v) { return v != null ? String(v) : ''; }
+  // Normalizar secciones nuevas (todas opcionales, siempre en un shape estable)
+  var pr = parsed.resumen || {};
+  var etapasPr = Array.isArray(pr.etapas) ? pr.etapas : [];
+  var resumen = {
+    superficie_total: _s(pr.superficie_total),
+    lotes_total: _numONull2(pr.lotes_total),
+    lotes_vendidos: _numONull2(pr.lotes_vendidos),
+    lotes_disponibles: _numONull2(pr.lotes_disponibles),
+    tamanos_lotes: _s(pr.tamanos_lotes),
+    etapas: etapasPr.map(function (e) { e = e || {}; return { nombre: _s(e.nombre), anio: _s(e.anio), lotes: _numONull2(e.lotes), estado: _s(e.estado) }; })
+  };
+  var mpPr = Array.isArray(parsed.master_plan) ? parsed.master_plan : [];
+  var master_plan = mpPr.map(function (m) { m = m || {}; return { etapa: _s(m.etapa), anio: _s(m.anio), descripcion: _s(m.descripcion), estado: _s(m.estado) }; });
+  var eqPr = Array.isArray(parsed.equipo) ? parsed.equipo : [];
+  var equipo = eqPr.map(function (m) { m = m || {}; return { nombre: _s(m.nombre), rol: _s(m.rol) }; });
+  var ubPr = parsed.ubicacion_detalle || {};
+  var distPr = Array.isArray(ubPr.distancias) ? ubPr.distancias : [];
+  var ubicacion_detalle = {
+    direccion: _s(ubPr.direccion),
+    coordenadas: _s(ubPr.coordenadas),
+    distancias: distPr.map(function (d) { d = d || {}; return { referencia: _s(d.referencia), distancia: _s(d.distancia) }; })
+  };
+
+  var data = {
+    emprendimiento: {
+      nombre: emp.nombre != null ? String(emp.nombre) : '',
+      ubicacion: emp.ubicacion != null ? String(emp.ubicacion) : '',
+      descripcion: emp.descripcion != null ? String(emp.descripcion) : '',
+      estado_obra: emp.estado_obra != null ? String(emp.estado_obra) : '',
+      fecha_entrega: emp.fecha_entrega != null ? String(emp.fecha_entrega) : '',
+      amenities: _arrStr(emp.amenities),
+      financiacion: emp.financiacion != null ? String(emp.financiacion) : '',
+      contacto: emp.contacto != null ? String(emp.contacto) : '',
+      link: emp.link != null && String(emp.link).trim() ? String(emp.link) : url
+    },
+    resumen: resumen,
+    master_plan: master_plan,
+    equipo: equipo,
+    ubicacion_detalle: ubicacion_detalle,
+    tipologias: tipologias.map(function (t) {
+      t = t || {};
+      return {
+        tipo: t.tipo != null ? String(t.tipo) : '',
+        ambientes: (t.ambientes === null || t.ambientes === undefined || t.ambientes === '') ? null : (isNaN(Number(t.ambientes)) ? t.ambientes : Number(t.ambientes)),
+        superficie_m2: (t.superficie_m2 === null || t.superficie_m2 === undefined || t.superficie_m2 === '') ? null : (isNaN(Number(t.superficie_m2)) ? t.superficie_m2 : Number(t.superficie_m2)),
+        precio: (t.precio === null || t.precio === undefined || t.precio === '') ? null : (isNaN(Number(t.precio)) ? t.precio : Number(t.precio)),
+        moneda: t.moneda != null ? String(t.moneda) : '',
+        disponibilidad: t.disponibilidad != null ? String(t.disponibilidad) : '',
+        notas: t.notas != null ? String(t.notas) : ''
+      };
+    }),
+    imagenes: {
+      fotos: _arrStr(imagenes.fotos),
+      planos: _arrStr(imagenes.planos),
+      renders: _arrStr(imagenes.renders)
+    }
+  };
+
+  // aviso si la IA no clasifico ninguna imagen pero SI habia imagenes en la pagina
+  var clasificadas = data.imagenes.fotos.length + data.imagenes.planos.length + data.imagenes.renders.length;
+  var aviso = '';
+  if (imgs.length > 0 && clasificadas === 0) aviso = 'Se encontraron ' + imgs.length + ' imagenes pero la IA no las clasifico; revisalas manualmente.';
+  else if (!data.emprendimiento.nombre) aviso = 'No se detecto el nombre del emprendimiento; completalo a mano.';
+
+  // ---- PASO DE VISION: leer LOTES + estado del/los PLANO(S) --------------------
+  // El texto de la pagina NO trae el estado de los lotes uno-por-uno (esta EN LA IMAGEN, por color).
+  // Aca miramos HASTA _MAX_PLANOS_VISION planos (subido a 5) y fusionamos los lotes que la vision lea.
+  // 100% DEFENSIVO: si no hay plano, o no se puede bajar, o la vision falla/parsea mal,
+  // NO rompemos el scrape -> devolvemos data:{...,lotes:[]} con un aviso. El costo de
+  // vision SOLO se paga si hay al menos un plano para mirar.
+  data.lotes = [];
+  var _normEstadoLote = function (e) {
+    var n = (e == null ? '' : String(e)).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+    if (['disponible', 'reservado', 'vendido', 'libre'].indexOf(n) >= 0) return n;
+    return 'desconocido';
+  };
+  var _numONull = function (v) {
+    if (v === null || v === undefined || v === '') return null;
+    var num = Number(v);
+    return isNaN(num) ? null : num;
+  };
+  var planosParaMirar = _elegirPlanosParaVision(data.imagenes);
+  var resumen_lotes = { total: 0, disponibles: 0, reservados: 0, vendidos: 0, leyenda: '', confianza: '' };
+  if (planosParaMirar.length === 0) {
+    // no hay nada que mirar -> no se cobra vision; aviso claro (sin pisar un aviso previo mas importante)
+    if (!aviso) aviso = 'No se encontro un plano/masterplan para leer los lotes; cargalos a mano.';
+  } else {
+    var lotesFusion = [];
+    var vistoLote = {};                                   // dedup por etiqueta normalizada
+    var leyendas = [];
+    var confianzas = [];
+    var algunoOk = false;
+    for (var pi = 0; pi < planosParaMirar.length; pi++) {
+      var urlPlano = planosParaMirar[pi];
+      try {
+        var visionOut = await _leerLotesDePlano(urlPlano, user_id);
+        if (visionOut && typeof visionOut === 'object') {
+          algunoOk = true;
+          if (visionOut.leyenda != null && String(visionOut.leyenda).trim()) leyendas.push(String(visionOut.leyenda).trim());
+          if (visionOut.confianza != null && String(visionOut.confianza).trim()) confianzas.push(String(visionOut.confianza).trim().toLowerCase());
+          var lotesArr = Array.isArray(visionOut.lotes) ? visionOut.lotes : [];
+          for (var li = 0; li < lotesArr.length; li++) {
+            var lo = lotesArr[li] || {};
+            var etiqueta = lo.etiqueta != null ? String(lo.etiqueta).trim() : '';
+            var estado = _normEstadoLote(lo.estado);
+            // dedup: misma etiqueta (no vacia) de dos planos -> no duplicar. Etiqueta vacia siempre entra.
+            var claveDedup = etiqueta ? ('e:' + etiqueta.toLowerCase()) : null;
+            if (claveDedup && vistoLote[claveDedup]) continue;
+            if (claveDedup) vistoLote[claveDedup] = 1;
+            lotesFusion.push({
+              etiqueta: etiqueta,
+              estado: estado,
+              superficie_m2: _numONull(lo.superficie_m2),
+              notas: lo.notas != null ? String(lo.notas) : ''
+            });
+          }
+        }
+      } catch (eVis) {
+        // un plano fallo (fetch/base64/vision) -> seguimos con el proximo, no rompemos
+        console.log('scrape/desarrollo vision plano fallo:', urlPlano, '-', (eVis && eVis.message) ? eVis.message : eVis);
+      }
+    }
+    data.lotes = lotesFusion;
+    // resumen agregado
+    resumen_lotes.total = lotesFusion.length;
+    lotesFusion.forEach(function (l) {
+      if (l.estado === 'disponible' || l.estado === 'libre') resumen_lotes.disponibles++;
+      else if (l.estado === 'reservado') resumen_lotes.reservados++;
+      else if (l.estado === 'vendido') resumen_lotes.vendidos++;
+    });
+    resumen_lotes.leyenda = leyendas.join(' | ');
+    // confianza global = la MAS BAJA de las lecturas (conservador); si no hubo, ''
+    if (confianzas.indexOf('baja') >= 0) resumen_lotes.confianza = 'baja';
+    else if (confianzas.indexOf('media') >= 0) resumen_lotes.confianza = 'media';
+    else if (confianzas.indexOf('alta') >= 0) resumen_lotes.confianza = 'alta';
+    // avisos especificos de vision (sin pisar un aviso previo mas importante)
+    if (!algunoOk && !aviso) aviso = 'Se encontro un plano pero no se pudieron leer los lotes; revisalos manualmente.';
+    else if (algunoOk && lotesFusion.length === 0 && !aviso) aviso = 'Se leyo el plano pero no se identificaron lotes; revisalo manualmente.';
+  }
+  data.resumen_lotes = resumen_lotes;
+
+  return {
+    ok: true,
+    data: data,
+    imagenes_encontradas: imgs.length,
+    planos_analizados: planosParaMirar.length,
+    aviso: aviso || undefined
+  };
+}
+
 app.post('/api/scrape/desarrollo', async function (req, res) {
   try {
     // ---- AUTH + owner (asesor -> admin_id, como el resto de endpoints) ----
@@ -11796,203 +12049,226 @@ app.post('/api/scrape/desarrollo', async function (req, res) {
       if (_yo && _yo.data && _yo.data.admin_id) user_id = _yo.data.admin_id; // el owner del tenant (sin fila -> es el dueño)
     } catch (eOwner) { /* sin fila -> user_id queda como esta */ }
 
-    // ---- Validar url ----
     var url = ((req.body && req.body.url) || '').trim();
     if (!url) return res.status(400).json({ error: 'Falta la url del proyecto' });
-    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-    try { new URL(url); } catch (eUrl) { return res.status(400).json({ error: 'La url no es valida' }); }
 
-    // ---- Fetch de la pagina (fetch TLS-tolerante, mismo mecanismo que el scraper inmobiliaria) ----
-    var html = '';
-    try {
-      var r = await fetchScrape(url);
-      if (!r || !r.ok) return res.status(502).json({ error: 'No se pudo acceder a la pagina (status ' + (r ? r.status : 'sin respuesta') + ')' });
-      html = await r.text();
-    } catch (eFetch) {
-      return res.status(502).json({ error: 'No se pudo bajar la pagina: ' + (eFetch && eFetch.message ? eFetch.message : 'error de red/timeout') });
-    }
-    if (!html || html.length < 50) return res.status(502).json({ error: 'La pagina vino vacia o inaccesible' });
-
-    // ---- Texto visible para la IA (truncado ~14k chars para acotar tokens/costo) ----
-    var texto = _htmlParaIA(html, 14000);
-    // ---- Imagenes + PDFs (con filename como pista para clasificar) ----
-    var imgs = _extraerImagenesDesarrollo(html, url, 60);
-    var listaImgs = imgs.map(function (x, i) { return (i + 1) + '. ' + x.filename + ' -> ' + x.url; }).join('\n');
-
-    if ((!texto || texto.length < 60) && imgs.length === 0) {
-      return res.status(422).json({ error: 'La pagina no tiene texto ni imagenes utiles para analizar (¿render por JS?)' });
-    }
-
-    // ---- Extraccion con IA ----
-    if (!process.env.ANTHROPIC_KEY) return res.status(503).json({ error: 'IA no disponible (sin ANTHROPIC_KEY)' });
-    var sys = 'Sos un extractor de datos de un proyecto inmobiliario / desarrollo (desarrolladora). ' +
-      'Te paso el TEXTO visible de la pagina de UN emprendimiento y una lista de URLs de imagenes con su nombre de archivo. ' +
-      'Entende la pagina (se adapta a cualquier estructura) y arma la estructura. NO inventes datos que no esten: si no aparece, deja "" o null o [].\n' +
-      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor) con esta forma EXACTA:\n' +
-      '{\n' +
-      '  "emprendimiento": { "nombre":"", "ubicacion":"", "descripcion":"", "estado_obra":"", "fecha_entrega":"", "amenities":[], "financiacion":"", "contacto":"", "link":"' + url + '" },\n' +
-      '  "tipologias": [ { "tipo":"", "ambientes":null, "superficie_m2":null, "precio":null, "moneda":"", "disponibilidad":"", "notas":"" } ],\n' +
-      '  "imagenes": { "fotos":[], "planos":[], "renders":[] }\n' +
-      '}\n' +
-      'REGLAS:\n' +
-      '- "estado_obra": normaliza a "pozo", "en_construccion" o "terminado" si el texto lo permite; si no, deja el texto tal cual o "".\n' +
-      '- "amenities": lista de strings (Pileta, Gimnasio, SUM, Seguridad, Cochera, etc.).\n' +
-      '- "tipologias": una por cada tipo de unidad/depto/lote que ofrezca (Monoambiente, 2 ambientes, Lote, etc.). "ambientes" y "superficie_m2" y "precio" numericos (o null). "moneda" en USD/ARS/PYG si se sabe.\n' +
-      '- "imagenes": clasifica CADA URL de la lista en fotos (obra/entorno/reales), planos (planta/plano/layout) o renders (render/ilustracion/fachada 3D). Usa el nombre de archivo (plano, planta, render, fachada, amenities, brochure) y el contexto. Los PDF suelen ser planos o brochure -> ponelos en "planos". Devolve las URLs COMPLETAS tal cual te las paso. Si dudas, "fotos".';
-
-    var userMsg = 'TEXTO DE LA PAGINA:\n' + (texto || '(sin texto)') + '\n\n' +
-      'IMAGENES / PDF ENCONTRADOS (nombre -> url):\n' + (listaImgs || '(ninguna)');
-
-    var iaResp;
-    try {
-      iaResp = await anthropic.messages.create({
-        model: MODELO_SCRAPE_DESARROLLO,
-        max_tokens: 2500,
-        system: sys,
-        messages: [{ role: 'user', content: userMsg }]
-      });
-    } catch (eIA) {
-      return res.status(502).json({ error: 'La IA no pudo procesar la pagina: ' + (eIA && eIA.message ? eIA.message : 'error') });
-    }
-    // Costo -> panel (best-effort, con el precio del MODELO usado)
-    try { if (iaResp && iaResp.usage) await registrarUsoTokens(user_id, iaResp.usage, 'scraper_desarrollo', PRECIO_SCRAPE_DESARROLLO); } catch (eTok) {}
-
-    var txt = (iaResp && iaResp.content && iaResp.content[0] && iaResp.content[0].text) ? iaResp.content[0].text : '';
-    var parsed = _parseJsonObjetoDefensivo(txt);
-    if (!parsed || typeof parsed !== 'object') {
-      return res.status(422).json({ error: 'La IA no devolvio un JSON valido. Reintentá o cargá el emprendimiento a mano.' });
-    }
-
-    // ---- Normalizar la salida a la forma prometida (defensivo: nunca undefined) ----
-    var emp = parsed.emprendimiento || {};
-    var tipologias = Array.isArray(parsed.tipologias) ? parsed.tipologias : [];
-    var imagenes = parsed.imagenes || {};
-    function _arrStr(a) { return Array.isArray(a) ? a.filter(function (x) { return x != null && String(x).trim() !== ''; }).map(String) : []; }
-    var data = {
-      emprendimiento: {
-        nombre: emp.nombre != null ? String(emp.nombre) : '',
-        ubicacion: emp.ubicacion != null ? String(emp.ubicacion) : '',
-        descripcion: emp.descripcion != null ? String(emp.descripcion) : '',
-        estado_obra: emp.estado_obra != null ? String(emp.estado_obra) : '',
-        fecha_entrega: emp.fecha_entrega != null ? String(emp.fecha_entrega) : '',
-        amenities: _arrStr(emp.amenities),
-        financiacion: emp.financiacion != null ? String(emp.financiacion) : '',
-        contacto: emp.contacto != null ? String(emp.contacto) : '',
-        link: emp.link != null && String(emp.link).trim() ? String(emp.link) : url
-      },
-      tipologias: tipologias.map(function (t) {
-        t = t || {};
-        return {
-          tipo: t.tipo != null ? String(t.tipo) : '',
-          ambientes: (t.ambientes === null || t.ambientes === undefined || t.ambientes === '') ? null : (isNaN(Number(t.ambientes)) ? t.ambientes : Number(t.ambientes)),
-          superficie_m2: (t.superficie_m2 === null || t.superficie_m2 === undefined || t.superficie_m2 === '') ? null : (isNaN(Number(t.superficie_m2)) ? t.superficie_m2 : Number(t.superficie_m2)),
-          precio: (t.precio === null || t.precio === undefined || t.precio === '') ? null : (isNaN(Number(t.precio)) ? t.precio : Number(t.precio)),
-          moneda: t.moneda != null ? String(t.moneda) : '',
-          disponibilidad: t.disponibilidad != null ? String(t.disponibilidad) : '',
-          notas: t.notas != null ? String(t.notas) : ''
-        };
-      }),
-      imagenes: {
-        fotos: _arrStr(imagenes.fotos),
-        planos: _arrStr(imagenes.planos),
-        renders: _arrStr(imagenes.renders)
-      }
-    };
-
-    // aviso si la IA no clasifico ninguna imagen pero SI habia imagenes en la pagina
-    var clasificadas = data.imagenes.fotos.length + data.imagenes.planos.length + data.imagenes.renders.length;
-    var aviso = '';
-    if (imgs.length > 0 && clasificadas === 0) aviso = 'Se encontraron ' + imgs.length + ' imagenes pero la IA no las clasifico; revisalas manualmente.';
-    else if (!data.emprendimiento.nombre) aviso = 'No se detecto el nombre del emprendimiento; completalo a mano.';
-
-    // ---- PASO DE VISION: leer LOTES + estado del/los PLANO(S) --------------------
-    // El texto de la pagina NO trae el estado de los lotes (esta EN LA IMAGEN, por color).
-    // Aca miramos HASTA _MAX_PLANOS_VISION planos y fusionamos los lotes que la vision lea.
-    // 100% DEFENSIVO: si no hay plano, o no se puede bajar, o la vision falla/parsea mal,
-    // NO rompemos el scrape -> devolvemos data:{...,lotes:[]} con un aviso. El costo de
-    // vision SOLO se paga si hay al menos un plano para mirar.
-    data.lotes = [];
-    var _normEstadoLote = function (e) {
-      var n = (e == null ? '' : String(e)).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
-      if (['disponible', 'reservado', 'vendido', 'libre'].indexOf(n) >= 0) return n;
-      return 'desconocido';
-    };
-    var _numONull = function (v) {
-      if (v === null || v === undefined || v === '') return null;
-      var num = Number(v);
-      return isNaN(num) ? null : num;
-    };
-    var planosParaMirar = _elegirPlanosParaVision(data.imagenes);
-    var resumen_lotes = { total: 0, disponibles: 0, reservados: 0, vendidos: 0, leyenda: '', confianza: '' };
-    if (planosParaMirar.length === 0) {
-      // no hay nada que mirar -> no se cobra vision; aviso claro (sin pisar un aviso previo mas importante)
-      if (!aviso) aviso = 'No se encontro un plano/masterplan para leer los lotes; cargalos a mano.';
-    } else {
-      var lotesFusion = [];
-      var vistoLote = {};                                   // dedup por etiqueta normalizada
-      var leyendas = [];
-      var confianzas = [];
-      var algunoOk = false;
-      for (var pi = 0; pi < planosParaMirar.length; pi++) {
-        var urlPlano = planosParaMirar[pi];
-        try {
-          var visionOut = await _leerLotesDePlano(urlPlano, user_id);
-          if (visionOut && typeof visionOut === 'object') {
-            algunoOk = true;
-            if (visionOut.leyenda != null && String(visionOut.leyenda).trim()) leyendas.push(String(visionOut.leyenda).trim());
-            if (visionOut.confianza != null && String(visionOut.confianza).trim()) confianzas.push(String(visionOut.confianza).trim().toLowerCase());
-            var lotesArr = Array.isArray(visionOut.lotes) ? visionOut.lotes : [];
-            for (var li = 0; li < lotesArr.length; li++) {
-              var lo = lotesArr[li] || {};
-              var etiqueta = lo.etiqueta != null ? String(lo.etiqueta).trim() : '';
-              var estado = _normEstadoLote(lo.estado);
-              // dedup: misma etiqueta (no vacia) de dos planos -> no duplicar. Etiqueta vacia siempre entra.
-              var claveDedup = etiqueta ? ('e:' + etiqueta.toLowerCase()) : null;
-              if (claveDedup && vistoLote[claveDedup]) continue;
-              if (claveDedup) vistoLote[claveDedup] = 1;
-              lotesFusion.push({
-                etiqueta: etiqueta,
-                estado: estado,
-                superficie_m2: _numONull(lo.superficie_m2),
-                notas: lo.notas != null ? String(lo.notas) : ''
-              });
-            }
-          }
-        } catch (eVis) {
-          // un plano fallo (fetch/base64/vision) -> seguimos con el proximo, no rompemos
-          console.log('scrape/desarrollo vision plano fallo:', urlPlano, '-', (eVis && eVis.message) ? eVis.message : eVis);
-        }
-      }
-      data.lotes = lotesFusion;
-      // resumen agregado
-      resumen_lotes.total = lotesFusion.length;
-      lotesFusion.forEach(function (l) {
-        if (l.estado === 'disponible' || l.estado === 'libre') resumen_lotes.disponibles++;
-        else if (l.estado === 'reservado') resumen_lotes.reservados++;
-        else if (l.estado === 'vendido') resumen_lotes.vendidos++;
-      });
-      resumen_lotes.leyenda = leyendas.join(' | ');
-      // confianza global = la MAS BAJA de las lecturas (conservador); si no hubo, ''
-      if (confianzas.indexOf('baja') >= 0) resumen_lotes.confianza = 'baja';
-      else if (confianzas.indexOf('media') >= 0) resumen_lotes.confianza = 'media';
-      else if (confianzas.indexOf('alta') >= 0) resumen_lotes.confianza = 'alta';
-      // avisos especificos de vision (sin pisar un aviso previo mas importante)
-      if (!algunoOk && !aviso) aviso = 'Se encontro un plano pero no se pudieron leer los lotes; revisalos manualmente.';
-      else if (algunoOk && lotesFusion.length === 0 && !aviso) aviso = 'Se leyo el plano pero no se identificaron lotes; revisalo manualmente.';
-    }
-    data.resumen_lotes = resumen_lotes;
-
+    var out = await _scrapeDesarrolloProfundo(url, user_id);
+    if (!out.ok) return res.status(out.status || 500).json({ error: out.error || 'Error interno' });
     return res.json({
       ok: true,
-      data: data,
-      imagenes_encontradas: imgs.length,
-      planos_analizados: planosParaMirar.length,
-      aviso: aviso || undefined
+      data: out.data,
+      imagenes_encontradas: out.imagenes_encontradas,
+      planos_analizados: out.planos_analizados,
+      aviso: out.aviso
     });
   } catch (e) {
     return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
   }
 });
+
+
+// ============================================================================
+// ACTUALIZAR UN EMPRENDIMIENTO POR SCRAPING  (manual + automatico)  — ADITIVO
+// ----------------------------------------------------------------------------
+// Vuelve a scrapear la source_url de UN emprendimiento y REEMPLAZA su ficha
+// (development + sectores + unidades), reusando _scrapeDesarrolloProfundo (scraper
+// profundo A) + guardarDesarrolladora (mismo UPDATE/reemplazo que /api/inventario/guardar).
+// Lo usan el endpoint manual (/api/scrape/desarrollo/actualizar) y el cron de auto-update.
+// ============================================================================
+
+// Mapea la SALIDA del scraper (data:{emprendimiento,resumen,master_plan,equipo,
+// ubicacion_detalle,tipologias,imagenes,lotes,resumen_lotes}) al BODY que espera
+// guardarDesarrolladora ({ development, dev_data, sectores, unidades }). Es un mapeo
+// CONSERVADOR: lo que no tiene columna propia va a dev_data (jsonb) para no perder nada.
+//   - emprendimiento.nombre/descripcion/estado_obra/fecha_entrega/link/ubicacion -> development
+//   - amenities/resumen/master_plan/equipo/ubicacion_detalle/tipologias/lotes overview -> dev_data.*
+//   - etapas del resumen -> sectores (nombre = etapa, para que queden como filas)
+//   - lotes leidos por vision -> unidades (tipo_producto 'lote', numero=etiqueta, estado)
+// development_id se inyecta aparte (en actualizarDevelopment) para forzar el UPDATE.
+function _mapScrapeAGuardar(data) {
+  data = data || {};
+  var emp = data.emprendimiento || {};
+  var resumen = data.resumen || {};
+  var etapas = Array.isArray(resumen.etapas) ? resumen.etapas : [];
+  var lotes = Array.isArray(data.lotes) ? data.lotes : [];
+
+  var development = {
+    nombre: emp.nombre || '',
+    // "tipo" del emprendimiento no lo infiere el scraper de forma fiable -> lo dejamos vacio (no pisa nada malo).
+    tipo: '',
+    zona: emp.ubicacion || '',
+    descripcion: emp.descripcion || '',
+    link: emp.link || '',
+    estado_obra: emp.estado_obra || '',
+    // avance_pct no viene del scraper -> null.
+    avance_pct: null,
+    fecha_entrega: emp.fecha_entrega || ''
+  };
+
+  // dev_data: todo lo rico del scraper que no tiene columna propia (no se pierde).
+  var dev_data = {
+    amenities: Array.isArray(emp.amenities) ? emp.amenities : [],
+    // "planes" reutiliza el jsonb existente para guardar financiacion + contacto + tipologias (info comercial).
+    planes: {
+      financiacion: emp.financiacion || '',
+      contacto: emp.contacto || '',
+      tipologias: Array.isArray(data.tipologias) ? data.tipologias : []
+    },
+    // "material" reutiliza el jsonb existente para el material descriptivo scrapeado.
+    material: {
+      resumen: resumen,
+      master_plan: Array.isArray(data.master_plan) ? data.master_plan : [],
+      equipo: Array.isArray(data.equipo) ? data.equipo : [],
+      ubicacion_detalle: data.ubicacion_detalle || {},
+      resumen_lotes: data.resumen_lotes || {}
+    },
+    legal: {}
+  };
+
+  // Sectores = etapas del OVERVIEW (nombre no vacio). Cada etapa -> una fila de sector.
+  var sectores = etapas
+    .filter(function (e) { return e && String(e.nombre || '').trim(); })
+    .map(function (e) { return { nombre: String(e.nombre), tipo: 'etapa', fecha_entrega: e.anio ? String(e.anio) : '' }; });
+
+  // Unidades = lotes leidos por vision (overview lote-por-lote, si el plano lo permitio).
+  var unidades = lotes.map(function (l) {
+    l = l || {};
+    return {
+      tipo_producto: 'lote',
+      numero: l.etiqueta || '',
+      tipologia: '',
+      superficie_terreno: (l.superficie_m2 === null || l.superficie_m2 === undefined) ? '' : l.superficie_m2,
+      estado: l.estado || 'disponible',
+      precio_estado: 'a_consultar',
+      moneda: 'USD'
+    };
+  });
+
+  return { development: development, dev_data: dev_data, sectores: sectores, unidades: unidades };
+}
+
+// Orquesta: scrapea `sourceUrl` (scraper profundo) -> mapea -> guardarDesarrolladora con
+// development_id forzado (UPDATE + reemplazo de sectores/unidades) -> setea ultimo_scrape.
+// NO usa req/res: reusable desde el endpoint manual y desde el cron. Devuelve
+// { ok:true, ...resultadoGuardar, scrape:{...} } o { ok:false, status, error }.
+async function actualizarDevelopment(devId, ownerId, sourceUrl) {
+  if (!sourceUrl || !String(sourceUrl).trim()) {
+    return { ok: false, status: 400, error: 'El emprendimiento no tiene URL de origen (source_url) para actualizar.' };
+  }
+  // 1) Scrape profundo de la source_url (reusa la funcion de A; registra tokens con ownerId).
+  var scr = await _scrapeDesarrolloProfundo(sourceUrl, ownerId);
+  if (!scr.ok) return { ok: false, status: scr.status || 502, error: scr.error || 'No se pudo scrapear la pagina' };
+
+  // 2) Map -> body de guardarDesarrolladora + inyectar development_id para FORZAR el UPDATE.
+  var body = _mapScrapeAGuardar(scr.data);
+  body.development_id = devId;
+
+  // 3) UPDATE + reemplazo de sectores/unidades (misma logica que /api/inventario/guardar).
+  var g = await guardarDesarrolladora(ownerId, body);
+  if (!g.ok) return { ok: false, status: g.status || 500, error: g.error, tabla: g.tabla, development_id: g.development_id };
+
+  // 4) Marcar ultimo_scrape (best-effort; si la columna no existe todavia, no rompe).
+  try { await supabase.from('developments').update({ ultimo_scrape: new Date().toISOString() }).eq('id', devId).eq('user_id', ownerId); } catch (eTs) {}
+
+  return {
+    ok: true,
+    status: 200,
+    development_id: g.development_id,
+    sectores_guardados: g.sectores_guardados,
+    unidades_guardadas: g.unidades_guardadas,
+    unidades_con_error: g.unidades_con_error,
+    actualizado: true,
+    scrape: {
+      imagenes_encontradas: scr.imagenes_encontradas,
+      planos_analizados: scr.planos_analizados,
+      aviso: scr.aviso
+    }
+  };
+}
+
+// ---- POST /api/scrape/desarrollo/actualizar --------------------------------
+// Body: { development_id }. Lee developments.source_url de ese dev (verifica tenant),
+// re-scrapea esa URL y REEMPLAZA la ficha. 🔴 COSTO: corre Sonnet + hasta 5 imagenes por corrida.
+app.post('/api/scrape/desarrollo/actualizar', async function (req, res) {
+  try {
+    // AUTH + owner (asesor -> admin_id, como el resto de endpoints)
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    try {
+      var _yo = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
+      if (_yo && _yo.data && _yo.data.admin_id) user_id = _yo.data.admin_id;
+    } catch (eOwner) { /* sin fila -> user_id queda como esta */ }
+
+    var devId = _invStr((req.body && (req.body.development_id || req.body.id)));
+    if (!devId) return res.status(400).json({ error: 'Falta development_id' });
+
+    // Traer source_url + verificar tenant (el dev debe pertenecer al owner).
+    var dRow = await supabase.from('developments').select('user_id, source_url').eq('id', devId).maybeSingle();
+    if (dRow.error) {
+      if (_invTablaFaltante(dRow.error)) return res.status(503).json({ error: 'La columna source_url no existe todavia (o la tabla developments). Corré la migracion migracion-scraper-desarrollo-v2.sql.', tabla: 'developments' });
+      return res.status(500).json({ error: 'Error leyendo el emprendimiento: ' + dRow.error.message });
+    }
+    if (!dRow.data) return res.status(404).json({ error: 'El emprendimiento no existe', development_id: devId });
+    if (dRow.data.user_id !== user_id) return res.status(403).json({ error: 'El emprendimiento no pertenece a tu cuenta' });
+    var sourceUrl = (dRow.data.source_url || '').trim();
+    if (!sourceUrl) return res.status(400).json({ error: 'Este emprendimiento no tiene URL de origen guardada. Guardá la source_url antes de actualizar por scraping.' });
+
+    var r = await actualizarDevelopment(devId, user_id, sourceUrl);
+    if (!r.ok) return res.status(r.status || 500).json(r);
+    delete r.status;
+    return res.json(r);
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
+  }
+});
+
+// ---- CRON: auto-update de emprendimientos (OPT-IN, default OFF) -------------
+// Cada hora busca developments con auto_scrape=true cuyo ultimo_scrape sea mas viejo
+// que scrape_cada_horas y los re-scrapea (misma funcion actualizarDevelopment).
+// 🔴 COSTO: corre Sonnet + vision por emprendimiento -> por eso es OPT-IN por dev y el
+// default es conservador (auto_scrape OFF, cada 24hs). GATEADO defensivo: si las columnas
+// de la migracion v2 no existen, el query falla -> NO corre nada (no rompe el server).
+async function revisarScrapingsDesarrollo() {
+  try {
+    var q = await supabase.from('developments')
+      .select('id, user_id, source_url, scrape_cada_horas, ultimo_scrape')
+      .eq('auto_scrape', true);
+    // Gate defensivo: columnas de la migracion v2 ausentes -> salir en silencio (no corre, no loguea error ruidoso).
+    if (q.error) {
+      if (!_invTablaFaltante(q.error)) console.log('[cron auto-scrape desarrollo] query fallo:', q.error.message);
+      return;
+    }
+    var devs = q.data || [];
+    if (!devs.length) return;
+    var ahora = Date.now();
+    for (var i = 0; i < devs.length; i++) {
+      var d = devs[i];
+      var url = (d.source_url || '').trim();
+      if (!url) continue;                                   // sin url -> nada que scrapear
+      var cada = Number(d.scrape_cada_horas);
+      if (!cada || isNaN(cada) || cada < 1) cada = 24;      // default conservador
+      // ¿le toca? nunca corrio, o paso mas tiempo que scrape_cada_horas desde el ultimo.
+      var due = true;
+      if (d.ultimo_scrape) {
+        var last = new Date(d.ultimo_scrape).getTime();
+        if (!isNaN(last) && (ahora - last) < cada * 3600 * 1000) due = false;
+      }
+      if (!due) continue;
+      try {
+        console.log('[cron auto-scrape desarrollo] actualizando dev', d.id, 'de', url, '(cada', cada, 'hs)');
+        var r = await actualizarDevelopment(d.id, d.user_id, url);
+        console.log('[cron auto-scrape desarrollo] dev', d.id, r.ok ? ('OK sectores=' + r.sectores_guardados + ' unidades=' + r.unidades_guardadas) : ('FALLO: ' + r.error));
+      } catch (eDev) {
+        console.log('[cron auto-scrape desarrollo] dev', d.id, 'excepcion:', (eDev && eDev.message) ? eDev.message : eDev);
+      }
+    }
+  } catch (e) {
+    console.log('[cron auto-scrape desarrollo] error general:', (e && e.message) ? e.message : e);
+  }
+}
+// Revisar cada hora, con un arranque a los 2 min del deploy (misma cadencia que el cron de inmobiliaria).
+setInterval(revisarScrapingsDesarrollo, 60 * 60 * 1000);
+setTimeout(revisarScrapingsDesarrollo, 120 * 1000);
 
 
 // ============================================================================
@@ -12042,6 +12318,173 @@ function _invTablaFaltante(err) {
   if (!err) return false;
   var m = String((err && (err.message || err.details || err.hint || err.code)) || '').toLowerCase();
   return /does not exist|could not find the table|relation .* does not exist|schema cache|pgrst205|pgrst204|42p01|undefined table/i.test(m);
+}
+
+// ---- FUNCION COMPARTIDA: guardar/actualizar un EMPRENDIMIENTO (desarrolladora) --
+// Extraida del branch desarrolladora de /api/inventario/guardar para poder REUSARLA
+// desde el endpoint de ACTUALIZAR por scraping y desde el cron de auto-update.
+// NO usa req/res. Recibe (user_id, body) con el MISMO shape del endpoint
+//   { development:{...}, dev_data:{...}, sectores:[...], unidades:[...], development_id? }
+// y devuelve { ok:true, status:200, development_id, sectores_guardados, unidades_guardadas,
+//   unidades_con_error, actualizado } o { ok:false, status, error, ... }.
+// Si trae development_id (o development.id) => UPDATE del dev existente (verifica tenant)
+// + REEMPLAZO total de sectores/unidades. Sin id => INSERT nuevo. Comportamiento
+// identico al original (solo movido a funcion). Los errores esperables (tabla faltante,
+// dev ajeno) vuelven como { ok:false, status } en vez de tirar.
+async function guardarDesarrolladora(user_id, b) {
+  var dev = b.development || {};
+  var devData = b.dev_data || {};
+  var sectores = Array.isArray(b.sectores) ? b.sectores : [];
+  var unidades = Array.isArray(b.unidades) ? b.unidades : [];
+
+  if (!_invStr(dev.nombre)) return { ok: false, status: 400, error: 'Falta el nombre del emprendimiento' };
+
+  // Campos comunes del emprendimiento (mismo mapeo para INSERT nuevo y UPDATE de edicion).
+  var filaDev = {
+    user_id: user_id,
+    nombre: _invStr(dev.nombre),
+    tipo: _invStr(dev.tipo),
+    zona: _invStr(dev.zona),
+    descripcion: _invStr(dev.descripcion),
+    link: _invStr(dev.link),
+    estado_obra: _invStr(dev.estado_obra),
+    avance_pct: _invInt(dev.avance_pct),
+    fecha_entrega: _invStr(dev.fecha_entrega),
+    dev_data: {
+      amenities: devData.amenities || [],
+      planes: devData.planes || [],
+      legal: devData.legal || {},
+      material: devData.material || {}
+    }
+  };
+
+  // ¿Edicion? Si el body trae development_id => UPDATE del emprendimiento existente
+  // y reemplazo de sus sectores/unidades. Sin development_id => INSERT nuevo (comportamiento actual intacto).
+  var devEditId = _invStr(b.development_id) || _invStr(dev.id);
+  var esEdicion = !!devEditId;
+  var development_id;
+
+  if (esEdicion) {
+    // 1a) Tenant safety: el emprendimiento debe pertenecer al user del token.
+    var dOwn = await supabase.from('developments').select('user_id').eq('id', devEditId).maybeSingle();
+    if (dOwn.error) {
+      if (_invTablaFaltante(dOwn.error)) return { ok: false, status: 503, error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' };
+      return { ok: false, status: 500, error: 'Error verificando el emprendimiento: ' + dOwn.error.message };
+    }
+    if (!dOwn.data) return { ok: false, status: 404, error: 'El emprendimiento a editar no existe', development_id: devEditId };
+    if (dOwn.data.user_id !== user_id) return { ok: false, status: 403, error: 'El emprendimiento no pertenece a tu cuenta' };
+
+    // 1b) UPDATE del emprendimiento (no tocamos user_id: se mantiene el dueño original).
+    var filaDevUpd = {
+      nombre: filaDev.nombre,
+      tipo: filaDev.tipo,
+      zona: filaDev.zona,
+      descripcion: filaDev.descripcion,
+      link: filaDev.link,
+      estado_obra: filaDev.estado_obra,
+      avance_pct: filaDev.avance_pct,
+      fecha_entrega: filaDev.fecha_entrega,
+      dev_data: filaDev.dev_data
+    };
+    var dUpd = await supabase.from('developments').update(filaDevUpd).eq('id', devEditId).eq('user_id', user_id).select('id').maybeSingle();
+    if (dUpd.error) {
+      if (_invTablaFaltante(dUpd.error)) return { ok: false, status: 503, error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' };
+      return { ok: false, status: 500, error: 'Error actualizando el emprendimiento: ' + dUpd.error.message };
+    }
+    development_id = (dUpd.data && dUpd.data.id) || devEditId;
+
+    // 1c) Reemplazo: borramos sectores y unidades actuales para reescribir exactamente lo que mando el form/scraper.
+    var uDel = await supabase.from('development_units').delete().eq('development_id', development_id).eq('user_id', user_id);
+    if (uDel.error && _invTablaFaltante(uDel.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
+    if (uDel.error) return { ok: false, status: 500, error: 'Error limpiando unidades previas: ' + uDel.error.message, development_id: development_id };
+    var sDel = await supabase.from('development_sectors').delete().eq('development_id', development_id).eq('user_id', user_id);
+    if (sDel.error && _invTablaFaltante(sDel.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id };
+    if (sDel.error) return { ok: false, status: 500, error: 'Error limpiando sectores previos: ' + sDel.error.message, development_id: development_id };
+  } else {
+    // 1) Emprendimiento -> developments (lo extra a dev_data jsonb)
+    var dIns = await supabase.from('developments').insert(filaDev).select('id').maybeSingle();
+    if (dIns.error) {
+      if (_invTablaFaltante(dIns.error)) return { ok: false, status: 503, error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' };
+      return { ok: false, status: 500, error: 'Error guardando el emprendimiento: ' + dIns.error.message };
+    }
+    development_id = dIns.data && dIns.data.id;
+  }
+
+  // 1d) Columnas de auto-update v2 (source_url / auto_scrape / scrape_cada_horas) — BEST-EFFORT
+  //     y SEPARADO del write principal: si la migracion v2 no corrio todavia, la columna no existe
+  //     y este update falla con PGRST204; lo tragamos para NO romper el guardado normal.
+  //     Solo escribimos las claves que el front realmente mando (no pisamos con defaults).
+  var v2 = {};
+  if (dev.source_url !== undefined) v2.source_url = _invStr(dev.source_url);
+  if (dev.auto_scrape !== undefined) v2.auto_scrape = !!dev.auto_scrape;
+  if (dev.scrape_cada_horas !== undefined) { var _h = _invInt(dev.scrape_cada_horas); if (_h && _h >= 1) v2.scrape_cada_horas = _h; }
+  if (Object.keys(v2).length) {
+    try { await supabase.from('developments').update(v2).eq('id', development_id).eq('user_id', user_id); } catch (eV2) { /* columna ausente -> ignorar */ }
+  }
+
+  // 2) Sectores -> development_sectors.
+  var sectorIds = [];
+  var sectoresOk = 0;
+  for (var s = 0; s < sectores.length; s++) {
+    var sec = sectores[s] || {};
+    if (!_invStr(sec.nombre)) { sectorIds.push(null); continue; }
+    var filaSec = {
+      development_id: development_id,
+      user_id: user_id,
+      nombre: _invStr(sec.nombre),
+      tipo: _invStr(sec.tipo),
+      fecha_entrega: _invStr(sec.fecha_entrega),
+      sector_data: {}
+    };
+    var sIns = await supabase.from('development_sectors').insert(filaSec).select('id').maybeSingle();
+    if (sIns.error) {
+      if (_invTablaFaltante(sIns.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id };
+      sectorIds.push(null);
+    } else { sectorIds.push(sIns.data && sIns.data.id); sectoresOk++; }
+  }
+
+  // 3) Unidades -> development_units (lo extra a unit_data jsonb)
+  var unidadesOk = 0, unidadesErr = 0;
+  for (var u = 0; u < unidades.length; u++) {
+    var un = unidades[u] || {};
+    var filaUn = {
+      development_id: development_id,
+      sector_id: null, // el form/scraper aun no liga unidad->sector (documentado en el resumen)
+      user_id: user_id,
+      tipo_producto: _invStr(un.tipo_producto),
+      numero: _invStr(un.numero),
+      tipologia: _invStr(un.tipologia),
+      m2_cubiertos: _invNum(un.m2_cubiertos),
+      m2_totales: _invNum(un.m2_totales),
+      superficie_terreno: _invNum(un.superficie_terreno),
+      frente: _invNum(un.frente),
+      fondo: _invNum(un.fondo),
+      orientacion: _invStr(un.orientacion),
+      piso: _invStr(un.piso),
+      precio: _invNum(un.precio),
+      precio_estado: _invStr(un.precio_estado) || 'a_consultar',
+      moneda: _invStr(un.moneda) || 'USD',
+      estado: _invStr(un.estado) || 'disponible',
+      unit_data: {},
+      images: []
+    };
+    var uIns = await supabase.from('development_units').insert(filaUn);
+    if (uIns.error) {
+      if (_invTablaFaltante(uIns.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
+      unidadesErr++;
+    } else unidadesOk++;
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    rubro: 'desarrolladora',
+    development_id: development_id,
+    sectores_guardados: sectoresOk,
+    unidades_guardadas: unidadesOk,
+    unidades_con_error: unidadesErr,
+    actualizado: esEdicion
+  };
 }
 
 // ---- POST /api/inventario/guardar -----------------------------------------
@@ -12184,153 +12627,12 @@ app.post('/api/inventario/guardar', async function (req, res) {
     }
 
     // ========================= DESARROLLADORA ==============================
+    // Logica movida a guardarDesarrolladora() (compartida con /api/scrape/desarrollo/actualizar y el cron).
     if (rubro === 'desarrolladora') {
-      var dev = b.development || {};
-      var devData = b.dev_data || {};
-      var sectores = Array.isArray(b.sectores) ? b.sectores : [];
-      var unidades = Array.isArray(b.unidades) ? b.unidades : [];
-
-      if (!_invStr(dev.nombre)) return res.status(400).json({ error: 'Falta el nombre del emprendimiento' });
-
-      // Campos comunes del emprendimiento (mismo mapeo para INSERT nuevo y UPDATE de edicion).
-      var filaDev = {
-        user_id: user_id,
-        nombre: _invStr(dev.nombre),
-        tipo: _invStr(dev.tipo),
-        zona: _invStr(dev.zona),
-        descripcion: _invStr(dev.descripcion),
-        link: _invStr(dev.link),
-        estado_obra: _invStr(dev.estado_obra),
-        avance_pct: _invInt(dev.avance_pct),
-        fecha_entrega: _invStr(dev.fecha_entrega),
-        dev_data: {
-          amenities: devData.amenities || [],
-          planes: devData.planes || [],
-          legal: devData.legal || {},
-          material: devData.material || {}
-        }
-      };
-
-      // ¿Edicion? Si el body trae development_id => UPDATE del emprendimiento existente
-      // y reemplazo de sus sectores/unidades. Sin development_id => INSERT nuevo (comportamiento actual intacto).
-      var devEditId = _invStr(b.development_id) || _invStr(dev.id);
-      var esEdicion = !!devEditId;
-      var development_id;
-
-      if (esEdicion) {
-        // 1a) Tenant safety: el emprendimiento debe pertenecer al user del token.
-        var dOwn = await supabase.from('developments').select('user_id').eq('id', devEditId).maybeSingle();
-        if (dOwn.error) {
-          if (_invTablaFaltante(dOwn.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
-          return res.status(500).json({ error: 'Error verificando el emprendimiento: ' + dOwn.error.message });
-        }
-        if (!dOwn.data) return res.status(404).json({ error: 'El emprendimiento a editar no existe', development_id: devEditId });
-        if (dOwn.data.user_id !== user_id) return res.status(403).json({ error: 'El emprendimiento no pertenece a tu cuenta' });
-
-        // 1b) UPDATE del emprendimiento (no tocamos user_id: se mantiene el dueño original).
-        var filaDevUpd = {
-          nombre: filaDev.nombre,
-          tipo: filaDev.tipo,
-          zona: filaDev.zona,
-          descripcion: filaDev.descripcion,
-          link: filaDev.link,
-          estado_obra: filaDev.estado_obra,
-          avance_pct: filaDev.avance_pct,
-          fecha_entrega: filaDev.fecha_entrega,
-          dev_data: filaDev.dev_data
-        };
-        var dUpd = await supabase.from('developments').update(filaDevUpd).eq('id', devEditId).eq('user_id', user_id).select('id').maybeSingle();
-        if (dUpd.error) {
-          if (_invTablaFaltante(dUpd.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
-          return res.status(500).json({ error: 'Error actualizando el emprendimiento: ' + dUpd.error.message });
-        }
-        development_id = (dUpd.data && dUpd.data.id) || devEditId;
-
-        // 1c) Reemplazo: borramos sectores y unidades actuales para reescribir exactamente lo que mando el form.
-        var uDel = await supabase.from('development_units').delete().eq('development_id', development_id).eq('user_id', user_id);
-        if (uDel.error && !_invTablaFaltante(uDel.error)) {
-          return res.status(500).json({ error: 'Error limpiando unidades previas: ' + uDel.error.message, development_id: development_id });
-        }
-        if (uDel.error && _invTablaFaltante(uDel.error)) return res.status(503).json({ error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id });
-        var sDel = await supabase.from('development_sectors').delete().eq('development_id', development_id).eq('user_id', user_id);
-        if (sDel.error && !_invTablaFaltante(sDel.error)) {
-          return res.status(500).json({ error: 'Error limpiando sectores previos: ' + sDel.error.message, development_id: development_id });
-        }
-        if (sDel.error && _invTablaFaltante(sDel.error)) return res.status(503).json({ error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id });
-      } else {
-        // 1) Emprendimiento -> developments (lo extra a dev_data jsonb)
-        var dIns = await supabase.from('developments').insert(filaDev).select('id').maybeSingle();
-        if (dIns.error) {
-          if (_invTablaFaltante(dIns.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
-          return res.status(500).json({ error: 'Error guardando el emprendimiento: ' + dIns.error.message });
-        }
-        development_id = dIns.data && dIns.data.id;
-      }
-
-      // 2) Sectores -> development_sectors. Guardamos el orden del form (idx) para mapear
-      //    cada unidad a su sector. El form NO liga aun unidad->sector explicitamente
-      //    (ver nota de campos sin destino), asi que las unidades quedan con sector_id null.
-      var sectorIds = [];
-      var sectoresOk = 0;
-      for (var s = 0; s < sectores.length; s++) {
-        var sec = sectores[s] || {};
-        if (!_invStr(sec.nombre)) { sectorIds.push(null); continue; }
-        var filaSec = {
-          development_id: development_id,
-          user_id: user_id,
-          nombre: _invStr(sec.nombre),
-          tipo: _invStr(sec.tipo),
-          fecha_entrega: _invStr(sec.fecha_entrega),
-          sector_data: {}
-        };
-        var sIns = await supabase.from('development_sectors').insert(filaSec).select('id').maybeSingle();
-        if (sIns.error) {
-          if (_invTablaFaltante(sIns.error)) return res.status(503).json({ error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id });
-          sectorIds.push(null);
-        } else { sectorIds.push(sIns.data && sIns.data.id); sectoresOk++; }
-      }
-
-      // 3) Unidades -> development_units (lo extra a unit_data jsonb)
-      var unidadesOk = 0, unidadesErr = 0;
-      for (var u = 0; u < unidades.length; u++) {
-        var un = unidades[u] || {};
-        var filaUn = {
-          development_id: development_id,
-          sector_id: null, // el form aun no liga unidad->sector (documentado en el resumen)
-          user_id: user_id,
-          tipo_producto: _invStr(un.tipo_producto),
-          numero: _invStr(un.numero),
-          tipologia: _invStr(un.tipologia),
-          m2_cubiertos: _invNum(un.m2_cubiertos),
-          m2_totales: _invNum(un.m2_totales),
-          superficie_terreno: _invNum(un.superficie_terreno),
-          frente: _invNum(un.frente),
-          fondo: _invNum(un.fondo),
-          orientacion: _invStr(un.orientacion),
-          piso: _invStr(un.piso),
-          precio: _invNum(un.precio),
-          precio_estado: _invStr(un.precio_estado) || 'a_consultar',
-          moneda: _invStr(un.moneda) || 'USD',
-          estado: _invStr(un.estado) || 'disponible',
-          unit_data: {},
-          images: []
-        };
-        var uIns = await supabase.from('development_units').insert(filaUn);
-        if (uIns.error) {
-          if (_invTablaFaltante(uIns.error)) return res.status(503).json({ error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id });
-          unidadesErr++;
-        } else unidadesOk++;
-      }
-
-      return res.json({
-        ok: true,
-        rubro: 'desarrolladora',
-        development_id: development_id,
-        sectores_guardados: sectoresOk,
-        unidades_guardadas: unidadesOk,
-        unidades_con_error: unidadesErr,
-        actualizado: esEdicion
-      });
+      var rDes = await guardarDesarrolladora(user_id, b);
+      if (!rDes.ok) return res.status(rDes.status || 500).json(rDes);
+      delete rDes.status;
+      return res.json(rDes);
     }
 
     // Rubro no soportado por este endpoint (inmobiliaria usa su propio camino intacto).

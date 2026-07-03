@@ -12520,7 +12520,10 @@ app.post('/api/scrape/desarrollo/job', async function (req, res) {
       devIdCol = devId;
     } else if (url) {
       tipo = 'desarrollo_nuevo';
-      input = { url: url };
+      // 🔴 Gate de costo por-scrapeo (opt-in): body.plano_deep=true -> el job corre en modo
+      // PROFUNDO (plano lote-por-lote, mas caro). Se guarda DENTRO del input para que el runner
+      // lo lea. Ausente/false -> NORMAL (identico al comportamiento anterior).
+      input = { url: url, plano_deep: !!(req.body && (req.body.plano_deep === true || req.body.plano_deep === 'true')) };
     } else {
       return res.status(400).json({ error: 'Falta la url del proyecto (o development_id para actualizar)' });
     }
@@ -12673,7 +12676,10 @@ async function procesarScrapeJobs() {
         if (!url) throw new Error('Job nuevo sin url');
         await _scrapeJobUpdate(job.id, { progreso: 20, mensaje: 'Bajando la página…' });
         await _scrapeJobUpdate(job.id, { progreso: 50, mensaje: 'Leyendo e interpretando…' });
-        var out = await _scrapeDesarrolloProfundo(url, job.user_id);
+        // 🔴 Gate de costo: un job iniciado por el usuario CON el flag corre PROFUNDO; ausente/false
+        // -> NORMAL. El cron de auto-update (revisarScrapingsDesarrollo) NO setea el flag -> sigue
+        // NORMAL siempre (proteccion de costo, no la toques).
+        var out = await _scrapeDesarrolloProfundo(url, job.user_id, { plano_deep: input.plano_deep === true });
         if (!out.ok) throw new Error(out.error || 'No se pudo scrapear la página');
         await _scrapeJobUpdate(job.id, { progreso: 80, mensaje: 'Analizando planos…' });
         await _scrapeJobUpdate(job.id, {

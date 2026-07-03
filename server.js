@@ -12396,7 +12396,7 @@ app.get('/api/scrape/jobs', async function (req, res) {
 // Devuelve UN job (estado/progreso/mensaje/resultado/error). Verifica que sea
 // del user (aislamiento por user_id). El front usa esto para leer el resultado
 // cuando estado='listo' (y cargarlo en el form) o mostrar el error.
-app.get('/api/scrape/job/:id?', async function (req, res) {
+async function _handlerScrapeJobUno(req, res) {
   try {
     var uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
@@ -12421,7 +12421,13 @@ app.get('/api/scrape/job/:id?', async function (req, res) {
   } catch (e) {
     return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' });
   }
-});
+}
+// path-to-regexp v8 (Express 5) NO soporta ':id?' opcional (crasheaba el boot con
+// "Unexpected ? at index 19"). Registramos las 2 formas que el handler ya contempla:
+//   /api/scrape/job/:id  (id como segmento, lo que usa el front)
+//   /api/scrape/job      (id como ?id=, fallback)
+app.get('/api/scrape/job/:id', _handlerScrapeJobUno);
+app.get('/api/scrape/job', _handlerScrapeJobUno);
 
 // ---- RUNNER (cron): procesarScrapeJobs -------------------------------------
 // Corre en el SERVER (no en el navegador) -> cumple "trabajo en segundo plano".

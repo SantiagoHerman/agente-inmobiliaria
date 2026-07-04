@@ -6345,6 +6345,34 @@ app.post('/api/contactos/verificar-numero', async (req, res) => {
   }
 });
 
+// ============================================================================
+// LUZ DE ESTADO DEL SISTEMA  ->  GET /api/estado-sistema  ->  { ok: boolean }
+// Endpoint LIVIANO para el puntito verde/rojo del dashboard. CERO IA, CERO tokens.
+// Solo chequea si el WhatsApp del DUEÑO (instancia Evolution) esta conectado.
+// Regla de alarma CONSERVADORA: ROJO (ok:false) SOLO si la conexion esta
+// CONFIRMADA caida (wa === false). Verde si esta 'open' (true) o si el estado es
+// INCIERTO / hubo timeout (null) -> nunca alarmamos sin certeza. No expone detalle.
+// ============================================================================
+app.get('/api/estado-sistema', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    // El WhatsApp es del DUEÑO; si el que pide es asesor, resolvemos su admin_id.
+    let ownerId = uid;
+    try { const _a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle(); if (_a && _a.data && _a.data.admin_id) ownerId = _a.data.admin_id; } catch (e) {}
+    const instancia = nombreInstancia(ownerId);
+    // instanciaConectada no tiene timeout propio: la envolvemos en un Promise.race
+    // de 4s para que el endpoint no se cuelgue si Evolution no responde.
+    let wa = null;
+    try { wa = await Promise.race([ instanciaConectada(instancia), new Promise(function (r) { setTimeout(function () { r(null); }, 4000); }) ]); } catch (e) { wa = null; }
+    const ok = (wa !== false);
+    return res.json({ ok: ok });
+  } catch (err) {
+    console.error('Error en /api/estado-sistema:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
 // ============ ASIGNACION / REASIGNACION MANUAL DE UN LEAD (RACE #3) ============
 // PROBLEMA QUE RESUELVE: antes el frontend (app/conversaciones/page.tsx ~asignarAsesor) escribia el asesor_id
 // DIRECTO a Supabase desde el cliente. Dos admins reasignando el MISMO lead casi a la vez = last-write-wins:

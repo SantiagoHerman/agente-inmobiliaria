@@ -436,7 +436,17 @@ function instruccionesAgenteItems(settings, rubro, perfilOverride) {
     // El item de rubro tampoco se elimina: garantizar que haya al menos uno (re-inyectar el default si falta).
     const k = _rubroKey(rubro);
     if (!items.some(function(x) { return x.categoria === 'rubro'; })) items.push({ id: 'rub-' + k, categoria: 'rubro', texto: DEFAULT_RUBRO[k], activo: true, es_sistema: true, orden: 100 });
-    else items.forEach(function(x) { if (x.categoria === 'rubro') x.es_sistema = true; });
+    else {
+      // Si el item de rubro guardado es un DEFAULT de sistema SIN editar (su texto coincide con ALGUN valor de DEFAULT_RUBRO),
+      // refrescarlo al default del rubro ACTUAL de la cuenta -> asi cambiar de rubro corrige el item viejo (ej. quedo el de
+      // inmobiliaria en una cuenta que paso a desarrolladora). Si el dueno lo EDITO (texto no coincide con ningun default) NO se toca.
+      const _defsRubro = Object.keys(DEFAULT_RUBRO).map(function(kk){ return DEFAULT_RUBRO[kk]; });
+      items.forEach(function(x) {
+        if (x.categoria !== 'rubro') return;
+        x.es_sistema = true;
+        if (_defsRubro.indexOf(x.texto) >= 0 && x.texto !== DEFAULT_RUBRO[k]) x.texto = DEFAULT_RUBRO[k];
+      });
+    }
     return items;
   }
   // DEFAULTS (el cliente nunca personalizo) -> reproduce EXACTAMENTE el comportamiento anterior.
@@ -1328,8 +1338,8 @@ async function elegirAsesorActivo(admin_id) {
     try { v2 = await repartoV2Activo(admin_id, null); } catch (eV2) { v2 = false; }
     let { data: activos } = await q;
     if (v2 && Array.isArray(activos)) {
-      // ADITIVO solo con flag ON: descartar a los que no reciben (disponibilidad='no_recibe').
-      activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe'; });
+      // ADITIVO solo con flag ON: descartar a los que no reciben (disponibilidad='no_recibe') y a los pausados ('pausa').
+      activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe' && a.disponibilidad !== 'pausa'; });
     }
     if (!activos || activos.length === 0) return null;
     // contar leads asignados a cada asesor activo. D1=B: la "carga" cuenta SOLO las conversaciones que el asesor
@@ -1783,8 +1793,15 @@ async function configUsuarioIACobertura(ownerId, conversation_id) {
 function sanearAgenteConfig(cfg, nombreFallback) {
   const _s = function(v){ return (v != null && String(v).trim()) ? String(v).trim() : ''; };
   const c = (cfg && typeof cfg === 'object') ? cfg : {};
-  // 'forma_hablar' o 'tono' (el form v4 puede usar cualquiera de los dos nombres).
-  const formaHablar = _s(c.forma_hablar) || _s(c.tono);
+  // FORMA DE HABLAR del usuario IA. c.forma_hablar es SIEMPRE 'principal'|'personalizado' (nunca un tono), por eso el
+  // fallback viejo (_s(c.forma_hablar) || _s(c.tono)) nunca llegaba a c.tono. Regla correcta:
+  //   - 'principal' (o ausente): NO seteamos formaHablar -> el runtime usa el TONO de la cuenta (comportamiento base).
+  //   - 'personalizado': resolvemos el tono elegido (c.tono) a su FRASE rica del mapa TONO. Si el value es desconocido
+  //     (o ya viene como texto libre), lo dejamos tal cual como fallback.
+  const formaHablar = (function(){
+    if (_s(c.forma_hablar) === 'personalizado') { var tv = _s(c.tono); return (tv && TONO[tv]) ? TONO[tv] : tv; }
+    return '';
+  })();
   const out = {
     nombre: _s(c.nombre) || _s(nombreFallback),
     formaHablar: formaHablar,
@@ -1801,7 +1818,12 @@ function sanearAgenteConfig(cfg, nombreFallback) {
     // prioriza agente_premium_re si viene definida (clave del form), si no cae a 'premium' (compat). Solo false explicito apaga.
     premium: (c.agente_premium_re !== undefined ? c.agente_premium_re !== false : c.premium !== false),
     // GENERO del usuario IA: 'hombre'/'mujer' (refina presentacion gendered cuando premium ON); cualquier otra cosa => '' (neutral).
-    genero: (function(){ var v = _s(c.genero); return (v === 'hombre' || v === 'mujer') ? v : ''; })()
+    genero: (function(){ var v = _s(c.genero); return (v === 'hombre' || v === 'mujer') ? v : ''; })(),
+    // ESTILO del usuario IA (autonomia/largo/emojis). Solo valores VALIDOS pasan; cualquier otra cosa => null/undefined
+    // para que el runtime caiga al de la cuenta (settings). DEFENSIVO: con agente_config null nada de esto se setea.
+    autonomia: (function(){ var v = _s(c.autonomia); return (v === 'conservador' || v === 'equilibrado' || v === 'comercial') ? v : null; })(),
+    largo: (function(){ var v = _s(c.largo); return (v === 'corto' || v === 'normal' || v === 'detallado') ? v : null; })(),
+    emojis: (c.emojis === true ? true : (c.emojis === false ? false : null))
   };
   // 'persona': hay config util? (al menos un nombre o algun campo con contenido). Si no, el caller cae a genérico.
   out.persona = !!(out.nombre || out.formaHablar || out.objetivo || out.conocimiento || out.noHacer || out.datosQueUsa);
@@ -2538,7 +2560,7 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
             .eq('admin_id', _ownerId)
             .in('id', opts.candidatos);
           const _ids = (_cands || [])
-            .filter(function(a){ return a.activo !== false && a.es_ia !== true && a.disponibilidad !== 'no_recibe'; })
+            .filter(function(a){ return a.activo !== false && a.es_ia !== true && a.disponibilidad !== 'no_recibe' && a.disponibilidad !== 'pausa'; })
             .map(function(a){ return a.id; });
           _asesor = _ids.length ? await asesorMenorCarga(_ids) : null;
         } catch (eCand) { _asesor = null; }
@@ -3234,6 +3256,133 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
   } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
 }
 
+// ============================================================================
+// WRAPPERS EVOLUTION: ubicacion / reaccion / editar / borrar / verificar-numero
+// (Evolution API v2.3.7). Mismo patron que enviarWhatsapp/enviarWhatsappMedia:
+// POST con headers apikey, leer el body SIEMPRE (Evolution devuelve key.id cuando
+// acepto el mensaje, aunque el HTTP no sea 2xx). Defensivos: ante fallo devuelven
+// un objeto de resultado, nunca throw hacia el endpoint.
+// ============================================================================
+
+// Envia una UBICACION al lead. Evolution: POST /message/sendLocation.
+// Devuelve { ok, waMessageId } (waMessageId = key.id de WhatsApp para el ack).
+async function enviarUbicacionWA(instancia, numero, latitude, longitude, name, address) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('sendLocation: falta EVOLUTION_URL/KEY'); return { ok: false, waMessageId: null }; }
+    const bodyLoc = {
+      number: numero,
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      name: (name != null ? String(name) : ''),
+      address: (address != null ? String(address) : '')
+    };
+    const resp = await fetch(EVOLUTION_URL + '/message/sendLocation/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify(bodyLoc)
+    });
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
+    const waId = (body && body.key && body.key.id) ? body.key.id : null;
+    const aceptado = !!waId || resp.ok;
+    if (!aceptado) console.error('sendLocation no aceptado:', resp.status, (bodyTxt || '').slice(0, 250));
+    return { ok: aceptado, waMessageId: waId };
+  } catch (e) { console.error('enviarUbicacionWA error:', e && e.message); return { ok: false, waMessageId: null }; }
+}
+
+// Reacciona (o quita la reaccion con emoji '') sobre un mensaje. Evolution: POST /message/sendReaction.
+// key = { remoteJid, fromMe, id } del mensaje reaccionado.
+async function enviarReaccionWA(instancia, key, emoji) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('sendReaction: falta EVOLUTION_URL/KEY'); return { ok: false }; }
+    if (!key || !key.remoteJid || !key.id) return { ok: false };
+    const resp = await fetch(EVOLUTION_URL + '/message/sendReaction/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({
+        key: { remoteJid: key.remoteJid, fromMe: key.fromMe === true, id: key.id },
+        reaction: (emoji != null ? String(emoji) : '')
+      })
+    });
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    const ok = resp.ok || (bodyTxt && bodyTxt.indexOf('"id"') >= 0);
+    if (!ok) console.error('sendReaction no aceptado:', resp.status, (bodyTxt || '').slice(0, 250));
+    return { ok: !!ok };
+  } catch (e) { console.error('enviarReaccionWA error:', e && e.message); return { ok: false }; }
+}
+
+// Edita el texto de un mensaje ya enviado. Evolution v2: POST /message/updateMessage.
+// key = { remoteJid, fromMe:true, id } (solo mensajes propios se pueden editar).
+async function editarMensajeWA(instancia, key, nuevoTexto) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('updateMessage: falta EVOLUTION_URL/KEY'); return { ok: false }; }
+    if (!key || !key.remoteJid || !key.id) return { ok: false };
+    const resp = await fetch(EVOLUTION_URL + '/message/updateMessage/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({
+        number: (key.remoteJid.split('@')[0]),
+        text: String(nuevoTexto != null ? nuevoTexto : ''),
+        key: { remoteJid: key.remoteJid, fromMe: true, id: key.id }
+      })
+    });
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
+    const ok = resp.ok || !!(body && body.key && body.key.id);
+    if (!ok) console.error('updateMessage no aceptado:', resp.status, (bodyTxt || '').slice(0, 250));
+    return { ok: !!ok };
+  } catch (e) { console.error('editarMensajeWA error:', e && e.message); return { ok: false }; }
+}
+
+// Borra un mensaje PARA TODOS. Evolution v2: DELETE /message/deleteMessageForEveryone.
+// key = { remoteJid, fromMe:true, id, participant? }.
+async function borrarMensajeWA(instancia, key) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('deleteMessage: falta EVOLUTION_URL/KEY'); return { ok: false }; }
+    if (!key || !key.remoteJid || !key.id) return { ok: false };
+    const keyBody = { remoteJid: key.remoteJid, fromMe: true, id: key.id };
+    if (key.participant) keyBody.participant = key.participant;
+    const resp = await fetch(EVOLUTION_URL + '/message/deleteMessageForEveryone/' + instancia, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify(keyBody)
+    });
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    const ok = resp.ok || (bodyTxt && (bodyTxt.indexOf('"id"') >= 0 || bodyTxt.indexOf('SUCCESS') >= 0));
+    if (!ok) console.error('deleteMessageForEveryone no aceptado:', resp.status, (bodyTxt || '').slice(0, 250));
+    return { ok: !!ok };
+  } catch (e) { console.error('borrarMensajeWA error:', e && e.message); return { ok: false }; }
+}
+
+// Verifica si uno o varios numeros tienen WhatsApp. Evolution: POST /chat/whatsappNumbers.
+// Devuelve { existe:boolean, jid } para el primer numero consultado.
+async function verificarNumeroWA(instancia, numero) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('whatsappNumbers: falta EVOLUTION_URL/KEY'); return { existe: false, error: 'evolution_no_configurado' }; }
+    const soloDigitos = String(numero || '').replace(/[^0-9]/g, '');
+    if (!soloDigitos) return { existe: false, error: 'numero_invalido' };
+    const resp = await fetch(EVOLUTION_URL + '/chat/whatsappNumbers/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({ numbers: [soloDigitos] })
+    });
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
+    if (!resp.ok || !Array.isArray(body)) {
+      // Evolution puede devolver el array directo o { }. Si no pudimos determinar -> error (el endpoint decide).
+      console.error('whatsappNumbers respuesta inesperada:', resp.status, (bodyTxt || '').slice(0, 250));
+      return { existe: false, error: 'respuesta_inesperada' };
+    }
+    // Evolution v2 devuelve un array de { jid, exists, number }. Buscar el match del numero consultado.
+    const item = body.find(function(x){
+      const n = String((x && (x.number || x.jid)) || '').replace(/[^0-9]/g, '');
+      return n.indexOf(soloDigitos) >= 0 || soloDigitos.indexOf(n) >= 0;
+    }) || body[0] || null;
+    const existe = !!(item && (item.exists === true || item.exists === 'true'));
+    return { existe: existe, jid: (item && item.jid) || null };
+  } catch (e) { console.error('verificarNumeroWA error:', e && e.message); return { existe: false, error: (e && e.message) || 'error' }; }
+}
+
 // ===== SOPORTE: subir una imagen (data URL base64) al bucket 'media', carpeta soporte/ =====
 // Reusa el patron de subirMediaAStorage (buffer -> supabase.storage 'media' -> publicUrl), pero la
 // fuente es una data URL que manda el cliente o el Maestro (no Evolution). Defensivo: si algo falla,
@@ -3500,12 +3649,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const tono = (agenteConfig && agenteConfig.formaHablar)
     ? ('FORMA DE HABLAR (tu estilo personal, respetalo): ' + agenteConfig.formaHablar)
     : (TONO[(settings && settings.agent_tone) || 'cercano'] || TONO.cercano);
-  const autonomia = AUTONOMIA[(settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
+  // AUTONOMIA/LARGO/EMOJIS del usuario IA con fallback al de la cuenta (settings). DEFENSIVO: con agenteConfig null,
+  // el primer operando queda vacio y se usa settings -> comportamiento identico a hoy.
+  const autonomia = AUTONOMIA[(agenteConfig && agenteConfig.autonomia) || (settings && settings.autonomy) || 'equilibrado'] || AUTONOMIA.equilibrado;
   const objetivo = (agenteConfig && agenteConfig.objetivo)
     ? ('TU OBJETIVO (hasta donde avanzas vos antes de derivar a un compañero): ' + agenteConfig.objetivo)
     : (OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar);
-  const largo = LARGO[(settings && settings.response_length) || 'corto'] || LARGO.corto;
-  const usaEmojis = settings && settings.use_emojis === true;
+  const largo = LARGO[(agenteConfig && agenteConfig.largo) || (settings && settings.response_length) || 'corto'] || LARGO.corto;
+  const usaEmojis = (agenteConfig && (agenteConfig.emojis === true || agenteConfig.emojis === false))
+    ? agenteConfig.emojis === true
+    : (settings && settings.use_emojis === true);
   const rubro = (settings && settings.rubro) || 'inmobiliaria';
   const company = (settings && settings.company_name) || 'la empresa';
   const instructions = (settings && settings.instructions) || '';
@@ -5012,6 +5165,41 @@ function _whatsappWebhookOk(req) {
   } catch (e) { return false; }
 }
 
+// REACCION ENTRANTE: el lead reacciono (o quito la reaccion) sobre un mensaje. reactionMessage = { key:{id,...}, text }.
+// Buscamos el mensaje reaccionado por wa_message_id = reactionMessage.key.id y actualizamos su columna `reacciones`
+// (jsonb con la lista de reacciones activas del lead). text='' => el lead QUITO la reaccion. 0 IA. Defensivo: si la
+// columna `reacciones` no existe todavia (migracion no corrida), no rompe (el update falla en silencio).
+async function manejarReaccionEntrante(instancia, reactionMessage, esFromMe) {
+  try {
+    const rm = reactionMessage || {};
+    const rKey = rm.key || {};
+    const targetId = rKey.id || null;             // id del mensaje AL QUE reacciono el que emitio la reaccion
+    if (!targetId) return;
+    const emoji = (rm.text != null) ? String(rm.text) : '';  // '' = reaccion quitada
+    // actor: 'lead' si la reaccion la mando el lead (envelope fromMe=false); 'crm' si la mandamos nosotros (eco de nuestra
+    // propia reaccion, p.ej. la que puso el asesor desde su telefono). Spec Diego: mostramos las del LEAD como chip.
+    const actor = (esFromMe === true) ? 'crm' : 'lead';
+    // Buscar el mensaje reaccionado por su wa_message_id (guardado tanto en salientes como entrantes).
+    let msgFila = null;
+    try {
+      const { data, error } = await supabase.from('messages').select('id, reacciones').eq('wa_message_id', targetId).limit(1).maybeSingle();
+      if (!error && data) msgFila = data;
+    } catch (eSel) { /* columna reacciones ausente u otro error -> reintento minimo sin ella */ }
+    if (!msgFila) {
+      try { const { data } = await supabase.from('messages').select('id').eq('wa_message_id', targetId).limit(1).maybeSingle(); if (data) msgFila = { id: data.id, reacciones: [] }; } catch (eSel2) {}
+    }
+    if (!msgFila) return; // no encontramos el mensaje reaccionado (p.ej. muy viejo, sin wa_message_id) -> nada que hacer
+    // Reconstruir la lista de reacciones del LEAD sobre ese mensaje. Un mensaje suele tener 1 reaccion por actor (el lead):
+    // reemplazamos la del lead. Guardamos [{emoji, actor:'lead', at}]. text='' -> quitar (lista vacia).
+    let lista = Array.isArray(msgFila.reacciones) ? msgFila.reacciones.slice() : [];
+    lista = lista.filter(function(r){ return r && r.actor !== actor; }); // reemplazar la reaccion previa del MISMO actor
+    if (emoji) lista.push({ emoji: emoji, actor: actor, at: new Date().toISOString() });
+    try {
+      await supabase.from('messages').update({ reacciones: lista }).eq('id', msgFila.id);
+    } catch (eUpd) { console.error('update reacciones (best-effort):', eUpd && eUpd.message); }
+  } catch (e) { console.error('manejarReaccionEntrante:', e && e.message); }
+}
+
 app.post('/api/webhook/whatsapp', async (req, res) => {
   // A3: validar el secreto ANTES de responder y ANTES de tocar base/IA. Sin env -> _whatsappWebhookOk()==true (no rompe).
   if (!_whatsappWebhookOk(req)) return res.status(401).json({ error: 'webhook no autorizado' });
@@ -5028,7 +5216,23 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const est = (d.status != null) ? d.status : (d.update && d.update.status); // 'SERVER_ACK'|'DELIVERY_ACK'|'READ'|'PLAYED' o numero 2..5
         const entregado = ['SERVER_ACK', 'DELIVERY_ACK', 'READ', 'PLAYED'].indexOf(String(est)) >= 0 || (typeof est === 'number' && est >= 2);
         if (keyId && entregado) {
+          // COMPAT: seguimos subiendo estado_envio a 'enviado' (cualquier logica existente que dependa de ese valor no cambia).
           await supabase.from('messages').update({ estado_envio: 'enviado' }).eq('wa_message_id', keyId).neq('estado_envio', 'enviado');
+          // TILDES ✓/✓✓/✓✓-azul: mapeamos el ack a un `estado_entrega` mas fino para que el front pinte el nivel exacto.
+          //   SERVER_ACK(2) -> 'enviado' (✓)   DELIVERY_ACK(3) -> 'entregado' (✓✓)   READ(4)/PLAYED(5) -> 'leido' (✓✓ azul)
+          // MONOTONO: nunca degradamos (un DELIVERY_ACK que llega tarde no baja un 'leido'). Lo logramos con un .in() sobre
+          // los estados INFERIORES al nuevo. DEFENSIVO: si la columna `estado_entrega` no existe (migracion no corrida), el
+          // update falla en silencio y solo queda el estado_envio de arriba (comportamiento actual). 0 IA.
+          let _nivel = null, _inferiores = null;
+          if (String(est) === 'READ' || String(est) === 'PLAYED' || (typeof est === 'number' && est >= 4)) { _nivel = 'leido'; _inferiores = ['enviado', 'entregado']; }
+          else if (String(est) === 'DELIVERY_ACK' || (typeof est === 'number' && est === 3)) { _nivel = 'entregado'; _inferiores = ['enviado']; }
+          else { _nivel = 'enviado'; _inferiores = []; }
+          try {
+            let _q = supabase.from('messages').update({ estado_entrega: _nivel }).eq('wa_message_id', keyId);
+            if (_inferiores.length) _q = _q.or('estado_entrega.is.null,estado_entrega.in.(' + _inferiores.join(',') + ')');
+            else _q = _q.is('estado_entrega', null);
+            await _q;
+          } catch (eEnt) { /* columna estado_entrega ausente: no-op, queda estado_envio */ }
         }
       } catch (eAck) { console.error('ack messages.update:', eAck && eAck.message); }
       return;
@@ -5052,11 +5256,31 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
     // Detectar multimedia entrante
     let tipoMediaEntrante = null;
-    if (msg.imageMessage) { tipoMediaEntrante = 'imagen'; if (!texto) texto = msg.imageMessage.caption || '[imagen]'; }
+    // UBICACION ENTRANTE: lat/lng vienen en locationMessage (Baileys: degreesLatitude/degreesLongitude). Antes esto caia
+    // en el return de 'sin texto ni media' (se descartaba). Ahora se guarda como mensaje tipo 'ubicacion' con un texto
+    // '[ubicacion]' + link de Google Maps, y lat/lng en columnas dedicadas (ver insert mas abajo).
+    let _ubicEntrante = null; // { lat, lng, name, address }
+    if (msg.locationMessage) {
+      const _lm = msg.locationMessage || {};
+      const _lat = (_lm.degreesLatitude != null) ? _lm.degreesLatitude : _lm.latitude;
+      const _lng = (_lm.degreesLongitude != null) ? _lm.degreesLongitude : _lm.longitude;
+      if (_lat != null && _lng != null) {
+        _ubicEntrante = { lat: Number(_lat), lng: Number(_lng), name: (_lm.name || ''), address: (_lm.address || '') };
+        tipoMediaEntrante = 'ubicacion';
+        if (!texto) texto = '[ubicacion]' + (_ubicEntrante.name ? (' ' + _ubicEntrante.name) : '');
+      }
+    }
+    else if (msg.imageMessage) { tipoMediaEntrante = 'imagen'; if (!texto) texto = msg.imageMessage.caption || '[imagen]'; }
     else if (msg.audioMessage) { tipoMediaEntrante = 'audio'; if (!texto) texto = '[audio]'; }
     else if (msg.videoMessage) { tipoMediaEntrante = 'video'; if (!texto) texto = msg.videoMessage.caption || '[video]'; }
     else if (msg.documentMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = (msg.documentMessage && msg.documentMessage.fileName) ? ('[documento] ' + msg.documentMessage.fileName) : '[documento]'; }
     else if (msg.documentWithCaptionMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = '[documento]'; }
+    // REACCION ENTRANTE (lead reacciono a un mensaje): NO es un mensaje normal. Se maneja aparte (asociar la reaccion al
+    // mensaje reaccionado) y se corta el flujo: no crea lead nuevo, no gasta IA. Se resuelve antes del guard de 'sin texto'.
+    if (msg.reactionMessage) {
+      try { await manejarReaccionEntrante(instanciaNombre, msg.reactionMessage, esFromMe); } catch (eReac) { console.error('reaccion entrante:', eReac && eReac.message); }
+      return;
+    }
     if (!texto && !tipoMediaEntrante) return;
 
     // Mensaje saliente escrito por un humano desde su WhatsApp: guardarlo con marca y cortar.
@@ -5214,7 +5438,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // procesan el audio como si fuera un mensaje escrito. Fallback total: si falta GROQ_KEY o falla la
     // transcripcion, 'texto' sigue siendo '[audio]' (comportamiento exacto de hoy).
     let mediaSubido = null;
-    if (tipoMediaEntrante) {
+    // UBICACION: NO hay archivo que bajar/transcribir; se maneja aparte (link de maps + lat/lng). Solo subimos media real.
+    if (tipoMediaEntrante && tipoMediaEntrante !== 'ubicacion') {
       try { mediaSubido = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante); } catch (eMedia) { console.error('subir media lead:', eMedia && eMedia.message); }
       if (tipoMediaEntrante === 'audio' && mediaSubido && mediaSubido.transcripcion) {
         texto = mediaSubido.transcripcion;
@@ -5225,8 +5450,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
     let _revertirIdiomaBase = false; // el lead retomo el idioma base con evidencia -> apagar traductor
-    // Traducir SOLO texto/audio/imagen; NO traducir videos ni documentos.
-    const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
+    // Traducir SOLO texto/audio/imagen; NO traducir videos, documentos ni ubicaciones (no hay texto real que traducir).
+    const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento' || tipoMediaEntrante === 'ubicacion');
     try {
       // El traductor es feature de plan (Pro+). El Basico NO traduce (se guarda el mensaje en su idioma original;
       // un humano lo atiende). El AUDIO en cambio NO se gatea (Groq, casi gratis) -> queda en todos los planes.
@@ -5250,11 +5475,33 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
     let mediaUrlLead = null; let mediaTipoLead = null;
     if (mediaSubido) { mediaUrlLead = mediaSubido.url; mediaTipoLead = mediaSubido.tipo; }
+    // UBICACION ENTRANTE: guardamos el link de Google Maps en media_url (para el boton "ver en Google Maps") y
+    // media_tipo='ubicacion' (el front dibuja la burbuja con mini-mapa/preview). Las columnas lat/lng dedicadas se
+    // agregan al insert de forma DEFENSIVA (ver _extraUbic + reintento abajo): si la migracion no corrio, el insert
+    // reintenta sin ellas y el mensaje igual se guarda (con content='[ubicacion]' + el link de maps).
+    let _extraUbic = null;
+    if (tipoMediaEntrante === 'ubicacion' && _ubicEntrante) {
+      mediaTipoLead = 'ubicacion';
+      mediaUrlLead = 'https://www.google.com/maps?q=' + _ubicEntrante.lat + ',' + _ubicEntrante.lng;
+      _extraUbic = { latitud: _ubicEntrante.lat, longitud: _ubicEntrante.lng };
+    }
     // IDEMPOTENCIA: persistimos wa_message_id (key.id) para que una RE-ENTREGA del webhook sea detectada por el guard
     // de arriba y no se re-procese. Si la columna no existiera aun, el insert no debe romper -> _waMsgId cae a null via
     // el spread condicional (no se manda la columna) y todo funciona como hoy. El indice UNIQUE parcial de la migracion
     // hace que dos entregas concurrentes fallen atomicamente en la DB (el catch de abajo lo absorbe sin perder el flujo).
-    await supabase.from('messages').insert(Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead }, _waMsgId ? { wa_message_id: _waMsgId } : {}));
+    {
+      const _baseIns = Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead }, _waMsgId ? { wa_message_id: _waMsgId } : {});
+      const _consUbic = _extraUbic ? Object.assign({}, _baseIns, _extraUbic) : _baseIns;
+      let _rIns = null;
+      try { _rIns = await supabase.from('messages').insert(_consUbic); } catch (eIns) { _rIns = { error: eIns }; }
+      // Si fallo POR la columna nueva de ubicacion (migracion no corrida), reintentar SIN lat/lng -> el mensaje igual se guarda.
+      if (_rIns && _rIns.error && _extraUbic) {
+        const _m = String((_rIns.error && (_rIns.error.message || _rIns.error.details || _rIns.error.hint)) || '').toLowerCase();
+        const _esColUbic = (_rIns.error.code === 'PGRST204') || _m.indexOf('latitud') >= 0 || _m.indexOf('longitud') >= 0 || (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
+        if (_esColUbic) { try { await supabase.from('messages').insert(_baseIns); } catch (eIns2) { console.error('insert ubicacion (fallback sin lat/lng):', eIns2 && eIns2.message); } }
+        else { console.error('insert mensaje entrante:', _rIns.error.message || _rIns.error); }
+      }
+    }
     // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente; si retomo el base, apagarlo.
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
     if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
@@ -5868,6 +6115,217 @@ app.post('/api/whatsapp/send', async (req, res) => {
     res.json({ sent: salio, estado_envio: salio ? 'enviado' : 'fallido' });
   } catch (err) {
     console.error('Error en /api/whatsapp/send:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
+// ENVIAR UBICACION al lead  ->  POST /api/whatsapp/ubicacion
+// body: { conversation_id, latitude, longitude, name?, address? }
+// Envia la ubicacion via Evolution (/message/sendLocation) y guarda el mensaje
+// saliente (media_tipo='ubicacion', media_url=link de maps, lat/lng dedicadas).
+// Auth + aislamiento por tenant IGUAL que /api/whatsapp/send.
+// ============================================================================
+app.post('/api/whatsapp/ubicacion', async (req, res) => {
+  try {
+    const { conversation_id, latitude, longitude, name, address } = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
+    const _lat = Number(latitude); const _lng = Number(longitude);
+    if (!isFinite(_lat) || !isFinite(_lng) || _lat < -90 || _lat > 90 || _lng < -180 || _lng > 180) {
+      return res.status(400).json({ error: 'Coordenadas invalidas' });
+    }
+    // 1) Conversacion -> tenant dueño REAL (no del body) + pertenencia por tenant (mismo criterio que /send, IDOR A2).
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', conversation_id).maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    if (!(await convPerteneceAUsuario(conv.user_id, _uidToken))) return res.status(403).json({ error: 'No autorizado' });
+    // 2) Telefono del contacto.
+    const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+    if (!contacto || !contacto.phone) return res.status(400).json({ error: 'El contacto no tiene telefono (no es WhatsApp)' });
+    const instancia = nombreInstancia(conv.user_id);
+    // 3) Guardar el mensaje saliente PRIMERO (estado 'enviando') con atribucion de autor. Reusamos _insertMensajeConAutor
+    //    (defensivo con autor_asesor_id/autor_nombre). Las columnas lat/lng se agregan aparte via update defensivo abajo.
+    const _mapsLink = 'https://www.google.com/maps?q=' + _lat + ',' + _lng;
+    const _autor = await _resolverAutorMensaje(conv.user_id, _uidToken);
+    const _txtUbic = '[ubicacion]' + (name ? (' ' + String(name)) : '');
+    const { data: msgIns } = await _insertMensajeConAutor(
+      { conversation_id: conversation_id, user_id: conv.user_id, role: 'human', content: _txtUbic, media_url: _mapsLink, media_tipo: 'ubicacion', enviado_por: 'Humano', estado_envio: 'enviando' },
+      _autor,
+      { select: 'id', single: true }
+    );
+    const msgId = msgIns ? msgIns.id : null;
+    // lat/lng dedicadas: update DEFENSIVO (si la migracion no corrio, no rompe).
+    if (msgId) { try { await supabase.from('messages').update({ latitud: _lat, longitud: _lng }).eq('id', msgId); } catch (eLL) {} }
+    await supabase.from('conversations').update({ last_message: _txtUbic, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // 4) Enviar via Evolution.
+    const r = await enviarUbicacionWA(instancia, contacto.phone, _lat, _lng, name, address);
+    // 5) Registrar estado + wa_message_id (para el ack de tildes). No usamos enviarWhatsapp (es texto), asi que actualizamos aca.
+    if (msgId) {
+      const upd = { estado_envio: r.ok ? 'enviado' : 'fallido' };
+      if (r.waMessageId) upd.wa_message_id = r.waMessageId;
+      try { await supabase.from('messages').update(upd).eq('id', msgId); } catch (eUpd) {}
+    }
+    return res.json({ sent: r.ok, estado_envio: r.ok ? 'enviado' : 'fallido' });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/ubicacion:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
+// REACCIONAR a un mensaje  ->  POST /api/whatsapp/reaccion
+// body: { message_id, emoji }
+// El asesor reacciona (cualquier emoji) sobre un mensaje de la conversacion via
+// Evolution (/message/sendReaction). emoji='' quita la reaccion.
+// ============================================================================
+app.post('/api/whatsapp/reaccion', async (req, res) => {
+  try {
+    const { message_id, emoji } = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!message_id) return res.status(400).json({ error: 'Falta message_id' });
+    // 1) Buscar el mensaje + su conversacion + wa_message_id + rol (para armar la key de WhatsApp).
+    const { data: m } = await supabase.from('messages').select('id, conversation_id, user_id, wa_message_id, role').eq('id', message_id).maybeSingle();
+    if (!m) return res.status(404).json({ error: 'Mensaje no encontrado' });
+    if (!m.wa_message_id) return res.status(400).json({ error: 'El mensaje no tiene id de WhatsApp (no se puede reaccionar)' });
+    // 2) Tenant dueño + pertenencia (derivado del mensaje, NO del body).
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', m.conversation_id).maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    if (!(await convPerteneceAUsuario(conv.user_id, _uidToken))) return res.status(403).json({ error: 'No autorizado' });
+    const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+    if (!contacto || !contacto.phone) return res.status(400).json({ error: 'El contacto no tiene telefono' });
+    // 3) La key: fromMe = true si el mensaje lo mando el CRM (role human/ai), false si es del lead (role contact).
+    const _fromMe = (m.role === 'human' || m.role === 'ai');
+    const remoteJid = String(contacto.phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
+    const instancia = nombreInstancia(conv.user_id);
+    const r = await enviarReaccionWA(instancia, { remoteJid: remoteJid, fromMe: _fromMe, id: m.wa_message_id }, (emoji != null ? String(emoji) : ''));
+    if (!r.ok) return res.status(502).json({ error: 'No se pudo enviar la reaccion' });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/reaccion:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
+// EDITAR un mensaje enviado  ->  POST /api/mensajes/editar
+// body: { message_id, nuevo_texto }
+// SOLO mensajes que envio EL ASESOR LOGUEADO (role='human', autor = el que pide)
+// y SOLO su ULTIMO mensaje enviado en esa conversacion. NO edita mensajes de la
+// IA (role='ai') ni de otro asesor. Evolution /message/updateMessage + actualiza
+// messages.content. (Ver GAP de autoria en el reporte.)
+// ============================================================================
+app.post('/api/mensajes/editar', async (req, res) => {
+  try {
+    const { message_id, nuevo_texto } = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!message_id || nuevo_texto == null || String(nuevo_texto).trim() === '') return res.status(400).json({ error: 'Faltan datos' });
+    // 1) Traer el mensaje con atribucion de autor (defensivo: si faltan columnas autor_*, reintentar sin ellas).
+    let m = null;
+    try { const r = await supabase.from('messages').select('id, conversation_id, user_id, wa_message_id, role, autor_asesor_id, created_at').eq('id', message_id).maybeSingle(); if (!r.error) m = r.data; } catch (e1) {}
+    if (!m) { try { const r2 = await supabase.from('messages').select('id, conversation_id, user_id, wa_message_id, role, created_at').eq('id', message_id).maybeSingle(); if (!r2.error) m = r2.data; } catch (e2) {} }
+    if (!m) return res.status(404).json({ error: 'Mensaje no encontrado' });
+    // 2) Tenant + pertenencia.
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', m.conversation_id).maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    if (!(await convPerteneceAUsuario(conv.user_id, _uidToken))) return res.status(403).json({ error: 'No autorizado' });
+    // 3) AUTORIA: solo un mensaje HUMANO (no IA, no lead, no sistema) del PROPIO asesor logueado.
+    if (m.role !== 'human') return res.status(403).json({ error: 'Solo podes editar tus propios mensajes' });
+    const _autor = await _resolverAutorMensaje(conv.user_id, _uidToken); // { asesorId, nombre }
+    const _esDueno = (_uidToken === conv.user_id);
+    // El que pide es asesor -> autor_asesor_id del mensaje debe ser el suyo. Si es el dueño -> autor_asesor_id null (el eco/app del dueño).
+    const _autorOk = _esDueno ? (m.autor_asesor_id == null || m.autor_asesor_id === undefined) : (_autor.asesorId && m.autor_asesor_id === _autor.asesorId);
+    if (!_autorOk) return res.status(403).json({ error: 'Solo podes editar tus propios mensajes' });
+    if (!m.wa_message_id) return res.status(400).json({ error: 'El mensaje no tiene id de WhatsApp (no se puede editar)' });
+    // 4) Debe ser el ULTIMO mensaje HUMANO de la conversacion. Los mensajes de la IA ('ai') o 'sistema' POSTERIORES se ignoran: el asesor puede editar su ultimo humano aunque la IA haya respondido despues. 409 solo si hay OTRO mensaje HUMANO mas nuevo.
+    const { data: ultimo } = await supabase.from('messages').select('id').eq('conversation_id', m.conversation_id).eq('role', 'human').order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!ultimo || ultimo.id !== m.id) return res.status(409).json({ error: 'Solo podes editar tu ultimo mensaje enviado' });
+    // 5) Telefono + editar via Evolution + actualizar content.
+    const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+    if (!contacto || !contacto.phone) return res.status(400).json({ error: 'El contacto no tiene telefono' });
+    const remoteJid = String(contacto.phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
+    const instancia = nombreInstancia(conv.user_id);
+    const r = await editarMensajeWA(instancia, { remoteJid: remoteJid, fromMe: true, id: m.wa_message_id }, String(nuevo_texto));
+    if (!r.ok) return res.status(502).json({ error: 'No se pudo editar el mensaje en WhatsApp' });
+    try { await supabase.from('messages').update({ content: String(nuevo_texto) }).eq('id', m.id); } catch (eUpd) { console.error('editar content:', eUpd && eUpd.message); }
+    // Si es el ultimo mensaje, reflejar el nuevo texto en la preview de la conversacion.
+    try { await supabase.from('conversations').update({ last_message: String(nuevo_texto), updated_at: new Date().toISOString() }).eq('id', m.conversation_id).eq('last_role', 'human'); } catch (eLm) {}
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en /api/mensajes/editar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
+// BORRAR un mensaje PARA TODOS  ->  POST /api/mensajes/borrar
+// body: { message_id }
+// Mismas reglas de autoria que editar (propio, ultimo, humano). Evolution
+// /message/deleteMessageForEveryone + marca messages.borrado=true (soft-delete).
+// ============================================================================
+app.post('/api/mensajes/borrar', async (req, res) => {
+  try {
+    const { message_id } = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!message_id) return res.status(400).json({ error: 'Falta message_id' });
+    let m = null;
+    try { const r = await supabase.from('messages').select('id, conversation_id, user_id, wa_message_id, role, autor_asesor_id, created_at').eq('id', message_id).maybeSingle(); if (!r.error) m = r.data; } catch (e1) {}
+    if (!m) { try { const r2 = await supabase.from('messages').select('id, conversation_id, user_id, wa_message_id, role, created_at').eq('id', message_id).maybeSingle(); if (!r2.error) m = r2.data; } catch (e2) {} }
+    if (!m) return res.status(404).json({ error: 'Mensaje no encontrado' });
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id').eq('id', m.conversation_id).maybeSingle();
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    if (!(await convPerteneceAUsuario(conv.user_id, _uidToken))) return res.status(403).json({ error: 'No autorizado' });
+    if (m.role !== 'human') return res.status(403).json({ error: 'Solo podes eliminar tus propios mensajes' });
+    const _autor = await _resolverAutorMensaje(conv.user_id, _uidToken);
+    const _esDueno = (_uidToken === conv.user_id);
+    const _autorOk = _esDueno ? (m.autor_asesor_id == null || m.autor_asesor_id === undefined) : (_autor.asesorId && m.autor_asesor_id === _autor.asesorId);
+    if (!_autorOk) return res.status(403).json({ error: 'Solo podes eliminar tus propios mensajes' });
+    if (!m.wa_message_id) return res.status(400).json({ error: 'El mensaje no tiene id de WhatsApp (no se puede eliminar)' });
+    // ULTIMO mensaje HUMANO de la conversacion. Los mensajes de la IA ('ai') o 'sistema' POSTERIORES se ignoran. 409 solo si hay OTRO mensaje HUMANO mas nuevo.
+    const { data: ultimo } = await supabase.from('messages').select('id').eq('conversation_id', m.conversation_id).eq('role', 'human').order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!ultimo || ultimo.id !== m.id) return res.status(409).json({ error: 'Solo podes eliminar tu ultimo mensaje enviado' });
+    const { data: contacto } = await supabase.from('contacts').select('phone').eq('id', conv.contact_id).maybeSingle();
+    if (!contacto || !contacto.phone) return res.status(400).json({ error: 'El contacto no tiene telefono' });
+    const remoteJid = String(contacto.phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
+    const instancia = nombreInstancia(conv.user_id);
+    const r = await borrarMensajeWA(instancia, { remoteJid: remoteJid, fromMe: true, id: m.wa_message_id });
+    if (!r.ok) return res.status(502).json({ error: 'No se pudo eliminar el mensaje en WhatsApp' });
+    // Soft-delete DEFENSIVO: marcar borrado=true/borrado_at. Si las columnas no existen, reintentar marcando el content.
+    let _okDel = false;
+    try { const rd = await supabase.from('messages').update({ borrado: true, borrado_at: new Date().toISOString(), content: '[mensaje eliminado]' }).eq('id', m.id); if (!rd.error) _okDel = true; } catch (eD) {}
+    if (!_okDel) { try { await supabase.from('messages').update({ content: '[mensaje eliminado]' }).eq('id', m.id); } catch (eD2) {} }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en /api/mensajes/borrar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
+// VERIFICAR si un numero tiene WhatsApp  ->  POST /api/contactos/verificar-numero
+// body: { telefono }  ->  { existe: boolean }
+// Se llama al apretar "Agregar" (cargar contacto): si el numero NO tiene WhatsApp,
+// el front BLOQUEA el alta. Usa la instancia del tenant del asesor logueado.
+// ============================================================================
+app.post('/api/contactos/verificar-numero', async (req, res) => {
+  try {
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const telefono = (req.body && req.body.telefono != null) ? String(req.body.telefono).replace(/[^0-9]/g, '') : '';
+    if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+    // Tenant dueño: el propio uid (si es dueño) o el admin_id de su fila de asesor. La instancia es la del DUEÑO.
+    let ownerId = _uidToken;
+    try { const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', _uidToken).maybeSingle(); if (ase && ase.admin_id) ownerId = ase.admin_id; } catch (eA) {}
+    const instancia = nombreInstancia(ownerId);
+    const r = await verificarNumeroWA(instancia, telefono);
+    // Si Evolution no pudo determinar (no configurado / respuesta rara), devolvemos 502 para que el front no bloquee a ciegas.
+    if (r && r.error) return res.status(502).json({ error: 'No se pudo verificar el numero', detalle: r.error });
+    return res.json({ existe: !!(r && r.existe) });
+  } catch (err) {
+    console.error('Error en /api/contactos/verificar-numero:', err && err.message);
     res.status(500).json({ error: (err && err.message) || 'Error interno' });
   }
 });
@@ -8248,6 +8706,8 @@ app.post('/api/asesores/cambiar-clave', async (req, res) => {
     // cambiar la clave en Supabase Auth
     const { error: errUpd } = await supabase.auth.admin.updateUserById(ases.auth_user_id, { password: String(clave_nueva) });
     if (errUpd) return res.status(500).json({ error: 'No se pudo cambiar la clave: ' + errUpd.message });
+    // Mantener clave_visible en sync (si no, el listado muestra la clave vieja tras cambiarla). Best-effort.
+    try { await supabase.from('asesores').update({ clave_visible: String(clave_nueva) }).eq('id', asesor_id).eq('admin_id', admin_id); } catch (eCv) {}
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

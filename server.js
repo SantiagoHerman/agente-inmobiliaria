@@ -2949,15 +2949,22 @@ async function _notificarRotacionV3(ownerId, convId, asesorId, leadRef, esRotaci
       if (_ase) { _aseNombre = _ase.nombre || null; _aseAuth = _ase.auth_user_id || null; }
     } catch (eAse) {}
     const _quien = _aseNombre || 'un asesor';
+    // `_txt` = mensaje PERSONAL (push) al asesor asignado; en la asignacion inicial va en 2a persona ("te asigno").
     const _txt = esRotacion
       ? ('La IA reasigno un lead (' + (leadRef || 'sin nombre') + ') a ' + _quien + ' porque el anterior no respondio a tiempo. Atendelo cuando puedas.')
       : ('La IA te asigno un lead (' + (leadRef || 'sin nombre') + ') para que lo atiendas. La IA sigue respondiendo hasta que le escribas.');
+    // FIX cosmetico: el aviso al canal COMPARTIDO "Todos" debe NOMBRAR al asesor asignado (consistente con el de
+    // rotacion), no ir en 2a persona sin nombre. En rotacion el texto ya nombra, asi que reusamos `_txt`; en la
+    // asignacion inicial usamos una variante que nombra a `_quien`.
+    const _txtCanal = esRotacion
+      ? _txt
+      : ('La IA le asigno el lead (' + (leadRef || 'sin nombre') + ') a ' + _quien + '. La IA sigue respondiendo hasta que le escriba.');
     // Push al asesor asignado (si tiene login/tokens). SIEMPRE (asi sabe que le toco), NO togglea (TAREA 1).
     if (_aseAuth) { try { await enviarPushAsesor(_aseAuth, 'Lead asignado por la IA', '', _txt.slice(0, 180)); } catch (eP) {} }
     // TAREA 1 (derivacion-v3-refinements): el post al canal "Todos" es TOGGLEABLE por business_settings.
     // derivacion_avisar_equipo (default TRUE = comportamiento actual). Solo postear si esta en true. Este bloque solo
     // corre con el flag derivacion_v3 ON (el llamador ya gatea), asi que con el flag OFF nada de esto se ejecuta.
-    try { if (await derivacionAvisarEquipo(ownerId)) await _postearAvisoInterno(ownerId, 'general', _txt); } catch (eG) {}
+    try { if (await derivacionAvisarEquipo(ownerId)) await _postearAvisoInterno(ownerId, 'general', _txtCanal); } catch (eG) {}
   } catch (e) { console.error('_notificarRotacionV3:', e && e.message); }
 }
 
@@ -8385,7 +8392,9 @@ async function revisarAvisosInternos() {
               if (!_au || _au === _sender) continue;
               try {
                 const _th = await _equipoThreadDm(ownerId, _sender, _au);
-                if (_th) { try { await supabase.from('team_messages').insert({ thread_id: _th.id, admin_id: ownerId, sender_auth_user_id: _sender, content: texto.slice(0, 4000), media_url: null, leido_por: [_sender] }); } catch (eIns) {} }
+                // Aviso de SISTEMA (es_sistema=true) para que se firme "🤖 Sistema", no "Administrador". Defensivo:
+                // si la columna no existe, reintentar sin ella (nunca se pierde el aviso).
+                if (_th) { const _rowSla = { thread_id: _th.id, admin_id: ownerId, sender_auth_user_id: _sender, content: texto.slice(0, 4000), media_url: null, leido_por: [_sender] }; try { const _rSlaSis = await supabase.from('team_messages').insert(Object.assign({}, _rowSla, { es_sistema: true })); if (_rSlaSis && _rSlaSis.error && /column|es_sistema|schema cache/i.test(_rSlaSis.error.message || '')) { await supabase.from('team_messages').insert(_rowSla); } } catch (eIns) { try { await supabase.from('team_messages').insert(_rowSla); } catch (eIns2) {} } }
               } catch (eDm) {}
               try { await enviarPushAsesor(_au, 'Asistente', '', 'Aviso interno: ' + texto.slice(0, 120)); } catch (eP2p) {}
             }
@@ -10275,10 +10284,10 @@ app.get('/api/equipo/mensajes', async function(req, res) {
     let msgs = null;
     {
       const r1 = await supabase.from('team_messages')
-        .select('id, sender_auth_user_id, content, media_url, media_tipo, media_nombre, leido_por, created_at')
+        .select('id, sender_auth_user_id, content, media_url, media_tipo, media_nombre, es_sistema, leido_por, created_at')
         .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
         .order('created_at', { ascending: true }).limit(500);
-      if (r1.error && /column|media_tipo|media_nombre|media_url|schema cache/i.test(r1.error.message || '')) {
+      if (r1.error && /column|media_tipo|media_nombre|media_url|es_sistema|schema cache/i.test(r1.error.message || '')) {
         const r2 = await supabase.from('team_messages')
           .select('id, sender_auth_user_id, content, leido_por, created_at')
           .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
@@ -10299,6 +10308,11 @@ app.get('/api/equipo/mensajes', async function(req, res) {
       (ases || []).forEach(function(a){ if (a.auth_user_id) nombrePorAuth[a.auth_user_id] = a.nombre; });
     }
     const out = (msgs || []).map(function(m){
+      // FIX cosmetico: los avisos automaticos de la IA/motor de derivacion (es_sistema=true) se firman como
+      // "🤖 Sistema", NO con el nombre del dueno ("Administrador"). Ademas `mio=false` SIEMPRE para estos, asi el
+      // dueno (cuando el aviso quedo firmado con su propio auth por falta de usuario IA) los ve del lado entrante
+      // con la etiqueta "🤖 Sistema" en vez de a su derecha como si los hubiera escrito el.
+      const _esSis = (m.es_sistema === true);
       return {
         id: m.id,
         content: m.content,
@@ -10306,9 +10320,9 @@ app.get('/api/equipo/mensajes', async function(req, res) {
         media_tipo: m.media_tipo || null,
         media_nombre: m.media_nombre || null,
         created_at: m.created_at,
-        mio: m.sender_auth_user_id === ident.authUserId,
-        // LABEL: el dueno es el ADMINISTRADOR inherente de la cuenta.
-        sender_nombre: nombrePorAuth[m.sender_auth_user_id] || (m.sender_auth_user_id === ident.ownerId ? 'Administrador' : 'Compañero')
+        mio: _esSis ? false : (m.sender_auth_user_id === ident.authUserId),
+        // LABEL: sistema => "🤖 Sistema"; si no, el nombre del asesor; el dueno es el ADMINISTRADOR inherente.
+        sender_nombre: _esSis ? '🤖 Sistema' : (nombrePorAuth[m.sender_auth_user_id] || (m.sender_auth_user_id === ident.ownerId ? 'Administrador' : 'Compañero'))
       };
     });
     return res.json({ ok: true, mensajes: out, tipo: thread.tipo });
@@ -10393,16 +10407,26 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto) {
     }
     if (!thread) return;
     const cuerpo = String(texto).slice(0, 4000);
+    // FIX cosmetico: marcar el aviso como de SISTEMA (es_sistema=true) para que el chat interno lo firme
+    // como "🤖 Sistema" y NO con el nombre del dueno ("Administrador"). Escritura DEFENSIVA: si la columna
+    // es_sistema no existe todavia (migracion no corrida), se reintenta el insert SIN esa key para que el
+    // aviso se postee igual (identico al comportamiento previo). Nunca se pierde el aviso por la columna.
+    const _baseAviso = {
+      thread_id: thread.id,
+      admin_id: ownerId,
+      sender_auth_user_id: senderId,
+      content: cuerpo,
+      media_url: null,
+      leido_por: [senderId]
+    };
     try {
-      await supabase.from('team_messages').insert({
-        thread_id: thread.id,
-        admin_id: ownerId,
-        sender_auth_user_id: senderId,
-        content: cuerpo,
-        media_url: null,
-        leido_por: [senderId]
-      });
-    } catch (eIns) { return; }
+      const _rSis = await supabase.from('team_messages').insert(Object.assign({}, _baseAviso, { es_sistema: true }));
+      if (_rSis && _rSis.error && /column|es_sistema|schema cache/i.test(_rSis.error.message || '')) {
+        await supabase.from('team_messages').insert(_baseAviso);
+      }
+    } catch (eIns) {
+      try { await supabase.from('team_messages').insert(_baseAviso); } catch (eIns2) { return; }
+    }
     // ===== FEATURE "grupo TODOS" [gated, DEFAULT OFF] =====
     // SOLO en la rama 'general' (= el canal interno "Todos"): si el tenant activo el flag y eligio un grupo
     // de WhatsApp, espejamos este mismo aviso al grupo. Best-effort ABSOLUTO: cualquier fallo aca (flag,
@@ -16294,7 +16318,10 @@ async function requiereSeccion(req, seccion){
     var jti = pay.jti;
     if (!jti) return { status: 401, error: 'Sesion invalida' };
     // 1) Sesion viva.
-    var s = await supabase.from('maestro_sesiones').select('id, maestro_usuario_id, last_activity, expires_at, revocada, inactividad_min').eq('jti', jti).maybeSingle();
+    // NOTA: inactividad_min NO es columna de maestro_sesiones (vive en maestro_usuarios). Pedirla aca hacia que PostgREST
+    // devolviera error en TODO el select -> el empleado quedaba fuera (fail-closed, nunca validaba sesion). La autoridad
+    // real de inactividad es el usuario (abajo); el fallback a la sesion se elimino por eso.
+    var s = await supabase.from('maestro_sesiones').select('id, maestro_usuario_id, last_activity, expires_at, revocada').eq('jti', jti).maybeSingle();
     // FAIL-SAFE: si la tabla no existe (error) o no hay fila -> el empleado NO entra (super-admin no pasa por aca).
     if (!s || s.error || !s.data) return { status: 401, error: 'Sesion no encontrada' };
     var ses = s.data;
@@ -16307,8 +16334,8 @@ async function requiereSeccion(req, seccion){
     if (!u || u.error || !u.data) return { status: 401, error: 'Usuario no encontrado' };
     var usr = u.data;
     if (usr.activo !== true) { await _cerrarSesion(jti, 'baja'); return { status: 401, error: 'Cuenta dada de baja' }; }
-    // Inactividad: last_activity + inactividad_min. Autoridad = el usuario (fallback a la sesion, luego 30).
-    var idleMin = (typeof usr.inactividad_min === 'number' && usr.inactividad_min > 0) ? usr.inactividad_min : ((typeof ses.inactividad_min === 'number' && ses.inactividad_min > 0) ? ses.inactividad_min : 30);
+    // Inactividad: last_activity + inactividad_min. Autoridad = el usuario (config vigente, aplica sin re-login); default 30.
+    var idleMin = (typeof usr.inactividad_min === 'number' && usr.inactividad_min > 0) ? usr.inactividad_min : 30;
     var lastAct = ses.last_activity ? new Date(ses.last_activity).getTime() : 0;
     if (lastAct && (ahora - lastAct) > idleMin * 60 * 1000) { await _cerrarSesion(jti, 'idle'); return { status: 401, error: 'Sesion expirada (inactividad)' }; }
     // 3) Permiso de seccion. 'base' (undefined/null) = cualquier sesion viva. '__admin__' = solo super-admin (empleado NO).

@@ -190,6 +190,53 @@ async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
       }
     }
   } catch (e) { console.error('Error enviarPushAsesor:', e && e.message); }
+  // FASE 2 (gated OFF): ESPEJO del push por-usuario a WhatsApp. Best-effort, NUNCA rompe el push.
+  try { await _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral); } catch (eDm) { console.error('Error _espejarPushAWhatsApp:', eDm && eDm.message); }
+}
+
+// ===== FASE 2: NOTIFICACION INDIVIDUAL POR WHATSAPP (espejo del PUSH por-usuario) =====
+// 🔴 ANTI-BAN + GATED OFF por DEFAULT. Cuando el dueno activa business_settings.notif_dm_wa_on
+// y el usuario destino tiene asesores.whatsapp_notif cargado, se le manda el MISMO texto del push
+// por WhatsApp a SU numero, usando enviarTextoGrupoWA (un POST directo a /message/sendText; el
+// numero personal va como `number`, igual de valido que un JID de grupo). Se ESPEJA solo lo que YA
+// se manda por push (0 mensajes nuevos). 100% DEFENSIVO: cualquier fallo/columna ausente/instancia
+// desconectada => no hace nada y NUNCA lanza (el push ya se envio). CERO IA (0 tokens).
+async function _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral) {
+  try {
+    if (!authUserId) return;
+    // 1) Resolver la fila del usuario destino en asesores (por auth_user_id): su numero + su dueno (admin_id).
+    //    DEFENSIVO: si la columna whatsapp_notif aun no existe (migracion no corrida), el select falla ->
+    //    reintentar sin ella (asi no rompe; simplemente no hay numero => no se espeja).
+    let ase = null;
+    try {
+      const { data } = await supabase.from('asesores').select('admin_id, whatsapp_notif').eq('auth_user_id', authUserId).maybeSingle();
+      ase = data || null;
+    } catch (eSel) {
+      try { const { data } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', authUserId).maybeSingle(); ase = data || null; } catch (eSel2) { ase = null; }
+    }
+    // El OWNER de la cuenta suele NO tener fila en asesores (su auth_user_id ES el user_id del tenant);
+    // en ese caso ownerId = authUserId. Si es un asesor, el dueno es su admin_id.
+    const ownerId = (ase && ase.admin_id) ? ase.admin_id : authUserId;
+    const numero = (ase && ase.whatsapp_notif != null) ? String(ase.whatsapp_notif).trim() : '';
+    if (!numero) return; // sin numero cargado => nada que espejar (comportamiento actual)
+    // 2) Gate por-tenant: leer el flag del dueno. DEFENSIVO: columna ausente / null / false => OFF.
+    let flagOn = false;
+    try {
+      const { data: bs } = await supabase.from('business_settings').select('notif_dm_wa_on').eq('user_id', ownerId).maybeSingle();
+      flagOn = !!(bs && bs.notif_dm_wa_on === true);
+    } catch (eBs) { flagOn = false; }
+    if (!flagOn) return; // gated OFF (default) => comportamiento actual EXACTO
+    // 3) Armar el MISMO texto que ve el usuario en el push (titulo + cuerpo). Reusa la logica del push:
+    //    bodyLiteral manda si vino; si no, 'Nuevo mensaje · <primeras 3 palabras>'.
+    const palabras = String(texto || '').trim().split(/\s+/).slice(0, 3).join(' ');
+    const cuerpo = bodyLiteral ? String(bodyLiteral) : ('Nuevo mensaje · ' + palabras);
+    const titulo = leadNombre ? String(leadNombre) : 'Nuevo lead';
+    const mensaje = (titulo + (cuerpo ? ('\n' + cuerpo) : '')).trim();
+    if (!mensaje) return;
+    // 4) Enviar por WhatsApp con la instancia del DUENO (best-effort). enviarTextoGrupoWA ya gatea
+    //    instanciaConectada y NUNCA lanza (devuelve bool); el numero personal va como `number`.
+    try { await enviarTextoGrupoWA(nombreInstancia(ownerId), numero, mensaje); } catch (eEnv) { console.error('_espejarPushAWhatsApp envio:', eEnv && eEnv.message); }
+  } catch (e) { console.error('_espejarPushAWhatsApp:', e && e.message); } // NUNCA lanza
 }
 
 // === SEGURIDAD: verificacion de identidad por token JWT de Supabase ===
@@ -9015,6 +9062,11 @@ function _camposUsuarioNuevos(b) {
   // DEFENSIVO: solo lo seteamos si llega un boolean; si la columna aun no existe en la base, el .update lo ignora/falla
   // en su propio bloque (no rompe el resto de la config) hasta que corra migracion-cargar-contacto.sql.
   if (typeof b.puede_cargar_contacto === 'boolean') out.puede_cargar_contacto = b.puede_cargar_contacto;
+  // FASE 2: numero personal para notificaciones por WhatsApp (asesores.whatsapp_notif). Acepta string:
+  // se guarda solo digitos (sanitiza espacios/+/guiones); '' => null (el usuario no recibe DM, solo push).
+  // DEFENSIVO: solo se setea si llega un string; si la columna aun no existe, el .update lo maneja en su
+  // propio bloque (no rompe el resto de la config) hasta que corra migracion-dm-individual.sql.
+  if (typeof b.whatsapp_notif === 'string') { const _num = b.whatsapp_notif.replace(/[^0-9]/g, ''); out.whatsapp_notif = _num ? _num : null; }
   // PARTE A (punto 9): config del agente IA (jsonb). Acepta objeto (config) o null (limpiar al pasar a Humano).
   if (b.agente_config && typeof b.agente_config === 'object') out.agente_config = b.agente_config;
   else if (b.agente_config === null) out.agente_config = null;

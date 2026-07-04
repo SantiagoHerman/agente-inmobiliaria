@@ -1471,6 +1471,24 @@ async function derivacionV3Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== FEATURE #15: FLAG POR-CUENTA ia_agenda ("la IA agenda citas") =====
+// GATE del comportamiento NUEVO "la IA puede agendar citas tentativas". Con el flag OFF
+// (default: false / ausente / null / columna inexistente / cualquier error) -> comportamiento
+// ACTUAL EXACTO: la tool agendar_cita NO se ofrece al agente, no se crea ninguna cita desde el
+// agente, y el prompt/flujo del agente queda BYTE-IDENTICO al de hoy. TRUE -> se ofrece la tool
+// + el agente puede crear la cita TENTATIVA (asesor_id=NULL) y avisar al equipo. FAIL-SAFE: si la
+// columna todavia no existe en prod, el .select devuelve error -> tratamos como OFF. Reusa un bs
+// ya cargado si trae la propiedad (evita una query extra por mensaje). Mismo patron que derivacionV3Activo.
+async function iaAgendaActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_agenda')) return bs.ia_agenda === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_agenda').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.ia_agenda === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
 // Minutos de espera por-cuenta antes de ROTAR al siguiente usuario disponible del depto (business_settings.
 // derivacion_espera_min). DEFAULT 10. Validado 1..240 (fuera de rango o ausente -> 10). Reusa un bs ya cargado si
 // lo trae. Ante cualquier error -> 10 (nunca romper). Solo se consulta cuando derivacion_v3 esta ON.
@@ -3612,6 +3630,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
   let _derivacionV3On = false;
   if (conversation_id && !modoPrueba) { try { _derivacionV3On = await derivacionV3Activo(user_id, settings || undefined); } catch (eDv3) { _derivacionV3On = false; } }
+  // FEATURE #15 (gated ia_agenda): ¿ofrecer la tool agendar_cita? SOLO con ia_agenda ON y en conv REAL
+  // (no modoPrueba). Con flag OFF -> false => la tool NO se agrega a toolsAgente y el prompt/flujo es
+  // BYTE-IDENTICO al actual. Reusa el `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
+  let _iaAgendaOn = false;
+  if (conversation_id && !modoPrueba) { try { _iaAgendaOn = await iaAgendaActivo(user_id, settings || undefined); } catch (eIaAg) { _iaAgendaOn = false; } }
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images').eq('user_id', user_id).eq('activa', true);
 
@@ -3968,6 +3991,19 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // FEATURE #15 (gated ia_agenda): tool agendar_cita. ADITIVO: con el flag OFF NO se agrega -> el prompt y el
+  // flujo son BYTE-IDENTICOS al actual. Cuando el lead acuerda un dia/hora concretos para una visita/reunion/llamada,
+  // el agente la llama para dejar la cita TENTATIVA en la agenda (sin asignar asesor). El sistema avisa al equipo y un
+  // asesor la toma. Al confirmarle al lead, NO nombres a ningun asesor: deci en generico que queda agendado y que un
+  // asesor del equipo se lo confirma. NO agrega una llamada de IA extra: la tool viaja en el turno que el agente ya hace.
+  if (_iaAgendaOn) {
+    toolsAgente.push({
+      name: 'agendar_cita',
+      description: 'Usala SOLO cuando el lead ya acordo un DIA y HORA concretos para una visita, reunion o llamada (ej: "el jueves a las 15hs", "manana a las 10 de la manana"). Deja la cita anotada en la agenda del equipo. Indica fecha_hora con el dia y hora acordados (lo mas explicito posible: incluye fecha y hora). NO la uses si el lead todavia no fijo un horario, ni para pedidos vagos ("algun dia", "mas adelante"). Al confirmarle al lead, NO nombres a ningun asesor ni persona (no digas "te atiende Walter"); deci de forma generica que queda agendado y que un asesor del equipo se lo confirma (ej: "listo, te lo dejo agendado y un asesor del equipo te confirma").',
+      input_schema: { type: 'object', properties: { fecha_hora: { type: 'string', description: 'Dia y hora acordados con el lead, lo mas explicito posible (ej: "2026-07-10 15:00", "jueves 10 de julio a las 15hs"). Preferentemente en formato ISO si podes.' }, tipo: { type: 'string', enum: ['visita','reunion','llamada','tasacion'], description: 'Tipo de cita. Opcional; por defecto "reunion".' }, departamento: { type: 'string', description: 'Nombre del area/departamento al que corresponde (ej: Ventas, Alquileres), si lo sabes. Opcional.' }, notas: { type: 'string', description: 'Nota breve para el asesor (ej: propiedad de interes, motivo). Opcional.' } }, required: ['fecha_hora'] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -4012,6 +4048,27 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       const _textoPrevioDv = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       reply = _textoPrevioDv || 'Perfecto, busco un asesor disponible para que te atienda, aguardame un momento.';
       if (!usaEmojis) { const _lDv = quitarEmojis(reply); if (_lDv) reply = _lDv; }
+    } else {
+    // FEATURE #15 (gated ia_agenda): ¿la IA pidio agendar_cita? Se maneja aca (antes de dueno/foto). NO hace 2do turno
+    // de IA (0 tokens): crea la cita TENTATIVA + avisa al equipo, y usa el texto que el agente ya escribio junto a la
+    // tool (o un fallback fijo GENERICO, sin nombrar asesor). La tool solo existe con ia_agenda ON y en conv real, asi
+    // que esta rama nunca se entra con el flag OFF (ACTUAL EXACTO). Defensivo: si la creacion falla, igual respondemos.
+    const _toolAgendar = _iaAgendaOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'agendar_cita'; }) : null;
+    if (_toolAgendar) {
+      const _textoPrevioAg = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resAg = { ok: false };
+      try {
+        const _leadNombreAg = (datosLead && datosLead.name) ? datosLead.name : null;
+        _resAg = await _agendarCitaTentativaAgente(user_id, conversation_id, _toolAgendar.input || {}, _leadNombreAg);
+      } catch (eAg) { console.error('flujo tool agendar_cita:', eAg && eAg.message); _resAg = { ok: false }; }
+      if (_resAg && _resAg.fechaInvalida) {
+        // El agente no dio una fecha parseable: pedirle al lead que la aclare (sin crear cita basura).
+        reply = _textoPrevioAg || 'Para dejarlo agendado necesito el dia y la hora exactos. ¿Que dia y a que hora te queda bien?';
+      } else {
+        // OK (cita creada o dedupe): confirmacion GENERICA. NUNCA nombrar un asesor (regla de Diego).
+        reply = _textoPrevioAg || 'Listo, te lo dejo agendado y un asesor del equipo te confirma. ¡Gracias!';
+      }
+      if (!usaEmojis) { const _lAg = quitarEmojis(reply); if (_lAg) reply = _lAg; }
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
@@ -4139,6 +4196,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       reply = _txt || 'Disculpa, ahora mismo no puedo mandarte la foto, pero seguimos por aca.';
     }
     } // cierra el else de _toolDueno (rama tool de foto / otras tools)
+    } // FEATURE #15: cierra el else de _toolAgendar (rama dueno/foto/otras tools)
     } // DERIVACION v3: cierra el else de _toolDerivar (rama tools existentes)
   } else {
     const block = (completion && completion.content) ? completion.content[0] : null;
@@ -9666,6 +9724,110 @@ async function _avisoDeptoDeConv(ownerId, conversationId) {
   } catch (e) { return null; }
 }
 
+// ===== FEATURE #15: crear la cita TENTATIVA cuando el agente llama la tool agendar_cita =====
+// Solo se llega aca con el flag ia_agenda ON (la tool no se ofrece con OFF). Deja una cita SIN ASIGNAR
+// (asesor_id=NULL, estado='agendada', origen='agente'), avisa al equipo por el canal "Todos" (0 IA, texto
+// fijo) y — si se pudo resolver el depto — tambien a su canal. DEDUPE: si ya hay una cita futura
+// 'agendada'/'confirmada' para esta conversacion, NO duplica (devuelve la existente). CERO llamada de IA
+// (la tool viaja en el turno actual). Defensivo: ante cualquier fallo devuelve { ok:false } y el agente
+// igual cierra con texto natural (no rompe la respuesta al lead). Duracion default 60 min (fecha_fin).
+// Devuelve { ok, citaId, duplicada, fechaLegible } (fechaLegible para el aviso al equipo).
+async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadNombre) {
+  try {
+    if (!ownerId || !conversationId) return { ok: false };
+    // 1) Parsear fecha_hora. El agente manda ISO o texto; toleramos ISO. Si NO parsea, pedimos reformular
+    //    (no crear cita basura). fecha_fin = fecha_hora + 60 min (duracion default).
+    const _raw = (input && input.fecha_hora != null) ? String(input.fecha_hora).trim() : '';
+    if (!_raw) return { ok: false, fechaInvalida: true };
+    const _fh = new Date(_raw);
+    if (isNaN(_fh.getTime())) return { ok: false, fechaInvalida: true };
+    const _fhISO = _fh.toISOString();
+    const _ffISO = new Date(_fh.getTime() + 60 * 60000).toISOString();
+    // 2) Resolver contacto (nombre/telefono) de la conversacion. Best-effort (para titulo/lead_*).
+    let _contactId = null, _leadNombre = (leadNombre && String(leadNombre).trim()) ? String(leadNombre).trim() : null, _leadTel = null;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('contact_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle();
+      if (_cv && _cv.contact_id) {
+        _contactId = _cv.contact_id;
+        const { data: _ct } = await supabase.from('contacts').select('name, phone').eq('id', _contactId).maybeSingle();
+        if (_ct) {
+          if (!_leadNombre && _ct.name && String(_ct.name).trim()) _leadNombre = String(_ct.name).trim();
+          if (_ct.phone && String(_ct.phone).trim()) _leadTel = String(_ct.phone).trim();
+        }
+      }
+    } catch (eCt) {}
+    // 3) DEDUPE: ¿ya hay una cita futura viva para esta conversacion? -> no duplicar.
+    try {
+      const _nowISO = new Date().toISOString();
+      const { data: _dups } = await supabase.from('citas').select('id')
+        .eq('user_id', ownerId).eq('conversation_id', conversationId)
+        .in('estado', ['agendada', 'confirmada']).gte('fecha_hora', _nowISO).limit(1);
+      if (_dups && _dups.length) return { ok: true, citaId: _dups[0].id, duplicada: true, fechaLegible: _formatearFechaCita(_fhISO) };
+    } catch (eDup) {}
+    // 4) Resolver departamento (por nombre -> id) si el agente lo paso. Best-effort; null = cualquier depto.
+    let _deptoId = null;
+    try {
+      const _hint = (input && input.departamento) ? String(input.departamento).trim().toLowerCase() : '';
+      if (_hint) {
+        const { data: _deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true);
+        const _m = (_deps || []).find(function(d){ return d.nombre && String(d.nombre).trim().toLowerCase() === _hint; });
+        if (_m) _deptoId = _m.id;
+      }
+    } catch (eDep) {}
+    // 5) Tipo (clampeado a un set seguro; default 'reunion').
+    const _TIPOS = ['visita', 'reunion', 'llamada', 'tasacion'];
+    const _tipo = (input && _TIPOS.indexOf(input.tipo) >= 0) ? input.tipo : 'reunion';
+    const _titulo = ('Cita' + (_leadNombre ? (' — ' + _leadNombre) : '')).slice(0, 160);
+    const _notas = (input && input.notas) ? String(input.notas).slice(0, 500) : null;
+    // 6) Insertar la cita TENTATIVA. asesor_id=NULL (sin asignar), estado='agendada', origen='agente'.
+    //    Campos nuevos (fecha_fin, departamento_id) son ADITIVOS/DEFENSIVOS: si la migracion aun no corrio,
+    //    el insert falla -> reintentamos con el set clasico (la cita igual queda creada, sin depto ni fin).
+    const _fila = {
+      user_id: ownerId, conversation_id: conversationId, contact_id: _contactId, asesor_id: null,
+      fecha_hora: _fhISO, fecha_fin: _ffISO, tipo: _tipo, titulo: _titulo, estado: 'agendada',
+      notas: _notas, lead_nombre: _leadNombre, lead_telefono: _leadTel, departamento_id: _deptoId, origen: 'agente'
+    };
+    let _citaId = null;
+    let _r = await supabase.from('citas').insert(_fila).select('id').single();
+    if (_r.error) {
+      // Reintento sin columnas potencialmente ausentes (migracion no corrida): fecha_fin/departamento_id.
+      const _filaMin = {
+        user_id: ownerId, conversation_id: conversationId, contact_id: _contactId, asesor_id: null,
+        fecha_hora: _fhISO, tipo: _tipo, titulo: _titulo, estado: 'agendada',
+        notas: _notas, lead_nombre: _leadNombre, lead_telefono: _leadTel, origen: 'agente'
+      };
+      const _r2 = await supabase.from('citas').insert(_filaMin).select('id').single();
+      if (_r2.error) { console.error('_agendarCitaTentativaAgente insert:', _r2.error.message); return { ok: false }; }
+      _citaId = _r2.data && _r2.data.id;
+    } else {
+      _citaId = _r.data && _r.data.id;
+    }
+    // 7) Aviso al canal "Todos" (0 IA, texto fijo). Best-effort. Ademas, si hay depto, a su canal (opcional).
+    const _fechaLegible = _formatearFechaCita(_fhISO);
+    const _txtAviso = '📅 Nueva cita para tomar: ' + _fechaLegible + (_leadNombre ? (' — ' + _leadNombre) : '');
+    try { await _postearAvisoInterno(ownerId, 'general', _txtAviso); } catch (eAv) {}
+    if (_deptoId) { try { await _postearAvisoInterno(ownerId, _deptoId, _txtAviso); } catch (eAvD) {} }
+    return { ok: true, citaId: _citaId, duplicada: false, fechaLegible: _fechaLegible };
+  } catch (e) { console.error('_agendarCitaTentativaAgente:', e && e.message); return { ok: false }; }
+}
+
+// Formatea una fecha ISO a texto legible en horario de Argentina (UTC-3) para los avisos internos.
+// Determinista, 0 IA. Defensivo: ante error devuelve el ISO tal cual.
+function _formatearFechaCita(iso) {
+  try {
+    const _d = new Date(iso);
+    if (isNaN(_d.getTime())) return String(iso);
+    const _ar = new Date(_d.getTime() - 3 * 60 * 60000); // UTC-3 (AR), leido via getUTC*
+    const _dias = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
+    const _dow = _dias[_ar.getUTCDay()];
+    const _dd = String(_ar.getUTCDate()).padStart(2, '0');
+    const _mm = String(_ar.getUTCMonth() + 1).padStart(2, '0');
+    const _hh = String(_ar.getUTCHours()).padStart(2, '0');
+    const _mi = String(_ar.getUTCMinutes()).padStart(2, '0');
+    return _dow + ' ' + _dd + '/' + _mm + ' ' + _hh + ':' + _mi + 'hs';
+  } catch (e) { return String(iso); }
+}
+
 // AVISO #1 — NO RESUELVE: la IA no supo resolver una consulta del lead. Texto FIJO + datos de la base (SQL). SIN IA.
 // Gated por avisos_internos.no_resuelve===true. Se llama desde registrarConsultaAprendizaje (regla 19), ADEMAS de lo
 // que ya hace ese flujo (NO remueve el WhatsApp al dueno). Dedupe: lo cubre el dedupe propio de regla 19 (1 por
@@ -14133,6 +14295,46 @@ app.post('/api/citas/actualizar', async function(req, res) {
       else { syncCitaACalendar(ownerId, b.id).catch(function(e){ console.error('cita upd syncCalendar:', e && e.message); }); }
     } catch (eCal) { console.error('actualizar cita syncCalendar:', eCal && eCal.message); }
     return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== FEATURE #15: TOMAR una cita TENTATIVA (claim atomico, CERO IA) =====
+// Un asesor (o el dueno) RECLAMA una cita que dejo el agente sin asignar (asesor_id=NULL, estado='agendada',
+// origen='agente'). Claim ATOMICO (compare-and-set): UPDATE ... WHERE id=cita AND asesor_id IS NULL AND
+// estado='agendada'. El PRIMERO gana; si otro ya la tomo (0 filas afectadas) -> 409. Aislado por tenant
+// (ownerId derivado del JWT). Un asesor comun setea asesor_id=SU id; el dueno (sin fila de asesor) la
+// confirma dejando asesor_id NULL pero estado='confirmada' + creado_por para dejar traza (la doble condicion
+// asesor_id IS NULL + estado='agendada' hace el claim atomico igual en el caso del dueno). 0 IA.
+app.post('/api/citas/tomar', async function(req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = userId, claimAsesorId = null;
+    var ase = await supabase.from('asesores').select('id, admin_id').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; claimAsesorId = ase.data.id; }
+    var b = req.body || {};
+    var citaId = b.cita_id || b.id;
+    if (!citaId) return res.status(400).json({ error: 'Falta cita_id' });
+    // Claim ATOMICO: solo si sigue tentativa (asesor_id IS NULL) Y agendada. .select() devuelve las filas
+    // afectadas: si el UPDATE no toco ninguna, ya la tomo otro (o no existe / no es de este tenant) -> 409.
+    var upd = { asesor_id: claimAsesorId, estado: 'confirmada' };
+    var q = supabase.from('citas').update(upd)
+      .eq('id', citaId).eq('user_id', ownerId)
+      .is('asesor_id', null).eq('estado', 'agendada')
+      .select('id');
+    var r = await q;
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    if (!r.data || !r.data.length) {
+      // 0 filas: o la tomo otro, o no existe/otro tenant. Distinguir para el mensaje (best-effort).
+      var chk = await supabase.from('citas').select('id, asesor_id, estado').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
+      if (!chk || !chk.data) return res.status(404).json({ error: 'Cita no encontrada' });
+      return res.status(409).json({ error: 'Ya la tomo otro asesor' });
+    }
+    // Traza de quien la tomo (best-effort; si la columna no existe, no-opea y la toma YA quedo firme).
+    try { await supabase.from('citas').update({ creado_por: userId }).eq('id', citaId); } catch (eCp) {}
+    // FEATURE #21: reflejar en Google Calendar (best-effort, inerte sin Calendar conectado).
+    try { syncCitaACalendar(ownerId, citaId).catch(function(e){ console.error('tomar cita syncCalendar:', e && e.message); }); } catch (eCal) {}
+    return res.json({ ok: true, id: citaId });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

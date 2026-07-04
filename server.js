@@ -5275,6 +5275,33 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     else if (msg.videoMessage) { tipoMediaEntrante = 'video'; if (!texto) texto = msg.videoMessage.caption || '[video]'; }
     else if (msg.documentMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = (msg.documentMessage && msg.documentMessage.fileName) ? ('[documento] ' + msg.documentMessage.fileName) : '[documento]'; }
     else if (msg.documentWithCaptionMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = '[documento]'; }
+    // CITA / REPLY ENTRANTE: si el lead respondio CITANDO otro mensaje, Baileys trae contextInfo con el id del mensaje
+    // citado (stanzaId) y una copia de su contenido (quotedMessage). El contextInfo vive en distinto nodo segun el tipo:
+    // en extendedTextMessage para texto, y dentro del nodo del media (imageMessage/videoMessage/...) para media. Lo
+    // buscamos de forma ROBUSTA en cualquiera de esos y de forma DEFENSIVA (optional chaining): nunca debe tirar el
+    // webhook. Guardamos responde_a_wa_id=stanzaId y cita_texto=texto citado (truncado ~200) en el insert de abajo.
+    let _respondeAId = null, _citaTexto = null;
+    try {
+      const _ctx = (msg.extendedTextMessage && msg.extendedTextMessage.contextInfo)
+        || (msg.imageMessage && msg.imageMessage.contextInfo)
+        || (msg.videoMessage && msg.videoMessage.contextInfo)
+        || (msg.audioMessage && msg.audioMessage.contextInfo)
+        || (msg.documentMessage && msg.documentMessage.contextInfo)
+        || (msg.documentWithCaptionMessage && msg.documentWithCaptionMessage.contextInfo)
+        || (msg.stickerMessage && msg.stickerMessage.contextInfo)
+        || (msg.locationMessage && msg.locationMessage.contextInfo)
+        || null;
+      if (_ctx && _ctx.stanzaId) {
+        _respondeAId = _ctx.stanzaId;
+        const _qm = _ctx.quotedMessage || {};
+        const _qt = _qm.conversation
+          || (_qm.extendedTextMessage && _qm.extendedTextMessage.text)
+          || (_qm.imageMessage && _qm.imageMessage.caption)
+          || (_qm.videoMessage && _qm.videoMessage.caption)
+          || '';
+        _citaTexto = _qt ? String(_qt).slice(0, 200) : null;
+      }
+    } catch (eCita) { _respondeAId = null; _citaTexto = null; }
     // REACCION ENTRANTE (lead reacciono a un mensaje): NO es un mensaje normal. Se maneja aparte (asociar la reaccion al
     // mensaje reaccionado) y se corta el flujo: no crea lead nuevo, no gasta IA. Se resuelve antes del guard de 'sin texto'.
     if (msg.reactionMessage) {
@@ -5491,14 +5518,19 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // hace que dos entregas concurrentes fallen atomicamente en la DB (el catch de abajo lo absorbe sin perder el flujo).
     {
       const _baseIns = Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead }, _waMsgId ? { wa_message_id: _waMsgId } : {});
-      const _consUbic = _extraUbic ? Object.assign({}, _baseIns, _extraUbic) : _baseIns;
+      // CITA / REPLY: columnas nuevas (migracion aditiva). Si el lead cito otro mensaje, guardamos el id citado y su texto.
+      // DEFENSIVO igual que lat/lng: si la migracion no corrio, el insert reintenta SIN estas columnas (ver fallback abajo).
+      const _extraCita = _respondeAId ? { responde_a_wa_id: _respondeAId, cita_texto: _citaTexto } : null;
+      // Un solo objeto de "columnas nuevas" (ubicacion + cita); si el insert falla por alguna, reintentamos sin todas ellas.
+      const _extraNuevas = (_extraUbic || _extraCita) ? Object.assign({}, _extraUbic || {}, _extraCita || {}) : null;
+      const _consNuevas = _extraNuevas ? Object.assign({}, _baseIns, _extraNuevas) : _baseIns;
       let _rIns = null;
-      try { _rIns = await supabase.from('messages').insert(_consUbic); } catch (eIns) { _rIns = { error: eIns }; }
-      // Si fallo POR la columna nueva de ubicacion (migracion no corrida), reintentar SIN lat/lng -> el mensaje igual se guarda.
-      if (_rIns && _rIns.error && _extraUbic) {
+      try { _rIns = await supabase.from('messages').insert(_consNuevas); } catch (eIns) { _rIns = { error: eIns }; }
+      // Si fallo POR una columna nueva (ubicacion o cita, migracion no corrida), reintentar SIN esas columnas -> el mensaje igual se guarda.
+      if (_rIns && _rIns.error && _extraNuevas) {
         const _m = String((_rIns.error && (_rIns.error.message || _rIns.error.details || _rIns.error.hint)) || '').toLowerCase();
-        const _esColUbic = (_rIns.error.code === 'PGRST204') || _m.indexOf('latitud') >= 0 || _m.indexOf('longitud') >= 0 || (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
-        if (_esColUbic) { try { await supabase.from('messages').insert(_baseIns); } catch (eIns2) { console.error('insert ubicacion (fallback sin lat/lng):', eIns2 && eIns2.message); } }
+        const _esColNueva = (_rIns.error.code === 'PGRST204') || _m.indexOf('latitud') >= 0 || _m.indexOf('longitud') >= 0 || _m.indexOf('responde_a_wa_id') >= 0 || _m.indexOf('cita_texto') >= 0 || (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
+        if (_esColNueva) { try { await supabase.from('messages').insert(_baseIns); } catch (eIns2) { console.error('insert entrante (fallback sin columnas nuevas):', eIns2 && eIns2.message); } }
         else { console.error('insert mensaje entrante:', _rIns.error.message || _rIns.error); }
       }
     }

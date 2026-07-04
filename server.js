@@ -4795,6 +4795,34 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
     return estadoFinal !== 'fallido'; // 'enviado' e 'indeterminado' cuentan como "no reintentar"
   } catch (e) { console.error('Excepcion enviando WhatsApp:', e && e.message); await registrar('indeterminado'); return true; }
 }
+
+// ===== FEATURE "grupo TODOS": envio de TEXTO PLANO a un GRUPO de WhatsApp (...@g.us) =====
+// Aviso INTERNO al equipo (espejo del canal "Todos"): NO usa el "teatro humano" (sin partir el
+// mensaje, sin "escribiendo...", sin delays aleatorios). Es un solo POST a Evolution /message/sendText
+// con el JID del grupo como `number` (Evolution/Baileys rutea al grupo cuando el number es un JID
+// ...@g.us). DEFENSIVO al 100%: gatea con instanciaConectada; TODO en try/catch; NUNCA lanza (devuelve
+// bool). NO registra estado en messages (es un aviso interno, no un mensaje al lead). Devuelve true si
+// Evolution acepto (HTTP 2xx o key.id presente), false si no. El caller trata el resultado como best-effort.
+async function enviarTextoGrupoWA(instancia, jid, texto) {
+  try {
+    if (!instancia || !jid || !String(jid).trim() || !texto || !String(texto).trim()) return false;
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('enviarTextoGrupoWA: faltan EVOLUTION_URL o EVOLUTION_KEY'); return false; }
+    // Gate: no intentar si la instancia no esta conectada (evita ruido y un fallo seguro).
+    const conectada = await instanciaConectada(instancia);
+    if (!conectada) { console.error('enviarTextoGrupoWA: instancia no conectada (' + instancia + ')'); return false; }
+    const resp = await fetch(EVOLUTION_URL + '/message/sendText/' + instancia, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+      body: JSON.stringify({ number: String(jid), text: String(texto).slice(0, 4000) })
+    });
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
+    const aceptado = !!(body && body.key && body.key.id); // misma senal fiable que enviarWhatsapp
+    if (!(resp.ok || aceptado)) { console.error('enviarTextoGrupoWA: Evolution rechazo', resp.status, (bodyTxt || '').slice(0, 200)); return false; }
+    return true;
+  } catch (e) { console.error('enviarTextoGrupoWA:', e && e.message); return false; } // NUNCA lanza
+}
+
 app.get('/health', (req, res) => { res.json({ status: 'ok', app: 'Raices CRM' }); });
 // ============================================================================
 // /health/deep - health check REAL de dependencias criticas (monitoreo externo)
@@ -6836,6 +6864,86 @@ app.get('/api/estado-sistema', async (req, res) => {
     return res.json({ ok: ok });
   } catch (err) {
     console.error('Error en /api/estado-sistema:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
+// FEATURE "grupo TODOS": endpoints para elegir el grupo de WhatsApp espejo del
+// canal interno "Todos". Opcion A: el cliente crea el grupo en WhatsApp con el
+// numero del CRM y lo elige aca; capturamos su JID (...@g.us). CERO IA.
+// ----------------------------------------------------------------------------
+// GET  /api/whatsapp/grupos      -> lista los grupos del WhatsApp del cliente
+//   (Evolution GET /group/fetchAllGroups/{instancia}?getParticipants=false).
+//   Devuelve { ok, grupos: [{ jid, nombre }] }. El subject a veces viene null en
+//   Evolution v2 (issue conocido) -> mostramos el jid como nombre en ese caso.
+// POST /api/whatsapp/grupo-todos { jid, on } -> guarda grupo_todos_jid + flag.
+// Ambos: verificarUsuario + resolver dueño (el WhatsApp/settings son del dueño).
+// ============================================================================
+app.get('/api/whatsapp/grupos', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    // El WhatsApp es del DUEÑO; si el que pide es asesor, resolvemos su admin_id.
+    let ownerId = uid;
+    try { const _a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle(); if (_a && _a.data && _a.data.admin_id) ownerId = _a.data.admin_id; } catch (e) {}
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(200).json({ ok: true, grupos: [] });
+    const instancia = nombreInstancia(ownerId);
+    // Defensivo: si la instancia no esta conectada, no fallamos duro -> lista vacia (el front avisa "conecta WhatsApp").
+    let conectada = false;
+    try { conectada = await instanciaConectada(instancia); } catch (eC) { conectada = false; }
+    if (!conectada) return res.status(200).json({ ok: true, grupos: [], conectada: false });
+    // Evolution v2.3.7: GET /group/fetchAllGroups/{instancia}?getParticipants=false. Race de 8s para no colgar.
+    let grupos = [];
+    try {
+      const _fetchGrupos = fetch(EVOLUTION_URL + '/group/fetchAllGroups/' + instancia + '?getParticipants=false', {
+        headers: { 'apikey': EVOLUTION_KEY }
+      }).then(async function (r) {
+        let txt = ''; try { txt = await r.text(); } catch (eT) {}
+        let j = null; try { j = txt ? JSON.parse(txt) : null; } catch (eJ) { j = null; }
+        return j;
+      });
+      const j = await Promise.race([ _fetchGrupos, new Promise(function (r) { setTimeout(function () { r(null); }, 8000); }) ]);
+      // Evolution devuelve un ARRAY de grupos; toleramos tambien un objeto con .groups por si cambia el shape.
+      let arr = [];
+      if (Array.isArray(j)) arr = j;
+      else if (j && Array.isArray(j.groups)) arr = j.groups;
+      grupos = (arr || [])
+        .map(function (g) {
+          const jid = (g && (g.id || g.remoteJid)) ? String(g.id || g.remoteJid) : '';
+          const nombre = (g && g.subject && String(g.subject).trim()) ? String(g.subject).trim() : jid; // subject a veces null -> jid
+          return { jid: jid, nombre: nombre };
+        })
+        .filter(function (g) { return g.jid && g.jid.indexOf('@g.us') >= 0; }); // solo grupos reales
+    } catch (eG) { console.error('/api/whatsapp/grupos fetchAllGroups:', eG && eG.message); grupos = []; }
+    return res.json({ ok: true, grupos: grupos, conectada: true });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/grupos:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+app.post('/api/whatsapp/grupo-todos', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    // El settings es del DUEÑO; si el que pide es asesor, resolvemos su admin_id.
+    let ownerId = uid;
+    try { const _a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle(); if (_a && _a.data && _a.data.admin_id) ownerId = _a.data.admin_id; } catch (e) {}
+    const b = req.body || {};
+    const on = b.on === true;
+    // JID: aceptamos vacio (limpiar). Si viene, validamos que sea un JID de grupo (...@g.us) para no guardar basura.
+    let jid = (b.jid == null) ? '' : String(b.jid).trim();
+    if (jid && jid.indexOf('@g.us') < 0) return res.status(400).json({ error: 'El grupo elegido no es valido (falta @g.us)' });
+    // Guardrail: no se puede activar el espejo sin elegir un grupo.
+    if (on && !jid) return res.status(400).json({ error: 'Elegí un grupo de WhatsApp antes de activarlo.' });
+    const { error: eUpd } = await supabase.from('business_settings')
+      .update({ grupo_todos_jid: jid || null, grupo_todos_wa_on: on })
+      .eq('user_id', ownerId);
+    if (eUpd) { console.error('/api/whatsapp/grupo-todos update:', eUpd.message); return res.status(500).json({ error: eUpd.message }); }
+    return res.json({ ok: true, jid: jid || null, on: on });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/grupo-todos:', err && err.message);
     res.status(500).json({ error: (err && err.message) || 'Error interno' });
   }
 });
@@ -10243,6 +10351,19 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto) {
         leido_por: [senderId]
       });
     } catch (eIns) { return; }
+    // ===== FEATURE "grupo TODOS" [gated, DEFAULT OFF] =====
+    // SOLO en la rama 'general' (= el canal interno "Todos"): si el tenant activo el flag y eligio un grupo
+    // de WhatsApp, espejamos este mismo aviso al grupo. Best-effort ABSOLUTO: cualquier fallo aca (flag,
+    // read, envio) NUNCA rompe el aviso interno ni el push de abajo. Con el flag OFF o sin JID -> no manda nada.
+    if (departamentoId === 'general') {
+      try {
+        const { data: _bsG, error: _eBsG } = await supabase.from('business_settings')
+          .select('grupo_todos_jid, grupo_todos_wa_on').eq('user_id', ownerId).maybeSingle();
+        if (!_eBsG && _bsG && _bsG.grupo_todos_wa_on === true && _bsG.grupo_todos_jid && String(_bsG.grupo_todos_jid).trim()) {
+          await enviarTextoGrupoWA(nombreInstancia(ownerId), String(_bsG.grupo_todos_jid).trim(), cuerpo);
+        }
+      } catch (eGrupo) { console.error('grupo TODOS (espejo WA):', eGrupo && eGrupo.message); } // NUNCA romper el aviso interno
+    }
     // Push a los miembros (0 tokens IA). Excluir al remitente. Dedupe.
     const vistos = {};
     for (let i = 0; i < destinatarios.length; i++) {

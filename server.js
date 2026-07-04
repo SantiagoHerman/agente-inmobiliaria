@@ -5816,10 +5816,30 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             return; // un humano tomo la conv durante el debounce -> NO generar (sin tokens). finally libera _genEnCurso.
           }
         }
+        // ===== HOTFIX MISRUTEO (FIX D): proteger la ROTACION de derivacion_v3 =====
+        // Bug en vivo: mientras un lead esta ROTANDO (derivacion_v3: asesor asignado, status='interesado', ai_enabled=true,
+        // la IA sigue atendiendo) si el lead vuelve a escribir, el bloque V2 de handoff/clasificacion/derivacion de abajo
+        // podia sacarlo de 'interesado' a 'listo_humano' (o apagar la IA) ANTES de que un ASESOR le escribiera, rompiendo
+        // la rotacion. FIX: si la conv esta rotando, la IA DEBE seguir respondiendo normal (generarRespuestaAgente corre
+        // igual), pero se SALTEAN TODOS los paths V2 que podrian escribir status='listo_humano'/ai_enabled=false (el
+        // handoff _pideHumano, la confirmacion pendiente, y toda la clasificacion+derivacion). La UNICA salida a
+        // listo_humano queda: un ASESOR escribe (lo maneja _finalizarRotacionV3 via /api/whatsapp/send).
+        // DEFENSIVO: derivacion_rotando se lee aparte (el select de la conv del webhook NO la trae). Con la columna
+        // ausente/undefined o derivacion_v3 OFF -> _enRotacion=false -> flujo BYTE-IDENTICO al actual.
+        let _enRotacion = false;
+        try {
+          let _rot = null;
+          try {
+            const { data: _cvRotW } = await supabase.from('conversations').select('derivacion_rotando').eq('id', _convId).maybeSingle();
+            _rot = _cvRotW ? _cvRotW.derivacion_rotando : null;
+          } catch (eRotCol) { _rot = null; } // columna ausente u otro error: tratar como NO rotando (comportamiento actual)
+          if (_rot === true) { _enRotacion = await derivacionV3Activo(user_id); }
+        } catch (eEnRot) { _enRotacion = false; } // ante cualquier fallo: NO rotando -> comportamiento actual
         {
           // HANDOFF LIMPIO: si el lead pide hablar con un humano, derivar YA con un mensaje claro y SIN gastar la
           // respuesta de la IA (ahorra tokens). Evita que el agente conteste algo fuera de tema antes de pasar al asesor.
-          if (_pideHumano(texto)) {
+          // FIX D: en rotacion NO tomamos este atajo (romperia la rotacion sacando la conv a listo_humano); la IA sigue.
+          if (!_enRotacion && _pideHumano(texto)) {
             const _msgHandoff = 'Dale, te paso con un compañero del equipo que te ayuda enseguida 🙌';
             try {
               await enviarWhatsapp(instanciaNombre, telefono, _msgHandoff);
@@ -5846,6 +5866,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // Si dice un NO claro -> cerrar la confirmacion y seguir con la IA normal. Si es AMBIGUO -> NO consumimos
           // aca: dejamos que el flujo normal corra y la clasificacion que YA corre mas abajo resuelva el si/no (fallback
           // a la clasificacion existente, sin llamada extra dedicada). Gate barato: Map en memoria primero (cero queries).
+          // FIX D: en rotacion se SALTEA todo este bloque de confirmacion (un "si" aca derivaria a listo_humano y romperia
+          // la rotacion). En rotacion la derivacion ya esta en curso; la salida a listo_humano la da un asesor al escribir.
+          if (!_enRotacion) {
           let _deptoConfPend = _confirmacionPendiente.get(_convId) || null;
           if (!_deptoConfPend) {
             try { if (await repartoV2Activo(user_id)) _deptoConfPend = await deptoConfirmacionPendiente(_convId); } catch (eRV) {}
@@ -5867,6 +5890,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             }
             // Ambiguo: no consumir; el flujo normal + la clasificacion de abajo deciden (fallback sin llamada extra).
           }
+          } // fin if(!_enRotacion): bloque de confirmacion de derivacion (FIX D)
           // PARTE B (punto 1): si ESTA conv la cubre un USUARIO IA (es_ia + ai_enabled + reparto_v2 ON), responder
           // COMO ese usuario (su agente_config). configUsuarioIACobertura ya gatea/sanea/aisla por tenant; devuelve
           // null en el camino genérico => generarRespuestaAgente responde con la persona de la cuenta (ACTUAL EXACTO).
@@ -5932,7 +5956,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // La derivacion ya se decidio (la IA la pidio y el sistema esta rotando); dejar que el clasificador suba a
           // listo_humano aca dispararia derivarAHumano y romperia la rotacion (doble derivacion). Ademas ahorra 1 Haiku.
           // BLINDAJE: si ya esta en 'listo_humano' o 'cerrado', NO se reclasifica (queda quieto)
-          if (!_rotacionV3Iniciada && estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
+          // FIX D: si la conv YA estaba ROTANDO (no recien iniciada), SALTEAR toda la clasificacion+derivacion (incluida
+          // la RED DE SEGURIDAD): en rotacion la IA responde pero NADIE debe subir el status a listo_humano ni apagar la
+          // IA por reclasificacion — la unica salida es que un ASESOR escriba (_finalizarRotacionV3 via /api/whatsapp/send).
+          if (!_enRotacion && !_rotacionV3Iniciada && estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
             // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId, pidioArea, deducido, fueraAlcance }.
             const _clasif = await clasificarEstado(texto, user_id);
             const nuevoEstado = _clasif && _clasif.estado;
@@ -7320,6 +7347,76 @@ async function escalarLeadsEnColaVencidos() {
       if (!anchorMs || (ahoraMs - anchorMs) < TOPE_MS) continue; // todavia no cumplio el tope de espera en cola
       // Marcar en memoria YA (antes de los pasos) para que ticks concurrentes no re-escalen.
       _escaladoFallback.add(conv.id);
+      // ===== HOTFIX MISRUTEO (FIX A): reintentar el DEPTO PROPIO antes de Administracion =====
+      // Bug en vivo: un lead de Venta que entro de noche quedo en cola (listo_humano, asesor_id=null) y a la manana
+      // este cron lo mandaba DIRECTO al recibe_fallback (Administracion) SIN reintentar su depto original, aunque ya
+      // hubiera vendedores disponibles. Antes de ir al fallback, re-consultamos el depto ORIGINAL de la conv:
+      //   - 'asignable'                     => asignar AHI (reusar el _est.asesor; MISMO UPDATE condicional del PASO 1).
+      //   - 'todos_pausa'                   => hay gente pero AHORA en pausa/fuera de horario (van a volver): NO escalar
+      //                                        a Administracion. DEJAR ESPERANDO y, clave, DES-marcar el dedupe (Set +
+      //                                        columna) para que un tick POSTERIOR lo re-evalue cuando haya alguien.
+      //   - 'sin_miembros' | 'solo_no_recibe' => estructural (depto vacio / todos en 'no recibe'): caer al PASO 1
+      //                                        (Administracion) como HOY (comportamiento actual).
+      // DEFENSIVO: sin departamento_id -> no tocar (sigue al PASO 1 = fallback, comportamiento actual). Si la columna o
+      // estadoDeptoParaReparto fallan -> try/catch cae al PASO 1 (no romper el cron). Con reparto_v2 OFF este cron ni
+      // siquiera llega hasta aca (se filtra arriba), asi que este bloque no altera cuentas sin la feature.
+      if (conv.departamento_id) {
+        try {
+          const _estProp = await estadoDeptoParaReparto(ownerId, conv.departamento_id);
+          const _estadoProp = _estProp && _estProp.estado;
+          if (_estadoProp === 'asignable' && _estProp.asesor) {
+            // GUARD es_ia (revision adversarial): estadoDeptoParaReparto/elegirAsesorParaDepartamento pueden elegir un
+            // USUARIO IA (es_ia=true) como cobertura cuando no hay humanos. Pero este lead esta en la cola HUMANA
+            // (listo_humano, ai_enabled=false): asignarle un usuario IA lo dejaria SIN que nadie responda (mismo motivo
+            // por el que el drenaje /api/asesores/activar excluye es_ia, server.js:8942). Si el elegido es IA -> NO
+            // asignar: tratarlo como 'todos_pausa' (dejar ESPERANDO a que haya un humano; NO ir a Administracion).
+            // DEFENSIVO: si la consulta falla o es_ia es falsy -> seguir con la asignacion normal (comportamiento actual).
+            let _esIaElegido = false;
+            try {
+              const { data: _aiChk } = await supabase.from('asesores').select('es_ia').eq('id', _estProp.asesor).maybeSingle();
+              _esIaElegido = !!(_aiChk && _aiChk.es_ia === true);
+            } catch (eIaChk) { _esIaElegido = false; } // columna ausente u otro error: no bloquear (asignacion normal)
+            if (_esIaElegido) {
+              // El unico candidato disponible es un usuario IA: la cola humana NO va a IA. Dejar esperando y DES-marcar el
+              // dedupe (Set + columna) para re-evaluar en un tick posterior cuando haya un humano (igual que 'todos_pausa').
+              try { _escaladoFallback.delete(conv.id); } catch (eDelIa) {}
+              try { await supabase.from('conversations').update({ escalado_fallback: false }).eq('id', conv.id); } catch (eUnIa) {}
+              continue; // esperar a un humano (no asignar IA, no escalar a Administracion)
+            }
+            // PATRON CANONICO (server.js:1866): UPDATE condicional .is('asesor_id', null) + .select(). Si no toca
+            // fila, otro flujo ya lo tomo -> saltar (queda atendido; no avisar al dueno ni escalar a Administracion).
+            const { data: _asgProp } = await supabase.from('conversations')
+              .update({ asesor_id: _estProp.asesor, ultimo_asesor_id: _estProp.asesor, updated_at: new Date().toISOString() })
+              .eq('id', conv.id).is('asesor_id', null).eq('admin_tomo', false).select('id');
+            if (_asgProp && _asgProp.length) {
+              // Asignado a su PROPIO depto: limpiar el pase agendado off-hours (igual que el PASO 1) y persistir el
+              // dedupe para no re-escalar. Writes APARTE best-effort (columnas opcionales): no rompen la asignacion.
+              try { await supabase.from('conversations').update({ handoff_pendiente: false }).eq('id', conv.id); } catch (eHp) {}
+              try { await supabase.from('conversations').update({ escalado_fallback: true }).eq('id', conv.id); } catch (eMk) {}
+              try { await cerrarOfertaFueraHorario(conv.id); } catch (eCF) {}
+              try { await cerrarConfirmacionDerivacion(conv.id); } catch (eCC) {}
+              console.log('Etapa8 FIX A: lead ' + conv.id + ' reasignado a su depto propio -> asesor ' + _estProp.asesor + ' (sin ir a Administracion)');
+              continue; // resuelto en el depto propio: NO caer al fallback ni al aviso
+            }
+            // No toco fila (ya lo tomo otro entre la lectura y este write): tratarlo como resuelto (no escalar, no avisar).
+            _escaladoFallback.add(conv.id);
+            try { await supabase.from('conversations').update({ escalado_fallback: true }).eq('id', conv.id); } catch (eMk2) {}
+            continue;
+          }
+          if (_estadoProp === 'todos_pausa') {
+            // Hay miembros que reciben pero AHORA ninguno disponible (pausa/horario): van a volver. NO escalar a
+            // Administracion; DEJAR ESPERANDO. DES-marcar el dedupe (Set en memoria + columna persistente si estuviera)
+            // para que un tick POSTERIOR lo re-evalue cuando haya gente. NO llegamos al marcado escalado_fallback=true.
+            try { _escaladoFallback.delete(conv.id); } catch (eDel) {}
+            try { await supabase.from('conversations').update({ escalado_fallback: false }).eq('id', conv.id); } catch (eUn) {}
+            continue; // esperar: se reintenta en un tick posterior
+          }
+          // 'sin_miembros' | 'solo_no_recibe' | cualquier otro: estructural -> seguir al PASO 1 (fallback), como HOY.
+        } catch (eFixA) {
+          // Cualquier fallo (columna ausente, estadoDeptoParaReparto tira, etc.): caer al comportamiento actual (PASO 1).
+          console.error('Etapa8 FIX A (depto propio):', eFixA && eFixA.message);
+        }
+      }
       // PASO 1: intentar asignar a un asesor del departamento con recibe_fallback=true (picker etapa 7).
       let _asignado = null;
       // RACE #9: si OTRO flujo (drenaje /api/asesores/activar, derivarAHumano) ya le puso asesor a esta conv
@@ -8839,6 +8936,10 @@ app.post('/api/asesores/activar', async (req, res) => {
     // PARTE A (punto 10): con reparto_v2 ON, ademas se excluye a los que tienen disponibilidad='no_recibe'
     // (que es como se mapean ahora Administrador/Empleado). Con flag OFF, queda igual que antes.
     let activos = null;
+    // HOTFIX MISRUTEO (FIX C): hoisteamos v2act al scope del handler (antes era local al bloque de abajo) para REUSARLO
+    // en el gate por-departamento del drenaje (mas abajo) sin repetir la query repartoV2Activo. Con el flag OFF queda
+    // false -> el gate por-lead NO restringe -> drenaje byte-identico al actual.
+    let v2act = false;
     {
       // PARTE B (fix hueco auditoria): traemos tambien es_ia para EXCLUIR usuarios IA del drenaje de la COLA humana.
       // La cola 'listo_humano' son leads que esperan un HUMANO; si se los asignaramos a un usuario IA quedarian con
@@ -8853,7 +8954,6 @@ app.post('/api/asesores/activar', async (req, res) => {
         act0 = r2.data;
       }
       activos = act0;
-      let v2act = false;
       try { v2act = await repartoV2Activo(admin_id, null); } catch (eV2a) { v2act = false; }
       if (v2act && Array.isArray(activos)) {
         activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe'; });
@@ -8863,8 +8963,43 @@ app.post('/api/asesores/activar', async (req, res) => {
     if (!activos || activos.length === 0) return res.json({ ok: true, asignados: 0 });
     // 3. Buscar leads EN COLA: listos para humano, sin asignar y no tomados por el admin.
     //    Filtramos por status='listo_humano' para NO repartir conversaciones que aun maneja la IA.
-    const { data: enEspera } = await supabase.from('conversations').select('id').eq('user_id', admin_id).eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+    // HOTFIX MISRUTEO (FIX C): traemos tambien departamento_id para que el asesor que se conecta SOLO drene leads
+    // de SU(S) departamento(s). Antes el drenaje repartia la cola account-wide por menor carga SIN mirar depto, asi
+    // que un asesor de Alquiler podia llevarse un lead de Venta (misruteo). DEFENSIVO: si departamento_id no existe,
+    // el reintento sin esa columna deja departamento_id=undefined en cada lead -> "sin depto" -> comportamiento ACTUAL
+    // (lo puede tomar cualquiera). Ver el gate por-lead mas abajo.
+    let enEspera = null;
+    try {
+      const _rEsp = await supabase.from('conversations').select('id, departamento_id').eq('user_id', admin_id).eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+      if (_rEsp.error) throw _rEsp.error;
+      enEspera = _rEsp.data;
+    } catch (eDeptoCol) {
+      // Columna departamento_id ausente u otro error: reintentar SIN ella -> cada lead queda sin depto (comportamiento ACTUAL).
+      const { data: _reEsp } = await supabase.from('conversations').select('id').eq('user_id', admin_id).eq('status', 'listo_humano').is('asesor_id', null).eq('admin_tomo', false);
+      enEspera = _reEsp;
+    }
     if (!enEspera || enEspera.length === 0) return res.json({ ok: true, asignados: 0 });
+    // HOTFIX MISRUTEO (FIX C): departamentos (modo='recibe') del asesor que SE CONECTA. Solo drenara leads cuyo
+    // departamento_id este en este set. DEFENSIVO: si la tabla/columna 'modo' no existe -> reintento sin ella (legacy
+    // = todos reciben). Si la lectura falla del todo -> Set vacio con bandera _sinMembresias=true, que hace que el gate
+    // por-lead caiga al comportamiento ACTUAL (no bloquea el drenaje). SOLO se filtra cuando reparto_v2 esta ON: con el
+    // flag OFF la variable v2act (calculada arriba) es false y el gate por-lead no restringe -> byte-identico a hoy.
+    const _misDeptos = new Set();
+    let _sinMembresias = false;
+    try {
+      let _memRows = null;
+      try {
+        const _rm = await supabase.from('usuario_departamento').select('departamento_id, modo').eq('asesor_id', asesor_id);
+        if (_rm.error) throw _rm.error;
+        _memRows = _rm.data;
+      } catch (eModoC) {
+        const _rm2 = await supabase.from('usuario_departamento').select('departamento_id').eq('asesor_id', asesor_id);
+        _memRows = (_rm2.data || []).map(function(m){ return { departamento_id: m.departamento_id, modo: null }; });
+      }
+      (_memRows || [])
+        .filter(function(m){ return m.modo == null || m.modo === 'recibe'; }) // excluir 'visualiza' (igual que elegirAsesorParaDepartamento)
+        .forEach(function(m){ if (m.departamento_id) _misDeptos.add(m.departamento_id); });
+    } catch (eMemAll) { _sinMembresias = true; /* no se pudo leer membresias: NO restringir (comportamiento actual) */ }
     // 4. Contar carga actual de cada activo para repartir equitativo
     const carga = {};
     for (const a of activos) {
@@ -8875,9 +9010,35 @@ app.post('/api/asesores/activar', async (req, res) => {
     }
     // 5. Repartir cada lead en espera al activo con menos carga
     let asignados = 0;
+    // HOTFIX MISRUTEO (FIX C): true SOLO cuando el gate por-departamento esta ACTIVO (reparto_v2 ON + membresias leidas).
+    // Con el flag OFF, o si no se pudieron leer las membresias, queda false -> el drenaje se comporta byte-identico al
+    // actual (reparto account-wide por menor carga, sin mirar depto).
+    const _gateDeptoActivo = (v2act === true && !_sinMembresias);
     for (const lead of enEspera) {
-      let mejor = activos[0].id; let menos = carga[mejor];
-      for (const a of activos) { if (carga[a.id] < menos) { menos = carga[a.id]; mejor = a.id; } }
+      // HOTFIX MISRUTEO (FIX C): el asesor que se conecta SOLO toma leads de SU(S) departamento(s). Si el lead tiene
+      // departamento_id y NO es miembro (modo='recibe') de ese depto -> saltearlo (queda en cola para su gente).
+      // DEFENSIVO: lead SIN departamento_id -> comportamiento actual (lo puede tomar). Si no se pudieron leer las
+      // membresias (_sinMembresias) o reparto_v2 OFF -> gate inactivo -> drenaje byte-identico al actual.
+      const _leadConDepto = _gateDeptoActivo && !!lead.departamento_id;
+      if (_leadConDepto && !_misDeptos.has(lead.departamento_id)) {
+        continue; // lead de otro depto: no lo drena este asesor (queda en cola para su gente)
+      }
+      // Target: si el lead ES de un depto de ESTE asesor (gate activo + tiene depto + es miembro), se lo asignamos al
+      // asesor que se CONECTA (spec: "asignarlo a este asesor"). Asi no cae en un tercero por menor-carga que podria NO
+      // ser del depto (lo que reintroduciria el misruteo). GUARD: solo si el asesor que se conecta es ELEGIBLE (esta en
+      // `activos`/`carga`, o sea NO fue filtrado por no_recibe/es_ia); si no lo es, NO drenamos este lead (queda en cola
+      // para sus companeros del depto). Para leads SIN depto (o gate inactivo) se conserva EXACTO el reparto account-wide
+      // por menor carga de siempre (con flag OFF esto es el unico camino -> byte-identico a hoy).
+      let mejor, menos;
+      if (_leadConDepto) {
+        if (!Object.prototype.hasOwnProperty.call(carga, asesor_id)) {
+          continue; // el asesor que se conecta no es receptor elegible (no_recibe / es_ia): dejar el lead para su gente
+        }
+        mejor = asesor_id; menos = carga[mejor];
+      } else {
+        mejor = activos[0].id; menos = carga[mejor];
+        for (const a of activos) { if (carga[a.id] < menos) { menos = carga[a.id]; mejor = a.id; } }
+      }
       // La asignacion va PRIMERO y sola, para no depender de columnas nuevas (si cola_avisada no existe,
       // Supabase devuelve error en vez de tirar excepcion y NO se escribiria la asignacion). Mantiene el drenaje intacto.
       // RACE #2 (PATRON CANONICO server.js:1866): UPDATE CONDICIONAL .is('asesor_id', null) + .select(). Si dos

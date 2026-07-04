@@ -3321,7 +3321,7 @@ async function editarMensajeWA(instancia, key, nuevoTexto) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify({
-        number: (key.remoteJid.split('@')[0]),
+        number: key.remoteJid, // JID COMPLETO (con @): createJid lo devuelve tal cual si ya tiene dominio -> no le saca el '9' argentino ni rompe con @lid
         text: String(nuevoTexto != null ? nuevoTexto : ''),
         key: { remoteJid: key.remoteJid, fromMe: true, id: key.id }
       })
@@ -6250,6 +6250,7 @@ app.post('/api/mensajes/editar', async (req, res) => {
     // El remoteJid reconstruido del telefono puede NO coincidir con el que WhatsApp/Evolution usan (normalizacion AR del '9', o @lid).
     // updateMessage lo valida ESTRICTO -> le pedimos a Evolution el remoteJid REAL del mensaje por su id y usamos ESE.
     let _jidEditar = remoteJid;
+    let _foundJid = false;
     try {
       const _rf = await fetch(EVOLUTION_URL + '/chat/findMessages/' + instancia, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
@@ -6259,10 +6260,10 @@ app.post('/api/mensajes/editar', async (req, res) => {
       let _recs = [];
       if (_jf) { if (Array.isArray(_jf)) _recs = _jf; else if (_jf.messages && Array.isArray(_jf.messages.records)) _recs = _jf.messages.records; else if (Array.isArray(_jf.messages)) _recs = _jf.messages; else if (Array.isArray(_jf.records)) _recs = _jf.records; }
       const _rec = _recs.find(function (x) { return x && x.key && x.key.id === m.wa_message_id; });
-      if (_rec && _rec.key && _rec.key.remoteJid) _jidEditar = _rec.key.remoteJid;
+      if (_rec && _rec.key && _rec.key.remoteJid) { _jidEditar = _rec.key.remoteJid; _foundJid = true; }
     } catch (_eFm) { console.error('findMessages para editar:', _eFm && _eFm.message); }
     const r = await editarMensajeWA(instancia, { remoteJid: _jidEditar, fromMe: true, id: m.wa_message_id }, String(nuevo_texto));
-    if (!r.ok) return res.status(502).json({ error: 'No se pudo editar en WhatsApp' + (r.status ? (' [' + r.status + ']') : '') + (r.detail ? (': ' + r.detail) : '') });
+    if (!r.ok) return res.status(502).json({ error: 'No se pudo editar en WhatsApp' + (r.status ? (' [' + r.status + ']') : '') + (r.detail ? (': ' + r.detail) : '') + ' | jid=' + _jidEditar + ' find=' + _foundJid });
     try { await supabase.from('messages').update({ content: String(nuevo_texto) }).eq('id', m.id); } catch (eUpd) { console.error('editar content:', eUpd && eUpd.message); }
     // Si es el ultimo mensaje, reflejar el nuevo texto en la preview de la conversacion.
     try { await supabase.from('conversations').update({ last_message: String(nuevo_texto), updated_at: new Date().toISOString() }).eq('id', m.conversation_id).eq('last_role', 'human'); } catch (eLm) {}

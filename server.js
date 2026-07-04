@@ -1512,6 +1512,51 @@ async function iaAgendaActivo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== MEJORA #3 (AGENDA): OFFSETS DE RECORDATORIO DE CITAS, CONFIGURABLES POR CUENTA =====
+// Devuelve un array de horas-antes (ej. [24, 1]) en las que se manda el recordatorio de una cita.
+// Fuente: business_settings.recordatorio_citas_horas (texto JSON, ej. '[24,1]'). DEFAULT [24,1] (24h + 1h
+// antes) => IDENTICO al comportamiento historico documentado (1 dia + 1 hora). FAIL-SAFE total: si la
+// columna no existe, esta vacia, o el JSON es invalido -> DEFAULT. Se saneia: solo numeros > 0 y <= 168h
+// (7 dias), se dedupe y se ORDENA DESC (primero el mas lejano). Si tras sanear queda vacio -> DEFAULT.
+// Reusa un bs ya cargado si trae la propiedad (evita query). NUNCA tira (cron en vivo).
+const _RECORDATORIO_DEFAULT_HORAS = [24, 1];
+function _parsearOffsetsRecordatorio(raw) {
+  try {
+    if (raw == null) return _RECORDATORIO_DEFAULT_HORAS.slice();
+    let arr = raw;
+    if (typeof raw === 'string') {
+      const s = raw.trim();
+      if (!s) return _RECORDATORIO_DEFAULT_HORAS.slice();
+      arr = JSON.parse(s);
+    }
+    if (!Array.isArray(arr)) return _RECORDATORIO_DEFAULT_HORAS.slice();
+    const vistos = {};
+    const limpio = [];
+    for (let i = 0; i < arr.length; i++) {
+      const n = Number(arr[i]);
+      if (!isFinite(n) || n <= 0 || n > 168) continue; // fuera de rango (0..7 dias) -> descartar
+      const k = String(n);
+      if (vistos[k]) continue;
+      vistos[k] = true;
+      limpio.push(n);
+    }
+    if (!limpio.length) return _RECORDATORIO_DEFAULT_HORAS.slice();
+    limpio.sort(function (a, b) { return b - a; }); // DESC: primero el mas lejano (24 antes que 1)
+    return limpio;
+  } catch (e) { return _RECORDATORIO_DEFAULT_HORAS.slice(); }
+}
+async function recordatorioOffsetsHoras(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'recordatorio_citas_horas')) {
+      return _parsearOffsetsRecordatorio(bs.recordatorio_citas_horas);
+    }
+    if (!user_id) return _RECORDATORIO_DEFAULT_HORAS.slice();
+    const { data, error } = await supabase.from('business_settings').select('recordatorio_citas_horas').eq('user_id', user_id).maybeSingle();
+    if (error || !data) return _RECORDATORIO_DEFAULT_HORAS.slice(); // columna ausente / sin fila -> default
+    return _parsearOffsetsRecordatorio(data.recordatorio_citas_horas);
+  } catch (e) { return _RECORDATORIO_DEFAULT_HORAS.slice(); }
+}
+
 // ===== DEPARTAMENTO DE MARKETING IA — FASE 0: FLAG POR-CUENTA marketing_ia =====
 // GATE de la feature NUEVA "generar contenido de marketing por texto" (endpoint
 // POST /api/marketing/generar). Con el flag OFF (default: false / ausente / null /
@@ -5330,33 +5375,93 @@ async function enviarAvisosTareas() {
   } catch (e) { console.error('enviarAvisosTareas:', e && e.message); }
 }
 
-// CRON: recordatorio de cita al LEAD (WhatsApp) + aviso al asesor (push), para citas agendadas en las proximas 24h
-// que aun no se recordaron. NO gasta tokens (solo WhatsApp + push). Marca recordatorio_enviado para no repetir.
+// CRON: recordatorio de cita al LEAD (WhatsApp) + aviso al asesor (push). NO gasta tokens (solo WhatsApp + push).
+// MEJORA #3: los OFFSETS son CONFIGURABLES por cuenta (business_settings.recordatorio_citas_horas, ej. '[24,1]').
+// DEFAULT [24,1] (24h + 1h antes). Idempotencia por-offset via citas.recordatorios_enviados (lista JSON de offsets
+// ya enviados). DEGRADACION byte-identica: si la columna recordatorios_enviados NO existe (migracion no corrida),
+// se usa el flag boolean clasico `recordatorio_enviado` y la ventana unica de 24h => comportamiento ACTUAL EXACTO.
+// _enviarRecordatorioUno hace el envio real (WhatsApp al lead + push al asesor). Reutilizado por ambos caminos.
+async function _enviarRecordatorioUno(c) {
+  try {
+    let tel = c.lead_telefono;
+    if (!tel && c.contact_id) { const { data: ct } = await supabase.from('contacts').select('phone').eq('id', c.contact_id).maybeSingle(); if (ct) tel = ct.phone; }
+    const fh = new Date(c.fecha_hora);
+    let cuando = c.fecha_hora;
+    try { cuando = fh.toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (eF) {}
+    if (tel) {
+      const inst = nombreInstancia(c.user_id);
+      const saludo = c.lead_nombre ? (' ' + String(c.lead_nombre).split(' ')[0]) : '';
+      const txt = 'Hola' + saludo + ', te recordamos tu ' + (c.tipo || 'cita') + ' para el ' + cuando + '. Si necesitas reprogramar, avisanos. Te esperamos!';
+      await enviarWhatsapp(inst, tel, txt, null);
+    }
+    if (c.asesor_id) { const { data: ase } = await supabase.from('asesores').select('auth_user_id').eq('id', c.asesor_id).maybeSingle(); if (ase && ase.auth_user_id) await enviarPushAsesor(ase.auth_user_id, 'Recordatorio de cita', '', (c.titulo || 'Cita') + ' — ' + cuando); }
+  } catch (e) { console.error('_enviarRecordatorioUno:', e && e.message); }
+}
 async function enviarRecordatoriosCitas() {
   try {
     const ahoraMs = Date.now();
     const ahoraISO = new Date(ahoraMs).toISOString();
-    const en24hISO = new Date(ahoraMs + 24 * 60 * 60 * 1000).toISOString();
-    const { data: citas } = await supabase.from('citas').select('*').eq('estado', 'agendada').eq('recordatorio_enviado', false).gte('fecha_hora', ahoraISO).lte('fecha_hora', en24hISO);
+    // Ventana AMPLIA: hasta el mayor offset posible admitido (168h = 7 dias). Asi el cron ve todas las citas
+    // que puedan tener algun recordatorio pendiente con cualquier config; el filtro fino es por-offset abajo.
+    const OFFSET_MAX_H = 168;
+    const enMaxISO = new Date(ahoraMs + OFFSET_MAX_H * 60 * 60 * 1000).toISOString();
+    // Traemos citas agendadas futuras cuyo recordatorio (clasico) aun no cerro. NOTA: filtramos por
+    // recordatorio_enviado=false para NO re-procesar las ya cerradas; el camino multi-offset marca ese flag
+    // en true SOLO cuando ya se enviaron TODOS sus offsets (ver abajo), asi no se pierde ningun offset.
+    const { data: citas } = await supabase.from('citas').select('*').eq('estado', 'agendada').eq('recordatorio_enviado', false).gte('fecha_hora', ahoraISO).lte('fecha_hora', enMaxISO);
     if (!citas || citas.length === 0) return;
+    // Cache de offsets por cuenta (evita una query de business_settings por cita).
+    const offsetsCache = {};
+    async function offsetsDe(uid) {
+      if (Object.prototype.hasOwnProperty.call(offsetsCache, uid)) return offsetsCache[uid];
+      const v = await recordatorioOffsetsHoras(uid, null);
+      offsetsCache[uid] = v;
+      return v;
+    }
     for (const c of citas) {
       try {
-        // CLAIM optimista: marcar recordado ANTES de enviar (evita doble envio si dos ejecuciones se solapan
-        // o si el proceso muere a mitad). Update condicional: solo gana si seguia en false; si no, saltar.
-        const claim = await supabase.from('citas').update({ recordatorio_enviado: true }).eq('id', c.id).eq('recordatorio_enviado', false).select('id');
-        if (!claim || !claim.data || claim.data.length === 0) continue;
-        let tel = c.lead_telefono;
-        if (!tel && c.contact_id) { const { data: ct } = await supabase.from('contacts').select('phone').eq('id', c.contact_id).maybeSingle(); if (ct) tel = ct.phone; }
-        const fh = new Date(c.fecha_hora);
-        let cuando = c.fecha_hora;
-        try { cuando = fh.toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch(eF){}
-        if (tel) {
-          const inst = nombreInstancia(c.user_id);
-          const saludo = c.lead_nombre ? (' ' + String(c.lead_nombre).split(' ')[0]) : '';
-          const txt = 'Hola' + saludo + ', te recordamos tu ' + (c.tipo || 'cita') + ' para el ' + cuando + '. Si necesitas reprogramar, avisanos. Te esperamos!';
-          await enviarWhatsapp(inst, tel, txt, null);
+        const fhMs = new Date(c.fecha_hora).getTime();
+        if (!isFinite(fhMs)) continue;
+        // ¿La base soporta el tracking multi-offset? Si la columna existe, `recordatorios_enviados` es
+        // string|null; si NO existe, el select('*') simplemente no la trae (undefined) -> degradamos.
+        const soportaMultiOffset = Object.prototype.hasOwnProperty.call(c, 'recordatorios_enviados');
+        if (!soportaMultiOffset) {
+          // --- CAMINO CLASICO (byte-identico): 1 recordatorio dentro de las 24h, flag boolean ---
+          if (fhMs - ahoraMs > 24 * 60 * 60 * 1000) continue; // aun fuera de la ventana de 24h -> saltar
+          const claim = await supabase.from('citas').update({ recordatorio_enviado: true }).eq('id', c.id).eq('recordatorio_enviado', false).select('id');
+          if (!claim || !claim.data || claim.data.length === 0) continue;
+          await _enviarRecordatorioUno(c);
+          continue;
         }
-        if (c.asesor_id) { const { data: ase } = await supabase.from('asesores').select('auth_user_id').eq('id', c.asesor_id).maybeSingle(); if (ase && ase.auth_user_id) await enviarPushAsesor(ase.auth_user_id, 'Recordatorio de cita', '', (c.titulo || 'Cita') + ' — ' + cuando); }
+        // --- CAMINO MULTI-OFFSET (config por cuenta) ---
+        const offsets = await offsetsDe(c.user_id); // ej. [24, 1] (ordenado DESC)
+        if (!offsets || !offsets.length) { continue; }
+        // Offsets ya enviados (parseo defensivo del texto JSON guardado).
+        let yaEnviados = [];
+        try { const _p = c.recordatorios_enviados ? JSON.parse(c.recordatorios_enviados) : []; if (Array.isArray(_p)) yaEnviados = _p.map(Number).filter(function (n) { return isFinite(n); }); } catch (eP) {}
+        // Buscar el offset PENDIENTE cuya hora de disparo YA paso (fecha_hora - offset <= ahora). Enviamos de a
+        // uno por corrida (el cron corre cada 30 min); si hay varios vencidos, el mas lejano primero (offsets DESC).
+        let offsetADisparar = null;
+        for (let i = 0; i < offsets.length; i++) {
+          const off = offsets[i];
+          if (yaEnviados.indexOf(off) >= 0) continue;                 // ya se mando este offset
+          if (fhMs - off * 60 * 60 * 1000 <= ahoraMs) { offsetADisparar = off; break; } // vencido y pendiente
+        }
+        if (offsetADisparar == null) continue; // nada vencido todavia (o todo enviado)
+        // CLAIM optimista por-offset: escribir la nueva lista SOLO si el valor previo sigue igual (compare-and-set
+        // sobre recordatorios_enviados). Si otra corrida lo cambio en el medio, 0 filas -> saltar (no duplica).
+        const nuevaLista = yaEnviados.concat([offsetADisparar]);
+        const restantes = offsets.filter(function (o) { return nuevaLista.indexOf(o) < 0; });
+        const upd = { recordatorios_enviados: JSON.stringify(nuevaLista) };
+        // Solo cerramos el flag boolean clasico cuando NO quedan offsets pendientes (asi el cron deja de traer la cita).
+        if (restantes.length === 0) upd.recordatorio_enviado = true;
+        let claimQ = supabase.from('citas').update(upd).eq('id', c.id).eq('recordatorio_enviado', false);
+        // compare-and-set sobre el valor previo (maneja null y string por separado).
+        if (c.recordatorios_enviados == null) claimQ = claimQ.is('recordatorios_enviados', null);
+        else claimQ = claimQ.eq('recordatorios_enviados', c.recordatorios_enviados);
+        const claim = await claimQ.select('id');
+        if (!claim || !claim.data || claim.data.length === 0) continue; // lo tomo otra corrida
+        await _enviarRecordatorioUno(c);
       } catch (eC) { console.error('recordatorio cita:', eC && eC.message); }
     }
   } catch (e) { console.error('enviarRecordatoriosCitas:', e && e.message); }
@@ -10198,6 +10303,8 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
       if (_dups && _dups.length) return { ok: true, citaId: _dups[0].id, duplicada: true, fechaLegible: _formatearFechaCita(_fhISO) };
     } catch (eDup) {}
     // 4) Resolver departamento (por nombre -> id) si el agente lo paso. Best-effort; null = cualquier depto.
+    //    MEJORA #2: si el agente NO paso un hint, caemos al departamento de la CONVERSACION del lead para que
+    //    el aviso vaya al canal del depto que corresponde (no solo al canal "Todos"). Sigue siendo defensivo.
     let _deptoId = null;
     try {
       const _hint = (input && input.departamento) ? String(input.departamento).trim().toLowerCase() : '';
@@ -10206,6 +10313,7 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
         const _m = (_deps || []).find(function(d){ return d.nombre && String(d.nombre).trim().toLowerCase() === _hint; });
         if (_m) _deptoId = _m.id;
       }
+      if (!_deptoId) { try { _deptoId = await _avisoDeptoDeConv(ownerId, conversationId); } catch (eDc) {} }
     } catch (eDep) {}
     // 5) Tipo (clampeado a un set seguro; default 'reunion').
     const _TIPOS = ['visita', 'reunion', 'llamada', 'tasacion'];
@@ -14599,14 +14707,29 @@ app.get('/api/citas', async function(req, res) {
   try {
     var userId = await verificarUsuario(req);
     if (!userId) return res.status(401).json({ error: 'No autorizado' });
-    var ownerId = userId, soloAsesorId = null;
+    var ownerId = userId, soloAsesorId = null, esAdmin = true;
     var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
-    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; if (!esAdministrador(ase.data)) soloAsesorId = ase.data.id; }
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; esAdmin = esAdministrador(ase.data); if (!esAdmin) soloAsesorId = ase.data.id; }
     var q = supabase.from('citas').select('*').eq('user_id', ownerId).order('fecha_hora', { ascending: true });
     if (soloAsesorId) q = q.eq('asesor_id', soloAsesorId);
     var r = await q;
     if (r.error) return res.status(500).json({ error: r.error.message });
-    return res.json({ ok: true, citas: r.data || [], esDueno: !(ase && ase.data) });
+    var citas = r.data || [];
+    // MEJORA #4: adjuntar el NOMBRE del asesor DUEÑO (asesor_id) de cada cita para mostrarlo en la agenda.
+    // Best-effort: 1 sola query batcheada por los asesor_id distintos. Si falla, las citas van sin nombre
+    // (la agenda no rompe). Las citas de la IA sin dueño (asesor_id null) quedan con asesor_nombre null.
+    try {
+      var ids = [];
+      var vistos = {};
+      for (var i = 0; i < citas.length; i++) { var aid = citas[i] && citas[i].asesor_id; if (aid && !vistos[aid]) { vistos[aid] = true; ids.push(aid); } }
+      if (ids.length) {
+        var ra = await supabase.from('asesores').select('id, nombre').in('id', ids).eq('admin_id', ownerId);
+        var nombreDe = {};
+        (ra && ra.data ? ra.data : []).forEach(function(a){ if (a && a.id) nombreDe[a.id] = a.nombre || null; });
+        citas.forEach(function(c){ c.asesor_nombre = (c && c.asesor_id && nombreDe[c.asesor_id]) ? nombreDe[c.asesor_id] : null; });
+      }
+    } catch (eNom) { /* sin nombres; la agenda funciona igual */ }
+    return res.json({ ok: true, citas: citas, esDueno: !(ase && ase.data), esAdmin: esAdmin, miAsesorId: soloAsesorId });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/citas', async function(req, res) {
@@ -14644,6 +14767,10 @@ app.post('/api/citas', async function(req, res) {
     // post-insert: si la migracion de la columna aun no corrio, el update no-opea y la cita
     // YA quedo creada igual (no rompe). Las citas de la IA quedan con creado_por=null + origen='agente'.
     if (citaId) { try { await supabase.from('citas').update({ creado_por: userId }).eq('id', citaId); } catch (eCp) {} }
+    // MEJORA #4: `lugar` (texto libre de donde es la cita, cuando NO hay propiedad ligada). Best-effort
+    // post-insert por el MISMO motivo que creado_por: si la columna aun no existe, el update no-opea y la
+    // cita YA quedo creada. Solo se setea si vino con contenido (no pisa con vacio).
+    if (citaId && b.lugar && String(b.lugar).trim()) { try { await supabase.from('citas').update({ lugar: String(b.lugar).slice(0,300) }).eq('id', citaId); } catch (eLu) {} }
     // MOTOR DE TAREAS (cero IA): si es alquiler_temporal y tenemos check-out, generar las
     // tareas de limpieza pre/post y avisar al equipo. Best-effort: si falla, la cita YA
     // quedo creada (no se revierte) y no se devuelve error al usuario.
@@ -14684,6 +14811,9 @@ app.post('/api/citas/actualizar', async function(req, res) {
     if (b.fecha_fin) { var ff2 = new Date(b.fecha_fin); if (!isNaN(ff2.getTime())) upd.fecha_fin = ff2.toISOString(); }
     else if (b.fecha_fin === null) upd.fecha_fin = null;
     if (typeof b.unidad === 'string') upd.unidad = b.unidad.slice(0,120);
+    // MEJORA #4: `lugar` editable (texto libre). Va con el bloque de campos nuevos; si la columna aun no
+    // existe, el retry defensivo de abajo lo descarta (lugar no esta en la whitelist clasica) y no rompe.
+    if (typeof b.lugar === 'string') upd.lugar = b.lugar.slice(0,300);
     var TIPOS_UPD = ['visita','venta','tasacion','llamada','reunion','alquiler','alquiler_temporal','otro'];
     if (b.tipo && TIPOS_UPD.indexOf(b.tipo) >= 0) upd.tipo = b.tipo;
     if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
@@ -14750,11 +14880,12 @@ app.post('/api/citas/tomar', async function(req, res) {
     if (!citaId) return res.status(400).json({ error: 'Falta cita_id' });
     // Claim ATOMICO: solo si sigue tentativa (asesor_id IS NULL) Y agendada. .select() devuelve las filas
     // afectadas: si el UPDATE no toco ninguna, ya la tomo otro (o no existe / no es de este tenant) -> 409.
+    // Traemos tambien departamento_id/lead_nombre/fecha_hora para el AVISO al equipo (MEJORA #2).
     var upd = { asesor_id: claimAsesorId, estado: 'confirmada' };
     var q = supabase.from('citas').update(upd)
       .eq('id', citaId).eq('user_id', ownerId)
       .is('asesor_id', null).eq('estado', 'agendada')
-      .select('id');
+      .select('id, departamento_id, lead_nombre, fecha_hora');
     var r = await q;
     if (r.error) return res.status(500).json({ error: r.error.message });
     if (!r.data || !r.data.length) {
@@ -14765,6 +14896,23 @@ app.post('/api/citas/tomar', async function(req, res) {
     }
     // Traza de quien la tomo (best-effort; si la columna no existe, no-opea y la toma YA quedo firme).
     try { await supabase.from('citas').update({ creado_por: userId }).eq('id', citaId); } catch (eCp) {}
+    // MEJORA #2: ANUNCIAR quien la tomo al canal del DEPARTAMENTO correspondiente (0 IA, texto fijo).
+    // Best-effort, no bloquea la respuesta. Resuelve el nombre del que la tomo (asesor o dueño) y postea
+    // "X tomó la cita ..." al mismo canal donde se aviso la cita tentativa (depto + general de fallback).
+    try {
+      var _cTomada = r.data[0] || {};
+      var _quien = 'Alguien';
+      try {
+        if (claimAsesorId) { var _qa = await supabase.from('asesores').select('nombre').eq('id', claimAsesorId).eq('admin_id', ownerId).maybeSingle(); if (_qa && _qa.data && _qa.data.nombre) _quien = String(_qa.data.nombre).trim(); }
+        else { _quien = 'El dueño'; } // quien toma sin fila de asesor = el dueño de la cuenta
+      } catch (eQ) {}
+      var _leadTxt = (_cTomada.lead_nombre && String(_cTomada.lead_nombre).trim()) ? (' de ' + String(_cTomada.lead_nombre).trim()) : '';
+      var _fechaTxt = _cTomada.fecha_hora ? (' para ' + _formatearFechaCita(_cTomada.fecha_hora)) : '';
+      var _txtTomada = '✅ ' + _quien + ' tomó la cita' + _leadTxt + _fechaTxt + '.';
+      var _depTomada = _cTomada.departamento_id || null;
+      if (_depTomada) { try { await _postearAvisoInterno(ownerId, _depTomada, _txtTomada); } catch (eAvD) {} }
+      try { await _postearAvisoInterno(ownerId, 'general', _txtTomada); } catch (eAvG) {}
+    } catch (eAviso) { console.error('tomar cita aviso equipo:', eAviso && eAviso.message); }
     // FEATURE #21: reflejar en Google Calendar (best-effort, inerte sin Calendar conectado).
     try { syncCitaACalendar(ownerId, citaId).catch(function(e){ console.error('tomar cita syncCalendar:', e && e.message); }); } catch (eCal) {}
     return res.json({ ok: true, id: citaId });

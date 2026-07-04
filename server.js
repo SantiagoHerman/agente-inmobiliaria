@@ -3311,13 +3311,13 @@ async function enviarReaccionWA(instancia, key, emoji) {
   } catch (e) { console.error('enviarReaccionWA error:', e && e.message); return { ok: false }; }
 }
 
-// Edita el texto de un mensaje ya enviado. Evolution v2: POST /message/updateMessage.
+// Edita el texto de un mensaje ya enviado. Evolution v2: POST /chat/updateMessage (vive bajo /chat/, NO /message/).
 // key = { remoteJid, fromMe:true, id } (solo mensajes propios se pueden editar).
 async function editarMensajeWA(instancia, key, nuevoTexto) {
   try {
     if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('updateMessage: falta EVOLUTION_URL/KEY'); return { ok: false }; }
     if (!key || !key.remoteJid || !key.id) return { ok: false };
-    const resp = await fetch(EVOLUTION_URL + '/message/updateMessage/' + instancia, {
+    const resp = await fetch(EVOLUTION_URL + '/chat/updateMessage/' + instancia, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify({
@@ -3334,15 +3334,15 @@ async function editarMensajeWA(instancia, key, nuevoTexto) {
   } catch (e) { console.error('editarMensajeWA error:', e && e.message); return { ok: false }; }
 }
 
-// Borra un mensaje PARA TODOS. Evolution v2: DELETE /message/deleteMessageForEveryone.
-// key = { remoteJid, fromMe:true, id, participant? }.
+// Borra un mensaje PARA TODOS. Evolution v2: DELETE /chat/deleteMessageForEveryone (vive bajo /chat/, NO /message/).
+// Body PLANO: { id, remoteJid, fromMe:true, participant? } a nivel raiz (NO envuelto en 'key').
 async function borrarMensajeWA(instancia, key) {
   try {
     if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('deleteMessage: falta EVOLUTION_URL/KEY'); return { ok: false }; }
     if (!key || !key.remoteJid || !key.id) return { ok: false };
-    const keyBody = { remoteJid: key.remoteJid, fromMe: true, id: key.id };
+    const keyBody = { id: key.id, remoteJid: key.remoteJid, fromMe: true };
     if (key.participant) keyBody.participant = key.participant;
-    const resp = await fetch(EVOLUTION_URL + '/message/deleteMessageForEveryone/' + instancia, {
+    const resp = await fetch(EVOLUTION_URL + '/chat/deleteMessageForEveryone/' + instancia, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify(keyBody)

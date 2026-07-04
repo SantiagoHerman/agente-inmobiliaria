@@ -1471,6 +1471,29 @@ async function derivacionV3Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== DERIVACION v4: FLAG POR-CUENTA derivacion_v4 (mismo patron defensivo que derivacionV3Activo) =====
+// GATE del REDISENO de derivacion pedido por Diego: "CUALQUIER disparador de derivacion entra en ROTACION (la IA
+// sigue atendiendo), y el UNICO pase a listo_humano + IA off es que un ASESOR ESCRIBA". Con el flag OFF (default:
+// false / ausente / null / columna inexistente / cualquier error) el comportamiento es EXACTO al de hoy (post-hotfix
+// misruteo A+C+D): los triggers del webhook (handoff _pideHumano, confirmaciones, ia_fuera_alcance, clasificacion a
+// listo_humano, cambio de tema) siguen yendo a listo_humano como siempre, la inactividad NO barre rotando, y el cron
+// de cola escala a los 30 min como hoy. Con el flag ON: TODOS esos triggers RUTEAN A ROTACION (status='interesado',
+// ai_enabled=true, derivacion_rotando=true) reusando la maquinaria de derivacion_v3 (iniciarRotacionDerivacionV3 +
+// el cron revisarRotacionDerivacionV3 + "el que escribe = la señal"). REQUISITO OPERATIVO: v4 se apoya en la rotacion
+// de v3, asi que en una cuenta con v4 ON tambien debe estar derivacion_v3 ON (la tool + el cron de rotacion). El
+// codigo NO fuerza eso (cada gate es independiente y defensivo); es una condicion de configuracion. FAIL-SAFE: si la
+// columna todavia no existe en prod, el .select devuelve error -> tratamos como OFF. Reusa un bs ya cargado si trae
+// la propiedad (evita una query extra por mensaje). MISMO patron EXACTO que derivacionV3Activo.
+async function derivacionV4Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_v4')) return bs.derivacion_v4 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('derivacion_v4').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.derivacion_v4 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
 // ===== FEATURE #15: FLAG POR-CUENTA ia_agenda ("la IA agenda citas") =====
 // GATE del comportamiento NUEVO "la IA puede agendar citas tentativas". Con el flag OFF
 // (default: false / ausente / null / columna inexistente / cualquier error) -> comportamiento
@@ -3001,6 +3024,134 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     console.log('Derivacion v3: lead ' + convId + ' SIN asesor disponible -> queda rotando (IA sigue); el cron deriva al liberarse alguien');
     return { ok: true, asesorId: null, esperando: true };
   } catch (e) { console.error('iniciarRotacionDerivacionV3:', e && e.message); return { ok: false }; }
+}
+
+// ===== DERIVACION v4: RUTEAR A ROTACION EN VEZ DE listo_humano (gated derivacion_v4) =====
+// Punto de entrada UNICO que reemplaza, con v4 ON, a cada trigger que hoy pasa una conv a listo_humano+IA off desde
+// el webhook (handoff _pideHumano, confirmaciones, ia_fuera_alcance, clasificacion a listo_humano, cambio de tema).
+// En vez de derivarAHumano(setStatus:true), la conv ENTRA EN ROTACION reusando iniciarRotacionDerivacionV3: asigna un
+// usuario disponible del depto (o queda rotando sin nadie), MANTIENE status='interesado' + ai_enabled=TRUE (la IA
+// sigue atendiendo, tambien de noche), y el cron de rotacion (revisarRotacionDerivacionV3) rota/finaliza segun "el que
+// escribe = la señal". La UNICA salida a listo_humano queda: un ASESOR escribe (lo maneja _finalizarRotacionV3).
+//   - deptoHint: NOMBRE de depto (string) que manda sobre el depto de la conv (pivot). Opcional.
+//   - deptoId:   ID de depto ya resuelto. Si viene y no hay deptoHint, se persiste en la conv antes de rotar (para que
+//                iniciarRotacionDerivacionV3 lo tome como el depto de la conv). Opcional.
+//   - leadRef:   referencia del lead para los avisos (nombre/telefono). Opcional.
+// Reusa TODOS los guards internos de iniciarRotacionDerivacionV3 (no arranca si un humano ya intervino). 0 tokens de
+// IA (SQL + plantillas). Devuelve true si quedo rotando (o ya lo estaba). Defensivo: ante cualquier error devuelve
+// false y el llamador cae a su comportamiento previo. Con v4 OFF este helper NO se llama (los callers gatean antes).
+async function _v4RutearARotacion(convId, ownerId, opts) {
+  opts = opts || {};
+  try {
+    if (!convId || !ownerId) return false;
+    // Si ya esta rotando, no re-arrancar (idempotente): la rotacion en curso ya cumple el objetivo.
+    try {
+      const { data: _cvR } = await supabase.from('conversations').select('derivacion_rotando, asesor_id, admin_tomo, ai_enabled, status').eq('id', convId).maybeSingle();
+      if (_cvR && _cvR.derivacion_rotando === true) return true; // ya rotando
+      // No arrancar si un humano ya intervino o la conv ya cerro (mismos guards que el webhook v3).
+      if (_cvR && (_cvR.asesor_id || _cvR.admin_tomo === true || _cvR.ai_enabled === false)) return false;
+      if (_cvR && (_cvR.status === 'listo_humano' || _cvR.status === 'cerrado')) return false;
+    } catch (ePre) { /* defensivo: si no pudimos leer, iniciarRotacionDerivacionV3 revalida por dentro igual */ }
+    // Si nos pasaron un depto YA resuelto (id) y NO un hint por nombre, persistirlo en la conv para que la rotacion lo
+    // tome. Solo si difiere del actual. Best-effort (no romper si la columna departamento_manual no existe).
+    if (opts.deptoId && !opts.deptoHint) {
+      try {
+        const { data: _cvD } = await supabase.from('conversations').select('departamento_id').eq('id', convId).maybeSingle();
+        if (!_cvD || _cvD.departamento_id !== opts.deptoId) {
+          try { await supabase.from('conversations').update({ departamento_id: opts.deptoId, departamento_manual: false }).eq('id', convId); }
+          catch (eUpD) { try { await supabase.from('conversations').update({ departamento_id: opts.deptoId }).eq('id', convId); } catch (eUpD2) {} }
+        }
+      } catch (eDp) { /* no romper: la rotacion resuelve el depto igual (conv/default) */ }
+    }
+    const _rr = await iniciarRotacionDerivacionV3(convId, ownerId, {
+      deptoHint: opts.deptoHint || null,
+      // anunciarLead: por defecto false (el agente/flujo ya le mando su reply al lead; la rotacion solo asigna + notifica).
+      // Los callers que consumen el turno SIN respuesta previa de la IA (ej. PUNTO 2: el lead respondio "Ventas" a la
+      // pregunta de area, o pidio humano y hay 1 solo depto) pasan anunciarLead:true + instancia/telefono para que la
+      // rotacion le mande al lead el acuse fijo ("busco un asesor disponible...") -> 0 tokens, plantilla fija.
+      anunciarLead: !!opts.anunciarLead,
+      instancia: opts.instancia || null,
+      telefono: opts.telefono || null,
+      leadRef: opts.leadRef || null
+    });
+    return !!(_rr && _rr.ok);
+  } catch (e) { console.error('_v4RutearARotacion:', e && e.message); return false; }
+}
+
+// ===== DERIVACION v4 (PUNTO 2): PEDIDO EXPLICITO DE HUMANO -> PREGUNTAR EL DEPARTAMENTO =====
+// Con v4 ON, cuando el lead PIDE explicitamente un humano (_pideHumano), NO se deriva directo: la IA PREGUNTA con que
+// area/departamento quiere hablar y, con la respuesta, entra en ROTACION en ESE depto. Mecanismo (mismo patron 2-capas
+// que _confirmacionPendiente: Map en memoria + columna persistente derivacion_pregunta_depto). 0 tokens: la pregunta y
+// el match del depto por nombre son plantillas fijas + SQL (NO se llama a la IA). Si el negocio tiene <=1 depto (o no
+// pudimos listar) NO tiene sentido preguntar: se rutea directo a rotacion (deptoHint null -> depto de la conv/default).
+const _deptoPreguntaPendiente = new Map(); // convId -> true (hay una pregunta "que area?" pendiente en este proceso)
+
+// Devuelve true si hay una pregunta de depto pendiente para esta conv (Map en memoria + columna, defensivo).
+async function _hayPreguntaDeptoPendiente(convId) {
+  try {
+    if (!convId) return false;
+    if (_deptoPreguntaPendiente.has(convId)) return _deptoPreguntaPendiente.get(convId) === true;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('derivacion_pregunta_depto').eq('id', convId).maybeSingle();
+      if (_cv && _cv.derivacion_pregunta_depto === true) { _deptoPreguntaPendiente.set(convId, true); return true; }
+    } catch (eF) { /* columna ausente: solo cuenta el Map en memoria */ }
+    return false;
+  } catch (e) { return false; }
+}
+
+// Limpia la pregunta de depto pendiente (consumida o cancelada): Map + columna. Best-effort.
+async function _cerrarPreguntaDeptoPendiente(convId) {
+  try {
+    if (!convId) return;
+    _deptoPreguntaPendiente.delete(convId);
+    try { await supabase.from('conversations').update({ derivacion_pregunta_depto: false }).eq('id', convId); } catch (eMark) {}
+  } catch (e) {}
+}
+
+// Le PREGUNTA al lead con que departamento quiere hablar y deja la pregunta pendiente. Lista los departamentos ACTIVOS
+// del tenant (por nombre) para que el lead elija. Si hay <=1 depto -> NO pregunta: devuelve { pregunto:false } y el
+// caller rutea directo a rotacion. 0 tokens (plantilla fija). Devuelve { pregunto:true } si dejo la pregunta hecha.
+async function _preguntarDeptoDerivacionV4(convId, ownerId, telefono, instancia) {
+  try {
+    if (!convId || !ownerId) return { pregunto: false };
+    let _deps = [];
+    try { const { data: _dd } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true); _deps = (_dd || []).filter(function(d){ return d && d.nombre; }); } catch (eDep) { _deps = []; }
+    if (_deps.length <= 1) return { pregunto: false }; // 0 o 1 depto: no tiene sentido preguntar (rotar directo)
+    // Dedupe: si ya hay una pregunta pendiente, no re-preguntar (no spamear).
+    try { if (await _hayPreguntaDeptoPendiente(convId)) return { pregunto: true }; } catch (eP) {}
+    const _lista = _deps.map(function(d){ return d.nombre; }).join(', ');
+    const _texto = 'Claro, te paso con el equipo. ¿Con que area preferis hablar? Tenemos: ' + _lista + '. Decime cual y te derivo enseguida.';
+    if (telefono) { try { await enviarWhatsapp(instancia || nombreInstancia(ownerId), telefono, _texto); } catch (eWa) { console.error('pregunta depto v4 WhatsApp:', eWa && eWa.message); } }
+    try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'ai', content: _texto, enviado_por: 'Agente IA' }); } catch (eMsg) {}
+    try { await supabase.from('conversations').update({ last_message: _texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', convId); } catch (eLm) {}
+    _deptoPreguntaPendiente.set(convId, true);
+    try { await supabase.from('conversations').update({ derivacion_pregunta_depto: true }).eq('id', convId); } catch (eMark) { /* columna ausente: solo cuenta el Map */ }
+    return { pregunto: true };
+  } catch (e) { console.error('_preguntarDeptoDerivacionV4:', e && e.message); return { pregunto: false }; }
+}
+
+// El lead RESPONDIO a la pregunta "¿con que area?". Matchea su texto contra los nombres de departamento del tenant (sin
+// acentos/case, match por inclusion) SIN llamar a la IA. Devuelve el nombre EXACTO del depto elegido (para usar como
+// deptoHint) o null si no matcheo ninguno (ej. "cualquiera", "no se" -> rota en el default). 0 tokens (solo SQL+regex).
+async function _resolverDeptoRespuestaV4(ownerId, texto) {
+  try {
+    if (!ownerId) return null;
+    const _norm = function(s){ return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
+    const _t = _norm(texto);
+    if (!_t) return null;
+    let _deps = [];
+    try { const { data: _dd } = await supabase.from('departamentos').select('nombre').eq('user_id', ownerId).eq('activo', true); _deps = (_dd || []).filter(function(d){ return d && d.nombre; }); } catch (eDep) { _deps = []; }
+    // Match por inclusion (el lead puede escribir "ventas" o "quiero ventas" o "el area de ventas"). Anti-falso-positivo:
+    // la direccion _n.indexOf(_t) (nombre CONTIENE el texto del lead) solo cuenta si el texto del lead tiene >=3 chars,
+    // para que un "a"/"ok" suelto no matchee "Administracion". La direccion _t.indexOf(_n) (el lead nombro el depto
+    // completo) siempre vale. Ante empate, gana el primer depto de la lista (orden estable de la query).
+    for (var i = 0; i < _deps.length; i++) {
+      var _n = _norm(_deps[i].nombre);
+      if (!_n) continue;
+      if (_t === _n || _t.indexOf(_n) >= 0 || (_t.length >= 3 && _n.indexOf(_t) >= 0)) return _deps[i].nombre;
+    }
+    return null; // no matcheo: el caller rota en el depto de la conv / default (cualquiera/no se)
+  } catch (e) { return null; }
 }
 
 // FINALIZA la rotacion cuando un HUMANO escribio: status='listo_humano', ai_enabled=false (la IA se calla), limpia
@@ -5835,11 +5986,47 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           } catch (eRotCol) { _rot = null; } // columna ausente u otro error: tratar como NO rotando (comportamiento actual)
           if (_rot === true) { _enRotacion = await derivacionV3Activo(user_id); }
         } catch (eEnRot) { _enRotacion = false; } // ante cualquier fallo: NO rotando -> comportamiento actual
+        // DERIVACION v4 (gated derivacion_v4): flag por-cuenta leido UNA vez por mensaje. En este scope (webhook) NO hay
+        // un `settings` ya cargado -> derivacionV4Activo hace su propia query chica por user_id (defensiva: columna ausente
+        // -> false). Con OFF -> todo el rediseño v4 de abajo es no-op y el flujo es BYTE-IDENTICO al de hoy (post-hotfix).
+        let _v4On = false;
+        try { _v4On = await derivacionV4Activo(user_id); } catch (eV4) { _v4On = false; }
         {
+          // DERIVACION v4 (PUNTO 2, respuesta): si hay una PREGUNTA DE DEPARTAMENTO pendiente (la sembro un pedido
+          // explicito de humano previo), interpretamos ESTE mensaje como la eleccion de area SIN llamar a la IA: matcheamos
+          // el texto contra los nombres de depto (0 tokens). Con el depto elegido (o el default si no matcheo "cualquiera/
+          // no se"), entramos en ROTACION en ese depto. Va ANTES del handoff para no re-preguntar. Solo con v4 ON.
+          if (_v4On && !_enRotacion) {
+            let _preguntaPend = false;
+            try { _preguntaPend = await _hayPreguntaDeptoPendiente(_convId); } catch (ePq) { _preguntaPend = false; }
+            if (_preguntaPend) {
+              try {
+                const _deptoElegido = await _resolverDeptoRespuestaV4(user_id, texto); // nombre exacto o null (default)
+                await _cerrarPreguntaDeptoPendiente(_convId);
+                // anunciarLead:true -> el lead respondio y consumimos el turno sin reply de la IA: mandarle el acuse fijo.
+                await _v4RutearARotacion(_convId, user_id, { deptoHint: _deptoElegido || null, anunciarLead: true, instancia: instanciaNombre, telefono: telefono, leadRef: (data.pushName || telefono) || null });
+              } catch (eResp) { console.error('v4 respuesta depto:', eResp && eResp.message); }
+              return; // consumido: la IA sigue atendiendo (rotando); no generamos otra respuesta en este turno
+            }
+          }
           // HANDOFF LIMPIO: si el lead pide hablar con un humano, derivar YA con un mensaje claro y SIN gastar la
           // respuesta de la IA (ahorra tokens). Evita que el agente conteste algo fuera de tema antes de pasar al asesor.
           // FIX D: en rotacion NO tomamos este atajo (romperia la rotacion sacando la conv a listo_humano); la IA sigue.
           if (!_enRotacion && _pideHumano(texto)) {
+            // DERIVACION v4 (PUNTO 2): pedido EXPLICITO de humano -> NO derivar directo. La IA PREGUNTA con que area
+            // quiere hablar; con la respuesta (proximo mensaje, arriba) entra en ROTACION en ese depto. Si hay <=1 depto
+            // (nada que elegir) -> rotar directo. Con v4 OFF: comportamiento ACTUAL EXACTO (handoff a listo_humano abajo).
+            if (_v4On) {
+              try {
+                const _pr = await _preguntarDeptoDerivacionV4(_convId, user_id, telefono, instanciaNombre);
+                if (!_pr || !_pr.pregunto) {
+                  // No habia mas de un depto que ofrecer: rotar directo (sin pregunta), depto de la conv/default.
+                  // anunciarLead:true -> consumimos el turno sin reply de la IA: mandarle el acuse fijo al lead.
+                  await _v4RutearARotacion(_convId, user_id, { anunciarLead: true, instancia: instanciaNombre, telefono: telefono, leadRef: (data.pushName || telefono) || null });
+                }
+              } catch (eV4H) { console.error('v4 handoff pedido humano:', eV4H && eV4H.message); }
+              return; // la IA sigue atendiendo (pregunto o rota); no generamos otra respuesta en este turno
+            }
             const _msgHandoff = 'Dale, te paso con un compañero del equipo que te ayuda enseguida 🙌';
             try {
               await enviarWhatsapp(instanciaNombre, telefono, _msgHandoff);
@@ -5878,9 +6065,16 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               await cerrarConfirmacionDerivacion(_convId);
               // R4: depto fijado por la IA (confirmacion de derivacion) -> departamento_manual=false. DEFENSIVO/best-effort.
               try { await supabase.from('conversations').update({ departamento_id: _deptoConfPend, departamento_manual: false }).eq('id', _convId); } catch (eUp) { try { await supabase.from('conversations').update({ departamento_id: _deptoConfPend }).eq('id', _convId); } catch (eUp2) {} }
-              try {
-                await derivarAHumano(_convId, user_id, 'confirmacion_derivar', { setStatus: true, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
-              } catch (eDer) { console.error('confirmacion derivar:', eDer && eDer.message); }
+              // DERIVACION v4 (PUNTO 3): con v4 ON, NO pasar a listo_humano: entrar en ROTACION en el depto confirmado (la
+              // IA sigue). Con v4 OFF -> comportamiento ACTUAL EXACTO (derivarAHumano setStatus:true -> listo_humano + IA off).
+              if (_v4On) {
+                try { await _v4RutearARotacion(_convId, user_id, { deptoId: _deptoConfPend, leadRef: (data.pushName || telefono) || null }); }
+                catch (eV4C) { console.error('v4 confirmacion derivar:', eV4C && eV4C.message); }
+              } else {
+                try {
+                  await derivarAHumano(_convId, user_id, 'confirmacion_derivar', { setStatus: true, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
+                } catch (eDer) { console.error('confirmacion derivar:', eDer && eDer.message); }
+              }
               return; // consumido: no generar respuesta de IA
             }
             const _sNeg = String(texto || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
@@ -5981,10 +6175,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 const _deptoPend = await deptoConfirmacionPendiente(_convId);
                 if (_deptoPend && nuevoEstado === 'listo_humano') {
                   await cerrarConfirmacionDerivacion(_convId);
-                  await supabase.from('conversations').update({ departamento_id: _deptoPend, status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
-                  // R4: depto fijado por la IA -> departamento_manual=false. Write APARTE best-effort (no romper el update critico de arriba si la columna no existe).
-                  try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
-                  await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
+                  // DERIVACION v4 (PUNTO 3): con v4 ON, NO pasar a listo_humano/IA off: entrar en ROTACION en el depto pendiente
+                  // (la IA sigue). Con v4 OFF -> comportamiento ACTUAL EXACTO (listo_humano + IA off + derivarAHumano).
+                  if (_v4On) {
+                    // R4: depto fijado por la IA -> departamento_manual=false (lo persiste _v4RutearARotacion via deptoId).
+                    try { await _v4RutearARotacion(_convId, user_id, { deptoId: _deptoPend, leadRef: (data.pushName || telefono) || null }); }
+                    catch (eV4Fb) { console.error('v4 confirmacion fallback:', eV4Fb && eV4Fb.message); }
+                  } else {
+                    await supabase.from('conversations').update({ departamento_id: _deptoPend, status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
+                    // R4: depto fijado por la IA -> departamento_manual=false. Write APARTE best-effort (no romper el update critico de arriba si la columna no existe).
+                    try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
+                    await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
+                  }
                   _yaDerivoEnEsteMensaje = true;
                 }
               } catch (ePendFb) { console.error('confirmacion fallback:', ePendFb && ePendFb.message); }
@@ -6032,7 +6234,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     // (re-derivamos a otro depto) -> limpiar handoff_pendiente para no cortocircuitar una oferta REAL
                     // posterior. Write APARTE best-effort/defensivo (columna opcional).
                     try { await supabase.from('conversations').update({ handoff_pendiente: false }).eq('id', _convId); } catch (eHp) {}
-                    await derivarAHumano(_convId, user_id, 'cambio_tema_rederivar', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
+                    // DERIVACION v4 (PUNTO 3): con v4 ON, el cambio de tema RE-DERIVA a ROTACION en el nuevo depto (la IA
+                    // sigue), no a listo_humano. El depto nuevo y asesor_id=null ya se escribieron arriba; _v4RutearARotacion
+                    // lo toma y rota. Con v4 OFF -> comportamiento ACTUAL EXACTO (derivarAHumano setStatus:true -> listo_humano).
+                    if (_v4On) {
+                      try { await _v4RutearARotacion(_convId, user_id, { deptoId: _departamentoId, leadRef: (data.pushName || telefono) || null }); }
+                      catch (eV4T) { console.error('v4 cambio de tema:', eV4T && eV4T.message); }
+                    } else {
+                      await derivarAHumano(_convId, user_id, 'cambio_tema_rederivar', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
+                    }
                     _yaDerivoEnEsteMensaje = true;
                   }
                   _cambioTemaManejado = true;
@@ -6057,8 +6267,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             // de derivacion (intenta SIEMPRE derivar por los pasos logicos; el WhatsApp al gerente es la ultima instancia
             // dentro de derivarAHumano). Solo con reparto_v2 ON. Si no se manejo por cambio de tema y aun no derivamos.
             if (_repV2Cls && _fueraAlcance && !_yaDerivoEnEsteMensaje && estadoActual !== 'listo_humano') {
-              await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
-              await derivarAHumano(_convId, user_id, 'ia_fuera_alcance', { setStatus: false, push: true, pushTitulo: 'Lead fuera de alcance de la IA', pushTexto: (data.pushName || telefono), resumen: true });
+              // DERIVACION v4 (PUNTO 3): con v4 ON, "fuera de alcance" NO pasa a listo_humano/IA off: entra en ROTACION en
+              // el depto deducido (o conv/default) y la IA SIGUE atendiendo. Con v4 OFF -> comportamiento ACTUAL EXACTO.
+              if (_v4On) {
+                try { await _v4RutearARotacion(_convId, user_id, { deptoId: _departamentoId || null, leadRef: (data.pushName || telefono) || null }); }
+                catch (eV4Fa) { console.error('v4 fuera de alcance:', eV4Fa && eV4Fa.message); }
+              } else {
+                await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
+                await derivarAHumano(_convId, user_id, 'ia_fuera_alcance', { setStatus: false, push: true, pushTitulo: 'Lead fuera de alcance de la IA', pushTexto: (data.pushName || telefono), resumen: true });
+              }
               _yaDerivoEnEsteMensaje = true;
             }
 
@@ -6080,6 +6297,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 if (_confirmar) {
                   // Pedir confirmacion: NO subir status ni asignar asesor. La conv sigue en su estado actual con IA ON.
                   await pedirConfirmacionDerivacion(_convId, user_id, _departamentoId, telefono, instanciaNombre);
+                } else if (_v4On && nuevoEstado === 'listo_humano') {
+                  // DERIVACION v4 (PUNTO 3): la clasificacion subio a listo_humano, pero con v4 ON NO pasamos a listo_humano/
+                  // IA off: entramos en ROTACION en el depto deducido (o conv/default) y la IA SIGUE atendiendo. NO tocamos
+                  // status/ai_enabled aca (los deja en 'interesado'/IA on): _v4RutearARotacion los mantiene. Con v4 OFF esta
+                  // rama no se toma (cae al else de abajo = comportamiento ACTUAL EXACTO). CITAS igual (fire-and-forget).
+                  try { await _v4RutearARotacion(_convId, user_id, { deptoId: _departamentoId || null, leadRef: (data.pushName || telefono) || null }); }
+                  catch (eV4Cl) { console.error('v4 clasificacion listo_humano:', eV4Cl && eV4Cl.message); }
+                  _yaDerivoEnEsteMensaje = true;
+                  detectarYAgendarCita(user_id, _convId).catch(function(){});
                 } else {
                   // temp-decay (gated): este cambio de estado (p.ej. en_conversacion->interesado, que propondria 'tibio')
                   // NO debe ENFRIAR un lead que ya estaba caliente. Con flag ON aplica el maximo (solo sube); con flag OFF
@@ -7056,6 +7282,7 @@ async function revisarInactividad() {
     // _pausaCache = settings de pausa por cuenta (crm_pausado/agente_pausado) para R2 (evitar re-querear por conv).
     const _reglasCache = {};
     const _pausaCache = {};
+    const _v4Cache = {}; // DERIVACION v4: flag por cuenta (para el barrido de rotacion->recontacto a las 72hs, PUNTO 7).
     // Conversaciones activas que podrian estar inactivas
     // DERIVACION v3 (gated): traemos derivacion_rotando para EXCLUIR del barrido las convs en rotacion (la IA sigue
     // atendiendo a proposito; no deben caer a recontacto). DEFENSIVO: si la columna no existe (migracion no corrida),
@@ -7077,9 +7304,19 @@ async function revisarInactividad() {
     }
     if (!activas || activas.length === 0) return;
     for (const conv of activas) {
-      // DERIVACION v3 (gated): conv en ROTACION -> la IA sigue atendiendo hasta que un humano escriba; NO barrer a
-      // recontacto. Con la columna ausente, conv.derivacion_rotando es undefined -> no-op (comportamiento actual).
-      if (conv.derivacion_rotando === true) continue;
+      // DERIVACION v3/v4 (gated): conv en ROTACION.
+      //  - v3 (sin v4): la IA sigue atendiendo hasta que un humano escriba; NO barrer a recontacto (skip, como hoy).
+      //  - v4 (PUNTO 7): si el lead NO responde 72hs estando en rotacion -> SACARLO de rotacion a recontacto. NO se
+      //    saltea: se deja pasar por el chequeo de 72hs de abajo y, si califica, se limpia la rotacion en el mismo write.
+      // Con la columna ausente, conv.derivacion_rotando es undefined -> no-op (comportamiento actual). Fail-safe: si no
+      // pudimos leer el flag v4, tratamos como v3 (skip) para no cambiar el comportamiento de una cuenta sin v4.
+      if (conv.derivacion_rotando === true) {
+        let _v4EnCuenta = _v4Cache[conv.user_id];
+        if (_v4EnCuenta === undefined) { try { _v4EnCuenta = await derivacionV4Activo(conv.user_id); } catch (eV4c) { _v4EnCuenta = false; } _v4Cache[conv.user_id] = _v4EnCuenta; }
+        if (_v4EnCuenta !== true) continue; // v3 puro: no barrer rotando (comportamiento actual)
+        // v4 ON: seguir al chequeo de 72hs. Marcamos para limpiar la rotacion al pasar a recontacto.
+        conv.__v4RotandoBarrer = true;
+      }
       // === reglas_v2 (gated, default OFF): con el flag OFF nada de esto corre y el barrido es IDENTICO al actual. ===
       const _reglasOn = await _reglasRecontactoV2(conv.user_id, _reglasCache);
       if (_reglasOn) {
@@ -7131,6 +7368,10 @@ async function revisarInactividad() {
       // 48h->tibio, 168h->frio). Es el caso de Diego: "aparece un recontacto ... y estaba caliente, sigue en caliente".
       // Con flag OFF -> _tempConDecayParaConv devuelve 'frio' SIN query -> BYTE-IDENTICO a hoy.
       const _tempRecontacto = await _tempConDecayParaConv(conv.id, 'frio', conv.user_id);
+      // DERIVACION v4 (PUNTO 7): si esta conv estaba ROTANDO (v4) y cumplio 72hs de silencio -> LIMPIAR la rotacion
+      // ANTES de pasar a recontacto (derivacion_rotando=false + purga de marcadores) para que el cron de rotacion deje
+      // de tratarla. Best-effort/idempotente. Solo aplica si el guard de arriba la marco (v4 ON + estaba rotando).
+      if (conv.__v4RotandoBarrer) { try { await _limpiarRotacionV3(conv.id); } catch (eLimp) {} }
       if (_libreDeHumano) {
         // RACE #6 (anti-stale, PATRON CANONICO server.js:1866): el snapshot conv.asesor_id/admin_tomo se leyo arriba;
         // si entre esa lectura y este write un HUMANO tomo el lead (/api/whatsapp/send setea asesor_id/admin_tomo),
@@ -7299,12 +7540,24 @@ async function escalarLeadsEnColaVencidos() {
     const _flagCache = {};
     const _topeCache = {}; // FASE 2 (punto 4): cache del tope de espera por tenant.
     const _horarioCache = {}; // FIX (2): cache del horario_oficina por tenant (para diferir pases agendados off-hours).
+    const _v4Cache = {}; // DERIVACION v4 (PUNTO 8): flag por cuenta (para NO escalar por los 30 min con v4 ON).
     for (const conv of enCola) {
       if (_escaladoFallback.has(conv.id)) continue; // ya escalado en este proceso
       // DERIVACION v3 (gated): si por alguna via quedo rotando, NO escalar (la maneja el cron de rotacion).
       if (conv.derivacion_rotando === true) continue;
       const ownerId = conv.user_id;
       if (!ownerId) continue;
+      // DERIVACION v4 (PUNTO 8): con v4 ON, este cron NO debe escalar a Administracion por los 30 min. En v4 los leads
+      // NO viven en la cola listo_humano-sin-asesor: siguen ROTANDO con la IA prendida (tambien de noche), y el pase a
+      // Administracion lo decide la rotacion SOLO cuando el depto esta estructuralmente sin recibir (PUNTO 6). El
+      // respaldo por IA caida ya asigna asesor en el momento de la derivacion (ia_caida_proveedor -> derivarAHumano),
+      // asi que no depende de este cron. Por eso, con v4 ON, SALTEAMOS la escalada por tiempo (queda solo el flujo v4).
+      // Fail-safe: si no pudimos leer el flag v4, seguimos con el comportamiento reparto_v2 de hoy (no saltear).
+      {
+        let _v4EnCuenta = _v4Cache[ownerId];
+        if (_v4EnCuenta === undefined) { try { _v4EnCuenta = await derivacionV4Activo(ownerId); } catch (eV4c) { _v4EnCuenta = false; } _v4Cache[ownerId] = _v4EnCuenta; }
+        if (_v4EnCuenta === true) continue; // v4 ON: no escalar por los 30 min
+      }
       // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO escalar (comportamiento actual).
       if (!(ownerId in _flagCache)) _flagCache[ownerId] = await repartoV2Activo(ownerId);
       if (_flagCache[ownerId] !== true) continue;

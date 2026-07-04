@@ -4287,20 +4287,30 @@ async function traducir(texto, idiomaDestino, user_id) {
   } catch (e) { console.error('Error traduciendo:', e && e.message); return texto; }
 }
 
-// Detecta el idioma de un texto. Devuelve un codigo (es/en/pt/de/it/fr) o 'es' por defecto.
-async function detectarIdioma(texto, user_id) {
+// Decide en que idioma debe SEGUIR la conversacion. Recibe el idioma ACTUAL como CONTEXTO y es STICKY:
+// mantiene el actual salvo evidencia fuerte (>=3 palabras seguidas en otro idioma) o pedido EXPLICITO de cambiar.
+// Distingue PEDIR hablar EN un idioma (cambia) de MENCIONAR un idioma/moneda como tema (ej. "guaranies" = moneda de
+// Paraguay -> NO cambia a guarani). Ante duda/error MANTIENE el idioma actual (nunca resetea solo).
+async function detectarIdioma(texto, user_id, idiomaActual) {
+  const actual = (idiomaActual && String(idiomaActual).trim()) || 'es';
   try {
-    if (!texto || texto.trim().length < 2) return 'es';
+    if (!texto || texto.trim().length < 2) return actual;
+    // Mensaje de UNA sola palabra (saludo/interjeccion suelta) nunca cambia el idioma -> mantener actual (y ahorrar la llamada).
+    if (texto.trim().split(/\s+/).filter(Boolean).length < 2) return actual;
     const comp = await anthropic.messages.create({
       model: MODELO_INTERNO,
-      max_tokens: 10,
-      system: 'Detecta el idioma PRINCIPAL del texto del usuario, el idioma en el que esta escrito la mayor parte. Mira la ORACION completa, no palabras aisladas. Si el mensaje entero es un saludo o frase corta (ej. hi, hello, bonjour, hallo), ESE es el idioma. Solo si dentro de una oracion larga hay una palabra prestada de otro idioma, ignora esa palabra y usa el idioma dominante de la oracion. Responde SOLO con el codigo de dos letras del idioma (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl, u otro codigo ISO 639-1 si corresponde). Nada mas.',
+      max_tokens: 12,
+      system: 'El idioma ACTUAL de la conversacion es "' + actual + '". Decidi en que idioma debe SEGUIR la charla, mirando el SENTIDO del mensaje (no palabras sueltas). '
+        + 'Reglas: (1) Por defecto MANTENE "' + actual + '". '
+        + '(2) Cambia a otro idioma SOLO si: el mensaje esta escrito con AL MENOS 3 PALABRAS SEGUIDAS claramente en ese otro idioma (una frase real en ese idioma), O el usuario PIDE EXPLICITAMENTE que le hables en otro idioma (ej. "hablame en ingles", "can you speak in english?", "podes responder en portugues?"). '
+        + '(3) NO cambies por: una palabra suelta, saludo o interjeccion (hey, ok, hi, hello, bye, thanks, ciao); ni por MENCIONAR el nombre de un idioma como TEMA o como MONEDA. Ejemplos que NO son pedido de cambiar de idioma (segui en "' + actual + '"): "el precio es 500.000 guaranies" o "el guarani es la moneda de Paraguay" (guarani = moneda), "me gusta el frances" (comentario). Distingui PEDIR HABLAR EN un idioma (cambiar) de HABLAR SOBRE un idioma o moneda (no cambiar). '
+        + 'Responde SOLO con el codigo ISO 639-1 de 2 letras del idioma en que debe seguir la conversacion (es, en, pt, fr, it, de, nl, ru, zh, ja, ko, ar, hi, tr, pl). Nada mas.',
       messages: [ { role: 'user', content: texto } ]
     });
     try { if (user_id && comp && comp.usage) await registrarUsoTokens(user_id, comp.usage, 'detectar_idioma', PRECIO_HAIKU); } catch(e){} // M17: MODELO_INTERNO (Haiku) -> precio Haiku (antes logueaba a precio Sonnet, ~3x inflado)
-    const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : 'es';
-    return ['es','en','pt','fr','it','de','nl','ru','zh','ja','ko','ar','hi','tr','pl'].indexOf(out) >= 0 ? out : 'es';
-  } catch (e) { return 'es'; }
+    const out = (comp && comp.content && comp.content[0] && comp.content[0].text) ? comp.content[0].text.trim().toLowerCase().substring(0,2) : actual;
+    return ['es','en','pt','fr','it','de','nl','ru','zh','ja','ko','ar','hi','tr','pl'].indexOf(out) >= 0 ? out : actual;
+  } catch (e) { return actual; }
 }
 async function enviarWhatsapp(instancia, numero, texto, messageId) {
   async function registrar(estado, waId) { // estado: 'enviado'|'fallido'|'indeterminado'; waId: key.id de WhatsApp (para confirmar entrega via ack)
@@ -5214,19 +5224,27 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentLead = texto;
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
+    let _revertirIdiomaBase = false; // el lead retomo el idioma base con evidencia -> apagar traductor
     // Traducir SOLO texto/audio/imagen; NO traducir videos ni documentos.
     const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento');
     try {
       // El traductor es feature de plan (Pro+). El Basico NO traduce (se guarda el mensaje en su idioma original;
       // un humano lo atiende). El AUDIO en cambio NO se gatea (Groq, casi gratis) -> queda en todos los planes.
       if (!_noTraducir && await planPermite(user_id, 'audio_traduccion')) {
-        const idiomaDetectado = await detectarIdioma(texto, user_id);
+        // STICKY: le pasamos el idioma ACTUAL de la conversacion como contexto para NO cambiar sin necesidad.
+        const idiomaActual = (conv && conv.idioma_lead) || 'es';
+        const idiomaDetectado = await detectarIdioma(texto, user_id, idiomaActual);
         if (idiomaDetectado && idiomaDetectado !== 'es') {
           const trad = await traducir(texto, 'es', user_id);
           if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
           // recordar el idioma del lead en la conversacion para el traductor saliente
           await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
           if (conv) conv.idioma_lead = idiomaDetectado;
+        } else if (idiomaDetectado === 'es' && conv && conv.idioma_lead && conv.idioma_lead !== 'es') {
+          // El lead RETOMO el espanol con evidencia suficiente (>=3 palabras / pedido) -> volver al base y apagar el traductor.
+          _revertirIdiomaBase = true;
+          await supabase.from('conversations').update({ idioma_lead: 'es', traductor_activo: false }).eq('id', conv.id);
+          if (conv) { conv.idioma_lead = 'es'; conv.traductor_activo = false; }
         }
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
@@ -5237,9 +5255,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // el spread condicional (no se manda la columna) y todo funciona como hoy. El indice UNIQUE parcial de la migracion
     // hace que dos entregas concurrentes fallen atomicamente en la DB (el catch de abajo lo absorbe sin perder el flujo).
     await supabase.from('messages').insert(Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: contentLead, content_original: contentOrigLead, idioma: idiomaLeadMsg, media_url: mediaUrlLead, media_tipo: mediaTipoLead }, _waMsgId ? { wa_message_id: _waMsgId } : {}));
-    // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente
+    // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente; si retomo el base, apagarlo.
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
     if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
+    else if (_revertirIdiomaBase) { _updConv.idioma_lead = 'es'; _updConv.traductor_activo = false; }
     await supabase.from('conversations').update(_updConv).eq('id', conv.id);
 
     // === MEMORIA DEL LEAD: extraer datos (nombre/origen/interes/presupuesto) y guardarlos en contacts ===

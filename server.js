@@ -1489,6 +1489,25 @@ async function iaAgendaActivo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== DEPARTAMENTO DE MARKETING IA — FASE 0: FLAG POR-CUENTA marketing_ia =====
+// GATE de la feature NUEVA "generar contenido de marketing por texto" (endpoint
+// POST /api/marketing/generar). Con el flag OFF (default: false / ausente / null /
+// columna inexistente / cualquier error) el endpoint devuelve 403 y NO llama a
+// Claude -> comportamiento byte-identico y CERO gasto hasta que el dueno lo active
+// por cuenta. TRUE -> el endpoint puede generar (cobrando 1 mensaje IA por
+// generacion). FAIL-SAFE: si la columna aun no existe en prod, el .select devuelve
+// error -> tratamos como OFF. Reusa un bs ya cargado si trae la propiedad (evita
+// una query extra). MISMO patron EXACTO que derivacionV3Activo / iaAgendaActivo.
+async function marketingIaActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'marketing_ia')) return bs.marketing_ia === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('marketing_ia').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> feature OFF
+    return !!(data && data.marketing_ia === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
 // Minutos de espera por-cuenta antes de ROTAR al siguiente usuario disponible del depto (business_settings.
 // derivacion_espera_min). DEFAULT 10. Validado 1..240 (fuera de rango o ausente -> 10). Reusa un bs ya cargado si
 // lo trae. Ante cualquier error -> 10 (nunca romper). Solo se consulta cuando derivacion_v3 esta ON.

@@ -6405,6 +6405,65 @@ app.get('/api/estado-sistema', async (req, res) => {
   }
 });
 
+// ============================================================================
+// AVISO DEL MAESTRO -> banner (y modal si es critico) en TODOS los dashboards.
+// El Maestro publica un mensaje global; los clientes lo leen por polling en su
+// dashboard (GET /api/aviso-activo). Solo puede haber UN aviso activo a la vez:
+// al publicar uno nuevo se desactivan (activo=false) los anteriores. CERO IA,
+// CERO tokens. Tabla avisos_maestro (RLS enabled sin policies -> solo service
+// key). ADITIVO: no toca ningun otro flujo.
+// - POST   /api/maestro/aviso  -> SOLO Maestro. { mensaje, nivel } -> { ok, id }
+// - DELETE /api/maestro/aviso  -> SOLO Maestro. Desactiva el aviso activo -> { ok }
+// - GET    /api/aviso-activo   -> cualquier usuario logueado -> { aviso | null }
+// Gate del Maestro: MISMO que el resto de /api/maestro/* (maestroAuth +
+// requiereSeccion(req,'notificaciones'), la seccion mas cercana: broadcast de
+// avisos). Copiado tal cual de /api/maestro/notificaciones.
+// ============================================================================
+app.post('/api/maestro/aviso', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var mensaje = (req.body && req.body.mensaje != null) ? String(req.body.mensaje).slice(0, 2000).trim() : '';
+    if (!mensaje) return res.status(400).json({ error: 'El mensaje esta vacio' });
+    var nivel = (req.body && String(req.body.nivel || '').toLowerCase() === 'critico') ? 'critico' : 'normal';
+    // Desactiva TODO aviso activo previo (solo uno vigente a la vez).
+    var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true);
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo actualizar avisos previos: ' + up.error.message });
+    var ins = await supabase.from('avisos_maestro').insert({ mensaje: mensaje, nivel: nivel, activo: true }).select('id').maybeSingle();
+    if (!ins || ins.error || !ins.data) return res.status(503).json({ error: 'No se pudo publicar el aviso: ' + ((ins && ins.error && ins.error.message) || 'sin id') });
+    return res.json({ ok: true, id: ins.data.id });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+app.delete('/api/maestro/aviso', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true);
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo quitar el aviso: ' + up.error.message });
+    return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Cualquier usuario logueado (verificarUsuario -> 401 si no hay uid). Devuelve el
+// aviso activo MAS RECIENTE o null. No expone mas que mensaje/nivel/id. CERO tokens.
+app.get('/api/aviso-activo', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var r = await supabase.from('avisos_maestro')
+      .select('id, mensaje, nivel')
+      .eq('activo', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    // FAIL-SAFE: si la tabla no existe todavia (migracion sin correr) o cualquier
+    // error de lectura -> devolvemos aviso:null y NO rompemos el dashboard.
+    if (!r || r.error || !r.data) return res.json({ aviso: null });
+    return res.json({ aviso: { id: r.data.id, mensaje: r.data.mensaje, nivel: r.data.nivel } });
+  }catch(e){ return res.json({ aviso: null }); }
+});
+
 // ============ ASIGNACION / REASIGNACION MANUAL DE UN LEAD (RACE #3) ============
 // PROBLEMA QUE RESUELVE: antes el frontend (app/conversaciones/page.tsx ~asignarAsesor) escribia el asesor_id
 // DIRECTO a Supabase desde el cliente. Dos admins reasignando el MISMO lead casi a la vez = last-write-wins:

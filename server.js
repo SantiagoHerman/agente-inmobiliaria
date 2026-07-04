@@ -3330,8 +3330,8 @@ async function editarMensajeWA(instancia, key, nuevoTexto) {
     let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
     const ok = resp.ok || !!(body && body.key && body.key.id);
     if (!ok) console.error('updateMessage no aceptado:', resp.status, (bodyTxt || '').slice(0, 250));
-    return { ok: !!ok };
-  } catch (e) { console.error('editarMensajeWA error:', e && e.message); return { ok: false }; }
+    return { ok: !!ok, status: resp.status, detail: (bodyTxt || '').slice(0, 200) };
+  } catch (e) { console.error('editarMensajeWA error:', e && e.message); return { ok: false, detail: (e && e.message) || 'error' }; }
 }
 
 // Borra un mensaje PARA TODOS. Evolution v2: DELETE /chat/deleteMessageForEveryone (vive bajo /chat/, NO /message/).
@@ -6248,7 +6248,7 @@ app.post('/api/mensajes/editar', async (req, res) => {
     const remoteJid = String(contacto.phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
     const instancia = nombreInstancia(conv.user_id);
     const r = await editarMensajeWA(instancia, { remoteJid: remoteJid, fromMe: true, id: m.wa_message_id }, String(nuevo_texto));
-    if (!r.ok) return res.status(502).json({ error: 'No se pudo editar el mensaje en WhatsApp' });
+    if (!r.ok) return res.status(502).json({ error: 'No se pudo editar en WhatsApp' + (r.status ? (' [' + r.status + ']') : '') + (r.detail ? (': ' + r.detail) : '') });
     try { await supabase.from('messages').update({ content: String(nuevo_texto) }).eq('id', m.id); } catch (eUpd) { console.error('editar content:', eUpd && eUpd.message); }
     // Si es el ultimo mensaje, reflejar el nuevo texto en la preview de la conversacion.
     try { await supabase.from('conversations').update({ last_message: String(nuevo_texto), updated_at: new Date().toISOString() }).eq('id', m.conversation_id).eq('last_role', 'human'); } catch (eLm) {}

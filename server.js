@@ -6033,6 +6033,23 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       }
     } catch (ePush) { console.error('push asesor:', ePush && ePush.message); }
 
+    // PROMOCION DE CATEGORIA DE RECONTACTO (recontacto v2). OJO: recontacto_categoria NO es la temperatura/
+    // interes del lead (ese es otro campo, que NO se toca aca). recontacto_categoria solo indica, para el reparto
+    // del cupo anti-baneo, si el lead YA ESCRIBIO alguna vez ('viejo') o NUNCA ESCRIBIO ('frio'). Un lead que
+    // ingreso como 'frio' (nunca-escribio) y ahora RESPONDE por primera vez pasa a 'viejo' (ya-escribio) de forma
+    // PERMANENTE. Asi, si mas adelante vuelve a recontacto (se queda callado otra vez), entra en el cupo de los
+    // que-ya-escribieron (70%), no en el de nunca-escribio (30%) con el que ingreso al CRM.
+    // UPDATE CONDICIONAL por recontacto_categoria='frio': idempotente (una sola vez), no vuelve a 'frio', y no
+    // necesita leer antes. Escribe UNICAMENTE recontacto_categoria (nunca temperatura). Best-effort / defensivo:
+    // si la columna no existe (migracion no corrida) o falla, el catch lo traga y el webhook sigue igual. Con
+    // recontacto_v2 OFF esto no cambia ningun envio (la categoria solo la lee el motor v2) -> inocuo hoy.
+    try {
+      await supabase.from('conversations')
+        .update({ recontacto_categoria: 'viejo' }) // SOLO la categoria de recontacto; NO la temperatura/interes
+        .eq('id', conv.id)
+        .eq('recontacto_categoria', 'frio');
+    } catch (ePromo) { /* columna ausente / error -> no promociona, no rompe */ }
+
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos
     if (convExistente && convExistente.status === 'recontacto') {
@@ -7411,6 +7428,27 @@ app.get('/api/whatsapp/estado', async (req, res) => {
 // ============ CRON: pasar a Recontacto las conversaciones inactivas (3 dias sin respuesta) ============
 // ---- Helpers de recontacto ----
 
+// ---------------------------------------------------------------------------
+// DEFAULTS del recontacto v2 (decisiones del dueno). Se usan como fallback cuando
+// la columna correspondiente de business_settings viene null/ausente. Los mismos
+// valores son el DEFAULT de las columnas en la migracion (deben quedar en sync).
+// NOTA: la CATEGORIA de recontacto ('frio'/'viejo') indica SOLO si el lead NUNCA
+// escribio ('frio') o YA escribio alguna vez ('viejo'); NO es la temperatura/interes
+// del lead (ese es otro campo distinto que este motor no toca).
+//   - RECONTACTO_TOPE_MAX_DEFAULT: techo diario de envios por cuenta (cima de la rampa).
+//   - RECONTACTO_SUBCUPO_FRIO_DEFAULT: % del techo diario reservado/limitado para la
+//     categoria 'frio' (los que NUNCA escribieron). El resto (100-esto) queda para
+//     'viejo' (los que YA escribieron). Decision del dueno: 30% nunca-escribio / 70% ya-escribio.
+//   - RECONTACTO_SALTO_VIEJO_DIA_DEFAULT: dia de la rampa en el que ARRANCA un lead
+//     'viejo' (ya-escribio): empieza mas arriba que un 'frio' (nunca-escribio, arranca dia 1).
+//   - RECONTACTO_GRACIA_FRIO_HS / _VIEJO_HS: horas de gracia antes del 1er recontacto
+//     de un contacto nuevo (sin recontacto previo). 'frio' = 48hs (mas conservador).
+const RECONTACTO_TOPE_MAX_DEFAULT = 300;
+const RECONTACTO_SUBCUPO_FRIO_DEFAULT = 30;
+const RECONTACTO_SALTO_VIEJO_DIA_DEFAULT = 3;
+const RECONTACTO_GRACIA_FRIO_HS = 48;
+const RECONTACTO_GRACIA_VIEJO_HS = 24;
+
 // GATE recontacto_reglas_v2 (default OFF). Dos reglas de Diego (2026-07-02), ambas 0 IA:
 //   R1: la DERIVACION/asignacion MANUAL de un humano CANCELA el reloj de recontacto -> el lead se "congela"
 //       (recontacto_congelado=true) y NI el cron de inactividad (revisarInactividad) NI el sender de recontacto
@@ -7429,6 +7467,23 @@ async function _reglasRecontactoV2(uid, _cache) {
   } catch (eR) { on = false; } // fail-safe: sin columna / error -> OFF (comportamiento actual)
   if (_cache) _cache[uid] = on;
   return on;
+}
+
+// Dia de la rampa en el que ARRANCA un lead categoria 'viejo' (recontacto v2). Se lee
+// APARTE del select principal del motor (igual que _reglasRecontactoV2) para NO acoplar el
+// motor entero a esta columna: si la columna todavia no existe (migracion no corrida) el
+// select principal no se rompe y el motor sigue operando; aca degradamos al default.
+// Fail-safe: sin columna / error / valor invalido -> RECONTACTO_SALTO_VIEJO_DIA_DEFAULT.
+async function _saltoViejoDia(uid, _cache) {
+  if (!uid) return RECONTACTO_SALTO_VIEJO_DIA_DEFAULT;
+  if (_cache && Object.prototype.hasOwnProperty.call(_cache, uid)) return _cache[uid];
+  let dia = RECONTACTO_SALTO_VIEJO_DIA_DEFAULT;
+  try {
+    const { data: bsS } = await supabase.from('business_settings').select('recontacto_salto_viejo_dia').eq('user_id', uid).maybeSingle();
+    if (bsS && Number.isFinite(bsS.recontacto_salto_viejo_dia) && bsS.recontacto_salto_viejo_dia > 0) dia = Math.floor(bsS.recontacto_salto_viejo_dia);
+  } catch (eS) { dia = RECONTACTO_SALTO_VIEJO_DIA_DEFAULT; } // fail-safe: sin columna / error -> default
+  if (_cache) _cache[uid] = dia;
+  return dia;
 }
 
 // Devuelve true si en el instante `tsMs` (epoch ms) estamos dentro del horario de oficina del user.
@@ -8586,7 +8641,7 @@ async function enviarRecontactosPendientes() {
 // Rampa de warm-up: dado el dia de actividad devuelve el tope diario de envios.
 // dia1=40, dia2=60, dia3=90, dia4=130, dia5=180, dia6=240, dia7=300, dia8+=+25%/dia hasta topeMax.
 function _topeWarmup(diaActividad, topeMax) {
-  const TM = (Number.isFinite(topeMax) && topeMax > 0) ? topeMax : 400;
+  const TM = (Number.isFinite(topeMax) && topeMax > 0) ? topeMax : RECONTACTO_TOPE_MAX_DEFAULT;
   const d = (Number.isFinite(diaActividad) && diaActividad > 0) ? Math.floor(diaActividad) : 1;
   const base = [40, 60, 90, 130, 180, 240, 300]; // dia 1..7
   if (d <= 7) return Math.min(base[d - 1], TM);
@@ -8682,8 +8737,18 @@ async function _enviarRecontactosV2(ahoraMs) {
         enviadosHoy = 0;
         try { await supabase.from('business_settings').update({ recontacto_warmup_dia: warmupDia, recontacto_enviados_hoy: 0, recontacto_enviados_fecha: hoyStr }).eq('user_id', uid); } catch (eUp) { continue; }
       }
-      const topeMax = Number.isFinite(bs.recontacto_tope_max) ? bs.recontacto_tope_max : 400;
-      const topeDiario = _topeWarmup(warmupDia, topeMax);
+      const topeMax = Number.isFinite(bs.recontacto_tope_max) ? bs.recontacto_tope_max : RECONTACTO_TOPE_MAX_DEFAULT;
+      // Rampa BASE de la cuenta (segun su propio dia de warm-up). La usa el sub-cupo de FRIOS: un frio NUNCA
+      // se beneficia del salto -> la base fria queda acotada por la rampa real de la cuenta.
+      const topeDiarioBase = _topeWarmup(warmupDia, topeMax);
+      // SALTO del 'viejo' en la rampa (configurable): dia de warm-up en el que ARRANCA un lead 'viejo'. Un
+      // 'viejo' (categoria = YA ESCRIBIO alguna vez) puede empezar MAS ARRIBA en la rampa que un 'frio'
+      // (categoria = NUNCA ESCRIBIO, arranca dia 1). Se lee aparte (helper defensivo) para no acoplar el motor
+      // entero a la columna nueva. El PRESUPUESTO DIARIO de la cuenta usa esta rampa "boosteada" (max entre el
+      // dia real y el salto): asi los que-ya-escribieron pueden salir desde el arranque; el sub-cupo de los
+      // que-nunca-escribieron sigue atado a la rampa BASE (no sube por el salto).
+      const saltoViejoDia = await _saltoViejoDia(uid);
+      const topeDiario = _topeWarmup(Math.max(warmupDia, saltoViejoDia), topeMax);
       const cupoRestante = Math.max(0, topeDiario - enviadosHoy);
       if (cupoRestante <= 0) continue; // ya se cumplio el cupo del dia -> nada mas hoy
 
@@ -8701,8 +8766,10 @@ async function _enviarRecontactosV2(ahoraMs) {
       if (nReal <= 0) continue; // esta tanda no manda (goteo: es normal y deseado)
 
       // Sub-cupo de FRIOS: porcentaje del cupo DIARIO reservado/limitado para frios (anti-quema de base fria).
-      const subPct = Number.isFinite(bs.recontacto_subcupo_frio) ? bs.recontacto_subcupo_frio : 60;
-      const subcupoFriosDia = Math.max(0, Math.floor(topeDiario * Math.max(0, Math.min(100, subPct)) / 100));
+      // Decision del dueno: 30% para frios / 70% para 'viejo' (calientes que YA escribieron). Atado a la rampa
+      // BASE (topeDiarioBase), NO a la boosteada: el salto beneficia a los viejos, nunca a los frios.
+      const subPct = Number.isFinite(bs.recontacto_subcupo_frio) ? bs.recontacto_subcupo_frio : RECONTACTO_SUBCUPO_FRIO_DEFAULT;
+      const subcupoFriosDia = Math.max(0, Math.floor(topeDiarioBase * Math.max(0, Math.min(100, subPct)) / 100));
 
       // --- Candidatas de esta cuenta en estado recontacto ---
       const { data: convs } = await supabase
@@ -8728,10 +8795,23 @@ async function _enviarRecontactosV2(ahoraMs) {
         if (_reglasOnCuenta && conv.recontacto_congelado === true) continue;
         // Exclusiones / pausas por conversacion
         if (conv.recontacto_excluido === true || conv.recontacto_pausado_lead === true) continue;
-        // Maximo de recontactos por conversacion
+        // Maximo de recontactos por conversacion. Al AGOTARLO (decision del dueno): en vez de dejar el lead
+        // colgado en 'recontacto' (recontactado en vano cada dia), CERRAR la conversacion (status='cerrado')
+        // para que el motor deje de recontactarlo. Si el lead VUELVE A ESCRIBIR, el webhook la reactiva con la
+        // IA encendida (ver path "lead responde a un caso cerrado", ~server.js:6069). Best-effort: no rompe el
+        // loop si el update falla; solo se hace una vez (al pasar el umbral, la conv ya no vuelve por status).
         const maxRec = (conv.recontacto_max != null) ? conv.recontacto_max : 5;
         const countRec = conv.recontacto_count || 0;
-        if (countRec >= maxRec) continue;
+        if (countRec >= maxRec) {
+          try {
+            await supabase.from('conversations')
+              .update({ status: 'cerrado', updated_at: new Date().toISOString() })
+              .eq('id', conv.id)
+              .eq('status', 'recontacto'); // condicional: solo si sigue en recontacto (no pisa un cambio concurrente)
+            console.log('Recontacto v2: conv ' + conv.id + ' AGOTO recontacto_max (' + maxRec + ') -> status=cerrado (cuenta ' + uid + ')');
+          } catch (eClose) { console.error('recontacto v2 cerrar agotado conv ' + conv.id + ':', eClose && eClose.message); }
+          continue;
+        }
         // Categoria (default 'frio')
         const categoria = (conv.recontacto_categoria === 'viejo') ? 'viejo' : 'frio';
         // 1 recontacto por dia por conversacion (mismo registro que legacy: tabla recontactos)
@@ -8747,9 +8827,9 @@ async function _enviarRecontactosV2(ahoraMs) {
           const _freqDias = ({ semanal: 7, cada10: 10, cada15: 15, mensual: 30 })[conv.recontacto_frecuencia] || 7;
           if ((ahoraMs - new Date(ultimoRec.enviado_at).getTime()) < (_freqDias * UN_DIA_MS)) continue;
         }
-        // GRACIA a contactos nuevos (sin recontacto previo): 48hs para frios, 24hs para viejos.
+        // GRACIA a contactos nuevos (sin recontacto previo): 48hs para frios, 24hs para viejos (decision del dueno).
         if (!ultimoRec && conv.created_at) {
-          const graciaMs = (categoria === 'frio') ? (48 * 60 * 60 * 1000) : UN_DIA_MS;
+          const graciaMs = ((categoria === 'frio') ? RECONTACTO_GRACIA_FRIO_HS : RECONTACTO_GRACIA_VIEJO_HS) * 60 * 60 * 1000;
           if ((ahoraMs - new Date(conv.created_at).getTime()) < graciaMs) continue;
         }
         // Sub-cupo de frios (best-effort por tanda, proporcional a esta corrida): si ya superamos lo que

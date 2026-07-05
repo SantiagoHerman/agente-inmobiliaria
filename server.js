@@ -8782,6 +8782,44 @@ async function _enviarRecontactosV2(ahoraMs) {
       // R1 (gated, default OFF): resolver el flag reglas_v2 UNA vez por cuenta v2 (la cuenta ya esta cargada aca).
       const _reglasOnCuenta = await _reglasRecontactoV2(uid);
 
+      // --- ORDEN DE SELECCION DETERMINISTICO POR PRIORIDAD (cola rodante con backlog) ---
+      // Con backlog grande (ej. 3000 pendientes, capacidad ~300/dia) el ORDEN de a QUIEN elegir importa: el
+      // goteo aleatorio queda SOLO sobre CUANTOS por tanda (nReal, ya calculado), NUNCA sobre a quien. Prioridad:
+      //   (1) CATEGORIA: primero 'viejo' (ya-escribio, cupo 70%), despues 'frio' (nunca-escribio, sub-cupo 30%);
+      //   (2) DENTRO de cada categoria: OLDEST-DUE-FIRST = el que hace MAS tiempo que espera desde su ultimo
+      //       recontacto (o desde created_at si nunca tuvo uno) -> nadie se queda colgado.
+      // Para (2) necesitamos el ultimo recontacto de cada conv (vive en la tabla recontactos, no en conversations).
+      // Lo traemos en UNA sola query por cuenta (no 1 por conv) y armamos un mapa conv_id -> ultimo enviado_at.
+      // DEFENSIVO: si la query falla, el mapa queda vacio (todos caen a created_at) y el orden sigue siendo estable.
+      const _ultimoRecPorConv = {};
+      try {
+        const { data: _recAll } = await supabase
+          .from('recontactos')
+          .select('conversation_id, enviado_at')
+          .eq('user_id', uid)
+          .order('enviado_at', { ascending: false }); // el PRIMERO visto por conv = el mas reciente
+        if (Array.isArray(_recAll)) {
+          for (const _r of _recAll) {
+            if (!_r || _r.conversation_id == null) continue;
+            if (!(_r.conversation_id in _ultimoRecPorConv)) _ultimoRecPorConv[_r.conversation_id] = _r.enviado_at || null;
+          }
+        }
+      } catch (eRecAll) { /* defensivo: sin datos -> todos ordenan por created_at */ }
+      // "Due-since" = instante desde el que la conv esta ESPERANDO recontacto: su ultimo recontacto, o si nunca
+      // tuvo uno, su created_at (el nunca-contactado es el mas overdue). Menor timestamp = espera hace mas = va primero.
+      const _dueSinceMs = function(c) {
+        const _ur = _ultimoRecPorConv[c.id];
+        const _base = _ur || c.created_at || null;
+        const _t = _base ? new Date(_base).getTime() : 0;
+        return Number.isFinite(_t) ? _t : 0;
+      };
+      const _prioCat = function(c) { return ((c.recontacto_categoria === 'viejo') ? 0 : 1); }; // viejo antes que frio
+      convs.sort(function(a, b) {
+        const _pa = _prioCat(a), _pb = _prioCat(b);
+        if (_pa !== _pb) return _pa - _pb;                // 1) categoria: viejo (0) antes que frio (1)
+        return _dueSinceMs(a) - _dueSinceMs(b);           // 2) oldest-due-first (menor timestamp primero)
+      });
+
       const empresaRec = bs.company_name ? bs.company_name : '';
       const agentNameRec = bs.agent_name ? bs.agent_name : '';
       const inst = { instancia_nombre: nombreInstancia(uid) };
@@ -8814,21 +8852,17 @@ async function _enviarRecontactosV2(ahoraMs) {
         }
         // Categoria (default 'frio')
         const categoria = (conv.recontacto_categoria === 'viejo') ? 'viejo' : 'frio';
-        // 1 recontacto por dia por conversacion (mismo registro que legacy: tabla recontactos)
-        const { data: ultimoRec } = await supabase
-          .from('recontactos')
-          .select('enviado_at')
-          .eq('conversation_id', conv.id)
-          .order('enviado_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (ultimoRec && ultimoRec.enviado_at) {
+        // Ultimo recontacto de esta conv: lo tomamos del MAPA ya cargado arriba (1 query por cuenta), NO con una
+        // query por conv. Mismo dato que antes (enviado_at del ultimo recontacto, o null si nunca tuvo). Con el
+        // mapa vacio (query fallo) todos caen a "sin recontacto previo" = comportamiento conservador (respeta gracia).
+        const _ultimoEnviadoAt = _ultimoRecPorConv[conv.id] || null;
+        if (_ultimoEnviadoAt) {
           // Respeta la FRECUENCIA por-lead (semanal/cada10/cada15/mensual): no recontacta antes de ese gap (ademas del warm-up/goteo).
           const _freqDias = ({ semanal: 7, cada10: 10, cada15: 15, mensual: 30 })[conv.recontacto_frecuencia] || 7;
-          if ((ahoraMs - new Date(ultimoRec.enviado_at).getTime()) < (_freqDias * UN_DIA_MS)) continue;
+          if ((ahoraMs - new Date(_ultimoEnviadoAt).getTime()) < (_freqDias * UN_DIA_MS)) continue;
         }
         // GRACIA a contactos nuevos (sin recontacto previo): 48hs para frios, 24hs para viejos (decision del dueno).
-        if (!ultimoRec && conv.created_at) {
+        if (!_ultimoEnviadoAt && conv.created_at) {
           const graciaMs = ((categoria === 'frio') ? RECONTACTO_GRACIA_FRIO_HS : RECONTACTO_GRACIA_VIEJO_HS) * 60 * 60 * 1000;
           if ((ahoraMs - new Date(conv.created_at).getTime()) < graciaMs) continue;
         }

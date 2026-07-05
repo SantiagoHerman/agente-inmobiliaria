@@ -5763,6 +5763,38 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       } catch (eIdem) { /* defensivo: ante cualquier fallo del guard, seguimos con el flujo actual (no dedupe durable) */ }
     }
 
+    // === COMANDO "AGREGAR INSTRUCCION" POR WHATSAPP (solo el DUENO) ===
+    // Si el mensaje es texto, empieza con "agregar instruccion ..." Y viene del NUMERO DEL DUENO
+    // (business_settings.whatsapp_contacto, o el numero de reportes reportes_config.whatsapp), lo tratamos como COMANDO:
+    // append a la seccion CORRECCIONES IA del set ACTIVO + confirmacion corta. NO se trata como lead (no deriva, no
+    // gasta IA) ni como pedido de reporte. Cero tokens (parseo + append al jsonb). DEFENSIVO: cualquier fallo -> se
+    // sigue el flujo normal (no rompe el webhook). Si NO hay numero de dueno configurado, el comando por WA no aplica.
+    try {
+      const _instrWA = (!tipoMediaEntrante && texto) ? _parseComandoAgregarInstruccion(texto) : null;
+      if (_instrWA) {
+        const { data: _bsDueno } = await supabase.from('business_settings').select('whatsapp_contacto, reportes_config, crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
+        // Numeros del dueno a comparar (whatsapp_contacto = numero de avisos; reportes_config.whatsapp = numero de reportes).
+        const _numsDueno = [];
+        if (_bsDueno && _bsDueno.whatsapp_contacto) _numsDueno.push(String(_bsDueno.whatsapp_contacto).replace(/[^0-9]/g, ''));
+        if (_bsDueno && _bsDueno.reportes_config && _bsDueno.reportes_config.whatsapp) _numsDueno.push(String(_bsDueno.reportes_config.whatsapp).replace(/[^0-9]/g, ''));
+        const _numTel = String(telefono).replace(/[^0-9]/g, '');
+        // Match por los ultimos 8 digitos (mismo criterio que el canal de reportes -> evita lios de prefijos/0/15).
+        const _esDueno = _numTel.length >= 8 && _numsDueno.some(function(n){ return n && n.length >= 8 && n.slice(-8) === _numTel.slice(-8); });
+        if (_esDueno) {
+          // Pausa total del Maestro o cliente en papelera: no procesar (mismo criterio que el canal del dueno de reportes).
+          if (_bsDueno && (_bsDueno.crm_pausado === true || _bsDueno.eliminado_at)) return;
+          const _resAgrWA = await _agregarInstruccionCorreccion(user_id, _instrWA);
+          if (_resAgrWA && _resAgrWA.ok) {
+            await enviarWhatsapp(instanciaNombre, telefono, '✅ Agregué esa instrucción a ' + (_resAgrWA.nombre || 'Agente principal') + '.');
+          } else {
+            await enviarWhatsapp(instanciaNombre, telefono, 'No pude agregar la instrucción ahora. Probá de nuevo en un momento.');
+          }
+          return; // el numero del dueno con el comando NO es un lead: cortamos el flujo aca.
+        }
+        // No es el dueno (o no hay numero configurado): NO es comando -> sigue el flujo normal (se trata como lead).
+      }
+    } catch (eCmdWA) { console.error('comando agregar-instruccion (whatsapp):', eCmdWA && eCmdWA.message); }
+
     // === REPORTE AL ADMIN: si quien escribe es el numero de reportes del dueno y pide reporte ===
     try {
       const { data: bsRep } = await supabase.from('business_settings').select('reportes_config, crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
@@ -10175,6 +10207,88 @@ app.post('/api/instrucciones-perfiles', async function(req, res) {
 });
 
 // ============ APRENDIZAJE IA (APRENDIZAJE_V2) ============
+// COMANDO "AGREGAR INSTRUCCION" — el DUENO agrega una instruccion a la IA escribiendo un mensaje que empieza con
+// "agregar instruccion[:] ..." (por la ventana de prueba o por WhatsApp desde su numero). Es ADITIVO y reusa el MISMO
+// mecanismo que la ventana de correccion: se guarda como item { categoria:'correccion' } (la seccion "CORRECCIONES IA")
+// en el set de instrucciones ACTIVO del tenant. El EFECTO en el prompt sigue gateado por aprendizaje_v2 (igual que
+// /api/agente/correccion). Parseo + append al jsonb: NO llama a Claude (cero tokens).
+//
+// _parseComandoAgregarInstruccion(texto) -> string|null. Devuelve el TEXTO de la instruccion si el mensaje empieza con
+// el comando (contempla variantes: "agregar instruccion", "agrega/agregá/agregame instruccion/instrucción", con/sin
+// dos puntos, con/sin acentos/mayusculas). Si no matchea el comando -> null (el flujo normal sigue). DEFENSIVO: nunca lanza.
+function _parseComandoAgregarInstruccion(texto) {
+  try {
+    if (!texto || typeof texto !== 'string') return null;
+    const t = texto.trim();
+    if (!t) return null;
+    // Normalizamos SOLO para detectar el prefijo (minusculas + sin acentos). El TEXTO de la instruccion se extrae del
+    // ORIGINAL (con sus acentos/mayusculas) para no degradar lo que el dueno escribio.
+    const _norm = t.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+    // "agregar/agrega/agregame/agregar la ... instruccion[es]" + opcional ":" y espacio.
+    const re = /^\s*agreg(?:ar|a|ame|á)?\s+(?:una?\s+|la\s+|esta\s+)?instruccion(?:es)?\s*:?\s*/i;
+    const m = _norm.match(re);
+    if (!m) return null;
+    // Extraer del ORIGINAL cortando la MISMA cantidad de caracteres que consumio el prefijo en el normalizado
+    // (NFD no cambia la longitud de las letras latinas base; los acentos se descomponen pero eran combinantes que
+    // no existian en el original salvo como parte de la letra -> para el prefijo ASCII "agregar instruccion" las
+    // longitudes coinciden). Para robustez, re-matcheamos el prefijo sobre el original de forma tolerante a acentos.
+    const reOrig = /^\s*agreg(?:ar|a|ame|á)?\s+(?:una?\s+|la\s+|esta\s+)?instrucci[oó]n(?:es)?\s*:?\s*/i;
+    let instruccion = t.replace(reOrig, '');
+    // Fallback: si por algun caso el replace sobre el original no recorto (variante de acento no cubierta), usar el
+    // largo consumido en el normalizado como corte por indice.
+    if (instruccion === t) instruccion = t.slice(m[0].length);
+    instruccion = String(instruccion || '').trim();
+    return instruccion || null; // "agregar instruccion" sin texto -> null (no hay nada que agregar)
+  } catch (e) { return null; }
+}
+
+// _agregarInstruccionCorreccion(ownerId, textoInstruccion) — APPEND ADITIVO de un item { categoria:'correccion' } al
+// set de instrucciones ACTIVO del tenant: el PERFIL ACTIVO (perfil_activo_id) si hay uno, o la Default
+// (business_settings.instrucciones_agente) si no. SCOPED al set activo (decision de Diego). NO borra ni pisa items.
+// Devuelve { ok:true, destino:'perfil'|'default', nombre } o { ok:false, error }. DEFENSIVO: ante cualquier fallo de
+// schema/DB devuelve ok:false SIN lanzar (el caller decide si sigue el flujo normal). Reusa instruccionesAgenteItems
+// para sembrar el set completo (mismas protegidas garantizadas) igual que /api/agente/correccion.
+async function _agregarInstruccionCorreccion(ownerId, textoInstruccion) {
+  try {
+    const correccion = String(textoInstruccion || '').trim().slice(0, 4000);
+    if (!ownerId || !correccion) return { ok: false, error: 'faltan datos' };
+    const r = await supabase.from('business_settings').select('rubro, instructions, instrucciones_agente, instruccion_perfiles, perfil_activo_id').eq('user_id', ownerId).maybeSingle();
+    if (r.error) return { ok: false, error: 'schema (¿falta migrar instrucciones_agente?): ' + (r.error.message || '') };
+    const bs = r.data || {};
+    const rubro = (bs && bs.rubro) || 'inmobiliaria';
+    const nuevoItem = { id: 'corr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), categoria: 'correccion', texto: correccion, activo: true, es_sistema: false, orden: 300 };
+
+    // Set ACTIVO = perfil activo (si existe en instruccion_perfiles) o Default.
+    let arrPerfiles = (bs && Array.isArray(bs.instruccion_perfiles)) ? bs.instruccion_perfiles.slice() : [];
+    const activoId = (bs && bs.perfil_activo_id) ? String(bs.perfil_activo_id) : null;
+    const idxPerfil = activoId ? arrPerfiles.findIndex(function(p){ return p && String(p.id) === activoId; }) : -1;
+
+    if (activoId && idxPerfil >= 0) {
+      const _backupPerfil = JSON.stringify(arrPerfiles[idxPerfil] || {});
+      const p = arrPerfiles[idxPerfil];
+      const itemsPrev = Array.isArray(p.items) ? p.items.slice() : [];
+      itemsPrev.push(nuevoItem);
+      arrPerfiles[idxPerfil] = { id: String(p.id), nombre: String(p.nombre || 'Perfil'), items: itemsPrev, updated_at: new Date().toISOString() };
+      const { error } = await supabase.from('business_settings').update({ instruccion_perfiles: arrPerfiles }).eq('user_id', ownerId);
+      if (error) { console.error('agregar-instruccion perfil (backup previo): ' + _backupPerfil); return { ok: false, error: (error.message || 'error de esquema') }; }
+      return { ok: true, destino: 'perfil', nombre: String(p.nombre || 'Perfil') };
+    }
+
+    // -> Default ("Agente principal"). Sembramos el set DEFAULT completo (sin perfil_activo_id/perfiles para que
+    //    instruccionesAgenteItems resuelva la Default y no contamine con items de un perfil) y agregamos la instruccion.
+    const _backupDefault = (bs && bs.instrucciones_agente) ? JSON.stringify(bs.instrucciones_agente) : 'null';
+    const _bsDefault = { instrucciones_agente: (bs && bs.instrucciones_agente) || null, instructions: (bs && bs.instructions) || '' };
+    const itemsActuales = instruccionesAgenteItems(_bsDefault, rubro).map(function(it){
+      return { id: it.id, categoria: it.categoria, texto: it.texto, activo: it.activo !== false, es_sistema: !!it.es_sistema, orden: (typeof it.orden === 'number') ? it.orden : 0 };
+    });
+    itemsActuales.push(nuevoItem);
+    const payload = { items: itemsActuales, updated_at: new Date().toISOString() };
+    const { error } = await supabase.from('business_settings').update({ instrucciones_agente: payload }).eq('user_id', ownerId);
+    if (error) { console.error('agregar-instruccion default (backup previo): ' + _backupDefault); return { ok: false, error: (error.message || 'error de esquema') }; }
+    return { ok: true, destino: 'default', nombre: 'Agente principal' };
+  } catch (e) { return { ok: false, error: (e && e.message) || 'error' }; }
+}
+
 // LOOP 1 — CORRECCIONES EN LA VENTANA DE PRUEBA. Cuando el dueno corrige a la IA ("no se dice asi, se dice asi"),
 // esa correccion se guarda como un item de instruccion { categoria:'correccion', ... } en el set de instrucciones
 // ACTIVO cuando ocurrio (la Default o el PERFIL indicado por perfil_id), NUNCA siempre la Default.
@@ -15649,6 +15763,23 @@ app.post('/api/probar-agente', async function(req, res) {
     var message = (req.body && req.body.message) ? String(req.body.message) : '';
     var historial = (req.body && Array.isArray(req.body.historial)) ? req.body.historial : [];
     if (!message.trim()) return res.status(400).json({ error: 'Mensaje vacio' });
+    // COMANDO "AGREGAR INSTRUCCION" (ventana de prueba = el dueno siempre): si el mensaje empieza con el comando, lo
+    // procesamos como append a la seccion CORRECCIONES IA del set ACTIVO y respondemos una confirmacion corta SIN
+    // llamar a la IA (cero tokens). DEFENSIVO: si el parse no matchea o el append falla por schema, seguimos el flujo
+    // normal (probar la IA como siempre) para no romper la ventana de prueba.
+    try {
+      var _instrPrueba = _parseComandoAgregarInstruccion(message);
+      if (_instrPrueba) {
+        // El que prueba puede ser el dueno o un asesor con acceso al panel: resolvemos el OWNER para escribir en el tenant.
+        var _identPrueba = await _equipoIdentidad(req);
+        var _ownerPrueba = (_identPrueba && _identPrueba.ownerId) ? _identPrueba.ownerId : user_id;
+        var _resAgr = await _agregarInstruccionCorreccion(_ownerPrueba, _instrPrueba);
+        if (_resAgr && _resAgr.ok) {
+          return res.json({ ok: true, reply: '✅ Agregué esa instrucción a ' + (_resAgr.nombre || 'Agente principal') + '.' });
+        }
+        // Si el append fallo (p.ej. falta migrar), NO rompemos: caemos al flujo normal de la IA de abajo.
+      }
+    } catch (eCmdPrueba) { console.error('comando agregar-instruccion (prueba):', eCmdPrueba && eCmdPrueba.message); }
     var r = await generarRespuestaAgente(user_id, null, message, { modoPrueba: true, historialManual: historial });
     return res.json({ ok: true, reply: r.reply });
   } catch (e) { console.error('Error probar-agente:', e); return res.status(500).json({ error: e && e.message }); }

@@ -191,23 +191,21 @@ function _estaMirando(authUserId, convId) {
   return (Date.now() - p.ts) < _presenciaTTL;
 }
 
-// RE-ENTRADA (anti-spam de notificaciones): ¿el lead "volvió a escribir" tras >= 20 min de silencio? Se usa para
-// NO mandar un push por CADA mensaje del lead (30 notis por 3 leads = estresante). Solo se avisa cuando el lead
-// reaparece tras un rato callado; si viene charlando seguido, no se re-notifica (el asesor ya sabe que está activo).
-// La ASIGNACIÓN inicial se avisa aparte (_notificarRotacionV3). El push va a la app Y al WhatsApp (el espejo está
-// dentro de enviarPushAsesor) => un solo aviso a los dos lados. Compara los 2 últimos mensajes del lead (role=
-// 'contact'). Fail-open (ante error / primer mensaje => true = notificar). CERO IA, 1 SELECT liviano.
-const _reentradaMs = 20 * 60 * 1000; // 20 min de silencio para considerarlo re-entrada
-async function _esReentradaLead(convId) {
-  try {
-    if (!convId) return true;
-    const { data } = await supabase.from('messages')
-      .select('created_at').eq('conversation_id', convId).eq('role', 'contact')
-      .order('created_at', { ascending: false }).limit(2);
-    if (!data || data.length < 2) return true; // primer (o único) mensaje del lead => notificar
-    const gap = new Date(data[0].created_at).getTime() - new Date(data[1].created_at).getTime();
-    return gap >= _reentradaMs;
-  } catch (e) { return true; } // fail-open: ante duda, notificar
+// ANTI-SPAM de notificaciones (estilo WhatsApp): NO mandar un push por CADA mensaje del lead (30 notis por 3 leads
+// = estresante). Combinado con la PRESENCIA (si el asesor está MIRANDO esa conversación, ni se llama a esto), esto
+// agrega un DEBOUNCE por conversación: como MÁXIMO 1 push cada 20 min. Así, si el asesor NO está mirando y el lead
+// manda una ráfaga de 20 mensajes, le llega UN aviso, no 20; y si el lead reaparece tras un rato, le llega otro.
+// Solo cuenta el tiempo cuando SE MANDA un push (si la presencia lo silenció, no consume la ventana → apenas el
+// asesor se va, el próximo mensaje avisa). Estado en memoria (se pierde al reiniciar → fail-open: notifica de más,
+// nunca de menos). Asume 1 instancia de backend. CERO IA, CERO DB.
+const _pushDebounceMs = 20 * 60 * 1000; // máx 1 push por conversación cada 20 min
+const _ultimoPushLead = new Map(); // convId -> ts del último push efectivamente enviado
+function _debePushearLead(convId) {
+  if (!convId) return true;
+  const key = String(convId);
+  const last = _ultimoPushLead.get(key) || 0;
+  if (Date.now() - last >= _pushDebounceMs) { _ultimoPushLead.set(key, Date.now()); return true; }
+  return false;
 }
 
 // Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
@@ -5951,8 +5949,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const _asesorRowId = conv.asesor_id || (convExistente && convExistente.asesor_id) || null;
           if (_asesorRowId) {
             const { data: _ase } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesorRowId).maybeSingle();
-            // ANTI-SPAM: igual que el push normal, solo notificar en la RE-ENTRADA (>= 20 min de silencio), no cada mensaje.
-            if (_ase && _ase.auth_user_id && await _esReentradaLead(conv.id)) { await enviarPushAsesor(_ase.auth_user_id, _pushName, texto); }
+            // ANTI-SPAM (debounce): igual que el push normal, máx 1 aviso por conversación cada 20 min, no cada mensaje.
+            if (_ase && _ase.auth_user_id && _debePushearLead(conv.id)) { await enviarPushAsesor(_ase.auth_user_id, _pushName, texto); }
           }
         } catch (ePush) { console.error('push asesor (pausa total):', ePush && ePush.message); }
       }
@@ -6095,9 +6093,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               _omitirPush = !!(_bsPres && _bsPres.notif_presencia === true);
             } catch (eFlag) { _omitirPush = false; }
           }
-          // ANTI-SPAM: solo notificar si el lead RE-ENTRA tras >= 20 min de silencio (no 1 push por cada mensaje).
-          // Va a la app y al WhatsApp (espejo dentro de enviarPushAsesor) => un solo aviso a los dos lados.
-          if (!_omitirPush && await _esReentradaLead(conv.id)) await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
+          // ANTI-SPAM (debounce): si el asesor NO está mirando (presencia), máx 1 push por conversación cada 20 min
+          // (una ráfaga de mensajes = 1 aviso). Va a la app y al WhatsApp (espejo dentro de enviarPushAsesor).
+          if (!_omitirPush && _debePushearLead(conv.id)) await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
         }
       }
     } catch (ePush) { console.error('push asesor:', ePush && ePush.message); }

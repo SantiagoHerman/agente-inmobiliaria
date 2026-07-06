@@ -191,6 +191,25 @@ function _estaMirando(authUserId, convId) {
   return (Date.now() - p.ts) < _presenciaTTL;
 }
 
+// RE-ENTRADA (anti-spam de notificaciones): ¿el lead "volvió a escribir" tras >= 20 min de silencio? Se usa para
+// NO mandar un push por CADA mensaje del lead (30 notis por 3 leads = estresante). Solo se avisa cuando el lead
+// reaparece tras un rato callado; si viene charlando seguido, no se re-notifica (el asesor ya sabe que está activo).
+// La ASIGNACIÓN inicial se avisa aparte (_notificarRotacionV3). El push va a la app Y al WhatsApp (el espejo está
+// dentro de enviarPushAsesor) => un solo aviso a los dos lados. Compara los 2 últimos mensajes del lead (role=
+// 'contact'). Fail-open (ante error / primer mensaje => true = notificar). CERO IA, 1 SELECT liviano.
+const _reentradaMs = 20 * 60 * 1000; // 20 min de silencio para considerarlo re-entrada
+async function _esReentradaLead(convId) {
+  try {
+    if (!convId) return true;
+    const { data } = await supabase.from('messages')
+      .select('created_at').eq('conversation_id', convId).eq('role', 'contact')
+      .order('created_at', { ascending: false }).limit(2);
+    if (!data || data.length < 2) return true; // primer (o único) mensaje del lead => notificar
+    const gap = new Date(data[0].created_at).getTime() - new Date(data[1].created_at).getTime();
+    return gap >= _reentradaMs;
+  } catch (e) { return true; } // fail-open: ante duda, notificar
+}
+
 // Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
 async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
   try {
@@ -5932,7 +5951,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const _asesorRowId = conv.asesor_id || (convExistente && convExistente.asesor_id) || null;
           if (_asesorRowId) {
             const { data: _ase } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesorRowId).maybeSingle();
-            if (_ase && _ase.auth_user_id) { await enviarPushAsesor(_ase.auth_user_id, _pushName, texto); }
+            // ANTI-SPAM: igual que el push normal, solo notificar en la RE-ENTRADA (>= 20 min de silencio), no cada mensaje.
+            if (_ase && _ase.auth_user_id && await _esReentradaLead(conv.id)) { await enviarPushAsesor(_ase.auth_user_id, _pushName, texto); }
           }
         } catch (ePush) { console.error('push asesor (pausa total):', ePush && ePush.message); }
       }
@@ -6075,7 +6095,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               _omitirPush = !!(_bsPres && _bsPres.notif_presencia === true);
             } catch (eFlag) { _omitirPush = false; }
           }
-          if (!_omitirPush) await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
+          // ANTI-SPAM: solo notificar si el lead RE-ENTRA tras >= 20 min de silencio (no 1 push por cada mensaje).
+          // Va a la app y al WhatsApp (espejo dentro de enviarPushAsesor) => un solo aviso a los dos lados.
+          if (!_omitirPush && await _esReentradaLead(conv.id)) await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
         }
       }
     } catch (ePush) { console.error('push asesor:', ePush && ePush.message); }
@@ -7296,6 +7318,24 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
         mensajeSistema = evt || null;
       }
     } catch (eHist) {}
+
+    // PUSH al asesor RECIÉN ASIGNADO cuando un USUARIO asigna/reasigna a mano (la asignación por IA ya avisa en
+    // _notificarRotacionV3). Va a la app Y al WhatsApp (el espejo está dentro de enviarPushAsesor) => un solo aviso.
+    // NO se throttlea (la asignación es un evento único, no un mensaje). Solo si cambió a un asesor HUMANO real.
+    try {
+      if (val && val !== asePrev) {
+        const { data: _aseDest } = await supabase.from('asesores').select('auth_user_id, es_ia').eq('id', val).maybeSingle();
+        if (_aseDest && _aseDest.auth_user_id && _aseDest.es_ia !== true) {
+          let _nomLead = '';
+          try {
+            const { data: _cv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).maybeSingle();
+            if (_cv && _cv.contact_id) { const { data: _ct } = await supabase.from('contacts').select('name, phone').eq('id', _cv.contact_id).maybeSingle(); _nomLead = (_ct && (_ct.name || _ct.phone)) || ''; }
+          } catch (eNl) {}
+          const _cuerpo = 'Se te asignó un nuevo lead' + (_nomLead ? (': ' + _nomLead) : '') + '. Entrá a atenderlo.';
+          await enviarPushAsesor(_aseDest.auth_user_id, 'Nuevo lead asignado', '', _cuerpo);
+        }
+      }
+    } catch (ePushAsig) { console.error('push asignacion manual:', ePushAsig && ePushAsig.message); }
 
     return res.json({
       ok: true,

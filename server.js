@@ -163,6 +163,34 @@ try {
   }
 } catch (e) { console.error('Error init firebase-admin:', e && e.message); }
 
+// ===== PRESENCIA EN VIVO (para NO notificar el chat que el asesor esta MIRANDO) =====
+// Map en memoria: authUserId -> { convId, ts }. El front manda un "latido" cada ~20s MIENTRAS tiene una
+// conversacion ABIERTA y la ventana VISIBLE; al salir/ocultar/cerrar manda visible:false (o el latido se corta
+// y el TTL lo vence). Es EFIMERO: se pierde si el proceso reinicia => FAIL-OPEN (se vuelve a notificar, nunca al
+// reves). Asume 1 instancia de backend (si hubiera varias, el que reciba el webhook podria no tener la presencia
+// -> manda el push igual = comportamiento de hoy, seguro). CERO IA, CERO DB (todo en memoria).
+const _presenciaTTL = 40 * 1000; // 40s sin latido => se considera AUSENTE.
+const _presencia = new Map();
+function _marcarPresencia(authUserId, convId, visible) {
+  if (!authUserId) return;
+  const key = String(authUserId);
+  if (visible && convId) {
+    _presencia.set(key, { convId: String(convId), ts: Date.now() });
+  } else {
+    // "salí/oculté": limpiar SOLO si la presencia actual es de ESA conv (evita que un latido viejo de la conv A
+    // pise la presencia de la conv B a la que el usuario ya se movio -> los POST son async y pueden desordenarse).
+    const p = _presencia.get(key);
+    if (!convId || (p && p.convId === String(convId))) _presencia.delete(key);
+  }
+}
+// ¿El asesor esta MIRANDO esa conversacion AHORA mismo? (latido fresco y sobre la MISMA conv).
+function _estaMirando(authUserId, convId) {
+  if (!authUserId || !convId) return false;
+  const p = _presencia.get(String(authUserId));
+  if (!p || p.convId !== String(convId)) return false;
+  return (Date.now() - p.ts) < _presenciaTTL;
+}
+
 // Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
 async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
   try {
@@ -3367,6 +3395,12 @@ async function revisarRotacionDerivacionV3() {
           try { _siguiente = await elegirAsesorActivo(ownerId); } catch (ePa) { _siguiente = null; }
         }
         const nowIso = new Date().toISOString();
+        // FIX churn (2026-07-06, incidente Raul→Jonathan 5x): si el "siguiente" es el MISMO asesor que YA tiene el
+        // lead (único disponible del depto que todavía no respondió), NO reasignar ni re-notificar. Evita el spam
+        // "rotado a X (antes X)" cada ~10 min. Seguimos esperando en silencio: apenas responda o se libere OTRO
+        // asesor del depto, el próximo tick actúa. La escalada SLA (por no responder) sigue por su cuenta, y el fin
+        // de rotación (toma manual / IA off) también (se chequea arriba). NO tocamos el timer ni asesor_id.
+        if (_siguiente && conv.asesor_id && String(_siguiente) === String(conv.asesor_id)) continue;
         if (_siguiente) {
           // Reasignar CONDICIONAL (FIX 1+4): optimistic concurrency contra el snapshot del batch (preImage). Si otro
           // proceso gano en el interin (toma/asignacion manual que puso asesor_id + _limpiarRotacionV3 -> rotando=false;
@@ -6023,12 +6057,25 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     }
 
     // === Notificacion push al asesor asignado (por cada mensaje entrante) ===
+    // REGLA "no notificar el chat que estoy mirando": si el asesor tiene ESA conversacion abierta y visible
+    // (presencia en vivo, Map en memoria) Y la cuenta activo business_settings.notif_presencia, se OMITE el push.
+    // FAIL-OPEN: el check de presencia es en memoria (gratis) y solo si esta mirando se lee el flag (raro). Ante
+    // cualquier duda/errores/flag ausente => se manda igual (comportamiento de hoy). Solo aplica al push del
+    // MENSAJE ENTRANTE (no a asignacion/SLA/etc., que se siguen enviando siempre).
     try {
       const _asesorRowId = conv.asesor_id || (convExistente && convExistente.asesor_id) || null;
       if (_asesorRowId) {
         const { data: _ase } = await supabase.from('asesores').select('auth_user_id').eq('id', _asesorRowId).maybeSingle();
         if (_ase && _ase.auth_user_id) {
-          await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
+          let _omitirPush = false;
+          if (_estaMirando(_ase.auth_user_id, conv.id)) {
+            // Solo cuando esta mirando (caso raro) pagamos un read para ver si la cuenta prendio la regla.
+            try {
+              const { data: _bsPres } = await supabase.from('business_settings').select('notif_presencia').eq('user_id', user_id).maybeSingle();
+              _omitirPush = !!(_bsPres && _bsPres.notif_presencia === true);
+            } catch (eFlag) { _omitirPush = false; }
+          }
+          if (!_omitirPush) await enviarPushAsesor(_ase.auth_user_id, (data.pushName || telefono), texto);
         }
       }
     } catch (ePush) { console.error('push asesor:', ePush && ePush.message); }
@@ -17407,6 +17454,20 @@ app.post('/api/push/registrar-token', async function(req, res){
     }
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// PRESENCIA: el front avisa que el usuario esta MIRANDO una conversacion (o que salio/oculto, visible:false).
+// Se usa para NO mandarle push del chat que ya tiene abierto y visible. SOLO estado en memoria (0 DB, 0 IA).
+// Fail-open: cualquier error responde ok:false y no rompe nada (el push se sigue mandando como hoy).
+app.post('/api/presencia', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var convId = (req.body && req.body.conversation_id) ? String(req.body.conversation_id).slice(0, 100) : null;
+    var visible = !(req.body && req.body.visible === false); // default true; solo false si viene explicito
+    _marcarPresencia(uid, convId, visible);
+    return res.json({ ok: true });
+  }catch(e){ return res.status(200).json({ ok: false }); }
 });
 
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.

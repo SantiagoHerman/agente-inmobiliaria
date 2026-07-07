@@ -1425,19 +1425,27 @@ async function asesorMenorCarga(idsCandidatos) {
 // queda EXACTAMENTE como antes (solo excluye rol='administrador') para no cambiar el comportamiento actual.
 async function elegirAsesorActivo(admin_id) {
   try {
-    let q = supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
-    let v2 = false;
-    try { v2 = await repartoV2Activo(admin_id, null); } catch (eV2) { v2 = false; }
-    let { data: activos } = await q;
-    if (v2 && Array.isArray(activos)) {
-      // ADITIVO solo con flag ON: descartar a los que no reciben (disponibilidad='no_recibe') y a los pausados ('pausa').
-      activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe' && a.disponibilidad !== 'pausa'; });
+    // DISPONIBILIDAD (decisión Diego 2026-07-06): SOLO el switch Activo/Pausa (activo) + el HORARIO. El campo aparte
+    // 'disponibilidad' (conectado/pausa/no_recibe) YA NO se usa para elegibilidad. Traemos horario_modo/horario_json
+    // para chequear el horario AHORA. DEFENSIVO: si esas columnas no existen, reintentamos con el set mínimo (sin horario).
+    let ases = null;
+    try {
+      const r = await supabase.from('asesores').select('id, horario_modo, horario_json').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+      if (r.error) throw r.error;
+      ases = r.data;
+    } catch (eHor) {
+      const r2 = await supabase.from('asesores').select('id').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+      ases = (r2.data || []).map(function(a){ return { id: a.id, horario_modo: null, horario_json: null }; });
     }
-    if (!activos || activos.length === 0) return null;
-    // contar leads asignados a cada asesor activo. D1=B: la "carga" cuenta SOLO las conversaciones que el asesor
-    // atiende de verdad (asignadas a el y en atencion humana = status 'listo_humano'). Se excluyen las cerradas y
-    // las que todavia maneja la IA (en_conversacion / interesado / recontacto). M19: reparto compartido.
-    return await asesorMenorCarga(activos.map(function(a){ return a.id; }));
+    if (!ases || ases.length === 0) return null;
+    // Horario de oficina de la cuenta (para los asesores en modo 'oficina'). Una query, DEFENSIVO.
+    let bsCuenta = null;
+    try { const { data: bsd } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', admin_id).maybeSingle(); bsCuenta = bsd || null; } catch (eBs) { bsCuenta = null; }
+    // Elegibles = Activos (query) Y dentro de su horario AHORA (asesorDisponibleAhora es FAIL-OPEN: sin horario => disponible).
+    const candidatos = ases.filter(function(a){ return asesorDisponibleAhora(a, bsCuenta); });
+    if (!candidatos.length) return null;
+    // Reparto equitativo: el de menos leads en atención humana (status 'listo_humano'). Desempate aleatorio.
+    return await asesorMenorCarga(candidatos.map(function(a){ return a.id; }));
   } catch (e) { console.error('Error elegirAsesorActivo:', e && e.message); return null; }
 }
 
@@ -2230,10 +2238,9 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId) {
       bsCuenta = bsd || null;
     } catch (eBs) { bsCuenta = null; }
     const candidatos = (ases || []).filter(function(a){
-      // recibe si disponibilidad es 'conectado' o si nunca se configuro (null/''/undefined = legacy)
-      const recibe = a.disponibilidad === 'conectado' || a.disponibilidad == null || a.disponibilidad === '';
-      if (!recibe) return false;
-      // ETAPA 9a: ademas debe estar DENTRO de su horario AHORA (24-7 siempre; oficina usa la cuenta; custom usa su json).
+      // DISPONIBILIDAD (decisión Diego 2026-07-06): SOLO el switch Activo/Pausa (activo, ya filtrado en el query) +
+      // el HORARIO. El campo aparte 'disponibilidad' (conectado/pausa/no_recibe) YA NO se usa para elegibilidad.
+      // Un asesor recibe si está Activo Y dentro de su horario AHORA (24-7 siempre; oficina usa la cuenta; custom su json).
       return asesorDisponibleAhora(a, bsCuenta);
     });
     if (!candidatos.length) return null;

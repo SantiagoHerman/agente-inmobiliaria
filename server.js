@@ -1739,6 +1739,23 @@ async function tempDecayActivo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== OPORTUNIDADES v1: FLAG POR-CUENTA oportunidades_v1 (mismo patron defensivo que repartoV2Activo) =====
+// GATE del motor de ENVIOS SEGMENTADOS ("Oportunidades"): un broadcast SEPARADO del recontacto, con su propia cola y
+// su propio cupo. Con el flag OFF (default: false / ausente / null / columna inexistente / cualquier error) -> el
+// cron procesarOportunidades() hace continue por cuenta y NO manda NADA, y los endpoints existen pero no disparan
+// envios. TRUE -> el cron procesa la oportunidad activa de menor prioridad con goteo seguro. FAIL-SAFE: si la columna
+// todavia no existe en prod (migracion-oportunidades.sql no corrida), el .select devuelve error -> tratamos como OFF.
+// Reusa un bs ya cargado si trae la propiedad (evita una query extra).
+async function oportunidadesV1Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'oportunidades_v1')) return bs.oportunidades_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('oportunidades_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.oportunidades_v1 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
 // Horas de inactividad para que un lead CALIENTE baje a TIBIO (business_settings.temp_horas_caliente_a_tibio).
 // DEFAULT 48. Validado 1..8760 (fuera de rango/ausente/error -> 48). Reusa un bs ya cargado si lo trae. Ante cualquier
 // error -> 48 (nunca romper). Solo se consulta cuando temp_decay_v2 esta ON.
@@ -7212,6 +7229,287 @@ app.post('/api/whatsapp/grupo-todos', async (req, res) => {
 });
 
 // ============================================================================
+// MOTOR "OPORTUNIDADES": ENVIOS SEGMENTADOS (broadcast) — ENDPOINTS.
+// ----------------------------------------------------------------------------
+// Broadcast SEPARADO del recontacto: su propia cola (tabla oportunidades) y su
+// propio cupo. Un envio se manda UNA sola vez, por goteo seguro (el cron
+// procesarOportunidades hace el drip). Cola por PRIORIDAD: una oportunidad a la
+// vez. Todo GATEADO por business_settings.oportunidades_v1 (default OFF) a nivel
+// CRON (los endpoints solo administran la cola; NO disparan envios). DEFENSIVO:
+// try/catch en todos; si la tabla/columna no existe, no rompen (devuelven vacio /
+// error controlado). Auth: verificarUsuario + resolver dueño (como recontacto).
+// ----------------------------------------------------------------------------
+
+// Helper: resuelve el ownerId (dueño) a partir del uid autenticado. Si es asesor,
+// devuelve su admin_id; si es el dueño, devuelve su propio uid. Mismo criterio que
+// los endpoints de recontacto/grupo-todos.
+async function _resolverOwnerId(uid) {
+  let ownerId = uid;
+  try { const _a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle(); if (_a && _a.data && _a.data.admin_id) ownerId = _a.data.admin_id; } catch (e) {}
+  return ownerId;
+}
+
+// Helper: resuelve el UNIVERSO de una oportunidad para un tenant (ownerId) segun
+// los segmentos elegidos + custom_ids (union, deduplicado por conversation_id).
+// Segmentos soportados (por status/temperatura de conversations del tenant):
+//   frios / tibios / calientes  -> temperatura frio/tibio/caliente
+//   en_conversacion             -> status='en_conversacion'
+//   en_recontacto               -> status='recontacto'
+// custom_ids = ids de conversations elegidas a mano. Devuelve un array de convs
+// { id, contact_id }. DEFENSIVO: si alguna query falla, la ignora (no rompe).
+async function _resolverUniversoOportunidad(ownerId, segmentos, customIds) {
+  const porId = {}; // conversation_id -> { id, contact_id }
+  const segs = Array.isArray(segmentos) ? segmentos.map(function (s) { return String(s || '').trim(); }) : [];
+  // Mapeo segmento -> filtro sobre conversations. Cada uno se consulta acotado al tenant.
+  const _tempDe = { frios: 'frio', tibios: 'tibio', calientes: 'caliente' };
+  const _statusDe = { en_conversacion: 'en_conversacion', en_recontacto: 'recontacto' };
+  for (const seg of segs) {
+    try {
+      let q = supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId);
+      if (Object.prototype.hasOwnProperty.call(_tempDe, seg)) { q = q.eq('temperatura', _tempDe[seg]); }
+      else if (Object.prototype.hasOwnProperty.call(_statusDe, seg)) { q = q.eq('status', _statusDe[seg]); }
+      else { continue; } // segmento desconocido -> ignorar
+      const { data } = await q.limit(100000);
+      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id }; });
+    } catch (eSeg) {}
+  }
+  // custom_ids: convs elegidas a mano (siempre acotado al tenant para no filtrar cross-tenant).
+  const cids = Array.isArray(customIds) ? customIds.map(function (x) { return String(x || '').trim(); }).filter(Boolean) : [];
+  if (cids.length) {
+    try {
+      const { data } = await supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId).in('id', cids.slice(0, 5000));
+      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id }; });
+    } catch (eC) {}
+  }
+  return Object.keys(porId).map(function (k) { return porId[k]; });
+}
+
+// GET /api/oportunidades -> lista las oportunidades del dueño, ordenadas por prioridad.
+app.get('/api/oportunidades', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    let lista = [];
+    try {
+      const { data } = await supabase.from('oportunidades').select('*').eq('user_id', ownerId).order('prioridad', { ascending: true }).order('created_at', { ascending: true });
+      lista = Array.isArray(data) ? data : [];
+    } catch (eT) { lista = []; } // tabla ausente / error -> lista vacia (no romper)
+    return res.json({ ok: true, oportunidades: lista });
+  } catch (err) {
+    console.error('Error en GET /api/oportunidades:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// POST /api/oportunidades/preview { segmentos, custom_ids } -> resuelve el universo
+// y devuelve { total, muestra:[hasta 5] }. NO crea nada. NO envia nada.
+app.post('/api/oportunidades/preview', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const b = req.body || {};
+    const universo = await _resolverUniversoOportunidad(ownerId, b.segmentos, b.custom_ids);
+    // Muestra: hasta 5 con nombre/telefono para que el dueño vea a quien le llegaria.
+    const muestra = [];
+    for (const c of universo.slice(0, 5)) {
+      let nombre = '', phone = '';
+      try { const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', c.contact_id).maybeSingle(); if (ct) { nombre = ct.name || ''; phone = ct.phone || ''; } } catch (eCt) {}
+      muestra.push({ conversation_id: c.id, contact_id: c.contact_id, nombre: nombre, phone: phone });
+    }
+    return res.json({ ok: true, total: universo.length, muestra: muestra });
+  } catch (err) {
+    console.error('Error en POST /api/oportunidades/preview:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// POST /api/oportunidades -> crea una oportunidad en 'en_cola'. prioridad = max+1 del
+// tenant. total = tamano del universo al momento de crear. NO dispara envios (eso lo
+// hace el cron gateado). Campos aceptados: nombre, segmentos, custom_ids, mensaje,
+// media {url,tipo}, link, max_dia, horario, ritmo, programado_para, estado ('borrador'
+// opcional). DEFENSIVO: si la tabla no existe, devuelve error controlado.
+app.post('/api/oportunidades', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const b = req.body || {};
+    // Universo -> total. (Se recalcula en el cron de todas formas via oportunidad_envios/dedupe.)
+    const universo = await _resolverUniversoOportunidad(ownerId, b.segmentos, b.custom_ids);
+    // prioridad = max actual + 1 (va al final de la cola).
+    let prioridad = 1;
+    try {
+      const { data: _mx } = await supabase.from('oportunidades').select('prioridad').eq('user_id', ownerId).order('prioridad', { ascending: false }).limit(1).maybeSingle();
+      if (_mx && Number.isFinite(Number(_mx.prioridad))) prioridad = Number(_mx.prioridad) + 1;
+    } catch (eMx) {}
+    // estado: 'borrador' si lo piden explicito; si no, 'en_cola'.
+    const estado = (b.estado === 'borrador') ? 'borrador' : 'en_cola';
+    const _mediaObj = (b.media && typeof b.media === 'object' && b.media.url) ? { url: String(b.media.url).slice(0, 2000), tipo: (b.media.tipo ? String(b.media.tipo).slice(0, 20) : 'imagen') } : null;
+    const _maxDia = (Number.isFinite(Number(b.max_dia)) && Number(b.max_dia) > 0) ? Math.min(Number(b.max_dia), 5000) : null;
+    const fila = {
+      user_id: ownerId,
+      nombre: (b.nombre != null) ? String(b.nombre).slice(0, 200) : null,
+      estado: estado,
+      prioridad: prioridad,
+      segmentos: Array.isArray(b.segmentos) ? b.segmentos : [],
+      custom_ids: Array.isArray(b.custom_ids) ? b.custom_ids : [],
+      mensaje: (b.mensaje != null) ? String(b.mensaje).slice(0, 5000) : null,
+      media: _mediaObj,
+      link: (b.link != null) ? String(b.link).slice(0, 2000) : null,
+      max_dia: _maxDia,
+      horario: (b.horario != null) ? String(b.horario).slice(0, 40) : 'oficina',
+      ritmo: (b.ritmo != null) ? String(b.ritmo).slice(0, 40) : 'normal',
+      programado_para: b.programado_para || null,
+      total: universo.length,
+      enviados: 0,
+      enviados_hoy: 0
+    };
+    let creada = null;
+    try {
+      const { data, error } = await supabase.from('oportunidades').insert(fila).select('*').single();
+      if (error) { console.error('POST /api/oportunidades insert:', error.message); return res.status(500).json({ error: error.message }); }
+      creada = data;
+    } catch (eIns) { console.error('POST /api/oportunidades:', eIns && eIns.message); return res.status(500).json({ error: 'No se pudo crear (tabla ausente?)' }); }
+    return res.json({ ok: true, oportunidad: creada });
+  } catch (err) {
+    console.error('Error en POST /api/oportunidades:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// PATCH /api/oportunidades/:id -> edita una oportunidad del dueño. Editar PAUSA su
+// envio: setea estado='pausada' (salvo que ya este 'completada', que no se toca).
+// Recalcula total si cambian los segmentos/custom_ids. DEFENSIVO.
+app.patch('/api/oportunidades/:id', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const id = req.params.id;
+    // Cargar la fila y validar pertenencia al tenant.
+    let actual = null;
+    try { const { data } = await supabase.from('oportunidades').select('*').eq('id', id).eq('user_id', ownerId).maybeSingle(); actual = data || null; } catch (eL) { actual = null; }
+    if (!actual) return res.status(404).json({ error: 'Oportunidad no encontrada' });
+    if (actual.estado === 'completada') return res.status(400).json({ error: 'La oportunidad ya se completo (no editable)' });
+    const b = req.body || {};
+    const upd = { updated_at: new Date().toISOString() };
+    if (b.nombre != null) upd.nombre = String(b.nombre).slice(0, 200);
+    if (b.mensaje != null) upd.mensaje = String(b.mensaje).slice(0, 5000);
+    if (b.link != null) upd.link = String(b.link).slice(0, 2000);
+    if (Object.prototype.hasOwnProperty.call(b, 'media')) upd.media = (b.media && typeof b.media === 'object' && b.media.url) ? { url: String(b.media.url).slice(0, 2000), tipo: (b.media.tipo ? String(b.media.tipo).slice(0, 20) : 'imagen') } : null;
+    if (Object.prototype.hasOwnProperty.call(b, 'max_dia')) upd.max_dia = (Number.isFinite(Number(b.max_dia)) && Number(b.max_dia) > 0) ? Math.min(Number(b.max_dia), 5000) : null;
+    if (b.horario != null) upd.horario = String(b.horario).slice(0, 40);
+    if (b.ritmo != null) upd.ritmo = String(b.ritmo).slice(0, 40);
+    if (Object.prototype.hasOwnProperty.call(b, 'programado_para')) upd.programado_para = b.programado_para || null;
+    let recalcularTotal = false;
+    if (Array.isArray(b.segmentos)) { upd.segmentos = b.segmentos; recalcularTotal = true; }
+    if (Array.isArray(b.custom_ids)) { upd.custom_ids = b.custom_ids; recalcularTotal = true; }
+    if (recalcularTotal) {
+      try {
+        const universo = await _resolverUniversoOportunidad(ownerId, upd.segmentos || actual.segmentos, upd.custom_ids || actual.custom_ids);
+        upd.total = universo.length;
+      } catch (eU) {}
+    }
+    // Editar PAUSA el envio (salvo 'completada', ya filtrado arriba). Asi editar detiene el goteo hasta reanudar.
+    upd.estado = 'pausada';
+    try {
+      const { data, error } = await supabase.from('oportunidades').update(upd).eq('id', id).eq('user_id', ownerId).select('*').single();
+      if (error) { console.error('PATCH /api/oportunidades update:', error.message); return res.status(500).json({ error: error.message }); }
+      return res.json({ ok: true, oportunidad: data });
+    } catch (eUpd) { console.error('PATCH /api/oportunidades:', eUpd && eUpd.message); return res.status(500).json({ error: 'No se pudo editar' }); }
+  } catch (err) {
+    console.error('Error en PATCH /api/oportunidades/:id:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// POST /api/oportunidades/:id/pausar -> estado='pausada'. POST .../reanudar -> vuelve
+// a 'en_cola' (el cron decide cuando le toca por prioridad). No tocan 'completada'.
+app.post('/api/oportunidades/:id/pausar', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const id = req.params.id;
+    try {
+      const { data, error } = await supabase.from('oportunidades').update({ estado: 'pausada', updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId).neq('estado', 'completada').select('*').maybeSingle();
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data) return res.status(404).json({ error: 'Oportunidad no encontrada o ya completada' });
+      return res.json({ ok: true, oportunidad: data });
+    } catch (eP) { return res.status(500).json({ error: 'No se pudo pausar' }); }
+  } catch (err) {
+    console.error('Error en POST /api/oportunidades/:id/pausar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+app.post('/api/oportunidades/:id/reanudar', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const id = req.params.id;
+    try {
+      const { data, error } = await supabase.from('oportunidades').update({ estado: 'en_cola', updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId).neq('estado', 'completada').select('*').maybeSingle();
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data) return res.status(404).json({ error: 'Oportunidad no encontrada o ya completada' });
+      return res.json({ ok: true, oportunidad: data });
+    } catch (eR) { return res.status(500).json({ error: 'No se pudo reanudar' }); }
+  } catch (err) {
+    console.error('Error en POST /api/oportunidades/:id/reanudar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// POST /api/oportunidades/reordenar { orden:[ids] } -> reasigna prioridad segun el
+// orden recibido (1..N). Solo afecta filas del tenant que esten en el array.
+app.post('/api/oportunidades/reordenar', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const b = req.body || {};
+    const orden = Array.isArray(b.orden) ? b.orden.map(function (x) { return String(x || '').trim(); }).filter(Boolean) : [];
+    if (!orden.length) return res.status(400).json({ error: 'Falta orden:[ids]' });
+    let i = 1;
+    for (const id of orden) {
+      try { await supabase.from('oportunidades').update({ prioridad: i, updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId); } catch (eU) {}
+      i++;
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en POST /api/oportunidades/reordenar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// DELETE /api/oportunidades/:id -> borra la oportunidad del tenant (best-effort borra
+// tambien sus oportunidad_envios). DEFENSIVO.
+app.delete('/api/oportunidades/:id', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const id = req.params.id;
+    // Validar pertenencia antes de borrar.
+    let existe = null;
+    try { const { data } = await supabase.from('oportunidades').select('id').eq('id', id).eq('user_id', ownerId).maybeSingle(); existe = data || null; } catch (eL) { existe = null; }
+    if (!existe) return res.status(404).json({ error: 'Oportunidad no encontrada' });
+    try { await supabase.from('oportunidad_envios').delete().eq('oportunidad_id', id); } catch (eDe) {} // best-effort
+    try {
+      const { error } = await supabase.from('oportunidades').delete().eq('id', id).eq('user_id', ownerId);
+      if (error) return res.status(500).json({ error: error.message });
+    } catch (eD) { return res.status(500).json({ error: 'No se pudo borrar' }); }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en DELETE /api/oportunidades/:id:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
 // AVISO DEL MAESTRO -> banner (y modal si es critico) en TODOS los dashboards.
 // El Maestro publica un mensaje global; los clientes lo leen por polling en su
 // dashboard (GET /api/aviso-activo). Solo puede haber UN aviso activo a la vez:
@@ -7763,9 +8061,9 @@ function mensajeRecontacto(nombre, esPrimerContacto, empresa, agentName) {
   const ag = (agentName && String(agentName).trim()) ? String(agentName).trim() : 'tu asesor/a'; // usar el nombre CONFIGURADO del cliente, no "Sofia"
   if (esPrimerContacto) {
     const nuevas = [
-      'Hola' + n + ', como estas? Soy ' + ag + emp + '. Te escribo para ponerme a disposicion por si estas buscando o pensando en algo. En que te puedo ayudar?',
-      'Hola' + n + '! Soy ' + ag + emp + '. Me pongo a disposicion para acompanarte en la busqueda. Contame que es lo que estas necesitando y vemos como te puedo ayudar.',
-      'Hola' + n + ', un gusto! Soy ' + ag + emp + '. Te contacto por si te puedo dar una mano buscando algo que se ajuste a lo que necesitas. Que tenias en mente?'
+      'Hola' + n + ', como estas? Soy ' + ag + emp + '. Te escribo para ver si seguis buscando. Si es asi, contame que necesitas y te muestro opciones. Seguis en la busqueda?',
+      'Hola' + n + '! Soy ' + ag + emp + '. Me pongo a disposicion para acompanarte en la busqueda. Contame que es lo que estas necesitando y te paso lo que tengamos. Seguis interesado/a?',
+      'Hola' + n + ', un gusto! Soy ' + ag + emp + '. Te contacto por si te puedo dar una mano buscando algo que se ajuste a lo que necesitas. Que tenias en mente? Si queres te muestro algunas opciones.'
     ];
     return nuevas[Math.floor(Math.random() * nuevas.length)];
   }
@@ -7780,9 +8078,10 @@ function mensajeRecontacto(nombre, esPrimerContacto, empresa, agentName) {
 
 // RECONTACTO basado en la MEMORIA del lead: arma un mensaje de reactivacion que RETOMA lo que el lead venia
 // buscando/hablando (memoria_viva + interes + ultimos mensajes), sin asumir ni inventar nada ("viendo opciones",
-// etc.). Usa SONNET (es un mensaje que le habla al CLIENTE -> misma calidad que la conversacion, nunca se baja
-// de Sonnet). Acotado por las salvaguardas del cron (max 5/lead + 1/dia). Devuelve null si no hay nada que
-// personalizar o si falla -> el caller cae a la plantilla.
+// etc.). Usa HAIKU (MODELO_INTERNO): el EMPUJON de recontacto es un saliente CORTO mientras el lead esta en estado
+// 'recontacto'; NO requiere Sonnet (apenas el lead responde vuelve a en_conversacion/interesado y el flujo normal
+// retoma Sonnet). Decision de Diego 2026-06-27. Acotado por las salvaguardas del cron (max 5/lead + 1/dia). Devuelve
+// null si no hay nada que personalizar o si falla -> el caller cae a la plantilla (que es $0, sin IA).
 async function mensajeRecontactoIA(user_id, conversation_id, nombre, empresa, agentName) {
   try {
     if (!conversation_id) return null;
@@ -8823,6 +9122,176 @@ async function enviarRecontactosPendientes() {
 }
 
 // ============================================================================
+// MOTOR "OPORTUNIDADES": ENVIOS SEGMENTADOS (broadcast) — CRON.
+// ----------------------------------------------------------------------------
+// Broadcast SEPARADO del recontacto: su PROPIA cola (tabla oportunidades) y su
+// PROPIO cupo (max_dia/enviados_hoy por oportunidad), independiente del cupo de
+// recontacto. Se procesa por PRIORIDAD: la oportunidad activa de MENOR prioridad,
+// UNA a la vez; hasta que no llega a estado='completada' NO arranca la siguiente.
+// Un envio se manda UNA sola vez (dedupe via oportunidad_envios). Goteo seguro:
+// CAP por tanda + gap 45-120s + tope diario + horario (mismos parametros que el
+// motor de recontacto v2, como referencia). Envia CON MEDIA si la oportunidad la
+// trae (enviarWhatsappMedia con caption = mensaje) o texto (enviarWhatsapp).
+//
+// GATEADO por oportunidades_v1 (default OFF): con el flag OFF para la cuenta -> se
+// SALTEA (continue) y NO manda NADA. Es prod en vivo: TODO en try/catch, un fallo
+// NUNCA rompe el boot ni otros crons. Corre cada 15 min (setInterval, mas abajo).
+// ============================================================================
+var _oportunidadesEnCurso = false;
+async function procesarOportunidades() {
+  if (_oportunidadesEnCurso) return; // guard anti-solape (una tanda puede tardar por el gap 45-120s)
+  _oportunidadesEnCurso = true;
+  try {
+    const ahoraMs = Date.now();
+    const ahoraIso = new Date().toISOString();
+    const CAP_TANDA = 4;         // tope DURO de envios por tanda por oportunidad (anti-baneo), igual que recontacto v2
+    const GAP_MIN_MS = 45000;    // gap 45-120s entre envios (anti-baneo), igual que recontacto v2
+    const GAP_RANGO_MS = 75000;
+    const hoyStr = (function(){ const a = new Date(); const u = a.getTime() + a.getTimezoneOffset()*60000; const arg = new Date(u - 3*60*60000); return arg.toISOString().slice(0,10); })();
+
+    // 1) Traer oportunidades ACTIVAS (en_cola/enviando) de todo el sistema, ordenadas por prioridad. Si la tabla no
+    //    existe (migracion no corrida) -> no hay nada que procesar (fail-safe). NO tocamos pausada/completada/borrador.
+    let activas = [];
+    try {
+      const { data } = await supabase.from('oportunidades')
+        .select('*')
+        .in('estado', ['en_cola', 'enviando'])
+        .order('prioridad', { ascending: true })
+        .order('created_at', { ascending: true });
+      activas = Array.isArray(data) ? data : [];
+    } catch (eSel) { return; } // sin tabla / error -> no procesar nada (fail-safe, no rompe el cron)
+    if (activas.length === 0) return;
+
+    // 2) Agrupar por cuenta y procesar SOLO la de MENOR prioridad por cuenta (una a la vez por tenant).
+    const _porCuenta = {}; // user_id -> primera (menor prioridad) oportunidad activa
+    for (const op of activas) {
+      if (!op || !op.user_id) continue;
+      if (!_porCuenta[op.user_id]) _porCuenta[op.user_id] = op; // ya vienen ordenadas por prioridad -> la primera es la menor
+    }
+
+    // Caches por corrida (evitan re-querear business_settings por cuenta).
+    const _bsCache = {};
+
+    for (const uid of Object.keys(_porCuenta)) {
+      try {
+        const op = _porCuenta[uid];
+        // Config de la cuenta (flag + horario + pausas). 1 sola lectura por cuenta.
+        let bs = _bsCache[uid];
+        if (bs === undefined) {
+          try { const { data } = await supabase.from('business_settings').select('user_id, oportunidades_v1, horario_oficina, crm_pausado, agente_pausado, eliminado_at').eq('user_id', uid).maybeSingle(); bs = data || null; }
+          catch (eBs) { bs = null; }
+          _bsCache[uid] = bs;
+        }
+        // GATE: si oportunidades_v1 NO esta ON para esta cuenta -> SALTEAR (no manda NADA). Default OFF.
+        if (!(await oportunidadesV1Activo(uid, bs || undefined))) continue;
+        // PAUSAS de cuenta (mismas reglas que recontacto): pausa global, pausa de cuenta, papelera -> no mandar.
+        if (_pausaGlobal === true || (bs && (bs.crm_pausado === true || bs.agente_pausado === true || bs.eliminado_at))) continue;
+        // HORARIO: la oportunidad respeta el horario de oficina de la cuenta (horario='oficina' por default). Si esta
+        // fuera de horario -> no mandar en esta tanda (se retoma en la proxima corrida dentro de horario).
+        const _horarioOwner = bs && bs.horario_oficina ? bs.horario_oficina : null;
+        if (op.horario !== 'siempre') { // 'siempre' = ignorar horario (no default); cualquier otro valor respeta oficina
+          if (!dentroHorarioOficina(_horarioOwner)) continue;
+        }
+        // PROGRAMACION: no arrancar antes de programado_para.
+        if (op.programado_para && new Date(op.programado_para).getTime() > ahoraMs) continue;
+
+        // Marcar 'enviando' (idempotente): si estaba en_cola pasa a enviando. Anti-stale en el WHERE (solo si sigue
+        // en un estado activo; si un humano la pauso durante el tick, no la reactivamos).
+        if (op.estado !== 'enviando') {
+          try {
+            const { data: _m } = await supabase.from('oportunidades').update({ estado: 'enviando', updated_at: ahoraIso })
+              .eq('id', op.id).in('estado', ['en_cola', 'enviando']).select('id');
+            if (!_m || !_m.length) continue; // la pausaron/borraron en el interin -> no procesar
+          } catch (eMk) { continue; }
+        }
+
+        // TOPE DIARIO de la oportunidad (max_dia): reset del contador si cambio la fecha.
+        let enviadosHoy = (Number.isFinite(op.enviados_hoy) ? op.enviados_hoy : 0) || 0;
+        const fechaPrev = op.enviados_fecha ? String(op.enviados_fecha).slice(0,10) : null;
+        if (fechaPrev !== hoyStr) {
+          enviadosHoy = 0;
+          try { await supabase.from('oportunidades').update({ enviados_hoy: 0, enviados_fecha: hoyStr }).eq('id', op.id); } catch (eRf) {}
+        }
+        const maxDia = (Number.isFinite(op.max_dia) && op.max_dia > 0) ? op.max_dia : 200; // default conservador
+        const cupoDiaRestante = Math.max(0, maxDia - enviadosHoy);
+        if (cupoDiaRestante <= 0) continue; // ya cumplio el cupo del dia -> nada mas hoy (retoma manana)
+
+        // Cuantos mandar en ESTA tanda: min(CAP por tanda, cupo del dia restante).
+        const nTanda = Math.min(CAP_TANDA, cupoDiaRestante);
+        if (nTanda <= 0) continue;
+
+        // Resolver el universo y EXCLUIR a los ya enviados (dedupe). Un envio va UNA sola vez.
+        let universo = [];
+        try { universo = await _resolverUniversoOportunidad(uid, op.segmentos, op.custom_ids); } catch (eUni) { universo = []; }
+        // Ya enviados de esta oportunidad (por conversation_id).
+        const _yaEnviados = {};
+        try {
+          const { data: _envs } = await supabase.from('oportunidad_envios').select('conversation_id').eq('oportunidad_id', op.id).limit(200000);
+          (_envs || []).forEach(function (e) { if (e && e.conversation_id) _yaEnviados[e.conversation_id] = true; });
+        } catch (eEnv) {}
+        const pendientes = universo.filter(function (c) { return !_yaEnviados[c.id]; });
+
+        // Si NO quedan pendientes -> la oportunidad esta COMPLETADA. Cerrarla y seguir con la proxima (proxima corrida).
+        if (pendientes.length === 0) {
+          try { await supabase.from('oportunidades').update({ estado: 'completada', updated_at: new Date().toISOString() }).eq('id', op.id); } catch (eC) {}
+          console.log('[OPORTUNIDADES] Oportunidad ' + op.id + ' COMPLETADA (cuenta ' + uid + '). Sigue la proxima por prioridad.');
+          continue;
+        }
+
+        // Instancia WhatsApp de la cuenta.
+        const instancia = nombreInstancia(uid);
+        // Mensaje + media (si trae). El caption del media = el mensaje; si no hay media, texto plano.
+        const cuerpoBase = (op.mensaje != null ? String(op.mensaje) : '').trim();
+        const linkTxt = (op.link ? ('\n' + String(op.link).trim()) : '');
+        const textoFinal = (cuerpoBase + linkTxt).trim();
+        const mediaUrl = (op.media && typeof op.media === 'object' && op.media.url) ? String(op.media.url) : null;
+        const mediaTipo = (op.media && typeof op.media === 'object' && op.media.tipo) ? String(op.media.tipo) : 'imagen';
+
+        let enviadosTanda = 0;
+        let enviadosTotalNuevo = (Number.isFinite(op.enviados) ? op.enviados : 0) || 0;
+        let enviadosHoyNuevo = enviadosHoy;
+        for (const c of pendientes) {
+          if (enviadosTanda >= nTanda) break;
+          // Datos del contacto.
+          let contacto = null;
+          try { const { data } = await supabase.from('contacts').select('name, phone').eq('id', c.contact_id).maybeSingle(); contacto = data || null; } catch (eCt) { contacto = null; }
+          if (!contacto || !contacto.phone) continue; // sin telefono -> saltar (pero NO marcar enviado: quedara pendiente)
+          // Enviar (CON MEDIA si corresponde). Defensivo: un fallo de envio no rompe la tanda.
+          let ok = false;
+          try {
+            if (mediaUrl) { ok = await enviarWhatsappMedia(instancia, contacto.phone, mediaUrl, mediaTipo, textoFinal || undefined); }
+            else if (textoFinal) { ok = await enviarWhatsapp(instancia, contacto.phone, textoFinal, null); }
+            else { ok = false; } // sin cuerpo ni media -> nada que mandar
+          } catch (eSend) { ok = false; }
+          if (!ok) { continue; } // no marcamos enviado si fallo -> se reintenta en la proxima tanda
+          // DEDUPE: registrar el envio (una sola vez).
+          try { await supabase.from('oportunidad_envios').insert({ oportunidad_id: op.id, contact_id: c.contact_id, conversation_id: c.id, enviado_at: new Date().toISOString() }); } catch (eIns) {}
+          // Actualizar last_message de la conv (best-effort, para que el asesor vea que salio algo).
+          try { await supabase.from('conversations').update({ last_message: (textoFinal || '[media]'), last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', c.id); } catch (eLm) {}
+          enviadosTanda++;
+          enviadosTotalNuevo++;
+          enviadosHoyNuevo++;
+          // Persistir contadores tras cada envio (durable ante corte).
+          try { await supabase.from('oportunidades').update({ enviados: enviadosTotalNuevo, enviados_hoy: enviadosHoyNuevo, enviados_fecha: hoyStr, updated_at: new Date().toISOString() }).eq('id', op.id); } catch (eUpC) {}
+          console.log('[OPORTUNIDADES] Enviado op ' + op.id + ' -> conv ' + c.id + ' (' + enviadosTotalNuevo + '/' + op.total + ')');
+          // Gap 45-120s entre envios (anti-baneo), salvo que sea el ultimo de la tanda.
+          if (enviadosTanda < nTanda) {
+            await new Promise(function (r) { setTimeout(r, GAP_MIN_MS + Math.floor(Math.random() * GAP_RANGO_MS)); });
+          }
+        }
+
+        // Si con este envio ya cubrimos TODO el universo (no quedan pendientes tras la tanda) -> completar.
+        if ((pendientes.length - enviadosTanda) <= 0) {
+          try { await supabase.from('oportunidades').update({ estado: 'completada', updated_at: new Date().toISOString() }).eq('id', op.id); } catch (eC2) {}
+          console.log('[OPORTUNIDADES] Oportunidad ' + op.id + ' COMPLETADA tras la tanda (cuenta ' + uid + ').');
+        }
+      } catch (eCuenta) { console.error('[OPORTUNIDADES] error en cuenta ' + uid + ':', eCuenta && eCuenta.message); }
+    }
+  } catch (e) { console.error('Error en procesarOportunidades:', e && e.message); }
+  finally { _oportunidadesEnCurso = false; } // liberar el guard SIEMPRE (nunca queda trabado)
+}
+
+// ============================================================================
 // MOTOR RECONTACTO v2 (anti-baneo): PAULATINO + ALEATORIO + SEGURO. Gateado por
 // business_settings.recontacto_v2 = true. Un numero "quieto" NUNCA salta a cientos
 // de mensajes/dia: rampa de warm-up por dia de actividad + goteo por franja horaria
@@ -9374,6 +9843,11 @@ setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)
 setInterval(enviarRecontactosPendientes, 15 * 60 * 1000);
 setTimeout(enviarRecontactosPendientes, 60 * 1000);
+// OPORTUNIDADES (envios segmentados / broadcast): revisar cada 15 min. GATEADO por oportunidades_v1 (default OFF):
+// con el flag OFF por cuenta el cron SALTEA esa cuenta y NO manda NADA. Broadcast separado del recontacto (cola y
+// cupo propios). Procesa la oportunidad de MENOR prioridad, una a la vez, con goteo seguro (CAP/gap/tope-dia/horario).
+setInterval(procesarOportunidades, 15 * 60 * 1000);
+setTimeout(procesarOportunidades, 110 * 1000); // primera corrida ~110s tras arrancar (proceso ya estable)
 // Recordatorios de citas: revisar cada 30 min (recordatorio al lead + aviso al asesor de citas en las proximas 24h)
 setInterval(enviarRecordatoriosCitas, 30 * 60 * 1000);
 setTimeout(enviarRecordatoriosCitas, 70 * 1000);

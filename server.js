@@ -9887,11 +9887,14 @@ app.post('/api/asesores/cambiar-alias', async (req, res) => {
     if (errAdmin || !adminData || !adminData.user || !adminData.user.email) return res.status(400).json({ error: 'No se pudo obtener el email del administrador' });
     const partes = String(adminData.user.email).split('@');
     const emailNuevo = partes[0] + '+' + aliasLimpio + '@' + partes[1];
-    // Re-sincronizar el email en Auth (email_confirm: no manda correo, queda confirmado). La CLAVE no se toca.
-    const { error: errUpd } = await supabase.auth.admin.updateUserById(ase.auth_user_id, { email: emailNuevo, email_confirm: true });
+    // Re-sincronizar el email en Auth. Usamos la función SQL cambiar_email_asesor (SECURITY DEFINER, solo service_role)
+    // que cambia el email en auth.users + auth.identities DIRECTAMENTE, porque updateUserById({email}) NO lo cambia al
+    // instante en esta config de Supabase ("secure email change" lo deja pendiente de una confirmación que nunca llega)
+    // -> el login quedaba desincronizado (el nombre cambiaba pero se seguía entrando con el alias viejo). La CLAVE no se toca.
+    const { error: errUpd } = await supabase.rpc('cambiar_email_asesor', { p_uid: ase.auth_user_id, p_email: emailNuevo });
     if (errUpd) {
       const _m = String(errUpd.message || '').toLowerCase();
-      if (_m.indexOf('already') >= 0 || _m.indexOf('registered') >= 0 || _m.indexOf('exists') >= 0 || _m.indexOf('duplicate') >= 0) return res.status(400).json({ error: 'Ese alias ya esta en uso, elegi otro' });
+      if (_m.indexOf('duplicate') >= 0 || _m.indexOf('unique') >= 0 || _m.indexOf('already') >= 0 || _m.indexOf('exists') >= 0) return res.status(400).json({ error: 'Ese alias ya esta en uso, elegi otro' });
       return res.status(500).json({ error: 'No se pudo cambiar el alias: ' + (errUpd.message || '') });
     }
     // Persistir el alias visible en la tabla (el email de Auth ya quedo cambiado; esto es el texto que se muestra/escribe).

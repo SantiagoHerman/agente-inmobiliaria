@@ -5954,9 +5954,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // (Groq) y de traducir/clasificar/responder (Claude) -> CERO gasto de tokens. La pausa POR-CONVERSACION
     // (ai_enabled) NO entra aca: esa deja transcribir+traducir para el humano y solo frena al agente (mas abajo).
     let _bsGate = null;
-    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado').eq('user_id', user_id).maybeSingle();
+    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado, idioma').eq('user_id', user_id).maybeSingle();
       if (_gq && _gq.error) { const _gq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsGate = _gq2 && _gq2.data; }
       else { _bsGate = _gq && _gq.data; } }
+    // Idioma BASE de la empresa (settings.idioma; default 'es'). Lo tomamos del _bsGate que YA se leyo arriba
+    // (0 queries extra, 0 IA). Se usa abajo para actualizar el idioma GUARDADO del lead cuando CAMBIA de idioma
+    // en el medio de la charla, sin asumir que el base es siempre espanol (empresas con base en/pt/etc).
+    const _idiomaBaseEmpresa = (_bsGate && _bsGate.idioma) || 'es';
     // Papelera (eliminado_at) o pausa TOTAL del Maestro (crm_pausado): NO se gasta ningun token de IA.
     // Guardamos el mensaje CRUDO (sin transcribir ni traducir) para que el chat siga visible al reactivar/restaurar,
     // subimos el archivo si lo hay (Storage no gasta tokens) y cortamos. Diferencia: en pausa total avisamos al
@@ -6005,6 +6009,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let contentOrigLead = null;
     let idiomaLeadMsg = null;
     let _revertirIdiomaBase = false; // el lead retomo el idioma base con evidencia -> apagar traductor
+    let _idiomaLeadDetectado = null; // idioma NO-base detectado este mensaje (aunque la traduccion salga identica) -> persistir siempre
     // Traducir SOLO texto/audio/imagen; NO traducir videos, documentos ni ubicaciones (no hay texto real que traducir).
     const _noTraducir = (tipoMediaEntrante === 'imagen' || tipoMediaEntrante === 'video' || tipoMediaEntrante === 'documento' || tipoMediaEntrante === 'ubicacion');
     try {
@@ -6012,19 +6017,27 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       // un humano lo atiende). El AUDIO en cambio NO se gatea (Groq, casi gratis) -> queda en todos los planes.
       if (!_noTraducir && await planPermite(user_id, 'audio_traduccion')) {
         // STICKY: le pasamos el idioma ACTUAL de la conversacion como contexto para NO cambiar sin necesidad.
-        const idiomaActual = (conv && conv.idioma_lead) || 'es';
+        // Base = idioma configurado por la empresa (no siempre 'es'). detectarIdioma YA corre por mensaje (Haiku):
+        // reusamos SU resultado para MANTENER SINCRONIZADO el idioma guardado del lead cuando CAMBIA en el medio de
+        // la charla (es->otro, otro->otro2, otro->base). CERO llamadas de IA nuevas.
+        const idiomaActual = (conv && conv.idioma_lead) || _idiomaBaseEmpresa;
         const idiomaDetectado = await detectarIdioma(texto, user_id, idiomaActual);
-        if (idiomaDetectado && idiomaDetectado !== 'es') {
-          const trad = await traducir(texto, 'es', user_id);
+        if (idiomaDetectado && idiomaDetectado !== _idiomaBaseEmpresa) {
+          // El lead habla (o cambio a) un idioma distinto al base -> traducir al base para el asesor y ACTUALIZAR
+          // el idioma guardado. Cubre tambien el cambio otro1->otro2 (idiomaDetectado nuevo != idioma_lead viejo).
+          const trad = await traducir(texto, _idiomaBaseEmpresa, user_id);
           if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
-          // recordar el idioma del lead en la conversacion para el traductor saliente
-          await supabase.from('conversations').update({ idioma_lead: idiomaDetectado }).eq('id', conv.id);
-          if (conv) conv.idioma_lead = idiomaDetectado;
-        } else if (idiomaDetectado === 'es' && conv && conv.idioma_lead && conv.idioma_lead !== 'es') {
-          // El lead RETOMO el espanol con evidencia suficiente (>=3 palabras / pedido) -> volver al base y apagar el traductor.
+          _idiomaLeadDetectado = idiomaDetectado; // persistir el idioma SIEMPRE que se detecto uno no-base (aunque la trad salga identica)
+          // recordar el idioma del lead en la conversacion para el traductor saliente (best-effort, no rompe el webhook)
+          if (!conv || conv.idioma_lead !== idiomaDetectado) {
+            try { await supabase.from('conversations').update({ idioma_lead: idiomaDetectado, traductor_activo: true }).eq('id', conv.id); } catch (eUpdIl) { console.error('upd idioma_lead:', eUpdIl && eUpdIl.message); }
+          }
+          if (conv) { conv.idioma_lead = idiomaDetectado; conv.traductor_activo = true; }
+        } else if (idiomaDetectado === _idiomaBaseEmpresa && conv && conv.idioma_lead && conv.idioma_lead !== _idiomaBaseEmpresa) {
+          // El lead RETOMO el idioma BASE con evidencia suficiente (>=3 palabras / pedido) -> volver al base y apagar el traductor.
           _revertirIdiomaBase = true;
-          await supabase.from('conversations').update({ idioma_lead: 'es', traductor_activo: false }).eq('id', conv.id);
-          if (conv) { conv.idioma_lead = 'es'; conv.traductor_activo = false; }
+          try { await supabase.from('conversations').update({ idioma_lead: _idiomaBaseEmpresa, traductor_activo: false }).eq('id', conv.id); } catch (eRev) { console.error('revertir idioma_lead:', eRev && eRev.message); }
+          if (conv) { conv.idioma_lead = _idiomaBaseEmpresa; conv.traductor_activo = false; }
         }
       }
     } catch (eTrad) { console.error('trad entrante:', eTrad && eTrad.message); }
@@ -6062,10 +6075,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         else { console.error('insert mensaje entrante:', _rIns.error.message || _rIns.error); }
       }
     }
-    // Si el lead escribe en un idioma distinto al base, activar el traductor automaticamente; si retomo el base, apagarlo.
+    // Si el lead escribe/CAMBIA a un idioma distinto al base, actualizar el idioma guardado + activar el traductor;
+    // si retomo el base, apagarlo. Persistimos el idioma detectado AUNQUE la traduccion haya salido identica
+    // (_idiomaLeadDetectado) para que el "menu"/idioma entrante NO quede fijo en el idioma inicial. 0 IA extra.
     const _updConv = { last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() };
-    if (idiomaLeadMsg) { _updConv.idioma_lead = idiomaLeadMsg; _updConv.traductor_activo = true; }
-    else if (_revertirIdiomaBase) { _updConv.idioma_lead = 'es'; _updConv.traductor_activo = false; }
+    const _idiomaLeadFinal = _idiomaLeadDetectado || idiomaLeadMsg;
+    if (_idiomaLeadFinal) { _updConv.idioma_lead = _idiomaLeadFinal; _updConv.traductor_activo = true; }
+    else if (_revertirIdiomaBase) { _updConv.idioma_lead = _idiomaBaseEmpresa; _updConv.traductor_activo = false; }
     await supabase.from('conversations').update(_updConv).eq('id', conv.id);
 
     // === MEMORIA DEL LEAD: extraer datos (nombre/origen/interes/presupuesto) y guardarlos en contacts ===

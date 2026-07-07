@@ -6744,7 +6744,14 @@ app.post('/api/whatsapp/send', async (req, res) => {
     // jamas pausa a la IA en sus PROPIOS envios; solo reacciona a un envio HUMANO real.
     {
       const { data: convEstado } = await supabase.from('conversations').select('status, ai_enabled').eq('id', conversation_id).maybeSingle();
-      if (convEstado && convEstado.ai_enabled === true && convEstado.status !== 'listo_humano') {
+      // FIX 2026-07-07 (caso Seba/Anton): un HUMANO respondió -> el lead pasa a 'listo_humano' con la IA APAGADA. Antes
+      // SOLO se apagaba la IA (y solo si estaba encendida), sin cambiar el status: un lead 'interesado'/'en_conversacion'
+      // atendido por un humano quedaba con su estado viejo -> fuera del radar del SLA y del flujo humano. No se toca si
+      // ya es listo_humano o está cerrado.
+      if (convEstado && convEstado.status !== 'listo_humano' && convEstado.status !== 'cerrado') {
+        await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+      } else if (convEstado && convEstado.ai_enabled === true) {
+        // Ya es listo_humano/cerrado pero la IA quedó encendida -> apagarla igual (no pisar la respuesta humana).
         await supabase.from('conversations').update({ ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
       }
     }
@@ -7237,7 +7244,14 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
 
     // 4) Armar el update (misma logica que tenia el front).
     const upd = { asesor_id: val };
-    if (val) { upd.ultimo_asesor_id = val; upd.admin_tomo = false; }
+    if (val) {
+      upd.ultimo_asesor_id = val; upd.admin_tomo = false;
+      // FIX 2026-07-07 (caso Seba/Anton): DERIVAR/asignar un lead a un HUMANO lo pasa a 'listo_humano' con la IA
+      // APAGADA. Antes solo se seteaba asesor_id, así que un lead 'interesado'/'en_conversacion' asignado a mano
+      // quedaba en su estado viejo con la IA como estuviera -> caía fuera del radar del SLA y del flujo humano.
+      upd.status = 'listo_humano';
+      upd.ai_enabled = false;
+    }
     if (deptoVal !== undefined) upd.departamento_id = deptoVal;
     // R1 (recontacto_reglas_v2, gated, default OFF): la DERIVACION/asignacion MANUAL de un humano CANCELA el reloj de
     // recontacto -> congelamos la conv para que ni el cron de inactividad ni el sender de recontacto la agarren. Si el

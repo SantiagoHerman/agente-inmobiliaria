@@ -8473,9 +8473,14 @@ async function revisarAvisosInternos() {
     // => se avisa SIEMPRE (decision del dueno).
     let _slaCandidatas = [];
     try {
+      // FIX 2026-07-07 (agujero real, caso Seba/Anton): antes SOLO se vigilaba status='listo_humano'. Pero un humano
+      // puede TOMAR un lead que sigue en 'interesado' (se asigna asesor + apaga la IA sin derivación formal). Ese lead,
+      // aunque el humano es el responsable, NO entraba al SLA -> el lead esperó 4½h y el dueño nunca fue avisado.
+      // Criterio nuevo = "hay un humano responsable y el lead está esperando": asesor asignado + IA APAGADA
+      // (ai_enabled=false) + último mensaje del lead (last_role='contact') + no cerrado. Cubre listo_humano E interesado.
       const { data: _sc } = await supabase.from('conversations')
         .select('id, user_id, departamento_id, asesor_id, last_role, updated_at')
-        .eq('status', 'listo_humano').not('asesor_id', 'is', null).eq('last_role', 'contact');
+        .not('asesor_id', 'is', null).eq('ai_enabled', false).eq('last_role', 'contact').neq('status', 'cerrado');
       _slaCandidatas = _sc || [];
     } catch (eSlaQ) { _slaCandidatas = []; }
     const _slaCfgCache = {};      // _avisosConfig por ownerId

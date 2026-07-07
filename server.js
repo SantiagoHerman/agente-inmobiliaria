@@ -7463,6 +7463,35 @@ app.post('/api/oportunidades/:id/reanudar', async (req, res) => {
   }
 });
 
+// POST /api/oportunidades/:id/reiniciar -> "Volver a empezar": resetea enviados=0,
+// enviados_hoy=0, estado='en_cola' y BORRA las filas de oportunidad_envios de esa
+// oportunidad para que pueda re-enviar desde cero. No toca prioridad ni contenido.
+// DEFENSIVO: valida pertenencia al tenant; si algo falla no rompe el resto.
+app.post('/api/oportunidades/:id/reiniciar', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const id = req.params.id;
+    // Validar pertenencia antes de tocar nada.
+    let existe = null;
+    try { const { data } = await supabase.from('oportunidades').select('id').eq('id', id).eq('user_id', ownerId).maybeSingle(); existe = data || null; } catch (eL) { existe = null; }
+    if (!existe) return res.status(404).json({ error: 'Oportunidad no encontrada' });
+    // Borrar los envios previos para que el dedupe permita re-enviar (best-effort).
+    try { await supabase.from('oportunidad_envios').delete().eq('oportunidad_id', id); } catch (eDe) {}
+    try {
+      const { data, error } = await supabase.from('oportunidades')
+        .update({ enviados: 0, enviados_hoy: 0, estado: 'en_cola', updated_at: new Date().toISOString() })
+        .eq('id', id).eq('user_id', ownerId).select('*').single();
+      if (error) { console.error('POST /api/oportunidades/:id/reiniciar update:', error.message); return res.status(500).json({ error: error.message }); }
+      return res.json({ ok: true, oportunidad: data });
+    } catch (eR) { console.error('POST /api/oportunidades/:id/reiniciar:', eR && eR.message); return res.status(500).json({ error: 'No se pudo reiniciar' }); }
+  } catch (err) {
+    console.error('Error en POST /api/oportunidades/:id/reiniciar:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
 // POST /api/oportunidades/reordenar { orden:[ids] } -> reasigna prioridad segun el
 // orden recibido (1..N). Solo afecta filas del tenant que esten en el array.
 app.post('/api/oportunidades/reordenar', async (req, res) => {

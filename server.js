@@ -5528,6 +5528,22 @@ async function _enviarRecordatorioUno(c) {
       await enviarWhatsapp(inst, tel, txt, null);
     }
     if (c.asesor_id) { const { data: ase } = await supabase.from('asesores').select('auth_user_id').eq('id', c.asesor_id).maybeSingle(); if (ase && ase.auth_user_id) await enviarPushAsesor(ase.auth_user_id, 'Recordatorio de cita', '', (c.titulo || 'Cita') + ' — ' + cuando); }
+    // "Recordar a": ademas del asesor dueno, avisar a los asesores extra elegidos al crear la cita.
+    // Best-effort: si la columna recordar_a no existe (c.recordar_a undefined) o el JSON es invalido, no hace nada.
+    try {
+      if (c.recordar_a) {
+        let extra = [];
+        try { const _pr = JSON.parse(c.recordar_a); if (Array.isArray(_pr)) extra = _pr.map(String); } catch (ePr) {}
+        extra = extra.filter(function (x) { return x && String(x) !== String(c.asesor_id || ''); });
+        if (extra.length) {
+          const { data: ax } = await supabase.from('asesores').select('id, auth_user_id').in('id', extra);
+          for (let _k = 0; _k < (ax ? ax.length : 0); _k++) {
+            const _a = ax[_k];
+            if (_a && _a.auth_user_id) { try { await enviarPushAsesor(_a.auth_user_id, 'Recordatorio de cita', '', (c.titulo || 'Cita') + ' — ' + cuando); } catch (ePu) {} }
+          }
+        }
+      }
+    } catch (eRx) { /* recordar_a opcional: nunca rompe el recordatorio base */ }
   } catch (e) { console.error('_enviarRecordatorioUno:', e && e.message); }
 }
 async function enviarRecordatoriosCitas() {
@@ -15329,7 +15345,14 @@ app.get('/api/citas', async function(req, res) {
         citas.forEach(function(c){ c.asesor_nombre = (c && c.asesor_id && nombreDe[c.asesor_id]) ? nombreDe[c.asesor_id] : null; });
       }
     } catch (eNom) { /* sin nombres; la agenda funciona igual */ }
-    return res.json({ ok: true, citas: citas, esDueno: !(ase && ase.data), esAdmin: esAdmin, miAsesorId: soloAsesorId });
+    // "Recordar a": lista de usuarios (asesores) de la cuenta para el multi-select del form. Best-effort:
+    // si falla, el campo queda vacio (la agenda no rompe). Devuelve solo id+nombre (no datos sensibles).
+    var asesoresLista = [];
+    try {
+      var ral = await supabase.from('asesores').select('id, nombre, alias').eq('admin_id', ownerId).order('created_at', { ascending: true });
+      asesoresLista = (ral && ral.data ? ral.data : []).map(function(a){ return { id: a.id, nombre: a.nombre || a.alias || 'Usuario' }; });
+    } catch (eAl) { /* sin lista; el form igual funciona */ }
+    return res.json({ ok: true, citas: citas, esDueno: !(ase && ase.data), esAdmin: esAdmin, miAsesorId: soloAsesorId, asesores: asesoresLista });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/citas', async function(req, res) {
@@ -15371,6 +15394,18 @@ app.post('/api/citas', async function(req, res) {
     // post-insert por el MISMO motivo que creado_por: si la columna aun no existe, el update no-opea y la
     // cita YA quedo creada. Solo se setea si vino con contenido (no pisa con vacio).
     if (citaId && b.lugar && String(b.lugar).trim()) { try { await supabase.from('citas').update({ lugar: String(b.lugar).slice(0,300) }).eq('id', citaId); } catch (eLu) {} }
+    // "Recordar a": lista de asesores (ids) a quienes pushear el recordatorio, ADEMAS del asesor dueno.
+    // Best-effort post-insert (mismo motivo que creado_por/lugar): si la columna recordar_a aun no existe,
+    // el update no-opea y la cita YA quedo creada. Se filtran a asesores validos de la cuenta y se guarda
+    // como JSON de ids (lo consume enviarRecordatorioUno). Cero IA / cero tokens.
+    if (citaId && Array.isArray(b.recordar_a) && b.recordar_a.length) {
+      try {
+        var idsRec = b.recordar_a.map(String).filter(Boolean).slice(0, 30);
+        var vr = await supabase.from('asesores').select('id').eq('admin_id', ownerId).in('id', idsRec);
+        var validos = (vr && vr.data ? vr.data : []).map(function(a){ return String(a.id); });
+        if (validos.length) await supabase.from('citas').update({ recordar_a: JSON.stringify(validos) }).eq('id', citaId);
+      } catch (eRa) { /* sin columna aun / error: la cita YA quedo creada */ }
+    }
     // MOTOR DE TAREAS (cero IA): si es alquiler_temporal y tenemos check-out, generar las
     // tareas de limpieza pre/post y avisar al equipo. Best-effort: si falla, la cita YA
     // quedo creada (no se revierte) y no se devuelve error al usuario.

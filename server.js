@@ -3445,7 +3445,7 @@ async function revisarRotacionDerivacionV3() {
         // Timer vencido (o sin ancla): buscar el SIGUIENTE disponible del depto (equitativo; evita repetir al actual
         // si hay mas de uno). Referencia del lead para los avisos.
         let _leadRef = null;
-        try { if (conv.contact_id) { const { data: _c } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle(); _leadRef = (_c && (_c.name || _c.phone)) || null; } } catch (eLr) {}
+        try { if (conv.contact_id) { const { data: _c } = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', conv.contact_id).maybeSingle(); _leadRef = (_c && (_c.nombre_manual || _c.name || _c.phone)) || null; } } catch (eLr) {}
         const _deptoId = conv.derivacion_depto_id || conv.departamento_id || null;
         let _siguiente = null;
         if (_deptoId) {
@@ -7427,7 +7427,7 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
           let _nomLead = '';
           try {
             const { data: _cv } = await supabase.from('conversations').select('contact_id').eq('id', conversation_id).maybeSingle();
-            if (_cv && _cv.contact_id) { const { data: _ct } = await supabase.from('contacts').select('name, phone').eq('id', _cv.contact_id).maybeSingle(); _nomLead = (_ct && (_ct.name || _ct.phone)) || ''; }
+            if (_cv && _cv.contact_id) { const { data: _ct } = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', _cv.contact_id).maybeSingle(); _nomLead = (_ct && (_ct.nombre_manual || _ct.name || _ct.phone)) || ''; }
           } catch (eNl) {}
           const _cuerpo = 'Se te asignó un nuevo lead' + (_nomLead ? (': ' + _nomLead) : '') + '. Entrá a atenderlo.';
           await enviarPushAsesor(_aseDest.auth_user_id, 'Nuevo lead asignado', '', _cuerpo);

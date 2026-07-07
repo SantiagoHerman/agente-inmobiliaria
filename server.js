@@ -9841,6 +9841,59 @@ app.post('/api/asesores/cambiar-clave', async (req, res) => {
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+
+// Cambiar el ALIAS (usuario de login) de un asesor. El alias es la parte que arma el email interno de Auth
+// (emailAdmin + '+' + aliasLimpio + '@' + dominio); por eso cambiarlo OBLIGA a re-sincronizar el email en Auth,
+// si no el login queda desincronizado (bug historico: se cambiaba el nombre visible pero el login seguia pidiendo
+// el alias original). La CLAVE NO se toca (se conserva). El dueno lo cambia desde la pantalla Usuarios. 0 tokens.
+app.post('/api/asesores/cambiar-alias', async (req, res) => {
+  try {
+    const { admin_id, asesor_id, alias_nuevo } = req.body || {};
+    // SEGURIDAD: validar identidad por token
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!admin_id || !asesor_id || !alias_nuevo) return res.status(400).json({ error: 'Faltan datos' });
+    const aliasLimpio = String(alias_nuevo).toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!aliasLimpio) return res.status(400).json({ error: 'El alias debe tener al menos una letra o numero' });
+    // El asesor debe pertenecer a este admin y tener usuario de Auth (login).
+    const { data: ase } = await supabase.from('asesores').select('*').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
+    if (!ase) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (!ase.auth_user_id) return res.status(400).json({ error: 'El usuario no tiene acceso (login) para cambiarle el alias' });
+    // Si el alias LIMPIO no cambia (mismo login), no re-sincronizamos Auth; solo actualizamos el texto visible si difiere.
+    const aliasActualLimpio = String(ase.usuario || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (aliasLimpio === aliasActualLimpio) {
+      if (String(ase.usuario || '') !== String(alias_nuevo).trim()) { try { await supabase.from('asesores').update({ usuario: String(alias_nuevo).trim() }).eq('id', asesor_id).eq('admin_id', admin_id); } catch (e) {} }
+      return res.json({ ok: true, alias: String(alias_nuevo).trim(), sin_cambios: true });
+    }
+    // Unicidad dentro del tenant: ningun OTRO usuario del admin puede tener el mismo alias limpio (evita colision de email).
+    const { data: hermanos } = await supabase.from('asesores').select('id, usuario').eq('admin_id', admin_id);
+    if (Array.isArray(hermanos)) {
+      for (const h of hermanos) {
+        if (String(h.id) === String(asesor_id)) continue;
+        if (String(h.usuario || '').toLowerCase().replace(/[^a-z0-9]/g, '') === aliasLimpio) {
+          return res.status(400).json({ error: 'Ese alias ya lo usa otro usuario de tu cuenta, elegi otro' });
+        }
+      }
+    }
+    // Armar el email nuevo a partir del email del admin (mismo criterio que /crear).
+    const { data: adminData, error: errAdmin } = await supabase.auth.admin.getUserById(admin_id);
+    if (errAdmin || !adminData || !adminData.user || !adminData.user.email) return res.status(400).json({ error: 'No se pudo obtener el email del administrador' });
+    const partes = String(adminData.user.email).split('@');
+    const emailNuevo = partes[0] + '+' + aliasLimpio + '@' + partes[1];
+    // Re-sincronizar el email en Auth (email_confirm: no manda correo, queda confirmado). La CLAVE no se toca.
+    const { error: errUpd } = await supabase.auth.admin.updateUserById(ase.auth_user_id, { email: emailNuevo, email_confirm: true });
+    if (errUpd) {
+      const _m = String(errUpd.message || '').toLowerCase();
+      if (_m.indexOf('already') >= 0 || _m.indexOf('registered') >= 0 || _m.indexOf('exists') >= 0 || _m.indexOf('duplicate') >= 0) return res.status(400).json({ error: 'Ese alias ya esta en uso, elegi otro' });
+      return res.status(500).json({ error: 'No se pudo cambiar el alias: ' + (errUpd.message || '') });
+    }
+    // Persistir el alias visible en la tabla (el email de Auth ya quedo cambiado; esto es el texto que se muestra/escribe).
+    const { error: errUsu } = await supabase.from('asesores').update({ usuario: String(alias_nuevo).trim() }).eq('id', asesor_id).eq('admin_id', admin_id);
+    if (errUsu) return res.status(500).json({ error: 'El alias cambio en el acceso pero no se pudo guardar el texto: ' + errUsu.message });
+    return res.json({ ok: true, alias: String(alias_nuevo).trim(), email: emailNuevo });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 app.post('/api/asesores/eliminar', async (req, res) => {
   try {
     const { admin_id, asesor_id } = req.body || {};

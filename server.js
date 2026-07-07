@@ -17508,6 +17508,29 @@ app.post('/api/presencia', async function(req, res){
   }catch(e){ return res.status(200).json({ ok: false }); }
 });
 
+// UI-FLAGS por-cuenta (NO gated / aditivo): devuelve los flags de experiencia/apariencia del DUEÑO de la cuenta,
+// resueltos con service key. Necesario porque la RLS de business_settings (unica policy own_business: auth.uid()=user_id)
+// NO deja que un ASESOR lea la fila del dueño desde el frontend -> el gate composerV2/ui_moderno caia SIEMPRE a false para
+// los asesores y veian la pantalla VIEJA de conversaciones. Aca resolvemos el owner (admin_id si quien pide es asesor) y
+// devolvemos SOLO flags booleanos (nada sensible: ningun token). Fail-open a false ante cualquier error. 0 tokens.
+app.get('/api/ui-flags', async function(req, res){
+  try{
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // Si quien pide es un ASESOR, los flags son los del DUEÑO (admin_id). El dueño no tiene fila en asesores -> queda igual.
+    try {
+      var _yo = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
+      if (_yo && _yo.data && _yo.data.admin_id) user_id = _yo.data.admin_id;
+    } catch (e) { /* sin fila -> es el dueño, user_id queda igual */ }
+    var ui_moderno = false, reparto_v2 = false;
+    try {
+      var _bs = await supabase.from('business_settings').select('ui_moderno, reparto_v2').eq('user_id', user_id).maybeSingle();
+      if (_bs && _bs.data) { ui_moderno = _bs.data.ui_moderno === true; reparto_v2 = _bs.data.reparto_v2 === true; }
+    } catch (e) { /* columna ausente / error -> false (fail-open) */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2 });
+  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false }); }
+});
+
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.
 // Borra el token del usuario autenticado. Se filtra por user_id + token para que nadie borre tokens ajenos.
 app.post('/api/push/baja-token', async function(req, res){

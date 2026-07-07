@@ -2715,6 +2715,34 @@ function temperaturaPorEstado(status) {
 // Las partes que NO comparten los 3 sitios (mandar WhatsApp del handoff, insertar el mensaje, agendar
 // cita) quedan FUERA: las sigue manejando cada sitio para no alterar el comportamiento.
 // Devuelve el asesor_id vigente (el ya asignado o el recien elegido) o null.
+
+// ============================================================================
+// HISTORIAL DE PASES INMUTABLE (append-only). Registra CADA cambio de asesor/derivacion como un mensaje de
+// SISTEMA (role='sistema') que se VE en el timeline del chat y NUNCA se borra ni se pisa. Problema que resuelve
+// (caso Diego/Anton): al reasignar de Administracion a Walter, el dato "la IA derivo a Valentina" DESAPARECIA
+// porque ese pase nunca se habia registrado (varios caminos de asignacion no dejaban rastro) y el asesor_id se
+// habia sobrescrito. Ahora cada pase queda escrito para siempre: IA->X, X->Y, sin-asignar, etc.
+//
+// origenId/destinoId: id en `asesores` o null (null = "la IA" cuando el origen no era un humano, y "sin asignar"
+// cuando el destino es null). `quien` (opcional) = quien hizo el pase (ej. "El administrador", "La IA", "El
+// sistema"). DEFENSIVO al 100%: cualquier fallo se traga; NUNCA rompe la asignacion (0 tokens de IA).
+async function registrarPaseAsesor(convId, ownerId, origenId, destinoId, quien) {
+  try {
+    if (!convId || !ownerId) return;
+    if ((origenId || null) === (destinoId || null)) return; // no hubo cambio real de asesor: no registrar
+    // Resolver nombres best-effort. Origen null -> "la IA" (no venia de un humano). Destino null -> "sin asignar".
+    async function _nom(id) {
+      if (!id) return null;
+      try { const { data: a } = await supabase.from('asesores').select('nombre').eq('id', id).maybeSingle(); return (a && a.nombre) ? a.nombre : null; } catch (e) { return null; }
+    }
+    const nomOrigen = origenId ? ((await _nom(origenId)) || 'un asesor') : 'la IA';
+    const nomDestino = destinoId ? ((await _nom(destinoId)) || 'un asesor') : 'sin asignar';
+    const quienStr = (quien && String(quien).trim()) ? (String(quien).trim() + ': ') : '';
+    const texto = '🔁 ' + quienStr + 'pase de ' + nomOrigen + ' a ' + nomDestino;
+    await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: texto, enviado_por: 'Sistema' });
+  } catch (e) { /* best-effort: un fallo al registrar el pase NUNCA rompe la asignacion */ }
+}
+
 async function derivarAHumano(convId, user_id, motivo, opts) {
   opts = opts || {};
   try {
@@ -2890,6 +2918,13 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
             const _txtEvt = _nomDep ? ('La IA derivó el lead a ' + _nomAse + ' (' + _nomDep + ')') : ('La IA derivó el lead a ' + _nomAse);
             await supabase.from('messages').insert({ conversation_id: convId, user_id: (_cv && _cv.user_id) || user_id, role: 'sistema', content: _txtEvt, enviado_por: 'Sistema' });
           } catch (eEvt) {}
+        }
+        // HISTORIAL DE PASES INMUTABLE: registrar el pase append-only para que ningun pase se pierda (era la causa del
+        // caso Diego). El bloque de arriba YA deja un texto rico "La IA derivó..." cuando _v2 + destino HUMANO; en ESE
+        // caso NO duplicamos. Registramos el pase inmutable en TODO otro caso: reparto_v2 OFF, o destino usuario IA.
+        // Origen = quien tenia el lead ANTES (_cv.asesor_id leido al inicio de derivarAHumano); null -> "la IA".
+        if (!(_v2 && !_asesorEsIA)) {
+          try { await registrarPaseAsesor(convId, (_cv && _cv.user_id) || user_id, (_cv && _cv.asesor_id) || null, _asesor, 'La IA'); } catch (ePase) {}
         }
       }
     }
@@ -3159,6 +3194,9 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
       const _ok = await _asignarRotacionV3(convId, _asesor, _deptoId, nowIso, true);
       if (!_ok) return { ok: false, yaTomado: true }; // otro proceso tomo el lead: respetar
       await _anunciarLead();
+      // HISTORIAL DE PASES INMUTABLE: la IA arranca la rotacion y asigna al primer disponible. La conv NO tenia
+      // asesor (guard arriba: si _cv.asesor_id existia, esta funcion retorna antes) -> origen = "la IA". Append-only.
+      try { await registrarPaseAsesor(convId, ownerId, null, _asesor, 'La IA'); } catch (ePase) {}
       await _notificarRotacionV3(ownerId, convId, _asesor, _leadRef, false);
       console.log('Derivacion v3: lead ' + convId + ' asignado a ' + _asesor + ' (rotando, IA sigue atendiendo)');
       return { ok: true, asesorId: _asesor, esperando: false };
@@ -3429,6 +3467,9 @@ async function revisarRotacionDerivacionV3() {
           // renotificar, NO loguear: tratar como skip (respetar al humano). Solo notificamos si tocamos una fila.
           const _reOk = await _asignarRotacionV3(conv.id, _siguiente, _deptoId, nowIso, false, { asesor_id: (conv.asesor_id || null) });
           if (!_reOk) { continue; } // otro proceso gano (toma/asignacion/cancelacion/finalizacion manual): skip
+          // HISTORIAL DE PASES INMUTABLE: la rotacion pasa el lead al siguiente asesor porque el anterior no respondio.
+          // Origen = quien lo tenia (conv.asesor_id; null si estaba sin asesor -> "la IA"). Destino = _siguiente. Append-only.
+          try { await registrarPaseAsesor(conv.id, ownerId, (conv.asesor_id || null), _siguiente, 'La IA'); } catch (ePase) {}
           await _notificarRotacionV3(ownerId, conv.id, _siguiente, _leadRef, !!conv.asesor_id);
           console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)'));
         } else {
@@ -8140,6 +8181,9 @@ async function escalarLeadsEnColaVencidos() {
               .update({ asesor_id: _estProp.asesor, ultimo_asesor_id: _estProp.asesor, updated_at: new Date().toISOString() })
               .eq('id', conv.id).is('asesor_id', null).eq('admin_tomo', false).select('id');
             if (_asgProp && _asgProp.length) {
+              // HISTORIAL DE PASES INMUTABLE: el cron reasigno un lead en cola a un asesor de su propio depto. La conv
+              // estaba sin asesor (update condicional .is('asesor_id', null)) -> origen = "la IA/sistema". Append-only.
+              try { await registrarPaseAsesor(conv.id, ownerId, null, _estProp.asesor, 'El sistema'); } catch (ePase) {}
               // Asignado a su PROPIO depto: limpiar el pase agendado off-hours (igual que el PASO 1) y persistir el
               // dedupe para no re-escalar. Writes APARTE best-effort (columnas opcionales): no rompen la asignacion.
               try { await supabase.from('conversations').update({ handoff_pendiente: false }).eq('id', conv.id); } catch (eHp) {}
@@ -8187,6 +8231,9 @@ async function escalarLeadsEnColaVencidos() {
             if (!_asgEsc || !_asgEsc.length) {
               _asignado = null; _yaTomado = true; // ya hay asesor/admin a cargo: no robar, no avisar al dueno
             } else {
+              // HISTORIAL DE PASES INMUTABLE: el cron escalo un lead en cola al depto fallback (ej. Administracion).
+              // La conv estaba sin asesor (update condicional .is('asesor_id', null)) -> origen = "el sistema". Append-only.
+              try { await registrarPaseAsesor(conv.id, ownerId, null, _asignado, 'El sistema'); } catch (ePase) {}
               // FIX (1a): ya hay un humano asignado en la manana -> el pase agendado off-hours dejo de aplicar.
               // Limpiar handoff_pendiente para que una oferta REAL posterior (manejarRespuestaFueraHorario) no se
               // cortocircuite. Write APARTE best-effort/defensivo (columna opcional): no debe romper la asignacion.

@@ -1537,6 +1537,10 @@ async function obtenerOcrearConvDeCanal(user_id, contactKey, canal, nombreNuevo,
 // del tenant y trae la propiedad reparto_v2, se reusa (sin query); si no, una query chica .select('reparto_v2').
 async function repartoV2Activo(user_id, bs) {
   try {
+    // DECISION DUENO 2026-07: reparto por DEPARTAMENTO siempre ON. Cada rubro trae sus departamentos por default;
+    // el ruteo por departamento es el unico camino (se elimino el modo "pool general" de la config). El pool
+    // (elegirAsesorActivo) queda solo como fallback interno cuando un lead no resuelve depto. Rollback = borrar esta linea.
+    return true;
     // Reusar un business_settings ya cargado si trae la propiedad (evita una query extra por mensaje).
     if (bs && Object.prototype.hasOwnProperty.call(bs, 'reparto_v2')) return bs.reparto_v2 === true;
     if (!user_id) return false;
@@ -4236,6 +4240,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         'APELLIDO: Si te preguntan tu apellido, aclara con amabilidad que no es un dato relevante, y ofrece pasarlo con un asesor del equipo si lo necesita en ese momento.',
     'LINKS DE PROPIEDADES: Cuando menciones o recomiendes una propiedad que en el inventario tenga un campo link, inclui ese link en tu respuesta para que el lead pueda ver mas informacion y fotos. Compartilo de forma natural, por ejemplo: Te paso el link para que veas las fotos y los detalles. Si la propiedad no tiene link en el inventario, no inventes ninguno ni menciones que falta.',
     'FOTOS DE PROPIEDADES: Cuando el lead te PIDA ver una foto de una propiedad (por ejemplo: mandame una del dormitorio, mostrame la pileta, tenes fotos de la cocina), usa la herramienta enviar_foto_propiedad indicando el numero de la propiedad (campo numero del inventario, ej: 12) y la categoria pedida. Solo podes mandar fotos de propiedades que en el inventario digan fotos disponibles. Las categorias validas son: dormitorio, bano, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Si no tenes claro de que propiedad habla, primero preguntale cual antes de usar la herramienta. No inventes fotos que no existan.',
+    // REGLA DE ORO DE DERIVACION (protegida: string literal fijo, el cliente NO puede editarla ni desactivarla desde
+    // la config; va SIEMPRE en el prompt). Fix del caso Fabiana: que la IA no adivine el area y pregunte cuando duda.
+    'REGLA DE ORO (obligatoria, no negociable): antes de dar por sentada un area o de encaminar el lead a un asesor, entende PRIMERO que necesita. Distingui si quiere COMPRAR, ALQUILAR, o si es un tema de ADMINISTRACION de un cliente que YA opera con la empresa (un pago, una expensa, un recibo, una cobranza). Si el mensaje no lo deja claro, o mezcla temas, o no estas segura, PREGUNTASELO con naturalidad (por ejemplo: "para orientarte bien: es por una compra o alquiler, o por un tema de administracion como un pago o una expensa?") y espera la respuesta antes de encaminarlo. NUNCA supongas el area por una palabra suelta: alguien que quiere comprar/alquilar y habla de FINANCIACION, CUOTAS, ANTICIPO, SEÑA o CONTRATO de la operacion es VENTA o ALQUILER, NO Administracion. Si la intencion es obvia (pregunta un precio, una propiedad, disponibilidad) NO hace falta preguntar: seguí normal.',
     instruccionesRubro,
     comportamientoSetter,
     // AGENTE PREMIUM EN REAL ESTATE (aplicado a TODOS por default; se apaga con agente_premium_re=false a nivel cuenta
@@ -4612,11 +4619,12 @@ async function clasificarEstado(mensajeCliente, user_id) {
       'Ademas, deduci a que DEPARTAMENTO del negocio corresponde la consulta del cliente, eligiendo SOLO uno de esta lista (por su nombre EXACTO) o "ninguno" si no estas seguro:',
       _deptos.map(function(d){ return '- ' + d.nombre + (d.criterio_derivacion ? (': ' + String(d.criterio_derivacion).slice(0, 200)) : ''); }).join('\n'),
       'REGLA DEPARTAMENTO: si no podes deducirlo con razonable seguridad del mensaje, responde "ninguno" (NO adivines).',
-      // REGLA DE ASIGNACION (parte IA): el departamento lo decide el TEMA de la charla, NO la conveniencia de
-      // ningun asesor. Si el lead habla de ADMINISTRACION o PAGOS (pagar, pago, abonar, cuota, expensas, seña/sena,
-      // recibo, comprobante, factura, cobranza, deuda, vencimiento, transferencia, contrato, financiacion) ->
-      // ese tema corresponde al departamento de ADMINISTRACION (si existe uno con ese nombre/criterio en la lista).
-      'REGLA TEMA->DEPTO: elegi el departamento por el TEMA del mensaje, NUNCA por conveniencia. Si el cliente habla de PAGOS o administracion (pagar, pago, abonar, cuota, expensas, seña, recibo, comprobante, factura, cobranza, deuda, vencimiento, transferencia, contrato, financiacion), corresponde al departamento de Administracion de la lista (el que en su criterio menciona pagos/cobranzas/recibos); si ese depto no existe en la lista, respondé "ninguno".',
+      // REGLA DE ASIGNACION (parte IA): el departamento lo decide el TEMA + la INTENCION del lead, NO la conveniencia.
+      // CLAVE (fix misruteo Fabiana): Administracion es SOLO para clientes que YA operan con la empresa (pagar una
+      // expensa/cuota mensual, un recibo/comprobante de pago, una cobranza o deuda vencida, un reclamo administrativo).
+      // Un lead que quiere COMPRAR o ALQUILAR y menciona financiacion, cuotas, anticipo, seña o el contrato de ESA
+      // operacion NO es Administracion: es Venta o Alquiler segun lo que busca. Ante la duda -> "ninguno" (no adivinar).
+      'REGLA TEMA->DEPTO: elegi el departamento por el TEMA e INTENCION del mensaje, NUNCA por conveniencia. El departamento de Administracion es SOLO para un cliente que YA opera con la empresa: pagar una expensa/cuota/recibo, un comprobante de pago, una cobranza o deuda vencida, un reclamo administrativo. OJO: alguien que quiere COMPRAR o ALQUILAR y menciona financiacion, cuotas, anticipo, seña o el contrato de la operacion NO es Administracion, es VENTA o ALQUILER segun lo que busca. Si dudas entre dos areas o no queda claro, responde "ninguno" (NO adivines).',
       // FASE 2 (punto 1): distinguir si el cliente PIDIO un area explicitamente (la nombro / pidio esa atencion)
       // o si vos la DEDUJISTE del tema. "pidio_area"=true SOLO si el cliente menciono/pidio el area el mismo.
       'Indica ademas "pidio_area": true SOLO si el cliente PIDIO o NOMBRO explicitamente ese departamento/area el mismo (ej. "quiero hablar con administracion", "me pasas con ventas"); false si vos lo dedujiste del tema.',

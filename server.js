@@ -10313,12 +10313,21 @@ app.post('/api/equipo/avisos-config', async function(req, res) {
     // if (espera>=p3) ... else if (>=p2) ... else if (>=p1). Si el dueno guarda p1/p2/p3 desordenados (ej. 90/60/30),
     // p2/p3 nunca dispararian. NORMALIZAMOS reordenando ascendente para garantizar paso1<=paso2<=paso3.
     { const _ord = [_p1, _p2, _p3].sort(function(a, b){ return a - b; }); _p1 = _ord[0]; _p2 = _ord[1]; _p3 = _ord[2]; }
-    const config = {
-      no_resuelve: b.no_resuelve === true,
-      lead_caliente: { on: lc.on === true, minutos: _min },
-      resumen: { on: rs.on === true, hora: _hora },
-      sla_humano: { on: sh.on !== false, paso1: _p1, paso2: _p2, paso3: _p3 }
-    };
+    // MERGE con lo ya guardado: solo se sobrescriben las claves que VIENEN en el request; el resto se conserva. Así,
+    // guardar los "avisos internos" (no_resuelve/lead_caliente/resumen) NO pisa el sla_humano — ni viceversa. Antes se
+    // reconstruía el objeto entero desde el request y cada guardado parcial borraba las otras claves (bug latente).
+    let _prev = {};
+    try { const { data: _ex } = await supabase.from('business_settings').select('avisos_internos').eq('user_id', ident.ownerId).maybeSingle(); if (_ex && _ex.avisos_internos && typeof _ex.avisos_internos === 'object') _prev = _ex.avisos_internos; } catch (ePrev) {}
+    const config = Object.assign({
+      no_resuelve: false,
+      lead_caliente: { on: false, minutos: 20 },
+      resumen: { on: false, hora: '20:00' },
+      sla_humano: { on: true, paso1: 30, paso2: 60, paso3: 90 }
+    }, _prev);
+    if ('no_resuelve' in b) config.no_resuelve = b.no_resuelve === true;
+    if ('lead_caliente' in b) config.lead_caliente = { on: lc.on === true, minutos: _min };
+    if ('resumen' in b) config.resumen = { on: rs.on === true, hora: _hora };
+    if ('sla_humano' in b) config.sla_humano = { on: sh.on !== false, paso1: _p1, paso2: _p2, paso3: _p3 };
     const { error } = await supabase.from('business_settings').update({ avisos_internos: config }).eq('user_id', ident.ownerId);
     if (error) {
       // DEFENSIVO: columna ausente u otro error de esquema -> avisar que falta correr la migracion (no romper).

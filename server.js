@@ -10056,6 +10056,76 @@ app.post('/api/asesores/config', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== VALIDAR EL WHATSAPP DE NOTIFICACION DE UN USUARIO (asesores.whatsapp_notif) =====
+// PROBLEMA que resuelve: hoy whatsapp_notif se guarda SOLO sacando no-digitos, sin verificar que sea un
+// WhatsApp real. Caso Bruno: quedo 542215776798 (sin el "9" de movil argentino) cuando su numero real es
+// 5492215776798 -> Evolution NO le entrega las notificaciones. Este endpoint chequea el numero contra
+// Evolution (misma instancia del DUENO) ANTES de guardar y, para AR, sugiere el numero con el "9" si ese
+// existe y el original no. CERO IA / 0 tokens (solo /chat/whatsappNumbers).
+//
+// Contrato: POST { numero, admin_id? } (auth por token). Devuelve:
+//   { ok:true, existe:true,  jid:'<normalizado>' }                     -> el numero SI figura en WhatsApp
+//   { ok:true, existe:false, sugerido:'<con 9>'|null }                 -> NO figura (avisar; ofrecer sugerido)
+//   { ok:true, existe:null }                                           -> Evolution no respondio/instancia off
+//                                                                          (best-effort: el front NO bloquea el guardado)
+// DEFENSIVO: cualquier fallo de Evolution => existe:null (no rompe ni bloquea el alta del usuario).
+app.post('/api/asesores/validar-whatsapp', async function(req, res) {
+  try {
+    // 1) AUTH por token (mismo verificarUsuario que el resto).
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+
+    // 2) Resolver el DUENO del tenant. Por default el que llama ES el dueño (su uid = user_id del tenant);
+    //    si es un asesor sub-cuenta, el dueño es su admin_id. (PATRON: todo gate/instancia resuelve el dueño;
+    //    ver /api/contactos/renombrar). La instancia de Evolution es la del dueño.
+    let ownerId = uid;
+    try {
+      const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (ase && ase.admin_id) ownerId = ase.admin_id;
+    } catch (e1) {}
+    // Si mandaron admin_id explicito y coincide con el dueño resuelto, lo respetamos (no cambia el tenant).
+    const b = req.body || {};
+    if (b.admin_id && typeof b.admin_id === 'string' && b.admin_id === ownerId) ownerId = b.admin_id;
+
+    // 3) Normalizar el numero IGUAL que se guarda (solo digitos).
+    const soloDigitos = String(b.numero == null ? '' : b.numero).replace(/[^0-9]/g, '');
+    if (!soloDigitos) return res.status(400).json({ error: 'Falta numero' });
+
+    // 4) Instancia del dueño. Si Evolution no esta configurado, no bloqueamos (best-effort).
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.json({ ok: true, existe: null, jid: soloDigitos });
+    const instancia = nombreInstancia(ownerId);
+
+    // 5) Consulta a Evolution para el numero tal cual vino.
+    const r1 = await verificarNumeroWA(instancia, soloDigitos);
+    // Errores de Evolution / instancia no conectada / respuesta rara => existe:null (best-effort, no bloquea).
+    if (r1 && r1.error) return res.json({ ok: true, existe: null, jid: soloDigitos });
+
+    if (r1 && r1.existe === true) {
+      // El numero SI figura. Devolvemos el jid normalizado por Evolution si lo trae (sin el @dominio).
+      const jidNorm = (r1.jid ? String(r1.jid).replace(/@.*$/, '').replace(/[^0-9]/g, '') : '') || soloDigitos;
+      return res.json({ ok: true, existe: true, jid: jidNorm });
+    }
+
+    // 6) NO figura. Para ARGENTINA: los moviles llevan un "9" entre el 54 (pais) y el area. Si vino SIN ese 9
+    //    (patron '54' + area, sin '549'), probamos la variante con "9" y, si ESA existe, la sugerimos.
+    let sugerido = null;
+    try {
+      if (soloDigitos.indexOf('54') === 0 && soloDigitos.indexOf('549') !== 0 && soloDigitos.length >= 12) {
+        const conNueve = '549' + soloDigitos.slice(2);
+        const r2 = await verificarNumeroWA(instancia, conNueve);
+        if (r2 && r2.existe === true) {
+          sugerido = (r2.jid ? String(r2.jid).replace(/@.*$/, '').replace(/[^0-9]/g, '') : '') || conNueve;
+        }
+      }
+    } catch (eSug) { /* si la 2da consulta falla, seguimos sin sugerido */ }
+
+    return res.json({ ok: true, existe: false, sugerido: sugerido });
+  } catch (e) {
+    // Nunca bloqueamos el flujo del usuario por un error nuestro: best-effort.
+    return res.json({ ok: true, existe: null });
+  }
+});
+
 // ===== CARGAR CONTACTO MANUAL (desde Conversaciones) =====
 // Un asesor con el permiso `puede_cargar_contacto` da de alta un contacto/conversacion a mano. La conversacion
 // entra directo en status='listo_humano', IA OFF (ai_enabled=false), asignada a ESE asesor. CERO IA (0 tokens).

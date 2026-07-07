@@ -4313,8 +4313,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (_derivacionV3On) {
     toolsAgente.push({
       name: 'derivar_a_humano',
-      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y, si lo sabes, el departamento/area (usa el nombre exacto del area de la empresa).',
-      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre del area/departamento al que corresponde el lead (ej: Ventas, Alquileres), si lo sabes. Opcional.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
+      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. IMPORTANTE (vos decidis el area): pasa SIEMPRE el departamento correcto segun lo que el lead necesita — Venta si quiere comprar, Alquiler si quiere alquilar, Administracion SOLO si es un cliente que ya opera con la empresa y consulta por un pago/expensa/recibo. NO derives adivinando: si todavia no sabes si es compra o alquiler, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
+      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre EXACTO del area/departamento al que corresponde el lead segun lo que necesita (ej: Venta, Alquiler, Administracion). Pasalo SIEMPRE que sepas la intencion; si no la sabes, primero preguntala al lead antes de derivar.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
     });
   }
 
@@ -4601,7 +4601,12 @@ async function clasificarEstado(mensajeCliente, user_id) {
         _deptos = _dd || [];
       }
     } catch (eDep) { _deptos = []; }
-    const _hayDeptos = _deptos.length > 0;
+    // FASE 2 (2026-07): Haiku NO decide el DEPARTAMENTO. El area la decide 100% el agente principal (Sonnet) via la
+    // tool derivar_a_humano; Haiku queda SOLO para el ESTADO (interesado/listo_humano). Con _hayDeptos=false el
+    // clasificador usa el prompt de una palabra (20 tokens, mas barato) y departamentoId sale null -> todos los
+    // consumidores del webhook estan guardados con if(_departamentoId...) y el area cae a la tool de Sonnet o al
+    // es_default (Venta) como fallback seguro. Rollback = volver a `_deptos.length > 0`.
+    const _hayDeptos = false;
     // Mapea el nombre que devuelve la IA -> id de departamento del tenant (match exacto, sin acentos/case).
     const _norm = function(s){ return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
     const _resolverDeptoId = function(nombre){

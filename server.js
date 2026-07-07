@@ -9310,6 +9310,12 @@ function _camposUsuarioNuevos(b) {
   // PARTE A (punto 9): config del agente IA (jsonb). Acepta objeto (config) o null (limpiar al pasar a Humano).
   if (b.agente_config && typeof b.agente_config === 'object') out.agente_config = b.agente_config;
   else if (b.agente_config === null) out.agente_config = null;
+  // ACCESO POR PANEL (permisos_paneles jsonb): { <navKey>: true }. Controla qué secciones del menú ve/entra el
+  // usuario. Ausencia/null => default "solo Conversaciones" (lo resuelve el front: guard + shell). DEFENSIVO: solo
+  // se setea si llega un objeto (o null para limpiar). Si la columna no existe todavía, el .update lo maneja en su
+  // propio bloque (no rompe el resto de la config) hasta correr la migración permisos_paneles.
+  if (b.permisos_paneles && typeof b.permisos_paneles === 'object' && !Array.isArray(b.permisos_paneles)) out.permisos_paneles = b.permisos_paneles;
+  else if (b.permisos_paneles === null) out.permisos_paneles = null;
   return out;
 }
 // Reemplaza la membresia de departamentos de un usuario (valida que los deptos sean de la cuenta).

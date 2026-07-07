@@ -8492,9 +8492,11 @@ async function revisarAvisosInternos() {
       try {
         const { data: cv2 } = await supabase.from('conversations').select('contact_id').eq('id', conv.id).maybeSingle();
         if (cv2 && cv2.contact_id) {
-          const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', cv2.contact_id).maybeSingle();
+          const { data: ct } = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', cv2.contact_id).maybeSingle();
           if (ct) {
-            const _n = (ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '';
+            // Usar el MISMO nombre que se ve en el chat: nombre_manual (corregido a mano) tiene prioridad sobre
+            // name (el que sincroniza WhatsApp/agenda). Fix Bruno/Roman: el aviso mostraba el name sincronizado.
+            const _n = (ct.nombre_manual && String(ct.nombre_manual).trim()) ? String(ct.nombre_manual).trim() : ((ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '');
             const _t = (ct.phone && String(ct.phone).trim()) ? String(ct.phone).trim() : '';
             leadRef = (_n || _t) ? (_n + (_t ? (_n ? ' (' + _t + ')' : _t) : '')) : 'un lead';
           }
@@ -8633,9 +8635,11 @@ async function revisarAvisosInternos() {
       try {
         const { data: cv2 } = await supabase.from('conversations').select('contact_id').eq('id', conv.id).maybeSingle();
         if (cv2 && cv2.contact_id) {
-          const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', cv2.contact_id).maybeSingle();
+          const { data: ct } = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', cv2.contact_id).maybeSingle();
           if (ct) {
-            const _n = (ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '';
+            // Usar el MISMO nombre que se ve en el chat: nombre_manual (corregido a mano) tiene prioridad sobre
+            // name (el que sincroniza WhatsApp/agenda). Fix Bruno/Roman: el aviso mostraba el name sincronizado.
+            const _n = (ct.nombre_manual && String(ct.nombre_manual).trim()) ? String(ct.nombre_manual).trim() : ((ct.name && String(ct.name).trim()) ? String(ct.name).trim() : '');
             const _t = (ct.phone && String(ct.phone).trim()) ? String(ct.phone).trim() : '';
             leadRef = (_n || _t) ? (_n + (_t ? (_n ? ' (' + _t + ')' : _t) : '')) : 'un lead';
           }

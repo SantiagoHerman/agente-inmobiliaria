@@ -18121,12 +18121,13 @@ app.get('/api/maestro/clientes', async function(req, res){
     var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
     // Pedimos eliminado_at para distinguir ACTIVOS (null) de ELIMINADOS (papelera). Si la columna aun no existe,
     // el select falla -> reintentamos sin ella (degradar bien: todos quedan como activos, eliminado_at=null).
-    var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado, eliminado_at');
+    var bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado, ui_moderno, eliminado_at');
+    if (bs && bs.error) { bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado, ui_moderno'); }
     if (bs && bs.error) { bs = await supabase.from('business_settings').select('user_id, company_name, rubro, crm_pausado'); }
     var subs = await supabase.from('subscriptions').select('user_id, plan, status, ai_messages_this_period, current_period_end, cortesia, limits_override, mensajes_extra, trial_con_tarjeta, ai_messages_limit_override, created_at');
     var byUser = {}; (subs.data || []).forEach(function(s){ byUser[s.user_id] = s; });
     var act = {}; try { var cv = await supabase.from('conversations').select('user_id, updated_at').order('updated_at', { ascending: false }).limit(3000); (cv.data || []).forEach(function(r){ if (!act[r.user_id]) act[r.user_id] = r.updated_at; }); } catch(eAct){}
-    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; var _topeEf = topeEfectivoIA(s, s.plan); var _tope = (_topeEf === Infinity) ? null : _topeEf; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', pausado: b.crm_pausado === true, eliminado: !!b.eliminado_at, eliminado_at: b.eliminado_at || null, cortesia: s.cortesia === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, tope: _tope, mensajes_extra: s.mensajes_extra || 0, vence: s.current_period_end || null, ultima_actividad: act[b.user_id] || null }; });
+    var clientes = (bs.data || []).map(function(b){ var s = byUser[b.user_id] || {}; var _topeEf = topeEfectivoIA(s, s.plan); var _tope = (_topeEf === Infinity) ? null : _topeEf; return { user_id: b.user_id, empresa: b.company_name || '(sin nombre)', rubro: b.rubro || '-', ui_moderno: b.ui_moderno === true, pausado: b.crm_pausado === true, eliminado: !!b.eliminado_at, eliminado_at: b.eliminado_at || null, cortesia: s.cortesia === true, plan: s.plan || null, estado: s.status || null, ai_mes: s.ai_messages_this_period || 0, tope: _tope, mensajes_extra: s.mensajes_extra || 0, vence: s.current_period_end || null, ultima_actividad: act[b.user_id] || null }; });
     try { var est = await Promise.all(clientes.map(function(c){ return Promise.race([ instanciaConectada(nombreInstancia(c.user_id)).catch(function(){ return null; }), new Promise(function(rz){ setTimeout(function(){ rz(null); }, 4000); }) ]); })); clientes.forEach(function(c, i){ c.whatsapp = (est[i] === true) ? 'conectado' : (est[i] === false ? 'desconectado' : 'desconocido'); }); } catch(eW){ clientes.forEach(function(c){ c.whatsapp = 'desconocido'; }); }
     var ahora = Date.now();
     clientes.forEach(function(c){ var sal = 'ok'; if (c.pausado) sal = 'pausada'; else if (c.whatsapp === 'desconectado') sal = 'whatsapp'; else if (c.tope && c.ai_mes >= (c.tope + (c.mensajes_extra || 0))) sal = 'tope'; else if (c.ultima_actividad && (ahora - new Date(c.ultima_actividad).getTime()) > 7 * 24 * 3600 * 1000) sal = 'inactivo'; c.salud = sal; });
@@ -18171,7 +18172,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
     var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
     var extraMovs = []; try { var em = await supabase.from('mensajes_extra_mov').select('cantidad, origen, nota, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(12); extraMovs = (em && em.data) || []; } catch (eEM) {}
-    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, ui_moderno: B.ui_moderno === true, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -18556,6 +18557,29 @@ app.post('/api/maestro/cliente/:id/rubro', async function(req, res){
     } catch(eMeta){}
     try { await supabase.from('admin_audit').insert({ accion: 'cambiar_rubro', target_user_id: uid, detalle: JSON.stringify({ rubro: rubro }) }); } catch(eA){}
     return res.json({ ok: true, rubro: rubro });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Prender/apagar el LOOK MODERNO (ui_moderno) de un cliente. Solo el Maestro. Antes solo se hacia por SQL manual
+// (por eso quedaba OFF en clientes nuevos). Al prenderlo, tambien NORMALIZA el rubro guardado a su valor canonico
+// (arregla cuentas legacy donde el menu/inventario no matcheaban 'hotel_cabanas' aunque el flag estuviera ON).
+app.post('/api/maestro/cliente/:id/ui-moderno', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var uid = req.params.id;
+    var on = !!(req.body && req.body.on);
+    var patch = { user_id: uid, ui_moderno: on, updated_at: new Date().toISOString() };
+    // Normalizar el rubro guardado (best-effort): si es legacy, lo dejamos en el canonico para que labels/inventario matcheen.
+    try {
+      var cur = await supabase.from('business_settings').select('rubro').eq('user_id', uid).maybeSingle();
+      var rubroActual = cur && cur.data && cur.data.rubro;
+      if (rubroActual) patch.rubro = normalizarRubro(rubroActual);
+    } catch (eR) {}
+    var up = await supabase.from('business_settings').upsert(patch, { onConflict: 'user_id' });
+    if (up && up.error) return res.status(400).json({ error: up.error.message });
+    try { await supabase.from('admin_audit').insert({ accion: 'ui_moderno', target_user_id: uid, detalle: JSON.stringify({ on: on, rubro: patch.rubro || null }) }); } catch(eA){}
+    return res.json({ ok: true, ui_moderno: on, rubro: patch.rubro || null });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

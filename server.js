@@ -59,7 +59,9 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', origin);
   }
   res.header('Access-Control-Allow-Headers', 'Content-Type, apikey, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  // Incluye PATCH y DELETE: sin ellos el navegador bloquea por CORS (preflight) esos metodos -> editar/borrar
+  // fallaban en silencio (ej. borrar/editar una Oportunidad quedaba "pausada"; "Quitar aviso" del Maestro).
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,PUT,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });

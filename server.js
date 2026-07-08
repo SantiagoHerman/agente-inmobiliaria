@@ -14159,89 +14159,75 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     const _uidToken = await verificarUsuario(req);
     if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
-    const leads = (req.body && req.body.leads) || [];
-    // Categoria de recontacto para los leads importados (recontacto v2). Default 'frio' (primer mensaje plantilla,
-    // gracia 48hs). Se puede pasar a nivel body (req.body.categoria, aplica a todos) o por lead (lead.categoria).
-    // Solo se aceptan 'frio'/'viejo'; cualquier otro valor cae a 'frio'. Con recontacto_v2 OFF la columna no se lee.
-    const _normCat = function(c){ return (c === 'viejo') ? 'viejo' : 'frio'; };
-    const categoriaBody = (req.body && req.body.categoria != null) ? _normCat(req.body.categoria) : null;
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
-    if (!Array.isArray(leads) || leads.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });
-    let creados = 0; let yaExistian = 0; let errores = 0; let conHistorial = 0;
-    // traer los chats UNA sola vez para recuperar historial (cache)
-    const instancia = nombreInstancia(user_id);
-    let chatsCache = [];
-    try {
-      const conectada = await instanciaConectada(instancia);
-      if (conectada) {
-        const rch = await fetch(EVOLUTION_URL + '/chat/findChats/' + instancia, { method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({}) });
-        if (rch.ok) { const jr = await rch.json(); chatsCache = Array.isArray(jr) ? jr : (jr && jr.chats ? jr.chats : []); }
-      }
-    } catch (e) { /* si no hay chats, igual importamos sin historial */ }
-    for (const lead of leads) {
-      const telefono = String(lead.telefono || '').replace(/[^0-9]/g, '');
-      if (!telefono || telefono.length < 8) { errores++; continue; }
-      try {
-        const { data: existente } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
-        let contactoId;
-        if (existente) {
-          contactoId = existente.id;
-          yaExistian++;
-        } else {
-          const nombre = lead.nombre || telefono;
-          // Igual que obtenerOcrearConvDeCanal: UPSERT idempotente (user_id,phone,channel) para no crear duplicados si
-          // dos importaciones o un webhook corren a la vez. DEFENSIVO: si el indice unico aun no existe, cae al INSERT
-          // ACTUAL EXACTO (re-lee primero por si otro lo creo). channel = 'whatsapp' (importacion de leads es WA).
-          let _nuevoId = null;
-          try {
-            const { data: nuevo, error: eUp } = await supabase.from('contacts')
-              .upsert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }, { onConflict: 'user_id,phone,channel' })
-              .select('id').single();
-            if (!eUp && nuevo) _nuevoId = nuevo.id;
-          } catch (eUpC) {}
-          if (!_nuevoId) {
-            const { data: _reC } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
-            if (_reC) { _nuevoId = _reC.id; yaExistian++; }
-            else {
-              const { data: nuevo, error: errC } = await supabase.from('contacts').insert({ user_id: user_id, name: nombre, phone: telefono, channel: 'whatsapp' }).select('id').single();
-              if (errC || !nuevo) { errores++; continue; }
-              _nuevoId = nuevo.id;
-              creados++;
-            }
-          } else {
-            creados++;
-          }
-          contactoId = _nuevoId;
-        }
-        // crear conversacion solo si el contacto NO tiene una
-        const { data: convExistente } = await supabase.from('conversations').select('id').eq('contact_id', contactoId).maybeSingle();
-        let convId;
-        if (!convExistente) {
-          // recontacto_categoria: por-lead > body > 'frio'. Importados son frios por defecto (primer msg plantilla).
-          const categoriaLead = (lead.categoria != null) ? _normCat(lead.categoria) : (categoriaBody != null ? categoriaBody : 'frio');
-          const _baseConv = { user_id: user_id, contact_id: contactoId, channel: 'whatsapp', status: 'recontacto', ai_enabled: true };
-          let { data: convNueva, error: errConv } = await supabase.from('conversations').insert(Object.assign({}, _baseConv, { recontacto_categoria: categoriaLead })).select('id').single();
-          // FAIL-SAFE: si la migracion v2 aun no corrio (columna inexistente -> PGRST204), reintentar SIN la columna
-          // para no romper la importacion. Con flag OFF esa columna no se lee igual.
-          if (errConv) { const r2 = await supabase.from('conversations').insert(_baseConv).select('id').single(); convNueva = r2.data; }
-          convId = convNueva ? convNueva.id : null;
-        } else {
-          convId = convExistente.id;
-        }
-        // #9 - recuperar e insertar historial SOLO si la conversacion no tiene mensajes aun
-        if (convId) {
-          const { data: yaTiene } = await supabase.from('messages').select('id').eq('conversation_id', convId).limit(1);
-          if (!yaTiene || yaTiene.length === 0) {
-            const historial = await recuperarHistorialLead(instancia, telefono, chatsCache);
-            if (historial.length > 0) {
-              const filas = historial.map(function(h){ return { conversation_id: convId, user_id: user_id, role: h.role, content: h.content, origen: 'historial_importado', created_at: h.created_at }; });
-              try { await supabase.from('messages').insert(filas); conHistorial++; } catch (e) { /* si falla el historial, no rompe la importacion */ }
-            }
-          }
-        }
-      } catch (e) { errores++; }
+    const leadsRaw = (req.body && req.body.leads) || [];
+    if (!Array.isArray(leadsRaw) || leadsRaw.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });
+
+    // Categoria de recontacto: 'frio' (nunca escrito) o 'viejo' ("ya le escribieron"). "viejo" ademas marca la
+    // conversacion como TIBIO (ya contactado), no frio. Se acepta por body (aplica a todos) o por-lead.
+    const _normCat = function (c) { return (c === 'viejo') ? 'viejo' : 'frio'; };
+    const catBody = (req.body && req.body.categoria != null) ? _normCat(req.body.categoria) : 'frio';
+
+    // 1) Normalizar + DEDUP por telefono dentro del request.
+    const porTel = {}; let invalidos = 0;
+    for (const lead of leadsRaw) {
+      const tel = String((lead && lead.telefono) || '').replace(/[^0-9]/g, '');
+      if (!tel || tel.length < 8) { invalidos++; continue; }
+      if (!porTel[tel]) porTel[tel] = { nombre: (lead && lead.nombre) || tel, categoria: (lead && lead.categoria != null) ? _normCat(lead.categoria) : catBody };
     }
-    return res.json({ ok: true, creados: creados, yaExistian: yaExistian, errores: errores, conHistorial: conHistorial });
+    const telefonos = Object.keys(porTel);
+    if (!telefonos.length) return res.json({ ok: true, total: leadsRaw.length, unicos: 0, creados: 0, yaExistian: 0, enRecontacto: 0, invalidos: invalidos });
+
+    // Helper: procesar en lotes de N (una query por lote, no una por lead -> no se cuelga con miles).
+    const LOTE = 500;
+    async function porLotes(arr, fn) { for (let i = 0; i < arr.length; i += LOTE) { await fn(arr.slice(i, i + LOTE)); } }
+
+    // 2) Contactos EXISTENTES (por telefono) en pocas queries.
+    const idPorTel = {}; // telefono -> contact_id
+    await porLotes(telefonos, async function (lote) {
+      try { const { data } = await supabase.from('contacts').select('id, phone').eq('user_id', user_id).in('phone', lote);
+        (data || []).forEach(function (c) { if (c && c.phone) idPorTel[String(c.phone)] = c.id; }); } catch (e) {}
+    });
+
+    // 3) Contactos NUEVOS: bulk insert por lotes.
+    const nuevosTel = telefonos.filter(function (t) { return !idPorTel[t]; });
+    let creados = 0;
+    await porLotes(nuevosTel, async function (lote) {
+      const filas = lote.map(function (t) { return { user_id: user_id, name: porTel[t].nombre, phone: t, channel: 'whatsapp' }; });
+      try { const { data, error } = await supabase.from('contacts').insert(filas).select('id, phone');
+        if (!error && Array.isArray(data)) { data.forEach(function (c) { if (c && c.phone) { idPorTel[String(c.phone)] = c.id; creados++; } }); } } catch (e) {}
+    });
+
+    // 4) Conversaciones: solo para contactos SIN conversacion. Primero detectar cuales ya tienen.
+    const contactIds = telefonos.map(function (t) { return idPorTel[t]; }).filter(Boolean);
+    const conConv = {};
+    await porLotes(contactIds, async function (lote) {
+      try { const { data } = await supabase.from('conversations').select('contact_id').eq('user_id', user_id).in('contact_id', lote);
+        (data || []).forEach(function (cv) { if (cv && cv.contact_id) conConv[cv.contact_id] = 1; }); } catch (e) {}
+    });
+    const sinConv = telefonos.filter(function (t) { return idPorTel[t] && !conConv[idPorTel[t]]; });
+
+    // 5) Bulk insert de conversaciones en 'recontacto'. Categoria 'viejo' -> temperatura 'tibio' (ya contactado);
+    //    'frio' -> 'frio'. FAIL-SAFE: si alguna columna faltara, reintenta el lote con el conjunto minimo.
+    let enRecontacto = 0;
+    await porLotes(sinConv, async function (lote) {
+      const filas = lote.map(function (t) {
+        const cat = porTel[t].categoria;
+        return { user_id: user_id, contact_id: idPorTel[t], channel: 'whatsapp', status: 'recontacto', ai_enabled: true, temperatura: (cat === 'viejo') ? 'tibio' : 'frio', recontacto_categoria: cat };
+      });
+      try {
+        const { data, error } = await supabase.from('conversations').insert(filas).select('id');
+        if (error) {
+          const filasMin = lote.map(function (t) { return { user_id: user_id, contact_id: idPorTel[t], channel: 'whatsapp', status: 'recontacto', ai_enabled: true, temperatura: (porTel[t].categoria === 'viejo') ? 'tibio' : 'frio' }; });
+          const r2 = await supabase.from('conversations').insert(filasMin).select('id');
+          if (!r2.error && Array.isArray(r2.data)) enRecontacto += r2.data.length;
+        } else if (Array.isArray(data)) { enRecontacto += data.length; }
+      } catch (e) {}
+    });
+
+    // NOTA: se saco la recuperacion de historial via Evolution (era 1 llamada HTTP por lead, en serie, sin timeout ->
+    // colgaba el import con archivos grandes). El historial, si hace falta, se puede recuperar despues por-lead.
+    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, invalidos: invalidos });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

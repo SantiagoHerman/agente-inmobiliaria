@@ -10003,6 +10003,85 @@ async function revisarWatchdogWhatsapp() {
 // Revisar fallidos cada 60 segundos (reenvia apenas WhatsApp vuelve a estar conectado)
 setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
+
+// ============================================================================
+// FOTOS DE PERFIL DE LOS LEADS (avatar) — se traen de WhatsApp UNA vez y se guardan en NUESTRO bucket.
+// Diseño anti-sobrecarga: nunca en el camino de un request. Un cron levanta de a poco los contactos que
+// todavia no tienen foto (foto_fetched_at IS NULL) -> cubre TODOS los origenes (primer mensaje, import,
+// recontacto, manual y los futuros): cualquier contacto nuevo entra sin foto y aca se rellena.
+// ============================================================================
+// Trae la URL de la foto de perfil de WhatsApp via Evolution v2 (POST /chat/fetchProfilePictureUrl). URL o null.
+async function fetchFotoPerfilEvolution(instancia, numero) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY || !instancia || !numero) return null;
+    const ctrl = new AbortController();
+    const to = setTimeout(function () { ctrl.abort(); }, 12000);
+    let url = null;
+    try {
+      const r = await fetch(EVOLUTION_URL + '/chat/fetchProfilePictureUrl/' + instancia, {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+        body: JSON.stringify({ number: String(numero) })
+      });
+      if (r.ok) { const j = await r.json().catch(function () { return null; }); url = (j && (j.profilePictureUrl || j.profilePicUrl)) || null; }
+    } finally { clearTimeout(to); }
+    return url;
+  } catch (e) { return null; }
+}
+// Descarga la foto (URL temporal de WhatsApp) y la sube a nuestro bucket 'media' (permanente). URL publica o null.
+async function descargarYSubirFotoPerfil(user_id, contact_id, url) {
+  try {
+    if (!url) return null;
+    const ctrl = new AbortController();
+    const to = setTimeout(function () { ctrl.abort(); }, 15000);
+    let buf = null, contentType = 'image/jpeg';
+    try {
+      const r = await fetch(url, { signal: ctrl.signal });
+      if (!r.ok) return null;
+      contentType = r.headers.get('content-type') || 'image/jpeg';
+      const ab = await r.arrayBuffer();
+      buf = Buffer.from(ab);
+    } finally { clearTimeout(to); }
+    if (!buf || !buf.length) return null;
+    const path = 'perfiles/' + user_id + '/' + contact_id + '.jpg';
+    const up = await supabase.storage.from('media').upload(path, buf, { contentType: contentType, upsert: true });
+    if (up.error) return null;
+    const pub = supabase.storage.from('media').getPublicUrl(path);
+    return (pub && pub.data && pub.data.publicUrl) ? (pub.data.publicUrl + '?v=' + Date.now()) : null;
+  } catch (e) { return null; }
+}
+// CRON: rellena fotos de contactos sin foto, de a 20 con gap de 0.8s, solo si la cuenta tiene WA conectado.
+let _fotosPerfilEnCurso = false;
+async function revisarFotosPerfil() {
+  if (_fotosPerfilEnCurso) return;
+  if (!EVOLUTION_URL || !EVOLUTION_KEY) return;
+  _fotosPerfilEnCurso = true;
+  try {
+    const { data: pend } = await supabase.from('contacts')
+      .select('id, user_id, phone')
+      .is('foto_fetched_at', null)
+      .not('phone', 'is', null)
+      .limit(20);
+    if (!pend || !pend.length) return;
+    const connCache = {}; // user_id -> bool (evita chequear la conexion por cada contacto)
+    for (const c of pend) {
+      try {
+        const instancia = nombreInstancia(c.user_id);
+        if (connCache[c.user_id] === undefined) { try { connCache[c.user_id] = await instanciaConectada(instancia); } catch (e) { connCache[c.user_id] = false; } }
+        if (!connCache[c.user_id]) continue; // WA desconectado -> reintentar en otra corrida (no marcar fetched)
+        const urlWa = await fetchFotoPerfilEvolution(instancia, c.phone);
+        let fotoFinal = null;
+        if (urlWa) fotoFinal = await descargarYSubirFotoPerfil(c.user_id, c.id, urlWa);
+        // marcar fetched SIEMPRE que la cuenta este conectada (haya foto o no) -> no re-consultar infinito.
+        await supabase.from('contacts').update({ foto_url: fotoFinal, foto_fetched_at: new Date().toISOString() }).eq('id', c.id);
+      } catch (e) {}
+      await new Promise(function (res) { setTimeout(res, 800); }); // ritmo suave
+    }
+  } catch (e) { console.error('revisarFotosPerfil:', e && e.message); }
+  finally { _fotosPerfilEnCurso = false; }
+}
+setInterval(revisarFotosPerfil, 4 * 60 * 1000);
+setTimeout(revisarFotosPerfil, 120 * 1000); // primera corrida ~2 min tras arrancar
 // ETAPA 8 (gated por reparto_v2 por-tenant): escalar leads en cola >30 min. Con flag OFF NO hace nada por cuenta.
 setInterval(escalarLeadsEnColaVencidos, 5 * 60 * 1000); // cada 5 min: granularidad para el umbral fijo de 30 min
 setTimeout(escalarLeadsEnColaVencidos, 80 * 1000); // primera corrida ~80s tras arrancar (cuando ya esta estable)

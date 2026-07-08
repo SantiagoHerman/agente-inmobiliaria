@@ -16871,19 +16871,24 @@ async function correrScrapingDeUsuario(cfg) {
     var lista = await traerListaPropiedades(sitio, null);
     if (!lista.length) return { ok: false, motivo: 'sin propiedades' };
     var creados = 0, actualizados = 0, errores = 0;
+    var numerosVistos = {}; // numeros que SÍ figuran en el sitio en esta corrida
     for (var i = 0; i < lista.length; i++) {
       try {
         var p = await procesarPropiedad(lista[i]);
         if (!p.numero) { errores++; continue; }
+        numerosVistos[String(p.numero)] = 1;
         var fila = {
           user_id: cfg.user_id, numero: String(p.numero), title: p.titulo || 'Sin titulo',
           type: p.tipo || null, zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null,
           price: p.precio || null, description: p.descripcion || null,
-          caracteristicas: p.caracteristicas || null, link: p.link || null, activa: true
+          caracteristicas: p.caracteristicas || null, link: p.link || null
         };
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
-        var ex = await supabase.from('properties').select('id, images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select('id, images, pausa_manual').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
+          // FIGURA en el sitio -> auto-DESPAUSA (activa=true) y actualiza info, SALVO que la hayas pausado a mano
+          // (pausa_manual): en ese caso se respeta tu pausa (activa=false) pero igual se refresca la info.
+          fila.activa = ex.data.pausa_manual ? false : true;
           // Refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar
           // galerias buenas ni las fotos ya CLASIFICADAS (categoria) de las propiedades sanas.
           var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
@@ -16891,13 +16896,34 @@ async function correrScrapingDeUsuario(cfg) {
           var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
           if (up.error) errores++; else actualizados++;
         } else {
+          fila.activa = true;
           if (_fotos.length) fila.images = _fotos.map(function(u){ return { url: u }; });
           var ins = await supabase.from('properties').insert(fila);
           if (ins.error) errores++; else creados++;
         }
       } catch (e) { errores++; }
     }
-    return { ok: true, creados: creados, actualizados: actualizados, errores: errores, total: lista.length };
+    // AUTO-PAUSA de las que YA NO figuran en el sitio: activa=false (NO se borran, quedan en el inventario). Nunca
+    // toca las pausadas a mano (pausa_manual). SALVAGUARDA anti-scrape-parcial: solo se auto-pausa si la corrida
+    // cubrio la mayor parte del catalogo scrapeado (>=70%); si el sitio vino corto (caida), no se pausa nada.
+    var pausadas = 0;
+    try {
+      var vistos = Object.keys(numerosVistos);
+      var todasR = await supabase.from('properties').select('id, numero, pausa_manual, link, activa').eq('user_id', cfg.user_id);
+      var todas = (todasR.data || []).filter(function(x){ return x.link; }); // solo las de origen scraping (tienen link)
+      var baseScrapeadas = todas.filter(function(x){ return !x.pausa_manual; }).length || 1;
+      var cobertura = vistos.length / baseScrapeadas;
+      var candidatas = todas.filter(function(x){ return x.activa !== false && !x.pausa_manual && !numerosVistos[String(x.numero)]; });
+      if (cobertura >= 0.7 && candidatas.length) {
+        var ids = candidatas.map(function(x){ return x.id; });
+        for (var j = 0; j < ids.length; j += 200) {
+          var loteIds = ids.slice(j, j + 200);
+          var upP = await supabase.from('properties').update({ activa: false }).in('id', loteIds);
+          if (!upP.error) pausadas += loteIds.length;
+        }
+      }
+    } catch (e) {}
+    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 

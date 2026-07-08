@@ -7316,7 +7316,8 @@ app.post('/api/oportunidades/preview', async (req, res) => {
     // Lista COMPLETA de destinatarios (cap defensivo) con nombre/telefono/temperatura/estado/asesor, para que
     // el dueño arme el listado (buscar / ordenar / ver el lead / sacar) en la vista previa. Consultas BATCHEADAS
     // (una por tabla), no una por lead. El dedup ya lo resolvio el universo (por conversation_id).
-    const CAP = 1000;
+    // CAP alto: la vista previa muestra la lista COMPLETA (el front la desliza en una ventana de tamano fijo).
+    const CAP = 5000;
     const top = universo.slice(0, CAP);
     const cIds = Array.from(new Set(top.map(function (c) { return c.contact_id; }).filter(Boolean)));
     const nombreDe = {}, phoneDe = {};
@@ -7346,6 +7347,47 @@ app.post('/api/oportunidades/preview', async (req, res) => {
     return res.json({ ok: true, total: universo.length, muestra: muestra, truncado: universo.length > CAP });
   } catch (err) {
     console.error('Error en POST /api/oportunidades/preview:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// GET /api/oportunidades/buscar-leads?q= -> busca leads del tenant por nombre o telefono, para AGREGARLOS
+// uno por uno a la lista (custom_ids = conversation_id). Devuelve hasta 20 { conversation_id, contact_id,
+// nombre, phone }. Scoped al tenant (contacts.user_id). Solo lee. CERO IA.
+app.get('/api/oportunidades/buscar-leads', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const q = String((req.query && req.query.q) || '').replace(/[,%()]/g, '').trim();
+    if (q.length < 2) return res.json({ ok: true, leads: [] });
+    const like = '%' + q + '%';
+    let contactos = [];
+    try {
+      const { data } = await supabase.from('contacts').select('id, name, nombre_manual, phone')
+        .eq('user_id', ownerId)
+        .or('name.ilike.' + like + ',nombre_manual.ilike.' + like + ',phone.ilike.' + like)
+        .limit(40);
+      contactos = Array.isArray(data) ? data : [];
+    } catch (eC) {}
+    if (!contactos.length) return res.json({ ok: true, leads: [] });
+    // Resolver la conversacion de cada contacto (la que se usa como custom_id).
+    const cIds = contactos.map(function (c) { return c.id; });
+    const convDe = {};
+    try {
+      const { data: convs } = await supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId).in('contact_id', cIds);
+      (convs || []).forEach(function (cv) { if (cv && cv.contact_id && !convDe[cv.contact_id]) convDe[cv.contact_id] = cv.id; });
+    } catch (eV) {}
+    const leads = [];
+    for (const c of contactos) {
+      const conv = convDe[c.id];
+      if (!conv) continue; // sin conversacion no se puede segmentar
+      leads.push({ conversation_id: conv, contact_id: c.id, nombre: c.nombre_manual || c.name || '', phone: c.phone || '' });
+      if (leads.length >= 20) break;
+    }
+    return res.json({ ok: true, leads: leads });
+  } catch (err) {
+    console.error('Error en GET /api/oportunidades/buscar-leads:', err && err.message);
     res.status(500).json({ error: (err && err.message) || 'Error interno' });
   }
 });

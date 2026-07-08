@@ -14304,12 +14304,14 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     await porLotes(sinConv, async function (lote) {
       const filas = lote.map(function (t) {
         const cat = porTel[t].categoria;
-        return { user_id: user_id, contact_id: idPorTel[t], channel: 'whatsapp', status: 'recontacto', ai_enabled: true, temperatura: (cat === 'viejo') ? 'tibio' : 'frio', recontacto_categoria: cat };
+        // Los importados entran SIEMPRE 'frio' (son fríos hasta pasar por el proceso). El "ya escribió antes" NO se
+        // fake-marca como tibio (se confundía con los tibios reales de Interesado): esa info queda en recontacto_categoria='viejo'.
+        return { user_id: user_id, contact_id: idPorTel[t], channel: 'whatsapp', status: 'recontacto', ai_enabled: true, temperatura: 'frio', recontacto_categoria: cat };
       });
       try {
         const { data, error } = await supabase.from('conversations').insert(filas).select('id');
         if (error) {
-          const filasMin = lote.map(function (t) { return { user_id: user_id, contact_id: idPorTel[t], channel: 'whatsapp', status: 'recontacto', ai_enabled: true, temperatura: (porTel[t].categoria === 'viejo') ? 'tibio' : 'frio' }; });
+          const filasMin = lote.map(function (t) { return { user_id: user_id, contact_id: idPorTel[t], channel: 'whatsapp', status: 'recontacto', ai_enabled: true, temperatura: 'frio' }; });
           const r2 = await supabase.from('conversations').insert(filasMin).select('id');
           if (!r2.error && Array.isArray(r2.data)) enRecontacto += r2.data.length;
         } else if (Array.isArray(data)) { enRecontacto += data.length; }

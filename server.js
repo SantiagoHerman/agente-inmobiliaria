@@ -10010,23 +10010,32 @@ setInterval(revisarInactividad, 60 * 60 * 1000);
 // todavia no tienen foto (foto_fetched_at IS NULL) -> cubre TODOS los origenes (primer mensaje, import,
 // recontacto, manual y los futuros): cualquier contacto nuevo entra sin foto y aca se rellena.
 // ============================================================================
-// Trae la URL de la foto de perfil de WhatsApp via Evolution v2 (POST /chat/fetchProfilePictureUrl). URL o null.
-async function fetchFotoPerfilEvolution(instancia, numero) {
+// Trae el PERFIL de WhatsApp (foto + about/frase) via Evolution v2 (POST /chat/fetchProfile). Si no vino la
+// foto, prueba /chat/fetchProfilePictureUrl. Devuelve { picture, about }. Tolerante a variantes del JSON.
+async function fetchPerfilEvolution(instancia, numero) {
+  const out = { picture: null, about: null };
   try {
-    if (!EVOLUTION_URL || !EVOLUTION_KEY || !instancia || !numero) return null;
-    const ctrl = new AbortController();
-    const to = setTimeout(function () { ctrl.abort(); }, 12000);
-    let url = null;
-    try {
-      const r = await fetch(EVOLUTION_URL + '/chat/fetchProfilePictureUrl/' + instancia, {
-        method: 'POST', signal: ctrl.signal,
-        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-        body: JSON.stringify({ number: String(numero) })
-      });
-      if (r.ok) { const j = await r.json().catch(function () { return null; }); url = (j && (j.profilePictureUrl || j.profilePicUrl)) || null; }
-    } finally { clearTimeout(to); }
-    return url;
-  } catch (e) { return null; }
+    if (!EVOLUTION_URL || !EVOLUTION_KEY || !instancia || !numero) return out;
+    const _post = async function (endpoint) {
+      const ctrl = new AbortController();
+      const to = setTimeout(function () { ctrl.abort(); }, 12000);
+      try {
+        const r = await fetch(EVOLUTION_URL + endpoint + instancia, { method: 'POST', signal: ctrl.signal, headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY }, body: JSON.stringify({ number: String(numero) }) });
+        if (!r.ok) return null;
+        return await r.json().catch(function () { return null; });
+      } catch (e) { return null; } finally { clearTimeout(to); }
+    };
+    const j = await _post('/chat/fetchProfile/');
+    if (j) {
+      out.picture = j.picture || j.profilePictureUrl || j.profilePicUrl || null;
+      out.about = (typeof j.status === 'string' ? j.status : (j.status && j.status.status)) || j.about || null;
+    }
+    if (!out.picture) {
+      const j2 = await _post('/chat/fetchProfilePictureUrl/');
+      if (j2) out.picture = j2.profilePictureUrl || j2.profilePicUrl || j2.url || null;
+    }
+    return out;
+  } catch (e) { return out; }
 }
 // Descarga la foto (URL temporal de WhatsApp) y la sube a nuestro bucket 'media' (permanente). URL publica o null.
 async function descargarYSubirFotoPerfil(user_id, contact_id, url) {
@@ -10069,11 +10078,14 @@ async function revisarFotosPerfil() {
         const instancia = nombreInstancia(c.user_id);
         if (connCache[c.user_id] === undefined) { try { connCache[c.user_id] = await instanciaConectada(instancia); } catch (e) { connCache[c.user_id] = false; } }
         if (!connCache[c.user_id]) continue; // WA desconectado -> reintentar en otra corrida (no marcar fetched)
-        const urlWa = await fetchFotoPerfilEvolution(instancia, c.phone);
+        const perfil = await fetchPerfilEvolution(instancia, c.phone);
         let fotoFinal = null;
-        if (urlWa) fotoFinal = await descargarYSubirFotoPerfil(c.user_id, c.id, urlWa);
+        if (perfil.picture) {
+          fotoFinal = await descargarYSubirFotoPerfil(c.user_id, c.id, perfil.picture); // intenta bucket (permanente)
+          if (!fotoFinal) fotoFinal = perfil.picture; // FALLBACK: si la descarga/subida falla, guardamos la URL directa de WhatsApp
+        }
         // marcar fetched SIEMPRE que la cuenta este conectada (haya foto o no) -> no re-consultar infinito.
-        await supabase.from('contacts').update({ foto_url: fotoFinal, foto_fetched_at: new Date().toISOString() }).eq('id', c.id);
+        await supabase.from('contacts').update({ foto_url: fotoFinal, about: (perfil.about ? String(perfil.about).slice(0, 300) : null), foto_fetched_at: new Date().toISOString() }).eq('id', c.id);
       } catch (e) {}
       await new Promise(function (res) { setTimeout(res, 800); }); // ritmo suave
     }

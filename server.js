@@ -15954,6 +15954,58 @@ function detectarOperacion(estado, textoExtra) {
 // M20: alias de extraerPrecioDe (misma logica de extraccion). Antes era una copia byte-identica salvo que
 // usaba limpiarHTML2; como limpiarHTML2 es ahora alias de limpiarHTML, ambas funciones quedan equivalentes.
 function extraerPrecio2(html) { return extraerPrecioDe(html); }
+// Galeria ROBUSTA desde el HTML de una ficha WordPress (0 IA): junta las imagenes de /wp-content/uploads,
+// colapsa el sufijo de tamano -WxH -> URL base (full-res), dedup y filtra el "chrome" del sitio
+// (logo/favicon/overlay/factura/icon/plugins/themes). Se usa como fallback cuando el post NO tiene adjuntos
+// por ?parent= (props VIEJAS de Anton, 2020/2021). Validado en vivo: Tatin -> 23 fotos, Galpon -> 13.
+function _galeriaHtmlDeUploads(html) {
+  if (!html || typeof html !== 'string') return [];
+  var all = html.match(/https?:\/\/[^"'\s)]+\/wp-content\/uploads\/[^"'\s)]+\.(?:jpg|jpeg|png|webp)/gi) || [];
+  // Descartar el "chrome" del sitio: por PATH (assets de themes/plugins) o por el NOMBRE de archivo.
+  // El set de nombres es deliberadamente conservador: se sacaron 'banner'/'icono'/'watermark' porque son
+  // subcadenas plausibles en el nombre de una foto REAL de una propiedad (evitar falsos positivos).
+  var chromePath = /\/wp-content\/(?:themes|plugins)\//i;
+  var chromeName = /(logo|favicon|factura|overlay|sprite|placeholder|avatar|loader|wpforms)/i;
+  var seen = {}, out = [];
+  for (var i = 0; i < all.length && out.length < 30; i++) {
+    var full = all[i];
+    if (chromePath.test(full)) continue;
+    var u = full.replace(/-\d+x\d+(\.\w+)$/, '$1'); // -1024x768.jpg -> .jpg (original)
+    var name = (u.split('/').pop() || '');          // filtrar por nombre, no por la URL entera
+    if (chromeName.test(name)) continue;
+    if (!seen[u]) { seen[u] = 1; out.push(u); }
+  }
+  return out;
+}
+// Arma la galeria COMPLETA de una propiedad WP (0 IA), en orden de preferencia:
+//   1) adjuntos por ?parent=<postId> (props NUEVAS con fotos adjuntas al post)
+//   2) galeria del HTML de la ficha (props VIEJAS sin adjuntos; reusa el html ya descargado)
+//   3) la featured como minimo
+// Devuelve un array de URLs (cap 30). Todo envuelto en try/catch: si algo falla, no rompe el scrape.
+async function _armarGaleriaProp(base, postId, html, featuredUrl) {
+  var fotos = [];
+  try {
+    if (base && postId) {
+      var pm = await _resolverMediaPorParent(base, [String(postId)]);
+      var arr = (pm && pm[String(postId)]) ? pm[String(postId)] : [];
+      if (arr && arr.length) fotos = arr.slice();
+    }
+  } catch (e) { /* parent-media fallo -> probamos HTML */ }
+  if (fotos.length < 2) {
+    try {
+      var hg = _galeriaHtmlDeUploads(html);
+      if (hg.length > fotos.length) fotos = hg;
+    } catch (e) { /* sin galeria HTML */ }
+  }
+  if (!fotos.length && featuredUrl) fotos = [featuredUrl];
+  // dedup final + cap 30
+  var seen = {}, out = [];
+  for (var i = 0; i < fotos.length && out.length < 30; i++) {
+    var u = fotos[i];
+    if (u && !seen[u]) { seen[u] = 1; out.push(u); }
+  }
+  return out;
+}
 // Procesa una propiedad de la API + su ficha. Devuelve objeto con todos los campos para revision.
 async function procesarPropiedad(p) {
   var emb = p._embedded || {};
@@ -15977,11 +16029,15 @@ async function procesarPropiedad(p) {
   var caract = [].concat(feats);
   if (banos) caract.push('Banos: ' + banos);
   if (parking && !/no|aplica/i.test(parking)) caract.push('Cochera: ' + parking);
+  // GALERIA COMPLETA (0 IA): adjuntos por ?parent (nuevas) -> HTML (viejas, reusa el `html` ya bajado
+  // arriba para el precio, sin fetch extra) -> featured como minimo.
+  var _base = (link || '').replace(/^(https?:\/\/[^\/]+).*/, '$1');
+  var fotos = await _armarGaleriaProp(_base, p.id, (html || ''), foto);
   return {
     numero: numero, titulo: titulo, tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
     ciudad: ciudad, zona: zona, caracteristicas: caract.join(', '), descripcion: descripcion,
-    link: link, foto: foto
+    link: link, foto: foto, fotos: fotos, postId: p.id
   };
 }
 
@@ -16647,11 +16703,16 @@ async function correrScrapingDeUsuario(cfg) {
           price: p.precio || null, description: p.descripcion || null,
           caracteristicas: p.caracteristicas || null, link: p.link || null, activa: true
         };
-        var ex = await supabase.from('properties').select('id').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
+        var ex = await supabase.from('properties').select('id, images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
+          // Refrescar fotos SOLO si conseguimos MAS que las guardadas (nunca regresar una galeria buena).
+          var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
+          if (_fotos.length > _stored) fila.images = _fotos.map(function(u){ return { url: u }; });
           var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
           if (up.error) errores++; else actualizados++;
         } else {
+          if (_fotos.length) fila.images = _fotos.map(function(u){ return { url: u }; });
           var ins = await supabase.from('properties').insert(fila);
           if (ins.error) errores++; else creados++;
         }
@@ -16668,10 +16729,18 @@ app.post('/api/scraping-config/correr-ahora', async function(req, res) {
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     var q = await supabase.from('scraping_config').select('*').eq('user_id', user_id).maybeSingle();
     if (!q.data) return res.json({ ok: false, mensaje: 'No hay configuracion guardada' });
-    var r = (q.data.modo === 'directo') ? await correrScrapingDeUsuario(q.data) : await correrScrapingPendiente(q.data);
-    await supabase.from('scraping_config').update({ ultimo_scraping: new Date().toISOString() }).eq('user_id', user_id);
-    return res.json({ ok: true, resultado: r });
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+    // Un scrape completo puede tardar varios minutos (baja la lista + ficha + galeria por propiedad).
+    // Respondemos YA y corremos en segundo plano: evita que el request HTTP quede colgado / lo corte el proxy.
+    // El frontend ya muestra "se esta ejecutando en segundo plano" y no espera este resultado.
+    res.json({ ok: true, corriendo: true, mensaje: 'La actualizacion se esta ejecutando en segundo plano.' });
+    (async function () {
+      try {
+        var r = (q.data.modo === 'directo') ? await correrScrapingDeUsuario(q.data) : await correrScrapingPendiente(q.data);
+        await supabase.from('scraping_config').update({ ultimo_scraping: new Date().toISOString() }).eq('user_id', user_id);
+        console.log('[correr-ahora] user', user_id, 'resultado', JSON.stringify(r));
+      } catch (e) { console.error('[correr-ahora bg]', e && e.message); }
+    })();
+  } catch (e) { try { return res.status(500).json({ error: e && e.message }); } catch (e2) {} }
 });
 
 async function correrScrapingPendiente(cfg) {
@@ -16689,16 +16758,19 @@ async function correrScrapingPendiente(cfg) {
       try {
         var p = await procesarPropiedad(lista[i]);
         if (!p.numero) continue;
+        var _fotosPend = Array.isArray(p.fotos) ? p.fotos : [];
         var nuevo = {
           numero: String(p.numero), title: p.titulo || 'Sin titulo', type: p.tipo || null,
           zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null, price: p.precio || null,
-          description: p.descripcion || null, caracteristicas: p.caracteristicas || null, link: p.link || null
+          description: p.descripcion || null, caracteristicas: p.caracteristicas || null, link: p.link || null,
+          images: _fotosPend.length ? _fotosPend.map(function(u){ return { url: u }; }) : null
         };
-        var ex = await supabase.from('properties').select('id,title,price,zone,description').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select('id,title,price,zone,description,images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
-          // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion)
+          // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion) o si la web tiene MAS fotos que las guardadas
           var v = ex.data;
-          var cambio = (String(v.price||'') !== String(nuevo.price||'')) || (String(v.title||'') !== String(nuevo.title||'')) || (String(v.zone||'') !== String(nuevo.zone||'')) || (String(v.description||'') !== String(nuevo.description||''));
+          var _masFotos = _fotosPend.length > (Array.isArray(v.images) ? v.images.length : 0);
+          var cambio = _masFotos || (String(v.price||'') !== String(nuevo.price||'')) || (String(v.title||'') !== String(nuevo.title||'')) || (String(v.zone||'') !== String(nuevo.zone||'')) || (String(v.description||'') !== String(nuevo.description||''));
           if (cambio) {
             await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'modificada', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: { title: v.title, price: v.price, zone: v.zone }, property_id: v.id });
             modificadas++;
@@ -16786,12 +16858,21 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
       var it = items[i];
       var d = it.datos_nuevos || {};
       var fila = { user_id: user_id, numero: String(it.numero), title: d.title || 'Sin titulo', type: d.type || null, zone: d.zone || null, price: d.price || null, description: d.description || null, caracteristicas: d.caracteristicas || null, link: d.link || null, activa: true };
+      var _fotosAcc = Array.isArray(d.images) ? d.images : []; // ya vienen como [{url:...}]
       if (it.tipo_cambio === 'modificada' && it.property_id) {
+        // refrescar fotos SOLO si el diff trae MAS que las guardadas (no regresar una galeria buena)
+        var _cur = await supabase.from('properties').select('images').eq('id', it.property_id).maybeSingle();
+        var _curN = (_cur.data && Array.isArray(_cur.data.images)) ? _cur.data.images.length : 0;
+        if (_fotosAcc.length > _curN) fila.images = _fotosAcc;
         await supabase.from('properties').update(fila).eq('id', it.property_id);
       } else {
-        var ex = await supabase.from('properties').select('id').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
-        if (ex.data && ex.data.id) { await supabase.from('properties').update(fila).eq('id', ex.data.id); }
-        else { await supabase.from('properties').insert(fila); }
+        var ex = await supabase.from('properties').select('id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
+        if (ex.data && ex.data.id) {
+          var _exN = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
+          if (_fotosAcc.length > _exN) fila.images = _fotosAcc;
+          await supabase.from('properties').update(fila).eq('id', ex.data.id);
+        }
+        else { if (_fotosAcc.length) fila.images = _fotosAcc; await supabase.from('properties').insert(fila); }
       }
       await supabase.from('scraping_pendientes').delete().eq('id', it.id);
       aplicados++;

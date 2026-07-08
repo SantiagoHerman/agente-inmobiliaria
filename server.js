@@ -7998,6 +7998,57 @@ async function _saltoViejoDia(uid, _cache) {
   return dia;
 }
 
+// UMBRAL DE INACTIVIDAD configurable por cuenta (business_settings.recontacto_umbral_dias): dias de
+// silencio del lead ANTES de pasar a recontacto. Hoy era fijo en 3 dias (72hs). Se lee APARTE del select
+// principal de revisarInactividad (igual que _reglasRecontactoV2 / _saltoViejoDia) para NO acoplar el barrido
+// a la columna nueva: si la columna no existe (migracion no corrida) el barrido no se rompe y usa el default.
+// Fail-safe TOTAL: sin columna / error / valor ausente o fuera de rango (1-60) -> RECONTACTO_UMBRAL_DIAS_DEFAULT
+// (=3), o sea comportamiento BYTE-IDENTICO al actual (las 72hs de siempre).
+const RECONTACTO_UMBRAL_DIAS_DEFAULT = 3;
+async function _umbralInactividadDias(uid, _cache) {
+  if (!uid) return RECONTACTO_UMBRAL_DIAS_DEFAULT;
+  if (_cache && Object.prototype.hasOwnProperty.call(_cache, uid)) return _cache[uid];
+  let dias = RECONTACTO_UMBRAL_DIAS_DEFAULT;
+  try {
+    const { data: bsU } = await supabase.from('business_settings').select('recontacto_umbral_dias').eq('user_id', uid).maybeSingle();
+    if (bsU && Number.isFinite(bsU.recontacto_umbral_dias)) {
+      const n = Math.floor(bsU.recontacto_umbral_dias);
+      if (n >= 1 && n <= 60) dias = n; // fuera de rango (o 0 / negativo) -> se queda el default 3
+    }
+  } catch (eU) { dias = RECONTACTO_UMBRAL_DIAS_DEFAULT; } // fail-safe: sin columna / error -> default (72hs)
+  if (_cache) _cache[uid] = dias;
+  return dias;
+}
+
+// HORARIO PROPIO DE RECONTACTO (business_settings.recontacto_horario): texto 'HH-HH' (ej '9-19') que acota
+// el envio de recontactos a ESA franja, distinta del horario de oficina general. Devuelve el OBJETO horario
+// EFECTIVO para alimentar dentroHorarioOficina / _minutosRestantesFranja:
+//   - Si recontactoHorarioTxt es un 'HH-HH' valido -> construye un horario sintetico ABIERTO TODOS LOS DIAS
+//     con esa unica franja (misma forma {dia:{franjas:[{desde,hasta}]}} que consumen los helpers de horario).
+//   - Si es null / vacio / invalido / degenerado (hasta <= desde) -> devuelve horarioOficina TAL CUAL
+//     (comportamiento ACTUAL EXACTO: el recontacto sigue el horario de oficina general).
+// NO consulta la base, NUNCA tira: ante cualquier duda cae al horario de oficina (fail-safe = comportamiento actual).
+function _horarioRecontactoEfectivo(recontactoHorarioTxt, horarioOficina) {
+  try {
+    if (recontactoHorarioTxt == null) return horarioOficina;
+    const s = String(recontactoHorarioTxt).trim();
+    if (!s) return horarioOficina;
+    const partes = s.split('-');
+    if (partes.length !== 2) return horarioOficina;
+    const hDesde = Number(String(partes[0]).trim());
+    const hHasta = Number(String(partes[1]).trim());
+    if (!Number.isFinite(hDesde) || !Number.isFinite(hHasta)) return horarioOficina;
+    if (hDesde < 0 || hDesde > 23 || hHasta < 0 || hHasta > 23) return horarioOficina;
+    if (hHasta <= hDesde) return horarioOficina; // franja degenerada -> no acotar; usar oficina
+    const franja = { desde: String(hDesde) + ':00', hasta: String(hHasta) + ':00' };
+    // Abierto TODOS los dias en esa franja (el recontacto no distingue dia de semana; el goteo/cupos ya limitan).
+    const dias = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
+    const horario = {};
+    for (const d of dias) horario[d] = { atiende: true, franjas: [franja] };
+    return horario;
+  } catch (e) { return horarioOficina; } // fail-safe: cualquier error -> horario de oficina (comportamiento actual)
+}
+
 // Devuelve true si en el instante `tsMs` (epoch ms) estamos dentro del horario de oficina del user.
 // Fail-safe: si no hay config o falla, devuelve false (no enviar). Variante con timestamp explicito:
 // la usa la escalada SLA para evaluar el horario SOBRE EL ANCHOR (el momento en que arranco la espera),
@@ -8143,12 +8194,14 @@ async function revisarInactividad() {
   if (_inactividadEnCurso) return;
   _inactividadEnCurso = true;
   try {
-    const TRES_DIAS_MS = 3 * 24 * 60 * 60 * 1000;
+    const TRES_DIAS_MS = 3 * 24 * 60 * 60 * 1000; // default legacy (72hs); se usa como fallback si algo falla
     const ahoraMs = Date.now();
     // recontacto_reglas_v2 (R1/R2): caches efimeros por corrida del cron. _reglasCache = flag por cuenta;
     // _pausaCache = settings de pausa por cuenta (crm_pausado/agente_pausado) para R2 (evitar re-querear por conv).
     const _reglasCache = {};
     const _pausaCache = {};
+    // UMBRAL configurable: dias de silencio antes de pasar a recontacto, por cuenta. Cache efimero por-tick.
+    const _umbralCache = {};
     const _v4Cache = {}; // DERIVACION v4: flag por cuenta (para el barrido de rotacion->recontacto a las 72hs, PUNTO 7).
     // Conversaciones activas que podrian estar inactivas
     // DERIVACION v3 (gated): traemos derivacion_rotando para EXCLUIR del barrido las convs en rotacion (la IA sigue
@@ -8221,9 +8274,14 @@ async function revisarInactividad() {
         .limit(1)
         .maybeSingle();
       if (respuestaPosterior) continue; // el lead ya respondio, no aplica
-      // Pasaron 72hs desde el ultimo mensaje de la IA?
+      // UMBRAL de inactividad configurable por cuenta (recontacto_umbral_dias, default 3 dias = 72hs).
+      // Fail-safe: sin columna / error / valor raro -> 3 dias (comportamiento actual). Cacheado por cuenta.
+      let _umbralDias = _umbralCache[conv.user_id];
+      if (_umbralDias === undefined) { try { _umbralDias = await _umbralInactividadDias(conv.user_id, _umbralCache); } catch (eUm) { _umbralDias = RECONTACTO_UMBRAL_DIAS_DEFAULT; _umbralCache[conv.user_id] = _umbralDias; } }
+      const _umbralMs = (Number.isFinite(_umbralDias) && _umbralDias >= 1 && _umbralDias <= 60) ? (_umbralDias * 24 * 60 * 60 * 1000) : TRES_DIAS_MS;
+      // Paso el umbral (por default 72hs) desde el ultimo mensaje de la IA sin respuesta del lead?
       const transcurrido = ahoraMs - new Date(ultimoAi.created_at).getTime();
-      if (transcurrido < TRES_DIAS_MS) continue;
+      if (transcurrido < _umbralMs) continue;
       // -> pasa a recontacto guardando el estado previo.
       // B7: NO forzar ai_enabled=true. Antes esto REACTIVABA la IA aunque un humano hubiera tomado la conversacion
       // (asesor_id seteado o admin_tomo=true) y la hubiera apagado a proposito -> la IA volvia a hablar pisando al
@@ -9092,12 +9150,20 @@ async function enviarRecontactosPendientes() {
         if (desdeUltimo < UN_DIA_MS) continue; // ya se mando uno hoy
       }
       // Leer config del user (fail-safe: si no hay, no enviar)
-      const { data: settings } = await supabase
-        .from('business_settings')
-        .select('horario_oficina, crm_pausado, agente_pausado, eliminado_at')
-        .eq('user_id', conv.user_id)
-        .maybeSingle();
-      if (!settings || !dentroHorarioOficina(settings.horario_oficina)) continue;
+      // recontacto_horario (franja propia del recontacto): DEFENSIVO. Si la columna no existe (migracion no corrida)
+      // el select falla y reintentamos SIN ella -> horario efectivo = horario_oficina (comportamiento ACTUAL EXACTO).
+      let settings = null;
+      try {
+        const r = await supabase.from('business_settings').select('horario_oficina, recontacto_horario, crm_pausado, agente_pausado, eliminado_at').eq('user_id', conv.user_id).maybeSingle();
+        if (r.error) throw r.error;
+        settings = r.data;
+      } catch (eRH) {
+        const { data: s2 } = await supabase.from('business_settings').select('horario_oficina, crm_pausado, agente_pausado, eliminado_at').eq('user_id', conv.user_id).maybeSingle();
+        settings = s2;
+      }
+      // Franja EFECTIVA: si recontacto_horario esta seteado ('HH-HH') se respeta ESA; si es null -> horario de oficina.
+      const _horarioEfec = _horarioRecontactoEfectivo(settings && settings.recontacto_horario, settings && settings.horario_oficina);
+      if (!settings || !dentroHorarioOficina(_horarioEfec)) continue;
       // PAUSA: si la cuenta esta pausada (total o agente), en papelera, o el sistema en pausa GLOBAL -> NO mandar.
       // Asi pausar frena TODO (respuestas Y recontactos), durable (la pausa vive en la base, no en memoria).
       if (_pausaGlobal === true || settings.crm_pausado === true || settings.agente_pausado === true || settings.eliminado_at) continue;
@@ -9408,11 +9474,22 @@ async function _enviarRecontactosV2(ahoraMs) {
   // Cuentas con el flag ON. Si la columna no existe (migracion no corrida) -> no hay cuentas v2 -> no hace nada.
   let cuentasV2 = [];
   try {
-    const { data: cc } = await supabase
-      .from('business_settings')
-      .select('user_id, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
-      .eq('recontacto_v2', true);
-    cuentasV2 = Array.isArray(cc) ? cc : [];
+    // recontacto_horario (franja propia del recontacto): DEFENSIVO. Si la columna NO existe (migracion no corrida)
+    // este select falla y reintentamos SIN ella -> horario efectivo = horario_oficina (comportamiento ACTUAL EXACTO).
+    try {
+      const r = await supabase
+        .from('business_settings')
+        .select('user_id, horario_oficina, recontacto_horario, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+        .eq('recontacto_v2', true);
+      if (r.error) throw r.error;
+      cuentasV2 = Array.isArray(r.data) ? r.data : [];
+    } catch (eRH) {
+      const { data: cc } = await supabase
+        .from('business_settings')
+        .select('user_id, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+        .eq('recontacto_v2', true);
+      cuentasV2 = Array.isArray(cc) ? cc : [];
+    }
   } catch (eCol) { return; } // sin columna / error -> no procesar nada v2 (fail-safe)
   if (cuentasV2.length === 0) return;
 
@@ -9422,8 +9499,10 @@ async function _enviarRecontactosV2(ahoraMs) {
       // PAUSAS de cuenta (mismas reglas que legacy + pausa propia de recontacto)
       if (_pausaGlobal === true || bs.crm_pausado === true || bs.agente_pausado === true || bs.eliminado_at) continue;
       if (bs.recontacto_pausado === true) continue;
-      // HORARIO de oficina: si estamos fuera, no mandar.
-      if (!dentroHorarioOficina(bs.horario_oficina)) continue;
+      // HORARIO: franja EFECTIVA del recontacto. Si recontacto_horario esta seteado ('HH-HH') se respeta ESA;
+      // si es null / ausente (columna inexistente -> undefined) -> horario de oficina (comportamiento ACTUAL EXACTO).
+      const _horarioEfec = _horarioRecontactoEfectivo(bs.recontacto_horario, bs.horario_oficina);
+      if (!dentroHorarioOficina(_horarioEfec)) continue;
 
       // --- WARM-UP: avanzar el dia SOLO cuando cambia la fecha de envio (los dias que efectivamente mando). ---
       let warmupDia = (Number.isFinite(bs.recontacto_warmup_dia) ? bs.recontacto_warmup_dia : 0) || 0;
@@ -9450,8 +9529,8 @@ async function _enviarRecontactosV2(ahoraMs) {
       const cupoRestante = Math.max(0, topeDiario - enviadosHoy);
       if (cupoRestante <= 0) continue; // ya se cumplio el cupo del dia -> nada mas hoy
 
-      // --- GOTEO: repartir el cupo restante a lo largo de los minutos restantes de la franja. ---
-      const minRestantes = _minutosRestantesFranja(bs.horario_oficina);
+      // --- GOTEO: repartir el cupo restante a lo largo de los minutos restantes de la franja EFECTIVA. ---
+      const minRestantes = _minutosRestantesFranja(_horarioEfec);
       if (minRestantes <= 0) continue; // fuera de franja util -> nada
       const tandasRestantes = Math.max(1, Math.ceil(minRestantes / FRANJA_INTERVALO_MIN));
       const factor = _factorAgresividad(bs.recontacto_agresividad);

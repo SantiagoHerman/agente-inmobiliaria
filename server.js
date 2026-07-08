@@ -7265,20 +7265,20 @@ async function _resolverUniversoOportunidad(ownerId, segmentos, customIds) {
   const _statusDe = { en_conversacion: 'en_conversacion', en_recontacto: 'recontacto' };
   for (const seg of segs) {
     try {
-      let q = supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId);
+      let q = supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id').eq('user_id', ownerId);
       if (Object.prototype.hasOwnProperty.call(_tempDe, seg)) { q = q.eq('temperatura', _tempDe[seg]); }
       else if (Object.prototype.hasOwnProperty.call(_statusDe, seg)) { q = q.eq('status', _statusDe[seg]); }
       else { continue; } // segmento desconocido -> ignorar
       const { data } = await q.limit(100000);
-      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id }; });
+      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null }; });
     } catch (eSeg) {}
   }
   // custom_ids: convs elegidas a mano (siempre acotado al tenant para no filtrar cross-tenant).
   const cids = Array.isArray(customIds) ? customIds.map(function (x) { return String(x || '').trim(); }).filter(Boolean) : [];
   if (cids.length) {
     try {
-      const { data } = await supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId).in('id', cids.slice(0, 5000));
-      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id }; });
+      const { data } = await supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id').eq('user_id', ownerId).in('id', cids.slice(0, 5000));
+      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null }; });
     } catch (eC) {}
   }
   return Object.keys(porId).map(function (k) { return porId[k]; });
@@ -7311,14 +7311,37 @@ app.post('/api/oportunidades/preview', async (req, res) => {
     const ownerId = await _resolverOwnerId(uid);
     const b = req.body || {};
     const universo = await _resolverUniversoOportunidad(ownerId, b.segmentos, b.custom_ids);
-    // Muestra: hasta 5 con nombre/telefono para que el dueño vea a quien le llegaria.
-    const muestra = [];
-    for (const c of universo.slice(0, 5)) {
-      let nombre = '', phone = '';
-      try { const { data: ct } = await supabase.from('contacts').select('name, phone').eq('id', c.contact_id).maybeSingle(); if (ct) { nombre = ct.name || ''; phone = ct.phone || ''; } } catch (eCt) {}
-      muestra.push({ conversation_id: c.id, contact_id: c.contact_id, nombre: nombre, phone: phone });
+    // Lista COMPLETA de destinatarios (cap defensivo) con nombre/telefono/temperatura/estado/asesor, para que
+    // el dueño arme el listado (buscar / ordenar / ver el lead / sacar) en la vista previa. Consultas BATCHEADAS
+    // (una por tabla), no una por lead. El dedup ya lo resolvio el universo (por conversation_id).
+    const CAP = 1000;
+    const top = universo.slice(0, CAP);
+    const cIds = Array.from(new Set(top.map(function (c) { return c.contact_id; }).filter(Boolean)));
+    const nombreDe = {}, phoneDe = {};
+    if (cIds.length) {
+      try {
+        const { data: cts } = await supabase.from('contacts').select('id, name, nombre_manual, phone').in('id', cIds.slice(0, CAP));
+        (cts || []).forEach(function (ct) { if (ct && ct.id) { nombreDe[ct.id] = ct.nombre_manual || ct.name || ''; phoneDe[ct.id] = ct.phone || ''; } });
+      } catch (eCt) {}
     }
-    return res.json({ ok: true, total: universo.length, muestra: muestra });
+    const aIds = Array.from(new Set(top.map(function (c) { return c.asesor_id; }).filter(Boolean)));
+    const asesorDe = {};
+    if (aIds.length) {
+      try {
+        const { data: ass } = await supabase.from('asesores').select('id, nombre').in('id', aIds);
+        (ass || []).forEach(function (a) { if (a && a.id) asesorDe[a.id] = a.nombre || ''; });
+      } catch (eA) {}
+    }
+    const _estadoLabel = { en_conversacion: 'En conversación', conversacion: 'En conversación', recontacto: 'En recontacto', interesado: 'Interesado', listo_humano: 'Derivado' };
+    const muestra = top.map(function (c) {
+      return {
+        conversation_id: c.id, contact_id: c.contact_id,
+        nombre: nombreDe[c.contact_id] || '', phone: phoneDe[c.contact_id] || '',
+        temperatura: c.temperatura || '', estado: _estadoLabel[c.status] || c.status || '',
+        asesor: c.asesor_id ? (asesorDe[c.asesor_id] || '') : '',
+      };
+    });
+    return res.json({ ok: true, total: universo.length, muestra: muestra, truncado: universo.length > CAP });
   } catch (err) {
     console.error('Error en POST /api/oportunidades/preview:', err && err.message);
     res.status(500).json({ error: (err && err.message) || 'Error interno' });

@@ -16721,9 +16721,10 @@ async function correrScrapingDeUsuario(cfg) {
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
         var ex = await supabase.from('properties').select('id, images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
-          // Refrescar fotos SOLO si conseguimos MAS que las guardadas (nunca regresar una galeria buena).
+          // Refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar
+          // galerias buenas ni las fotos ya CLASIFICADAS (categoria) de las propiedades sanas.
           var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
-          if (_fotos.length > _stored) fila.images = _fotos.map(function(u){ return { url: u }; });
+          if (_stored < 2 && _fotos.length > _stored) fila.images = _fotos.map(function(u){ return { url: u }; });
           var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
           if (up.error) errores++; else actualizados++;
         } else {
@@ -16784,7 +16785,8 @@ async function correrScrapingPendiente(cfg) {
         if (ex.data && ex.data.id) {
           // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion) o si la web tiene MAS fotos que las guardadas
           var v = ex.data;
-          var _masFotos = _fotosPend.length > (Array.isArray(v.images) ? v.images.length : 0);
+          var _storedN = Array.isArray(v.images) ? v.images.length : 0;
+          var _masFotos = _storedN < 2 && _fotosPend.length > _storedN; // solo si la galeria guardada es pobre
           var cambio = _masFotos || (String(v.price||'') !== String(nuevo.price||'')) || (String(v.title||'') !== String(nuevo.title||'')) || (String(v.zone||'') !== String(nuevo.zone||'')) || (String(v.description||'') !== String(nuevo.description||''));
           if (cambio) {
             await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'modificada', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: { title: v.title, price: v.price, zone: v.zone }, property_id: v.id });
@@ -16875,16 +16877,16 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
       var fila = { user_id: user_id, numero: String(it.numero), title: d.title || 'Sin titulo', type: d.type || null, zone: d.zone || null, price: d.price || null, description: d.description || null, caracteristicas: d.caracteristicas || null, link: d.link || null, activa: true };
       var _fotosAcc = Array.isArray(d.images) ? d.images : []; // ya vienen como [{url:...}]
       if (it.tipo_cambio === 'modificada' && it.property_id) {
-        // refrescar fotos SOLO si el diff trae MAS que las guardadas (no regresar una galeria buena)
+        // refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar las sanas/clasificadas
         var _cur = await supabase.from('properties').select('images').eq('id', it.property_id).maybeSingle();
         var _curN = (_cur.data && Array.isArray(_cur.data.images)) ? _cur.data.images.length : 0;
-        if (_fotosAcc.length > _curN) fila.images = _fotosAcc;
+        if (_curN < 2 && _fotosAcc.length > _curN) fila.images = _fotosAcc;
         await supabase.from('properties').update(fila).eq('id', it.property_id);
       } else {
         var ex = await supabase.from('properties').select('id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
           var _exN = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
-          if (_fotosAcc.length > _exN) fila.images = _fotosAcc;
+          if (_exN < 2 && _fotosAcc.length > _exN) fila.images = _fotosAcc;
           await supabase.from('properties').update(fila).eq('id', ex.data.id);
         }
         else { if (_fotosAcc.length) fila.images = _fotosAcc; await supabase.from('properties').insert(fila); }

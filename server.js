@@ -4224,6 +4224,49 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   } catch (eDev) { console.error('inventario desarrollos:', eDev && eDev.message); inventarioDesarrollos = ''; }
 
+  // ===== INVENTARIO DE HOTEL / CABAÑAS (ADITIVO + GATEADO por rubro) =====
+  // Solo para rubro 'hotel_cabanas'. Lee hotel_unidades + hotel_tarifa (esquema propio de hotel) y arma el bloque
+  // de unidades/habitaciones/cabañas con capacidad + tarifas por temporada, para que la IA las OFREZCA (antes NO
+  // las leía → un hotel cargaba sus cabañas y la IA no las veía). Gateado: para inmobiliaria/desarrolladora queda ''
+  // => .filter(Boolean) lo descarta y el prompt es el ACTUAL EXACTO. Aislado por user_id. Deploy-safe: si la tabla
+  // no existe (migracion no corrida), el select falla y queda sin inventario (no rompe).
+  const _esHotel = normalizarRubro(rubro) === 'hotel_cabanas';
+  // Cómo se nombra el negocio segun rubro (para que la IA NO se presente siempre como "la inmobiliaria").
+  const _negocioLabel = _esHotel ? 'el alojamiento' : (normalizarRubro(rubro) === 'desarrolladora' ? 'la desarrolladora' : 'la inmobiliaria');
+  let inventarioHotel = '';
+  if (_esHotel) try {
+    const { data: _uds, error: _udErr } = await supabase.from('hotel_unidades')
+      .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos')
+      .eq('user_id', user_id).eq('activa', true);
+    if (!_udErr && _uds && _uds.length > 0) {
+      const _udIds = _uds.map(function(u){ return u.id; });
+      const { data: _tars } = await supabase.from('hotel_tarifa')
+        .select('unidad_id, temporada, fecha_desde, fecha_hasta, precio_noche, moneda, min_noches, ocupacion_base')
+        .in('unidad_id', _udIds).eq('user_id', user_id);
+      const _tarsPorU = {};
+      (_tars || []).forEach(function(t){ (_tarsPorU[t.unidad_id] = _tarsPorU[t.unidad_id] || []).push(t); });
+      const _bloquesH = _uds.map(function(u){
+        const at = u.atributos || {};
+        const specs = [
+          u.capacidad ? 'capacidad ' + u.capacidad : '',
+          at.camas ? at.camas + ' camas' : '',
+          at.dormitorios ? at.dormitorios + ' dorm' : '',
+          at.banos ? at.banos + ' banos' : '',
+          at.vista ? 'vista ' + at.vista : ''
+        ].filter(Boolean).join(', ');
+        const _tarsTxt = (_tarsPorU[u.id] || []).map(function(t){
+          const _rango = (t.fecha_desde || t.fecha_hasta) ? (' [' + (t.fecha_desde || '') + (t.fecha_hasta ? ' al ' + t.fecha_hasta : '') + ']') : '';
+          return (t.temporada || 'tarifa') + ': ' + (t.precio_noche != null ? (t.moneda || 'ARS') + ' ' + t.precio_noche + '/noche' : 'consultar') + (t.min_noches ? ' (min ' + t.min_noches + ' noches)' : '') + _rango;
+        });
+        const _precioTxt = _tarsTxt.length ? _tarsTxt.join(' ; ') : (u.precio_base != null ? (u.moneda || 'ARS') + ' ' + u.precio_base + '/noche' : 'consultar');
+        let _amenTxt = '';
+        try { const _am = at.amenities || {}; const _ks = Object.keys(_am).filter(function(k){ return _am[k]; }); if (_ks.length) _amenTxt = ' | amenities: ' + _ks.join(', '); } catch (eAm) {}
+        return '- ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + (u.descripcion ? ' | ' + u.descripcion : '');
+      });
+      if (_bloquesH.length > 0) inventarioHotel = _bloquesH.join(String.fromCharCode(10));
+    }
+  } catch (eHot) { console.error('inventario hotel:', eHot && eHot.message); inventarioHotel = ''; }
+
   let historial = [];
   if (modoPrueba && historialManual) {
     historial = historialManual.map(function(m){ return { role: m.role === 'ai' ? 'assistant' : 'user', content: m.content }; });
@@ -4302,13 +4345,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const _vozV2 = (settings && settings.agente_voz_v2 === true) || modoPrueba;
   // Bloque premium: playbook (si ON) + perfil gendered (si ON y hay genero). Si OFF => '' => .filter(Boolean) lo descarta y el prompt queda IDENTICO al de hoy.
   // Si _vozV2 esta ON, la voz nueva REEMPLAZA al playbook viejo y a las personas gendered: aca se fuerza '' y la voz se inyecta mas abajo en systemStatic.
-  const _bloquePremium = _vozV2
+  const _bloquePremium = (_vozV2 || _esHotel)
     ? ''
     : (_premiumOn
         ? (PREMIUM_PLAYBOOK + (_premiumPersona(_generoEfectivo) ? ('\n' + _premiumPersona(_generoEfectivo)) : ''))
         : '');
   // Voz V2 + linea de CONTEXTO de franja horaria (para que el saludo por hora funcione de verdad). Solo si _vozV2.
-  const _bloqueVozV2 = _vozV2
+  const _bloqueVozV2 = (_vozV2 && !_esHotel)
     ? ('CONTEXTO: ahora es de ' + _franjaArg() + ' (saluda en consecuencia: buen dia / buenas tardes / buenas noches).\n' + VOZ_AGENTE_V2.split('Nadia:').join((agentName || 'la asesora') + ':'))
     : '';
   const bloqueIAConocimiento = _ic.conocimiento ? ('LO QUE SABES Y MANEJAS VOS (tu conocimiento propio como parte del equipo): ' + _ic.conocimiento) : '';
@@ -4326,7 +4369,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     'FOTOS DE PROPIEDADES: Cuando el lead te PIDA ver una foto de una propiedad (por ejemplo: mandame una del dormitorio, mostrame la pileta, tenes fotos de la cocina), usa la herramienta enviar_foto_propiedad indicando el numero de la propiedad (campo numero del inventario, ej: 12) y la categoria pedida. Solo podes mandar fotos de propiedades que en el inventario digan fotos disponibles. Las categorias validas son: dormitorio, bano, cocina, comedor, living, parque, frente, pileta, cochera, exterior, otra. Si no tenes claro de que propiedad habla, primero preguntale cual antes de usar la herramienta. No inventes fotos que no existan.',
     // REGLA DE ORO DE DERIVACION (protegida: string literal fijo, el cliente NO puede editarla ni desactivarla desde
     // la config; va SIEMPRE en el prompt). Fix del caso Fabiana: que la IA no adivine el area y pregunte cuando duda.
-    'REGLA DE ORO (obligatoria, no negociable): antes de dar por sentada un area o de encaminar el lead a un asesor, entende PRIMERO que necesita. Distingui si quiere COMPRAR, ALQUILAR, o si es un tema de ADMINISTRACION de un cliente que YA opera con la empresa (un pago, una expensa, un recibo, una cobranza). Si el mensaje no lo deja claro, o mezcla temas, o no estas segura, PREGUNTASELO con naturalidad (por ejemplo: "para orientarte bien: es por una compra o alquiler, o por un tema de administracion como un pago o una expensa?") y espera la respuesta antes de encaminarlo. NUNCA supongas el area por una palabra suelta: alguien que quiere comprar/alquilar y habla de FINANCIACION, CUOTAS, ANTICIPO, SEÑA o CONTRATO de la operacion es VENTA o ALQUILER, NO Administracion. Si la intencion es obvia (pregunta un precio, una propiedad, disponibilidad) NO hace falta preguntar: seguí normal.',
+    _esHotel
+      ? 'REGLA DE ORO (obligatoria, no negociable): antes de encaminar al huesped, entende PRIMERO que necesita. Distingui si es una CONSULTA para reservar (fechas de entrada/salida, cantidad de personas, tipo de unidad/cabania), un tema de una RESERVA ya hecha (pago, sena, check-in/check-out, cambio de fechas) o info general del alojamiento. Si el mensaje no lo deja claro o mezcla temas, PREGUNTASELO con naturalidad y espera la respuesta antes de encaminarlo. NUNCA supongas por una palabra suelta. Si la intencion es obvia (pregunta un precio, disponibilidad o una unidad) NO hace falta preguntar: segui normal.'
+      : 'REGLA DE ORO (obligatoria, no negociable): antes de dar por sentada un area o de encaminar el lead a un asesor, entende PRIMERO que necesita. Distingui si quiere COMPRAR, ALQUILAR, o si es un tema de ADMINISTRACION de un cliente que YA opera con la empresa (un pago, una expensa, un recibo, una cobranza). Si el mensaje no lo deja claro, o mezcla temas, o no estas segura, PREGUNTASELO con naturalidad (por ejemplo: "para orientarte bien: es por una compra o alquiler, o por un tema de administracion como un pago o una expensa?") y espera la respuesta antes de encaminarlo. NUNCA supongas el area por una palabra suelta: alguien que quiere comprar/alquilar y habla de FINANCIACION, CUOTAS, ANTICIPO, SEÑA o CONTRATO de la operacion es VENTA o ALQUILER, NO Administracion. Si la intencion es obvia (pregunta un precio, una propiedad, disponibilidad) NO hace falta preguntar: seguí normal.',
     instruccionesRubro,
     comportamientoSetter,
     // AGENTE PREMIUM EN REAL ESTATE (aplicado a TODOS por default; se apaga con agente_premium_re=false a nivel cuenta
@@ -4338,9 +4383,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     _bloqueVozV2,
     instruccionIdioma,
     'Respondes consultas de clientes por WhatsApp.',
-    _vozV2
-      ? 'Si es el primer mensaje, presentate con naturalidad y calidez (tu nombre y la inmobiliaria, sin anunciar tu cargo de forma tiesa) y engancha la charla desde la primera palabra. El registro del saludo lo define tu TONO configurado (ver mas abajo) y lo respetas desde la primera palabra; SOLO si tu tono es Adaptativo espejas como te escribe el lead (relajada y de vos si te escribe asi, formal pero calida si te escribe formal). NO es obligatorio pedir el nombre del cliente de entrada: si surge solo lo usas, y si no, no pasa nada. Si ya lo dio antes, no lo vuelvas a pedir.'
-      : 'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y la inmobiliaria) y preguntale su nombre de forma natural. Ese saludo y presentacion YA tienen que estar escritos en el TONO configurado (ver mas abajo), desde la primera palabra. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si el tono es cercano/relajado; Sr./Sra. y apellido si el tono es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
+    (_vozV2 && !_esHotel)
+      ? 'Si es el primer mensaje, presentate con naturalidad y calidez (tu nombre y ' + _negocioLabel + ', sin anunciar tu cargo de forma tiesa) y engancha la charla desde la primera palabra. El registro del saludo lo define tu TONO configurado (ver mas abajo) y lo respetas desde la primera palabra; SOLO si tu tono es Adaptativo espejas como te escribe el lead (relajada y de vos si te escribe asi, formal pero calida si te escribe formal). NO es obligatorio pedir el nombre del cliente de entrada: si surge solo lo usas, y si no, no pasa nada. Si ya lo dio antes, no lo vuelvas a pedir.'
+      : 'Si es el primer mensaje y todavia no sabes el nombre del cliente, presentate brevemente (deci tu nombre y ' + _negocioLabel + ') y preguntale su nombre de forma natural. Ese saludo y presentacion YA tienen que estar escritos en el TONO configurado (ver mas abajo), desde la primera palabra. Una vez que sepas el nombre, usalo para dirigirte a la persona segun el tono configurado (por nombre de pila si el tono es cercano/relajado; Sr./Sra. y apellido si el tono es formal). No vuelvas a pedir el nombre si ya lo dio antes en la conversacion.',
     tono, autonomia, objetivo, largo,
     usaEmojis ? 'Podes usar algun emoji con moderacion.' : 'EMOJIS PROHIBIDOS: NO uses ningun emoji, emoticon ni simbolo grafico. Responde SIEMPRE solo con texto plano, sin excepciones.',
     _bloquesInstr.internas,
@@ -4355,7 +4400,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     aprendizajeActivo ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes: usa la herramienta consultar_al_dueno con la pregunta concreta, y decile al lead con naturalidad que lo consultas y le confirmas enseguida.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
-    'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:', inventario, '',
+    // Para hotel NO se muestra "Propiedades disponibles" (usa el bloque de unidades de abajo); inmobiliaria/desarrolladora igual que siempre.
+    _esHotel ? '' : 'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:',
+    _esHotel ? '' : inventario,
+    '',
+    // INVENTARIO DE HOTEL / CABAÑAS (ADITIVO + GATEADO por rubro): unidades con capacidad + tarifas por noche/temporada.
+    inventarioHotel ? 'Unidades / habitaciones / cabanias disponibles (ofrecelas SOLO estas; no inventes). Distingui por capacidad y por temporada/fechas; las tarifas son POR NOCHE. Si el cliente te da fechas y cantidad de personas, cruzalas contra la capacidad y la temporada; ante dudas de disponibilidad exacta, ofrece confirmar la reserva:' : '',
+    inventarioHotel || '',
     // INVENTARIO DE DESARROLLOS (ADITIVO + GATEADO): solo presente si la cuenta tiene el modulo activo.
     // Con el flag OFF, inventarioDesarrollos === '' => .filter(Boolean) descarta estas 2 lineas y el prompt es el ACTUAL EXACTO.
     inventarioDesarrollos ? 'Emprendimientos / desarrollos disponibles (proyectos en pozo, en construccion o terminados; ofrecelos cuando el cliente busca obra nueva, financiacion en cuotas o inversion). Usa SOLO estos; no inventes unidades ni precios. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. Si el emprendimiento tiene link, compartilo:' : '',
@@ -17036,6 +17087,13 @@ async function revisarScrapingsAutomaticos() {
     var diaHoy = nombresDias[diaSemana];
     for (var i = 0; i < cuentas.length; i++) {
       var cfg = cuentas[i];
+      // GUARD POR RUBRO: este cron scrapea PROPERTIES (listados de inmobiliaria). Hotel no scrapea propiedades y
+      // desarrolladora tiene su propio cron (revisarScrapingsDesarrollo). Si la cuenta no es inmobiliaria, saltar
+      // (evita filas huerfanas en properties que la IA de ese rubro ignora). Defensivo: ante error, no bloquea.
+      try {
+        var _bsRubro = await supabase.from('business_settings').select('rubro').eq('user_id', cfg.user_id).maybeSingle();
+        if (normalizarRubro((_bsRubro.data && _bsRubro.data.rubro) || 'inmobiliaria') !== 'inmobiliaria') continue;
+      } catch (eGuardR) {}
       var horarios = Array.isArray(cfg.horarios) ? cfg.horarios : [];
       var dias = Array.isArray(cfg.dias_semana) ? cfg.dias_semana : [];
       // determinar la hora objetivo segun frecuencia

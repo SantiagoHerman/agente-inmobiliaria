@@ -7578,6 +7578,25 @@ app.delete('/api/maestro/aviso', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
+// GET para el PANEL MAESTRO (auth de Maestro, NO de usuario Supabase). El panel no tiene sesion Supabase,
+// asi que NO puede usar /api/aviso-activo (verificarUsuario -> 401) -> el panel creia que no habia aviso y
+// dejaba el boton "Quitar aviso" deshabilitado aunque hubiera uno activo en los dashboards. Devuelve el aviso
+// activo mas reciente o null.
+app.get('/api/maestro/aviso', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var r = await supabase.from('avisos_maestro')
+      .select('id, mensaje, nivel')
+      .eq('activo', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!r || r.error || !r.data) return res.json({ aviso: null });
+    return res.json({ aviso: { id: r.data.id, mensaje: r.data.mensaje, nivel: r.data.nivel } });
+  }catch(e){ return res.json({ aviso: null }); }
+});
+
 // Cualquier usuario logueado (verificarUsuario -> 401 si no hay uid). Devuelve el
 // aviso activo MAS RECIENTE o null. No expone mas que mensaje/nivel/id. CERO tokens.
 app.get('/api/aviso-activo', async function(req, res){

@@ -210,14 +210,35 @@ function _debePushearLead(convId) {
   return false;
 }
 
+// Registro (best-effort, DEPLOY-SAFE) de cada aviso push -> tabla `notificaciones`. Es la PRUEBA con tilde de entrega
+// (estado: 'entregado' | 'sin_dispositivo' | 'error'). Fire-and-forget: NO se await desde el push -> nunca lo frena
+// ni lo rompe. Si la tabla aun no existe (migracion no corrida), el insert falla en silencio.
+function _logNotif(authUserId, titulo, cuerpo, meta, res) {
+  try {
+    supabase.from('asesores').select('admin_id, nombre').eq('auth_user_id', authUserId).maybeSingle().then(function (r) {
+      var ad = (r && r.data && r.data.admin_id) || authUserId; // si no es asesor (es el dueno), se registra a su propio id
+      var nom = (r && r.data && r.data.nombre) || null;
+      supabase.from('notificaciones').insert({
+        admin_id: ad, destinatario_auth_user_id: authUserId, destinatario_nombre: nom,
+        tipo: (meta && meta.tipo) || 'aviso', canal: 'push',
+        titulo: titulo ? String(titulo).slice(0, 140) : null,
+        cuerpo: cuerpo ? String(cuerpo).slice(0, 400) : null,
+        conversation_id: (meta && meta.conversation_id) || null,
+        tokens_total: res.total || 0, tokens_ok: res.ok || 0, tokens_fail: res.fail || 0, estado: res.estado
+      }).then(function () {}, function () {});
+    }, function () {});
+  } catch (e) {}
+}
+
 // Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
-async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
+// meta (opcional): { tipo, conversation_id } para enriquecer el registro. Backward-compatible (los callers sin meta funcionan igual).
+async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral, meta) {
   try {
     if (!_fcmReady || !authUserId) return;
     const { data: toks } = await supabase.from('device_tokens').select('token').eq('user_id', authUserId);
-    if (!toks || !toks.length) return;
+    if (!toks || !toks.length) { _logNotif(authUserId, leadNombre, bodyLiteral || texto, meta, { total: 0, ok: 0, fail: 0, estado: 'sin_dispositivo' }); return; }
     const tokens = toks.map(function (t) { return t.token; }).filter(Boolean);
-    if (!tokens.length) return;
+    if (!tokens.length) { _logNotif(authUserId, leadNombre, bodyLiteral || texto, meta, { total: 0, ok: 0, fail: 0, estado: 'sin_dispositivo' }); return; }
     const palabras = String(texto || '').trim().split(/\s+/).slice(0, 3).join(' ');
     // bodyLiteral: para avisos que NO son un mensaje de lead (ej. cupo IA al 80/100%), se respeta el cuerpo tal cual.
     const _body = bodyLiteral ? String(bodyLiteral) : ('Nuevo mensaje · ' + palabras);
@@ -226,16 +247,19 @@ async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral) {
       notification: { title: leadNombre || 'Nuevo lead', body: _body },
       android: { priority: 'high', notification: { channelId: 'mensajes', sound: 'default', priority: 'high' } }
     });
-    // Limpiar tokens invalidos (desinstalados / expirados)
+    // Contar entregados/fallidos (para el tilde) + limpiar tokens invalidos (desinstalados / expirados)
+    let _ok = 0, _fail = 0;
     if (resp && resp.responses) {
       for (let i = 0; i < resp.responses.length; i++) {
         const r = resp.responses[i];
+        if (r && r.success) _ok++; else _fail++;
         const code = (r && r.error && r.error.code) || '';
         if (!r.success && /not-registered|invalid-registration-token|invalid-argument/.test(code)) {
           try { await supabase.from('device_tokens').delete().eq('token', tokens[i]); } catch (eDel) {}
         }
       }
     }
+    _logNotif(authUserId, leadNombre, _body, meta, { total: tokens.length, ok: _ok, fail: _fail, estado: _ok > 0 ? 'entregado' : 'error' });
   } catch (e) { console.error('Error enviarPushAsesor:', e && e.message); }
   // FASE 2 (gated OFF): ESPEJO del push por-usuario a WhatsApp. Best-effort, NUNCA rompe el push.
   try { await _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral); } catch (eDm) { console.error('Error _espejarPushAWhatsApp:', eDm && eDm.message); }
@@ -18693,6 +18717,23 @@ app.post('/api/push/baja-token', async function(req, res){
     await supabase.from('device_tokens').delete().eq('user_id', uid).eq('token', token);
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// Historial de AVISOS push enviados a los usuarios del dueno (la PRUEBA con tilde de entrega). Owner-scoped por token.
+// ?destinatario=<auth_user_id> filtra por un usuario. DEPLOY-SAFE: si la tabla `notificaciones` no existe -> lista vacia.
+app.get('/api/notificaciones', async function(req, res){
+  try{
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // Resolver el dueno: si el que consulta es un asesor, su admin_id; si es el dueno, su propio uid.
+    var ownerId = uid;
+    try { var { data: yo } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle(); if (yo && yo.admin_id) ownerId = yo.admin_id; } catch (e) {}
+    var q = supabase.from('notificaciones').select('*').eq('admin_id', ownerId).order('created_at', { ascending: false }).limit(500);
+    if (req.query && req.query.destinatario) q = q.eq('destinatario_auth_user_id', String(req.query.destinatario));
+    var { data, error } = await q;
+    if (error) return res.json({ ok: true, notificaciones: [] }); // tabla ausente / migracion no corrida
+    return res.json({ ok: true, notificaciones: data || [] });
+  }catch(e){ return res.json({ ok: true, notificaciones: [] }); }
 });
 
 // Cargar saldo manual de Anthropic (la API no expone el saldo; el dueno lo ingresa al recargar)

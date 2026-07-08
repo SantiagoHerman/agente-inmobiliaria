@@ -16872,6 +16872,11 @@ async function correrScrapingDeUsuario(cfg) {
     if (!lista.length) return { ok: false, motivo: 'sin propiedades' };
     var creados = 0, actualizados = 0, errores = 0;
     var numerosVistos = {}; // numeros que SÍ figuran en el sitio en esta corrida
+    // DEPLOY-SAFE: si la columna pausa_manual aun NO existe (migracion no corrida), caemos al comportamiento
+    // anterior (sin auto-pausa/despausa) para no romper la actualizacion de inventario. Al existir, se activa sola.
+    var _tienePausa = true;
+    try { var _pb = await supabase.from('properties').select('pausa_manual').limit(1); if (_pb.error) _tienePausa = false; } catch (e) { _tienePausa = false; }
+    var _selCols = _tienePausa ? 'id, images, pausa_manual' : 'id, images';
     for (var i = 0; i < lista.length; i++) {
       try {
         var p = await procesarPropiedad(lista[i]);
@@ -16884,11 +16889,11 @@ async function correrScrapingDeUsuario(cfg) {
           caracteristicas: p.caracteristicas || null, link: p.link || null
         };
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
-        var ex = await supabase.from('properties').select('id, images, pausa_manual').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select(_selCols).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
           // FIGURA en el sitio -> auto-DESPAUSA (activa=true) y actualiza info, SALVO que la hayas pausado a mano
           // (pausa_manual): en ese caso se respeta tu pausa (activa=false) pero igual se refresca la info.
-          fila.activa = ex.data.pausa_manual ? false : true;
+          fila.activa = (_tienePausa && ex.data.pausa_manual) ? false : true;
           // Refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar
           // galerias buenas ni las fotos ya CLASIFICADAS (categoria) de las propiedades sanas.
           var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
@@ -16907,7 +16912,7 @@ async function correrScrapingDeUsuario(cfg) {
     // toca las pausadas a mano (pausa_manual). SALVAGUARDA anti-scrape-parcial: solo se auto-pausa si la corrida
     // cubrio la mayor parte del catalogo scrapeado (>=70%); si el sitio vino corto (caida), no se pausa nada.
     var pausadas = 0;
-    try {
+    if (_tienePausa) try {
       var vistos = Object.keys(numerosVistos);
       var todasR = await supabase.from('properties').select('id, numero, pausa_manual, link, activa').eq('user_id', cfg.user_id);
       var todas = (todasR.data || []).filter(function(x){ return x.link; }); // solo las de origen scraping (tienen link)

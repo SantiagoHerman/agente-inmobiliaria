@@ -18755,13 +18755,13 @@ app.get('/api/ui-flags', async function(req, res){
       var _yo = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
       if (_yo && _yo.data && _yo.data.admin_id) user_id = _yo.data.admin_id;
     } catch (e) { /* sin fila -> es el dueño, user_id queda igual */ }
-    var ui_moderno = false, reparto_v2 = false;
+    var ui_moderno = false, reparto_v2 = false, rubro = 'inmobiliaria';
     try {
-      var _bs = await supabase.from('business_settings').select('ui_moderno, reparto_v2').eq('user_id', user_id).maybeSingle();
-      if (_bs && _bs.data) { ui_moderno = _bs.data.ui_moderno === true; reparto_v2 = _bs.data.reparto_v2 === true; }
+      var _bs = await supabase.from('business_settings').select('ui_moderno, reparto_v2, rubro').eq('user_id', user_id).maybeSingle();
+      if (_bs && _bs.data) { ui_moderno = _bs.data.ui_moderno === true; reparto_v2 = _bs.data.reparto_v2 === true; if (_bs.data.rubro) rubro = normalizarRubro(_bs.data.rubro); }
     } catch (e) { /* columna ausente / error -> false (fail-open) */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2 });
-  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false }); }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro });
+  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria' }); }
 });
 
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.

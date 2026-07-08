@@ -15966,16 +15966,31 @@ function _galeriaHtmlDeUploads(html) {
   // subcadenas plausibles en el nombre de una foto REAL de una propiedad (evitar falsos positivos).
   var chromePath = /\/wp-content\/(?:themes|plugins)\//i;
   var chromeName = /(logo|favicon|factura|overlay|sprite|placeholder|avatar|loader|wpforms)/i;
-  var seen = {}, out = [];
-  for (var i = 0; i < all.length && out.length < 30; i++) {
+  var seen = {}, limpias = [];
+  for (var i = 0; i < all.length; i++) {
     var full = all[i];
     if (chromePath.test(full)) continue;
     var u = full.replace(/-\d+x\d+(\.\w+)$/, '$1'); // -1024x768.jpg -> .jpg (original)
     var name = (u.split('/').pop() || '');          // filtrar por nombre, no por la URL entera
     if (chromeName.test(name)) continue;
-    if (!seen[u]) { seen[u] = 1; out.push(u); }
+    if (!seen[u]) { seen[u] = 1; limpias.push(u); }
   }
-  return out;
+  // DE-CONTAMINACION: la seccion "propiedades similares" del theme mete 1-2 fotos de OTRAS propiedades
+  // (su portada) al final del HTML. La galeria real comparte la carpeta de subida AAAA/MM y aporta muchas
+  // fotos; el intruso aporta 1-2. Nos quedamos con las carpetas que aportan >=3 fotos (o la mayoritaria) y
+  // descartamos los intrusos. Solo se aplica si hay mas de una carpeta y algo para ganar (evita falsos).
+  if (limpias.length > 3) {
+    var folderDe = function (x) { var m = x.match(/\/uploads\/(\d{4}\/\d{2})\//); return m ? m[1] : '?'; };
+    var cont = {};
+    for (var c = 0; c < limpias.length; c++) { var f = folderDe(limpias[c]); cont[f] = (cont[f] || 0) + 1; }
+    var carpetas = Object.keys(cont);
+    if (carpetas.length > 1) {
+      var maxN = 0; for (var k = 0; k < carpetas.length; k++) { if (cont[carpetas[k]] > maxN) maxN = cont[carpetas[k]]; }
+      var filtrada = limpias.filter(function (x) { var f = folderDe(x); return cont[f] >= 3 || cont[f] === maxN; });
+      if (filtrada.length >= 2 && filtrada.length < limpias.length) limpias = filtrada;
+    }
+  }
+  return limpias.slice(0, 30);
 }
 // Arma la galeria COMPLETA de una propiedad WP (0 IA), en orden de preferencia:
 //   1) adjuntos por ?parent=<postId> (props NUEVAS con fotos adjuntas al post)

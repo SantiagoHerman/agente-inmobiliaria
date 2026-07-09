@@ -297,6 +297,13 @@ async function _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral)
       flagOn = !!(bs && bs.notif_dm_wa_on === true);
     } catch (eBs) { flagOn = false; }
     if (!flagOn) return; // gated OFF (default) => comportamiento actual EXACTO
+    // SWITCH POR-USUARIO (asesores.notif_wa_activa): si el usuario apago el aviso por WhatsApp, NO espejar (ej. ya
+    // recibe push en Android y no quiere la notif doble). Read SEPARADO y DEFENSIVO: si la columna aun no existe,
+    // data viene null => se trata como ON (no bloquea). Default ON.
+    try {
+      const { data: _nw } = await supabase.from('asesores').select('notif_wa_activa').eq('auth_user_id', authUserId).maybeSingle();
+      if (_nw && _nw.notif_wa_activa === false) return;
+    } catch (eNW) {}
     // 3) Armar el MISMO texto que ve el usuario en el push (titulo + cuerpo). Reusa la logica del push:
     //    bodyLiteral manda si vino; si no, 'Nuevo mensaje · <primeras 3 palabras>'.
     const palabras = String(texto || '').trim().split(/\s+/).slice(0, 3).join(' ');
@@ -10387,6 +10394,8 @@ app.post('/api/asesores/crear', async (req, res) => {
     const { data: nuevoAse, error: errIns } = await supabase.from('asesores').insert(Object.assign({ admin_id: admin_id, auth_user_id: authId, nombre: nombre, usuario: usuario, cargo: (cargo && cargo.trim()) ? cargo.trim() : (esIa ? 'Agente IA' : 'Asesor'), rol: rolFinal, estado: 'activo', activo: true }, _nuevos)).select('id').single();
     if (errIns) { if (authId) { try { await supabase.auth.admin.deleteUser(authId); } catch (e) {} } return res.status(400).json({ error: errIns.message }); }
     try { if (nuevoAse && nuevoAse.id) await _setDepartamentosUsuario(nuevoAse.id, admin_id, req.body.departamentos); } catch (eDep) { console.error('membresia depto al crear:', eDep && eDep.message); }
+    // Switch por-usuario "recibir aviso por WhatsApp" (asesores.notif_wa_activa). Update SEPARADO y DEFENSIVO (no rompe el alta si la columna aun no existe).
+    if (nuevoAse && nuevoAse.id && typeof req.body.notif_wa_activa === 'boolean') { try { await supabase.from('asesores').update({ notif_wa_activa: req.body.notif_wa_activa }).eq('id', nuevoAse.id); } catch (eNW) {} }
     return res.json({ ok: true, email: email, id: nuevoAse && nuevoAse.id });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -10405,6 +10414,9 @@ app.post('/api/asesores/config', async (req, res) => {
     if (!ase) return res.status(404).json({ error: 'Usuario no encontrado' });
     const nuevos = _camposUsuarioNuevos(b);
     if (Object.keys(nuevos).length) { const { error } = await supabase.from('asesores').update(nuevos).eq('id', b.asesor_id).eq('admin_id', b.admin_id); if (error) return res.status(500).json({ error: error.message }); }
+    // Switch por-usuario "recibir aviso por WhatsApp" (asesores.notif_wa_activa). Update SEPARADO y DEFENSIVO: si la
+    // columna aun no existe (migracion no corrida), falla en silencio y NO rompe el resto del guardado.
+    if (typeof b.notif_wa_activa === 'boolean') { try { await supabase.from('asesores').update({ notif_wa_activa: b.notif_wa_activa }).eq('id', b.asesor_id).eq('admin_id', b.admin_id); } catch (eNW) {} }
     if (Array.isArray(b.departamentos)) await _setDepartamentosUsuario(b.asesor_id, b.admin_id, b.departamentos);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }

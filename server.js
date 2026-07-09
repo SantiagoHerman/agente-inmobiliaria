@@ -5830,26 +5830,21 @@ async function manejarReaccionEntrante(instancia, reactionMessage, esFromMe) {
   } catch (e) { console.error('manejarReaccionEntrante:', e && e.message); }
 }
 
-// ===== REGLA DE ORO: los numeros del EQUIPO no entran como lead ni hablan con la IA =====
-// Los telefonos de los USUARIOS del sistema (asesores.whatsapp_notif) y el numero del DUENO
-// (business_settings.whatsapp_contacto) existen SOLO para RECIBIR notificaciones. Si uno de ellos escribe al
-// WhatsApp del negocio, NO debe crear un lead/conversacion ni gastar IA. Comparamos por los ULTIMOS 10 digitos
-// (tolerante al 9 de celular AR y al codigo de pais que Evolution puede traer distinto).
+// ===== REGLA DE ORO: los numeros de los USUARIOS no entran como lead ni hablan con la IA =====
+// Los telefonos de los USUARIOS del sistema (asesores.whatsapp_notif) existen SOLO para RECIBIR notificaciones. Si
+// un usuario escribe al WhatsApp del negocio, NO debe crear un lead/conversacion ni gastar IA.
+// OJO — NO incluir al DUENO: el numero del dueno (business_settings.whatsapp_contacto / reportes_config.whatsapp) ES
+// un CANAL con la IA (agregar instrucciones, pedir reportes, responder dudas, contestar aprendizaje — ver el bloque
+// de comandos del dueno mas abajo en el webhook, ~L6009+). Excluirlo rompia ese canal. El dueño SI habla con la IA.
+// Comparamos por los ULTIMOS 10 digitos (tolerante al 9 de celular AR y al codigo de pais que Evolution puede traer).
 function _sufTel(s) { var d = String(s == null ? '' : s).replace(/[^0-9]/g, ''); return d.length >= 10 ? d.slice(-10) : d; }
 async function esNumeroDelEquipo(user_id, telefono) {
   try {
     var suf = _sufTel(telefono);
     if (!suf || suf.length < 8) return false; // muy corto -> no arriesgar un falso positivo
-    // 1) Numeros de notificacion de los usuarios (asesores) de esta cuenta.
-    try {
-      var ase = await supabase.from('asesores').select('whatsapp_notif').eq('admin_id', user_id).not('whatsapp_notif', 'is', null);
-      if (ase && ase.data && ase.data.some(function (a) { return a.whatsapp_notif && _sufTel(a.whatsapp_notif) === suf; })) return true;
-    } catch (eA) {}
-    // 2) Numero del DUENO (business_settings.whatsapp_contacto).
-    try {
-      var bs = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', user_id).maybeSingle();
-      if (bs && bs.data && bs.data.whatsapp_contacto && _sufTel(bs.data.whatsapp_contacto) === suf) return true;
-    } catch (eB) {}
+    // Numeros de notificacion de los USUARIOS (asesores) de esta cuenta. El dueno NO va aca (es canal de la IA).
+    var ase = await supabase.from('asesores').select('whatsapp_notif').eq('admin_id', user_id).not('whatsapp_notif', 'is', null);
+    if (ase && ase.data && ase.data.some(function (a) { return a.whatsapp_notif && _sufTel(a.whatsapp_notif) === suf; })) return true;
     return false;
   } catch (e) { return false; } // DEFENSIVO: ante cualquier error NO bloquear (no perder leads reales)
 }

@@ -10110,6 +10110,40 @@ setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
 
 // ============================================================================
+// WATCHDOG DE WHATSAPP: avisa al MAESTRO cuando el WhatsApp de un cliente se DESCONECTA (o queda restringido y cae la
+// sesion). Motivo: Diego no se enteraba de la desconexion de Anton. Cada 5 min chequea la instancia de cada cliente
+// activo; en la TRANSICION conectado->desconectado crea una notif del Maestro (dedupe 2h) + push. Estado en memoria:
+// tras un reinicio del backend no dispara falsos (primera lectura solo siembra el estado). 0 IA.
+// ============================================================================
+var _waEstadoPrev = {}; // user_id -> bool (ultima conexion conocida)
+async function revisarWhatsappDesconexiones() {
+  try {
+    var bs = await supabase.from('business_settings').select('user_id, company_name, crm_pausado, eliminado_at');
+    var cuentas = (bs.data || []).filter(function (c) { return c && c.user_id && !c.eliminado_at && c.crm_pausado !== true; });
+    for (var i = 0; i < cuentas.length; i++) {
+      var c = cuentas[i];
+      var conn = null;
+      try { conn = await instanciaConectada(nombreInstancia(c.user_id)); } catch (eC) { conn = null; }
+      if (conn === null || typeof conn === 'undefined') continue; // indeterminado -> no tocar el estado
+      var prev = _waEstadoPrev[c.user_id];
+      _waEstadoPrev[c.user_id] = conn;
+      if (prev === true && conn === false) {
+        try {
+          var desde = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+          var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'whatsapp_desconectado').eq('ref_user_id', c.user_id).gte('created_at', desde).limit(1);
+          if (ya && ya.data && ya.data.length) continue; // dedupe: ya avisamos en las ultimas 2h
+        } catch (eD) {}
+        crearNotifMaestro('whatsapp_desconectado', 'WhatsApp desconectado: ' + (c.company_name || 'cliente'),
+          'El WhatsApp de ' + (c.company_name || 'un cliente') + ' se desconecto (o fue restringido por WhatsApp). No puede iniciar/enviar mensajes hasta reconectar o que se levante la restriccion. Revisa la cuenta y NO fuerces envios automaticos.',
+          { ref_user_id: c.user_id, severidad: 'critico' }).catch(function () {});
+      }
+    }
+  } catch (e) { console.error('revisarWhatsappDesconexiones:', e && e.message); }
+}
+setInterval(revisarWhatsappDesconexiones, 5 * 60 * 1000);
+setTimeout(function () { revisarWhatsappDesconexiones().catch(function () {}); }, 60 * 1000); // siembra inicial a los 60s
+
+// ============================================================================
 // FOTOS DE PERFIL DE LOS LEADS (avatar) — se traen de WhatsApp UNA vez y se guardan en NUESTRO bucket.
 // Diseño anti-sobrecarga: nunca en el camino de un request. Un cron levanta de a poco los contactos que
 // todavia no tienen foto (foto_fetched_at IS NULL) -> cubre TODOS los origenes (primer mensaje, import,

@@ -14535,6 +14535,34 @@ app.post('/api/scrape/universal', async function(req, res) {
       } catch (e) {}
     }
 
+    // RUTEO POR RUBRO: un HOTEL guarda las unidades scrapeadas en hotel_unidades (no en properties). Desarrolladora
+    // tiene su scraper propio (no cae aca). Inmobiliaria = comportamiento actual EXACTO (mas abajo).
+    var _rubScrape = 'inmobiliaria';
+    try { var _bsScr = await supabase.from('business_settings').select('rubro').eq('user_id', user_id).maybeSingle(); _rubScrape = normalizarRubro((_bsScr.data && _bsScr.data.rubro) || 'inmobiliaria'); } catch (eR) {}
+    if (_rubScrape === 'hotel_cabanas') {
+      if (modo === 'reset') { try { await supabase.from('hotel_unidades').delete().eq('user_id', user_id); } catch (eDel) {} }
+      var hCre = 0, hAct = 0, hErr = 0;
+      for (var kh = 0; kh < props.length; kh++) {
+        var ph = props[kh];
+        var filaH = {
+          user_id: user_id,
+          title: ph.titulo || 'Unidad',
+          type: ph.tipo || null,
+          descripcion: ph.descripcion || null,
+          precio_base: _sInvN(ph.precio),
+          moneda: 'ARS',
+          activa: true,
+          atributos: { origen_url: ph.link || null, caracteristicas: ph.caracteristicas || null, zona: [ph.ciudad, ph.zona].filter(Boolean).join(' - ') || null }
+        };
+        try {
+          var exH = await supabase.from('hotel_unidades').select('id').eq('user_id', user_id).eq('title', filaH.title).maybeSingle();
+          if (exH.data && exH.data.id) { var upH = await supabase.from('hotel_unidades').update(filaH).eq('id', exH.data.id); if (upH.error) hErr++; else hAct++; }
+          else { var insH = await supabase.from('hotel_unidades').insert(filaH); if (insH.error) hErr++; else hCre++; }
+        } catch (eH) { hErr++; }
+      }
+      return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: props.length, creados: hCre, actualizados: hAct, errores: hErr });
+    }
+
     // modo reset: borrar el inventario actual del usuario antes de cargar
     if (modo === 'reset') {
       await supabase.from('properties').delete().eq('user_id', user_id);

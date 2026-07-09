@@ -18805,6 +18805,131 @@ app.post('/api/presencia', async function(req, res){
 // NO deja que un ASESOR lea la fila del dueño desde el frontend -> el gate composerV2/ui_moderno caia SIEMPRE a false para
 // los asesores y veian la pantalla VIEJA de conversaciones. Aca resolvemos el owner (admin_id si quien pide es asesor) y
 // devolvemos SOLO flags booleanos (nada sensible: ningun token). Fail-open a false ante cualquier error. 0 tokens.
+// ============================================================================
+// API PÚBLICA DE SINCRONIZACIÓN DE INVENTARIO (conectar el sistema/web del cliente con el CRM) — PUSH.
+// Cada cliente tiene su API KEY (business_settings.inventario_api_key). Su sistema hace POST a /api/public/
+// inventario/sync con su inventario (formato canónico por rubro). Auth por API KEY (header x-api-key o
+// Authorization: Bearer), NO por JWT. Rutea por RUBRO y hace UPSERT por 'numero' (crea o actualiza; no borra).
+// Común a los 3 mundos: auth + ruteo + upsert. Distinto por mundo: el mapeo de campos a su tabla.
+// ============================================================================
+const _cryptoInv = require('crypto');
+function _nuevaApiKeyInv() { return 'inv_' + _cryptoInv.randomBytes(24).toString('hex'); }
+function _sInvS(v){ return (v == null) ? null : (String(v).trim() || null); }
+function _sInvN(v){ if (v == null || v === '') return null; var n = Number(String(v).replace(/[^0-9.\-]/g, '')); return isNaN(n) ? null : n; }
+function _sInvI(v){ var n = _sInvN(v); return n == null ? null : Math.round(n); }
+function _sInvB(v, def){ if (v === true) return true; if (v === false) return false; return def; }
+
+// GET/crea la API key del inventario del dueño (autenticado por JWT). Owner-only.
+app.get('/api/inventario/api-key', async function(req, res){
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var bs = await supabase.from('business_settings').select('inventario_api_key').eq('user_id', uid).maybeSingle();
+    if (bs && bs.error) return res.status(503).json({ error: 'Falta la columna inventario_api_key (corré la migración).' });
+    var key = bs && bs.data && bs.data.inventario_api_key;
+    if (!key) {
+      key = _nuevaApiKeyInv();
+      var up = await supabase.from('business_settings').update({ inventario_api_key: key }).eq('user_id', uid);
+      if (up && up.error) return res.status(503).json({ error: 'Falta la columna inventario_api_key (corré la migración).' });
+    }
+    return res.json({ ok: true, api_key: key });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Regenerar la API key (invalida la anterior).
+app.post('/api/inventario/api-key/regenerar', async function(req, res){
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var key = _nuevaApiKeyInv();
+    var up = await supabase.from('business_settings').update({ inventario_api_key: key }).eq('user_id', uid);
+    if (up && up.error) return res.status(503).json({ error: 'Falta la columna inventario_api_key (corré la migración).' });
+    return res.json({ ok: true, api_key: key });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// UPSERT inmobiliaria (properties) por 'numero'.
+async function _syncInvInmobiliaria(user_id, items){
+  var creadas = 0, actualizadas = 0, errores = 0;
+  for (var i = 0; i < items.length; i++){
+    var it = items[i] || {};
+    try {
+      var numero = _sInvS(it.numero != null ? it.numero : it.id_externo);
+      if (!numero) { errores++; continue; }
+      var fila = {
+        user_id: user_id, numero: numero,
+        title: _sInvS(it.title != null ? it.title : it.titulo),
+        type: _sInvS(it.type != null ? it.type : it.tipo),
+        zone: _sInvS(it.zone != null ? it.zone : it.zona),
+        description: _sInvS(it.description != null ? it.description : it.descripcion),
+        rooms: _sInvI(it.rooms != null ? it.rooms : it.ambientes),
+        dormitorios: _sInvI(it.dormitorios), banos: _sInvI(it.banos), cocheras: _sInvI(it.cocheras),
+        amenities: _sInvS(it.amenities), link: _sInvS(it.link != null ? it.link : it.url),
+        venta_activa: _sInvB(it.venta_activa, undefined), venta_precio: _sInvN(it.venta_precio),
+        anual_activa: _sInvB(it.anual_activa, undefined), anual_precio: _sInvN(it.anual_precio),
+        temporal_activa: _sInvB(it.temporal_activa, undefined), temporal_precio_dia: _sInvN(it.temporal_precio_dia),
+        activa: _sInvB(it.activa, true)
+      };
+      if (Array.isArray(it.images)) fila.images = it.images;
+      Object.keys(fila).forEach(function(k){ if (fila[k] === undefined) delete fila[k]; });
+      var ex = await supabase.from('properties').select('id').eq('user_id', user_id).eq('numero', numero).maybeSingle();
+      if (ex.data && ex.data.id) { var u = await supabase.from('properties').update(fila).eq('id', ex.data.id); if (u.error) errores++; else actualizadas++; }
+      else { var ins = await supabase.from('properties').insert(fila); if (ins.error) errores++; else creadas++; }
+    } catch (e) { errores++; }
+  }
+  return { creadas: creadas, actualizadas: actualizadas, errores: errores, total: items.length };
+}
+
+// UPSERT hotel (hotel_unidades) por 'numero' (o title si no hay numero).
+async function _syncInvHotel(user_id, items){
+  var creadas = 0, actualizadas = 0, errores = 0;
+  for (var i = 0; i < items.length; i++){
+    var it = items[i] || {};
+    try {
+      var numero = _sInvS(it.numero != null ? it.numero : it.id_externo);
+      var title = _sInvS(it.title != null ? it.title : it.nombre) || 'Unidad';
+      var fila = {
+        user_id: user_id, numero: numero, title: title,
+        type: _sInvS(it.type != null ? it.type : it.tipo_unidad),
+        capacidad: _sInvI(it.capacidad != null ? it.capacidad : it.capacity),
+        descripcion: _sInvS(it.descripcion != null ? it.descripcion : it.description),
+        precio_base: _sInvN(it.precio_base != null ? it.precio_base : it.precio),
+        moneda: _sInvS(it.moneda) || 'ARS',
+        atributos: (it.atributos && typeof it.atributos === 'object') ? it.atributos : {},
+        activa: _sInvB(it.activa, true)
+      };
+      Object.keys(fila).forEach(function(k){ if (fila[k] === undefined) delete fila[k]; });
+      var q = supabase.from('hotel_unidades').select('id').eq('user_id', user_id);
+      q = numero ? q.eq('numero', numero) : q.eq('title', title);
+      var ex = await q.maybeSingle();
+      if (ex.data && ex.data.id) { var u = await supabase.from('hotel_unidades').update(fila).eq('id', ex.data.id); if (u.error) errores++; else actualizadas++; }
+      else { var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creadas++; }
+    } catch (e) { errores++; }
+  }
+  return { creadas: creadas, actualizadas: actualizadas, errores: errores, total: items.length };
+}
+
+// POST público de sync (auth por API key). Rutea por rubro.
+app.post('/api/public/inventario/sync', async function(req, res){
+  try {
+    var key = (((req.headers['x-api-key'] || '') + '').trim()) || (((req.headers['authorization'] || '') + '').replace(/^Bearer\s+/i, '').trim());
+    if (!key || key.length < 16) return res.status(401).json({ error: 'Falta la API key (header x-api-key)' });
+    var bs = await supabase.from('business_settings').select('user_id, rubro').eq('inventario_api_key', key).maybeSingle();
+    if (bs && bs.error) return res.status(503).json({ error: 'Config no disponible (¿falta la migración inventario_api_key?)' });
+    if (!bs.data || !bs.data.user_id) return res.status(401).json({ error: 'API key no reconocida' });
+    var user_id = bs.data.user_id;
+    var rubro = normalizarRubro(bs.data.rubro || 'inmobiliaria');
+    var items = Array.isArray(req.body && req.body.items) ? req.body.items : (Array.isArray(req.body) ? req.body : null);
+    if (!items) return res.status(400).json({ error: 'Falta el array "items" en el body' });
+    if (items.length > 2000) return res.status(400).json({ error: 'Maximo 2000 items por request' });
+    var out;
+    if (rubro === 'hotel_cabanas') out = await _syncInvHotel(user_id, items);
+    else if (rubro === 'desarrolladora') return res.status(501).json({ error: 'Sync de desarrolladora: proxima fase (por ahora usa el import).' });
+    else out = await _syncInvInmobiliaria(user_id, items);
+    return res.json(Object.assign({ ok: true, rubro: rubro }, out));
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.get('/api/ui-flags', async function(req, res){
   try{
     var user_id = await verificarUsuario(req);

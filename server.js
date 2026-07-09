@@ -5830,6 +5830,30 @@ async function manejarReaccionEntrante(instancia, reactionMessage, esFromMe) {
   } catch (e) { console.error('manejarReaccionEntrante:', e && e.message); }
 }
 
+// ===== REGLA DE ORO: los numeros del EQUIPO no entran como lead ni hablan con la IA =====
+// Los telefonos de los USUARIOS del sistema (asesores.whatsapp_notif) y el numero del DUENO
+// (business_settings.whatsapp_contacto) existen SOLO para RECIBIR notificaciones. Si uno de ellos escribe al
+// WhatsApp del negocio, NO debe crear un lead/conversacion ni gastar IA. Comparamos por los ULTIMOS 10 digitos
+// (tolerante al 9 de celular AR y al codigo de pais que Evolution puede traer distinto).
+function _sufTel(s) { var d = String(s == null ? '' : s).replace(/[^0-9]/g, ''); return d.length >= 10 ? d.slice(-10) : d; }
+async function esNumeroDelEquipo(user_id, telefono) {
+  try {
+    var suf = _sufTel(telefono);
+    if (!suf || suf.length < 8) return false; // muy corto -> no arriesgar un falso positivo
+    // 1) Numeros de notificacion de los usuarios (asesores) de esta cuenta.
+    try {
+      var ase = await supabase.from('asesores').select('whatsapp_notif').eq('admin_id', user_id).not('whatsapp_notif', 'is', null);
+      if (ase && ase.data && ase.data.some(function (a) { return a.whatsapp_notif && _sufTel(a.whatsapp_notif) === suf; })) return true;
+    } catch (eA) {}
+    // 2) Numero del DUENO (business_settings.whatsapp_contacto).
+    try {
+      var bs = await supabase.from('business_settings').select('whatsapp_contacto').eq('user_id', user_id).maybeSingle();
+      if (bs && bs.data && bs.data.whatsapp_contacto && _sufTel(bs.data.whatsapp_contacto) === suf) return true;
+    } catch (eB) {}
+    return false;
+  } catch (e) { return false; } // DEFENSIVO: ante cualquier error NO bloquear (no perder leads reales)
+}
+
 app.post('/api/webhook/whatsapp', async (req, res) => {
   // A3: validar el secreto ANTES de responder y ANTES de tocar base/IA. Sin env -> _whatsappWebhookOk()==true (no rompe).
   if (!_whatsappWebhookOk(req)) return res.status(401).json({ error: 'webhook no autorizado' });
@@ -5954,6 +5978,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const { data: inst } = await supabase.from('whatsapp_instancias').select('user_id').eq('instancia_nombre', instanciaNombre).maybeSingle();
     if (!inst) { console.error('Instancia sin user_id:', instanciaNombre); return; }
     const user_id = inst.user_id;
+
+    // REGLA DE ORO: si quien escribe es un numero del EQUIPO (usuario/dueño), NO crear lead ni hablar con la IA.
+    // Sus numeros solo sirven para recibir notificaciones. Cortar ACA, antes de crear contacto/conversacion o gastar IA.
+    if (await esNumeroDelEquipo(user_id, telefono)) { console.log('[regla-oro] numero del equipo ignorado como lead:', telefono, user_id); return; }
 
     // === IDEMPOTENCIA DEL WEBHOOK ENTRANTE (FIX: "la IA se presenta 2 veces") ===
     // Evolution puede RE-ENTREGAR el mismo messages.upsert (reintento >6s, o multi-instancia). El debounce en memoria

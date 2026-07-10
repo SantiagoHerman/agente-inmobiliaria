@@ -9364,6 +9364,9 @@ async function enviarRecontactosPendientes() {
       const { data: contacto } = await supabase.from('contacts').select('name, phone').eq('id', conv.contact_id).maybeSingle();
       if (!contacto || !contacto.phone) continue;
       const inst = { instancia_nombre: nombreInstancia(conv.user_id) };
+      // GUARD ANTI-BANEO: si el WhatsApp de la cuenta esta desconectado/restringido, NO recontactar (golpear un numero
+      // caido empeora la restriccion y frena la recuperacion). Se salta; cuando reconecta, retoma. Fail-safe: ante duda, no enviar.
+      try { const _cRec = await instanciaConectada(inst.instancia_nombre); if (_cRec !== true) continue; } catch (eCRec) { continue; }
       // Enviar el mensaje variado
       // Detectar si la conversacion tiene historial real (lead de agenda vs lead con charla previa)
       const { data: msgsPrevios } = await supabase.from('messages').select('id, origen').eq('conversation_id', conv.id).neq('origen', 'historial_importado').limit(1);
@@ -9526,6 +9529,8 @@ async function procesarOportunidades() {
 
         // Instancia WhatsApp de la cuenta.
         const instancia = nombreInstancia(uid);
+        // GUARD ANTI-BANEO: no disparar oportunidades si el WhatsApp esta desconectado/restringido (empeora la restriccion).
+        try { const _cOp = await instanciaConectada(instancia); if (_cOp !== true) continue; } catch (eCOp) { continue; }
         // Mensaje + media (si trae). El caption del media = el mensaje; si no hay media, texto plano.
         const cuerpoBase = (op.mensaje != null ? String(op.mensaje) : '').trim();
         const linkTxt = (op.link ? ('\n' + String(op.link).trim()) : '');
@@ -9791,6 +9796,15 @@ async function _enviarRecontactosV2(ahoraMs) {
       const empresaRec = bs.company_name ? bs.company_name : '';
       const agentNameRec = bs.agent_name ? bs.agent_name : '';
       const inst = { instancia_nombre: nombreInstancia(uid) };
+
+      // GUARD ANTI-BANEO: si el WhatsApp de la cuenta esta DESCONECTADO (o restringido y cayo la sesion), NO intentar
+      // enviar recontactos -> seguir golpeando un numero caido/restringido lo EMPEORA y frena la recuperacion (caso
+      // Anton 2026-07-09: siguio intentando toda la tarde con el numero ya caido). Se saltea la cuenta esta tanda;
+      // cuando reconecta, retoma solo. DEFENSIVO: si no se puede determinar el estado (null) -> por las dudas NO enviar.
+      try {
+        const _connRec = await instanciaConectada(inst.instancia_nombre);
+        if (_connRec !== true) { console.log('[recontacto-guard] WA desconectado/restringido -> salteo cuenta ' + uid); continue; }
+      } catch (eConnRec) { continue; }
 
       let enviadosCuenta = 0;       // enviados en ESTA tanda para esta cuenta
       let friosEnviadosTanda = 0;   // frios enviados en esta tanda (para respetar el sub-cupo diario, best-effort)

@@ -10142,13 +10142,17 @@ async function revisarWhatsappDesconexiones() {
       var prev = _waEstadoPrev[c.user_id];
       _waEstadoPrev[c.user_id] = conn;
       if (prev === true && conn === false) {
+        // AUTO-PAUSA anti-baneo: al desconectarse, PAUSAR recontacto + oportunidades de la cuenta (queda apagado hasta
+        // que el dueno lo reactive a mano). Evita que, al reconectar, retome envios masivos contra un numero recien
+        // restringido y lo re-restrinja. Best-effort (no rompe el aviso si falla el update).
+        try { await supabase.from('business_settings').update({ recontacto_pausado: true, oportunidades_v1: false }).eq('user_id', c.user_id); } catch (ePa) {}
         try {
           var desde = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
           var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'whatsapp_desconectado').eq('ref_user_id', c.user_id).gte('created_at', desde).limit(1);
           if (ya && ya.data && ya.data.length) continue; // dedupe: ya avisamos en las ultimas 2h
         } catch (eD) {}
         crearNotifMaestro('whatsapp_desconectado', 'WhatsApp desconectado: ' + (c.company_name || 'cliente'),
-          'El WhatsApp de ' + (c.company_name || 'un cliente') + ' se desconecto (o fue restringido por WhatsApp). No puede iniciar/enviar mensajes hasta reconectar o que se levante la restriccion. Revisa la cuenta y NO fuerces envios automaticos.',
+          'El WhatsApp de ' + (c.company_name || 'un cliente') + ' se desconecto (o fue restringido por WhatsApp). Pause AUTOMATICAMENTE su recontacto y oportunidades para no empeorar la restriccion. No puede iniciar mensajes hasta reconectar. Cuando vuelva a estar OK, reactivalos a mano y arranca con goteo bajo.',
           { ref_user_id: c.user_id, severidad: 'critico' }).catch(function () {});
       }
     }

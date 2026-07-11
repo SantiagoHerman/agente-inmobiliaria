@@ -4252,6 +4252,26 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         .in('unidad_id', _udIds).eq('user_id', user_id);
       const _tarsPorU = {};
       (_tars || []).forEach(function(t){ (_tarsPorU[t.unidad_id] = _tarsPorU[t.unidad_id] || []).push(t); });
+      // ===== DISPONIBILIDAD REAL (F1.1) =====
+      // Traer las reservas BLOQUEANTES (deposit_pending|confirmed|checked_in) de estas unidades cuyo check_out
+      // sea >= hoy, para que la IA NUNCA ofrezca una unidad en fechas ya ocupadas (bug #1). Se DERIVA de
+      // hotel_reservas (no se usa hotel_disponibilidad). Aislado por user_id + acotado a las unidades listadas.
+      // Defensivo: si la tabla no existe o el select falla, _ocupadasPorU queda vacio => bloque de OCUPADA vacio =
+      // comportamiento actual EXACTO. NO necesita gate reservas_v1: sin reservas cargadas no cambia nada.
+      // 🔴💰 Costo IA: agrega tokens de INPUT marginales (pocas decenas por reserva activa). No agrega llamadas de IA.
+      const _ocupadasPorU = {};
+      try {
+        const _hoyRes = _fechaLocalArg();
+        const { data: _resBloq, error: _resErr } = await supabase.from('hotel_reservas')
+          .select('unit_id, check_in, check_out, status')
+          .eq('user_id', user_id)
+          .in('unit_id', _udIds)
+          .in('status', ['deposit_pending', 'confirmed', 'checked_in'])
+          .gte('check_out', _hoyRes);
+        if (!_resErr && _resBloq && _resBloq.length > 0) {
+          _resBloq.forEach(function(r){ if (r && r.unit_id && r.check_in && r.check_out) (_ocupadasPorU[r.unit_id] = _ocupadasPorU[r.unit_id] || []).push(r); });
+        }
+      } catch (eResBloq) { console.error('reservas bloqueantes hotel:', eResBloq && eResBloq.message); }
       const _bloquesH = _uds.map(function(u){
         const at = u.atributos || {};
         const specs = [
@@ -4268,7 +4288,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _precioTxt = _tarsTxt.length ? _tarsTxt.join(' ; ') : (u.precio_base != null ? (u.moneda || 'ARS') + ' ' + u.precio_base + '/noche' : 'consultar');
         let _amenTxt = '';
         try { const _am = at.amenities || {}; const _ks = Object.keys(_am).filter(function(k){ return _am[k]; }); if (_ks.length) _amenTxt = ' | amenities: ' + _ks.join(', '); } catch (eAm) {}
-        return '- ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + (u.descripcion ? ' | ' + u.descripcion : '');
+        const _lineaBase = '- ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + (u.descripcion ? ' | ' + u.descripcion : '');
+        // F1.1: anexar una linea "OCUPADA del X al Y" por cada reserva bloqueante (fechas semiabiertas: check_out es dia de salida = libre).
+        const _ocupU = _ocupadasPorU[u.id] || [];
+        const _ocupTxt = _ocupU.map(function(r){ return String.fromCharCode(10) + '    OCUPADA del ' + r.check_in + ' al ' + r.check_out; }).join('');
+        return _lineaBase + _ocupTxt;
       });
       if (_bloquesH.length > 0) inventarioHotel = _bloquesH.join(String.fromCharCode(10));
     }
@@ -4414,6 +4438,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // INVENTARIO DE HOTEL / CABAÑAS (ADITIVO + GATEADO por rubro): unidades con capacidad + tarifas por noche/temporada.
     inventarioHotel ? 'Unidades / habitaciones / cabanias disponibles (ofrecelas SOLO estas; no inventes). Distingui por capacidad y por temporada/fechas; las tarifas son POR NOCHE. Si el cliente te da fechas y cantidad de personas, cruzalas contra la capacidad y la temporada; ante dudas de disponibilidad exacta, ofrece confirmar la reserva:' : '',
     inventarioHotel || '',
+    // F1.1: instruccion de disponibilidad real. Solo presente si hay inventario de hotel (=> no afecta otros rubros).
+    inventarioHotel ? 'DISPONIBILIDAD (IMPORTANTE): algunas unidades tienen debajo una o mas lineas "OCUPADA del X al Y" (fechas ya reservadas; la fecha de salida es dia de egreso = queda libre esa noche). NUNCA ofrezcas una unidad para fechas que se SOLAPAN con un periodo OCUPADO. Hay solape si la fecha de ingreso pedida es ANTERIOR a la salida ocupada Y la fecha de salida pedida es POSTERIOR al ingreso ocupado. Si el huesped pide fechas ocupadas, ofrecele OTRA unidad libre para esas fechas o proponele fechas alternativas libres. Las unidades o fechas SIN linea "OCUPADA" estan disponibles.' : '',
     // INVENTARIO DE DESARROLLOS (ADITIVO + GATEADO): solo presente si la cuenta tiene el modulo activo.
     // Con el flag OFF, inventarioDesarrollos === '' => .filter(Boolean) descarta estas 2 lineas y el prompt es el ACTUAL EXACTO.
     inventarioDesarrollos ? 'Emprendimientos / desarrollos disponibles (proyectos en pozo, en construccion o terminados; ofrecelos cuando el cliente busca obra nueva, financiacion en cuotas o inversion). Usa SOLO estos; no inventes unidades ni precios. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. Si el emprendimiento tiene link, compartilo:' : '',
@@ -4837,24 +4863,37 @@ async function clasificarEstado(mensajeCliente, user_id) {
 // Mismo patron barato que clasificarEstado/clasificarTemperatura: una llamada chica a Anthropic que devuelve JSON.
 // Solo extrae lo que el lead DICE explicitamente; no inventa (campo vacio si no lo menciona).
 // datosPrevios se pasan como contexto para no duplicar lo ya sabido. Robusta a errores (try/catch).
-async function extraerDatosLead(texto, datosPrevios, user_id) {
+// esHotel (F1.2, opcional, default false): si es una cuenta rubro hotel_cabanas, el MISMO llamado (sin llamada de
+// IA extra, costo ~0) extrae ademas fechas de estadia y huespedes para guardarlos en conversations.cal_*. Con
+// esHotel=false el prompt y la salida son BYTE-IDENTICOS al comportamiento actual (inmobiliaria/desarrolladora).
+async function extraerDatosLead(texto, datosPrevios, user_id, esHotel) {
   try {
     if (!texto || !texto.trim()) return { nombre: '', origen: '', interes: '', presupuesto: '' };
     const prev = datosPrevios || {};
+    const _hoyISO = _fechaLocalArg();
     const prompt = [
       'Sos un extractor de datos de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
       'A partir del MENSAJE del cliente, devolve SOLO un JSON con estos campos (string):',
-      '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "" }',
+      esHotel
+        ? '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "", "fecha_ingreso": "", "fecha_salida": "", "adultos": "", "ninos": "", "mascotas": "", "tipo_alojamiento": "" }'
+        : '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "" }',
       '- nombre: el nombre de pila/nombre propio SOLO si el cliente lo dice (ej: "soy Juan", "me llamo Ana"). Si no lo dice, "".',
       '- origen: de donde viene o como llego (ej: "Instagram", "Facebook", "un anuncio", "me recomendo un amigo", una ciudad/pais). Si no lo dice, "".',
       '- interes: que busca o le interesa (ej: "departamento 2 ambientes en Palermo", "casa para alquilar", "cabana para 4 personas el finde"). Si no lo dice, "".',
       '- presupuesto: cuanto puede/quiere gastar si lo menciona (ej: "USD 80000", "hasta 200 mil pesos por mes"). Si no lo dice, "".',
+      esHotel ? ('HOY es ' + _hoyISO + ' (formato YYYY-MM-DD). Usalo para resolver el ano de las fechas.') : '',
+      esHotel ? '- fecha_ingreso: fecha de check-in / llegada si la menciona, SIEMPRE en formato YYYY-MM-DD. Resolve expresiones tipo "del 15 al 20 de enero" tomando el ano de la PROXIMA ocurrencia futura respecto de HOY. Si no da una fecha o no se puede armar la fecha completa, "".' : '',
+      esHotel ? '- fecha_salida: fecha de check-out / salida en formato YYYY-MM-DD (misma logica de ano que fecha_ingreso). Si no la dice, "".' : '',
+      esHotel ? '- adultos: cantidad de adultos como numero entero (ej "2"). Si no lo dice, "".' : '',
+      esHotel ? '- ninos: cantidad de ninos/chicos como numero entero (ej "1"). Si no lo dice, "".' : '',
+      esHotel ? '- mascotas: "si" si viaja con mascota (perro/gato/etc), "no" si aclara que NO lleva. Si no lo menciona, "".' : '',
+      esHotel ? '- tipo_alojamiento: que tipo de unidad busca si lo dice (ej "cabana", "habitacion doble", "departamento", "suite"). Si no lo dice, "".' : '',
       'REGLAS: extrae SOLO lo que el cliente menciona EXPLICITAMENTE en este mensaje. NO inventes ni asumas. Si un dato no aparece, dejalo "".',
       'Responde UNICAMENTE el JSON, sin texto adicional, sin markdown.',
       (prev.nombre || prev.interes || prev.presupuesto) ? ('Datos ya conocidos (no hace falta repetirlos, solo agrega lo nuevo): ' + JSON.stringify({ nombre: prev.nombre || '', interes: prev.interes || '', presupuesto: prev.presupuesto || '' })) : '',
       'Mensaje del cliente: ' + JSON.stringify(texto)
     ].filter(Boolean).join('\n');
-    const r = await anthropic.messages.create({ model: MODELO_INTERNO, max_tokens: 150, messages: [{ role: 'user', content: prompt }] }); // Haiku: extraccion INTERNA de datos (regla de modelos). Errar a vacio es seguro.
+    const r = await anthropic.messages.create({ model: MODELO_INTERNO, max_tokens: esHotel ? 220 : 150, messages: [{ role: 'user', content: prompt }] }); // Haiku: extraccion INTERNA de datos (regla de modelos). Errar a vacio es seguro.
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'extraer_datos', PRECIO_HAIKU); } catch(e){}
     let out = (r && r.content && r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
     // por si la IA envuelve en ```json ... ```
@@ -4863,12 +4902,21 @@ async function extraerDatosLead(texto, datosPrevios, user_id) {
     let parsed = {};
     try { parsed = JSON.parse(out); } catch (eP) { return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
     const limpiar = function(v){ return (typeof v === 'string') ? v.trim() : ''; };
-    return {
+    const _res = {
       nombre: limpiar(parsed.nombre),
       origen: limpiar(parsed.origen),
       interes: limpiar(parsed.interes),
       presupuesto: limpiar(parsed.presupuesto)
     };
+    if (esHotel) {
+      _res.fecha_ingreso = limpiar(parsed.fecha_ingreso);
+      _res.fecha_salida = limpiar(parsed.fecha_salida);
+      _res.adultos = limpiar(parsed.adultos);
+      _res.ninos = limpiar(parsed.ninos);
+      _res.mascotas = limpiar(parsed.mascotas);
+      _res.tipo_alojamiento = limpiar(parsed.tipo_alojamiento);
+    }
+    return _res;
   } catch (e) { console.error('Error extrayendo datos del lead:', e && e.message); return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
 }
 
@@ -6119,7 +6167,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // (Groq) y de traducir/clasificar/responder (Claude) -> CERO gasto de tokens. La pausa POR-CONVERSACION
     // (ai_enabled) NO entra aca: esa deja transcribir+traducir para el humano y solo frena al agente (mas abajo).
     let _bsGate = null;
-    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado, idioma').eq('user_id', user_id).maybeSingle();
+    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado, idioma, rubro').eq('user_id', user_id).maybeSingle();
       if (_gq && _gq.error) { const _gq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsGate = _gq2 && _gq2.data; }
       else { _bsGate = _gq && _gq.data; } }
     // Idioma BASE de la empresa (settings.idioma; default 'es'). Lo tomamos del _bsGate que YA se leyo arriba
@@ -6256,8 +6304,32 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       (async function(){
         try {
           const datosPrevios = { nombre: contacto.name, interes: contacto.interest, presupuesto: contacto.budget };
-          const ext = await extraerDatosLead(contentLead, datosPrevios, user_id);
+          // F1.2: en cuentas hotel, el MISMO llamado extrae ademas fechas/huespedes (costo IA ~0). rubro viene del
+          // _bsGate ya leido (0 queries extra). En otros rubros esHotel=false => extractor byte-identico al actual.
+          const _esHotelLead = normalizarRubro(_bsGate && _bsGate.rubro) === 'hotel_cabanas';
+          const ext = await extraerDatosLead(contentLead, datosPrevios, user_id, _esHotelLead);
           if (!ext) return;
+          // F1.2: guardar fechas de estadia y huespedes en conversations.cal_* (UPDATE DEFENSIVO). Solo escribe los
+          // campos que el lead menciono explicitamente (los vacios NO pisan lo ya guardado). Si alguna columna cal_*
+          // no existe (migracion no corrida) el update devuelve error y se ignora (no rompe el flujo). 0 IA extra.
+          if (_esHotelLead) {
+            try {
+              const _updCal = {};
+              const _reFecha = /^\d{4}-\d{2}-\d{2}$/;
+              if (ext.fecha_ingreso && _reFecha.test(ext.fecha_ingreso) && !isNaN(Date.parse(ext.fecha_ingreso))) _updCal.cal_fecha_ingreso = ext.fecha_ingreso;
+              if (ext.fecha_salida && _reFecha.test(ext.fecha_salida) && !isNaN(Date.parse(ext.fecha_salida))) _updCal.cal_fecha_salida = ext.fecha_salida;
+              const _ad = parseInt(ext.adultos, 10); if (!isNaN(_ad) && _ad >= 0 && _ad < 1000) _updCal.cal_adultos = _ad;
+              const _ni = parseInt(ext.ninos, 10); if (!isNaN(_ni) && _ni >= 0 && _ni < 1000) _updCal.cal_ninos = _ni;
+              const _mas = String(ext.mascotas || '').trim().toLowerCase();
+              if (_mas === 'si' || _mas === 'sí' || _mas === 'true') _updCal.cal_mascotas = true;
+              else if (_mas === 'no' || _mas === 'false') _updCal.cal_mascotas = false;
+              if (ext.tipo_alojamiento && String(ext.tipo_alojamiento).trim()) _updCal.cal_tipo_alojamiento = String(ext.tipo_alojamiento).trim().slice(0, 200);
+              if (Object.keys(_updCal).length > 0) {
+                const { error: _eCal } = await supabase.from('conversations').update(_updCal).eq('id', conv.id);
+                if (_eCal) console.error('cal_* hotel update:', _eCal.message);
+              }
+            } catch (eCal) { console.error('cal_* hotel:', eCal && eCal.message); }
+          }
           const updContacto = {};
           // NOMBRE: NO se auto-cambia (decision del dueno 2026-07-02). El nombre queda el de WhatsApp
           // (pushName); si hay que corregirlo, se hace A MANO (nombre_manual). La IA NO pisa el name con el

@@ -337,6 +337,31 @@ async function _getSupaJwks() {
   return { jose: _joseMod, jwks: _supaJwks };
 }
 
+// ============================================================================
+// ACCESO DE USUARIOS (switch Activo/Apagado del dueño). Cuando el dueño APAGA a un usuario (asesores.activo=false),
+// ademas de sacarlo del reparto, se le CIERRA la sesion y se le BLOQUEA el ingreso externo (solo el dueño entra a sus
+// chats desde el panel). Implementacion SIN costo por-request: un Set en memoria de los auth_user_id SIN acceso
+// (activo=false), refrescado cada 60s + actualizado al instante cuando el dueño toca el switch. verificarUsuario corta
+// si el uid esta en el Set -> el frontend recibe 401 y cierra la sesion sola. Ademas se banea/desbanea el LOGIN en
+// Supabase Auth (defensa extra para el ingreso externo; best-effort). El DUEÑO nunca esta en asesores -> nunca se corta.
+// ============================================================================
+var _asesoresSinAcceso = new Set(); // auth_user_id de asesores con activo=false (acceso apagado)
+async function _refrescarAsesoresSinAcceso() {
+  try {
+    const { data } = await supabase.from('asesores').select('auth_user_id').eq('activo', false).not('auth_user_id', 'is', null);
+    const s = new Set();
+    (data || []).forEach(function (r) { if (r && r.auth_user_id) s.add(r.auth_user_id); });
+    _asesoresSinAcceso = s;
+  } catch (e) { /* defensivo: si falla, dejar el set como esta (no cambiar el estado de acceso por un error puntual) */ }
+}
+setInterval(_refrescarAsesoresSinAcceso, 60 * 1000);
+setTimeout(function () { _refrescarAsesoresSinAcceso().catch(function () {}); }, 3000);
+// Banear / desbanear el LOGIN de un usuario en Supabase Auth (best-effort; el corte inmediato ya lo da el Set + verificarUsuario).
+async function _setBanUsuario(authUserId, banear) {
+  if (!authUserId) return;
+  try { await supabase.auth.admin.updateUserById(authUserId, { ban_duration: banear ? '876000h' : 'none' }); } catch (e) { /* best-effort */ }
+}
+
 async function verificarUsuario(req) {
   try {
     const auth = req.headers.authorization || req.headers.Authorization || '';
@@ -346,12 +371,16 @@ async function verificarUsuario(req) {
     try {
       const { jose, jwks } = await _getSupaJwks();
       const { payload } = await jose.jwtVerify(token, jwks, { algorithms: ['ES256', 'RS256'] });
-      if (payload && payload.sub) return payload.sub;
+      if (payload && payload.sub) {
+        if (_asesoresSinAcceso.has(payload.sub)) return null; // usuario con acceso APAGADO por el dueño -> corta (401)
+        return payload.sub;
+      }
     } catch (eLocal) { /* cae al fallback defensivo de abajo */ }
     // 2) Fallback DEFENSIVO (por si el JWKS aun no cargo): getUser. Igual de robusto que el comportamiento previo.
     try {
       const { data, error } = await supabase.auth.getUser(token);
       if (error || !data || !data.user) return null;
+      if (_asesoresSinAcceso.has(data.user.id)) return null; // acceso APAGADO -> corta
       return data.user.id;
     } catch (e2) { return null; }
   } catch (e) {
@@ -10546,6 +10575,42 @@ app.post('/api/asesores/config', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== SWITCH ACTIVO/APAGADO (acceso del usuario) =====
+// El dueño APAGA (activo=false) -> el usuario NO recibe leads + SE LE CIERRA LA SESION y se le BLOQUEA el ingreso
+// externo (queda en _asesoresSinAcceso -> verificarUsuario corta con 401 en su proximo request; + ban en Auth). Sus
+// leads asignados QUEDAN con el (no se reasignan). El dueño SIEMPRE entra a sus chats (visibilidad de tenant, no cambia).
+// ACTIVAR (activo=true) -> lo repone (el drenaje de la cola de leads lo hace /api/asesores/activar). Contrato:
+// POST { admin_id, asesor_id, activo }  (auth por token; admin_id debe coincidir con el JWT).
+app.post('/api/asesores/acceso', async (req, res) => {
+  try {
+    const { admin_id, asesor_id, activo } = req.body || {};
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== admin_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!admin_id || !asesor_id || typeof activo !== 'boolean') return res.status(400).json({ error: 'Faltan datos' });
+    const { data: ase } = await supabase.from('asesores').select('id, auth_user_id').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
+    if (!ase) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const { error } = await supabase.from('asesores').update({ activo: activo, estado: activo ? 'activo' : 'pausa' }).eq('id', asesor_id).eq('admin_id', admin_id);
+    if (error) return res.status(500).json({ error: error.message });
+    if (ase.auth_user_id) {
+      if (activo === false) { _asesoresSinAcceso.add(ase.auth_user_id); await _setBanUsuario(ase.auth_user_id, true); }
+      else { _asesoresSinAcceso.delete(ase.auth_user_id); await _setBanUsuario(ase.auth_user_id, false); }
+    }
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== SENTINELA DE ACCESO =====
+// El frontend lo pinga cada ~30s. Si el dueño APAGO al usuario, verificarUsuario devuelve null -> 401 -> el front
+// cierra la sesion sola. Ultra-liviano: 0 queries extra (solo la validacion del token + el chequeo del Set en memoria).
+app.get('/api/asesores/estado-acceso', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ ok: false });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(401).json({ ok: false }); }
+});
+
 // ===== VALIDAR EL WHATSAPP DE NOTIFICACION DE UN USUARIO (asesores.whatsapp_notif) =====
 // PROBLEMA que resuelve: hoy whatsapp_notif se guarda SOLO sacando no-digitos, sin verificar que sea un
 // WhatsApp real. Caso Bruno: quedo 542215776798 (sin el "9" de movil argentino) cuando su numero real es
@@ -10874,6 +10939,8 @@ app.post('/api/asesores/activar', async (req, res) => {
     let _dispAct = 'conectado';
     try { const { data: _aPrev } = await supabase.from('asesores').select('disponibilidad').eq('id', asesor_id).maybeSingle(); if (_aPrev && _aPrev.disponibilidad === 'no_recibe') _dispAct = 'no_recibe'; } catch (eDisp) {}
     await supabase.from('asesores').update({ activo: true, estado: 'activo', disponibilidad: _dispAct }).eq('id', asesor_id);
+    // Reponer el ACCESO del usuario (si estaba apagado): sacarlo del Set en memoria + desbanear el login en Auth.
+    try { const { data: _aAcc } = await supabase.from('asesores').select('auth_user_id').eq('id', asesor_id).maybeSingle(); if (_aAcc && _aAcc.auth_user_id) { _asesoresSinAcceso.delete(_aAcc.auth_user_id); await _setBanUsuario(_aAcc.auth_user_id, false); } } catch (eAcc) {}
     // 2. Buscar asesores activos de la inmobiliaria (excluyendo administradores: no reciben leads)
     // PARTE A (punto 10): con reparto_v2 ON, ademas se excluye a los que tienen disponibilidad='no_recibe'
     // (que es como se mapean ahora Administrador/Empleado). Con flag OFF, queda igual que antes.

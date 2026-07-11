@@ -16336,6 +16336,427 @@ app.get('/api/inventario/cargar', async function (req, res) {
 });
 
 
+// ============================================================================
+// ===== FASE 2 — MOTOR DE RESERVAS DE HOTEL (endpoints backend) ==============
+// ============================================================================
+// TODO gateado por business_settings.reservas_v1 en los endpoints que MUTAN
+// (crear/estado/pago/editar); los GET (lista/rack) responden acotados al tenant
+// (ownerId) sin exponer datos de otras cuentas. Auth verificarUsuario + ownerId
+// por admin_id (un asesor opera sobre la cuenta del dueno). DEFENSIVO: si faltan
+// las tablas hotel_reservas/hotel_pagos -> 503 con mensaje claro (_invTablaFaltante),
+// nunca crashea. NO cambia el comportamiento de inmobiliaria/desarrolladora ni de
+// hoteles con reservas_v1 OFF. CERO IA / CERO tokens (solo SQL + storage).
+// Rutas PLANAS (Express 5): solo segmentos :param OBLIGATORIOS, sin ? ni *.
+
+// Estados que BLOQUEAN el calendario (una unidad no puede tener dos de estos
+// SOLAPADOS en las mismas fechas). El resto (tentative/quote_sent/cancelled/
+// lost/checked_out) NO bloquea.
+var _HR_BLOQUEANTES = ['deposit_pending', 'confirmed', 'checked_in'];
+// Orden del ciclo de vida "hacia adelante". cancelled/lost salen aparte (terminal).
+var _HR_ORDEN = { tentative: 0, quote_sent: 1, deposit_pending: 2, confirmed: 3, checked_in: 4, checked_out: 5 };
+var _HR_TERMINALES = ['checked_out', 'cancelled', 'lost'];
+// Estados con los que una reserva puede NACER (carga manual puede nacer confirmada).
+var _HR_ESTADOS_INICIALES = ['tentative', 'quote_sent', 'deposit_pending', 'confirmed'];
+
+// Gate maestro reservas_v1 (mirror EXACTO de oportunidadesV1Activo): ante cualquier
+// error o columna ausente -> false (comportamiento actual). NUNCA rompe.
+async function _reservasV1Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'reservas_v1')) return bs.reservas_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('reservas_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> flag OFF (comportamiento actual)
+    return !!(data && data.reservas_v1 === true);
+  } catch (e) { return false; }
+}
+
+// Normaliza 'YYYY-MM-DD' -> ISO al MEDIODIA UTC (evita corrimiento de dia por TZ al
+// crear la cita espejo). null si la fecha es invalida.
+function _hrFechaISOmediodia(d) {
+  var s = String(d || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  return s + 'T12:00:00.000Z';
+}
+
+// Busca reservas BLOQUEANTES de una unidad que SOLAPEN [check_in, check_out) (intervalos
+// semiabiertos: ex.check_in < nueva.check_out AND ex.check_out > nueva.check_in), excluyendo
+// una reserva propia (excludeId). Devuelve el array de conflictos (vacio = libre). Si la tabla
+// falta, tira { _tablaFaltante:true } para que el caller responda 503.
+async function _hrConflictosSolape(ownerId, unit_id, check_in, check_out, excludeId) {
+  var r = await supabase.from('hotel_reservas')
+    .select('id, check_in, check_out, status, contact_id')
+    .eq('user_id', ownerId).eq('unit_id', unit_id)
+    .in('status', _HR_BLOQUEANTES)
+    .lt('check_in', check_out).gt('check_out', check_in); // solape semiabierto a nivel SQL
+  if (r.error) { if (_invTablaFaltante(r.error)) throw { _tablaFaltante: true, tabla: 'hotel_reservas' }; throw r.error; }
+  return (r.data || []).filter(function (x) { return String(x.id) !== String(excludeId || ''); });
+}
+function _hrConflictoOut(lista) {
+  return (lista || []).map(function (c) { return { id: c.id, check_in: c.check_in, check_out: c.check_out, status: c.status }; });
+}
+
+// Crea la CITA ESPEJO de una reserva confirmada (tipo alquiler_temporal) y DISPARA el motor
+// de housekeeping (generarTareasAlquiler, igual que POST /api/citas). Devuelve cita_id o null
+// (best-effort: si algo falla, la reserva NO se revierte). Guarda unidad_id (con retry defensivo).
+async function _hrCrearCitaEspejo(ownerId, reserva) {
+  try {
+    var ci = _hrFechaISOmediodia(reserva.check_in);
+    var co = _hrFechaISOmediodia(reserva.check_out);
+    if (!ci) return null;
+    var unidadTitle = '';
+    try { var u = await supabase.from('hotel_unidades').select('title, numero').eq('id', reserva.unit_id).maybeSingle(); if (u && u.data) unidadTitle = u.data.title || u.data.numero || ''; } catch (eU) {}
+    var leadNombre = null, leadTel = null;
+    if (reserva.contact_id) { try { var c = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', reserva.contact_id).maybeSingle(); if (c && c.data) { leadNombre = c.data.nombre_manual || c.data.name || null; leadTel = c.data.phone || null; } } catch (eC) {} }
+    var titulo = ('Reserva ' + (unidadTitle || 'unidad') + (leadNombre ? (' - ' + leadNombre) : '')).slice(0, 160);
+    var fila = {
+      user_id: ownerId, fecha_hora: ci, fecha_fin: co, tipo: 'alquiler_temporal',
+      titulo: titulo, estado: 'agendada', contact_id: reserva.contact_id || null,
+      conversation_id: reserva.conversation_id || null,
+      unidad: unidadTitle ? String(unidadTitle).slice(0, 120) : null, unidad_id: reserva.unit_id || null,
+      todo_el_dia: true, lead_nombre: leadNombre ? String(leadNombre).slice(0, 120) : null,
+      lead_telefono: leadTel ? String(leadTel).slice(0, 40) : null, origen: 'manual'
+    };
+    var r = await supabase.from('citas').insert(fila).select('id').single();
+    if (r.error) {
+      // Retry defensivo sin la columna mas nueva (unidad_id) por si el cache/migracion.
+      var filaMin = Object.assign({}, fila); delete filaMin.unidad_id;
+      r = await supabase.from('citas').insert(filaMin).select('id').single();
+      if (r.error) { console.error('_hrCrearCitaEspejo insert cita:', r.error.message); return null; }
+    }
+    var citaId = r.data && r.data.id;
+    // Motor de housekeeping (limpiezas pre/post): mismo disparo que POST /api/citas alquiler_temporal.
+    if (citaId && co) { try { await generarTareasAlquiler(ownerId, citaId, ci, co, titulo); } catch (eG) { console.error('_hrCrearCitaEspejo generarTareas:', eG && eG.message); } }
+    return citaId || null;
+  } catch (e) { console.error('_hrCrearCitaEspejo:', e && e.message); return null; }
+}
+
+// Recalcula deposit_amount / balance_amount / payment_status de una reserva a partir de la
+// suma de pagos APROBADOS. Best-effort: devuelve { deposit_amount, balance_amount, payment_status,
+// aprobado } o null.
+async function _hrRecalcularMontos(ownerId, reservaId, totalAmount) {
+  try {
+    var pr = await supabase.from('hotel_pagos').select('amount, status').eq('user_id', ownerId).eq('reservation_id', reservaId);
+    if (pr.error) { if (_invTablaFaltante(pr.error)) return null; }
+    var sumApr = 0;
+    (pr.data || []).forEach(function (p) { if (p && p.status === 'approved') sumApr += Number(p.amount) || 0; });
+    var total = Number(totalAmount) || 0;
+    var balance = total > 0 ? (total - sumApr) : (0 - sumApr);
+    var payStatus = 'unpaid';
+    if (sumApr <= 0) payStatus = 'unpaid';
+    else if (total > 0 && sumApr >= total) payStatus = 'paid';
+    else payStatus = 'partial';
+    var upd = { deposit_amount: sumApr, balance_amount: balance, payment_status: payStatus, updated_at: new Date().toISOString() };
+    await supabase.from('hotel_reservas').update(upd).eq('id', reservaId).eq('user_id', ownerId);
+    return { deposit_amount: sumApr, balance_amount: balance, payment_status: payStatus, aprobado: sumApr };
+  } catch (e) { console.error('_hrRecalcularMontos:', e && e.message); return null; }
+}
+
+// ---- GET /api/hotel/reservas ------------------------------------------------
+// Lista de reservas del tenant con filtros por querystring: ?estado= ?unidad=
+// ?desde= ?hasta= ?conversation_id=. Join liviano a contacts (nombre/tel) y
+// hotel_unidades (title). Acotado a ownerId (no expone otras cuentas). Sin gate
+// (leer no muta; sin reservas cargadas devuelve lista vacia = inerte).
+app.get('/api/hotel/reservas', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    var query = req.query || {};
+    var q = supabase.from('hotel_reservas').select('*').eq('user_id', ownerId);
+    if (query.estado) q = q.eq('status', String(query.estado));
+    if (query.unidad) q = q.eq('unit_id', String(query.unidad));
+    if (query.conversation_id) q = q.eq('conversation_id', String(query.conversation_id));
+    // Rango [desde, hasta): reservas que SOLAPAN el rango (semiabierto).
+    if (query.hasta) q = q.lt('check_in', String(query.hasta).slice(0, 10));
+    if (query.desde) q = q.gt('check_out', String(query.desde).slice(0, 10));
+    q = q.order('check_in', { ascending: true }).limit(2000);
+    var r = await q;
+    if (r.error) {
+      if (_invTablaFaltante(r.error)) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia. Corré la migracion de reservas.', tabla: 'hotel_reservas' });
+      return res.status(500).json({ error: r.error.message });
+    }
+    var reservas = r.data || [];
+    // Join liviano por batch de ids (sin depender de FKs de PostgREST).
+    var cIds = [], uIds = [];
+    reservas.forEach(function (x) { if (x.contact_id) cIds.push(x.contact_id); if (x.unit_id) uIds.push(x.unit_id); });
+    var contactosMap = {}, unidadesMap = {};
+    if (cIds.length) { try { var cr = await supabase.from('contacts').select('id, name, nombre_manual, phone').in('id', Array.from(new Set(cIds))); (cr.data || []).forEach(function (c) { contactosMap[c.id] = { nombre: c.nombre_manual || c.name || null, telefono: c.phone || null }; }); } catch (eC) {} }
+    if (uIds.length) { try { var ur = await supabase.from('hotel_unidades').select('id, title, numero').in('id', Array.from(new Set(uIds))); (ur.data || []).forEach(function (u) { unidadesMap[u.id] = { title: u.title || u.numero || null }; }); } catch (eU) {} }
+    var out = reservas.map(function (x) {
+      return Object.assign({}, x, {
+        contacto: x.contact_id ? (contactosMap[x.contact_id] || null) : null,
+        unidad_ref: x.unit_id ? (unidadesMap[x.unit_id] || null) : null
+      });
+    });
+    return res.json({ ok: true, reservas: out });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/hotel/reservas/crear ----------------------------------------
+// GATEADO reservas_v1. Crea una reserva. body: { contact_id | conversation_id,
+// unit_id, check_in, check_out, adults, children, pets, total_amount, currency,
+// status?, source?, notas }. ANTI-SOLAPE server-side si nace bloqueante -> 409.
+app.post('/api/hotel/reservas/crear', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _reservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas no esta activada para esta cuenta.', gate: 'reservas_v1' });
+    var b = req.body || {};
+    var contactId = b.contact_id || null;
+    var conversationId = b.conversation_id || null;
+    // Derivar contact desde la conversacion si no vino contact_id (acotado al tenant).
+    if (!contactId && conversationId) {
+      try { var cv = await supabase.from('conversations').select('contact_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle(); if (cv && cv.data) contactId = cv.data.contact_id || null; } catch (eCv) {}
+    }
+    var unitId = b.unit_id || null;
+    if (!unitId) return res.status(400).json({ error: 'Falta unit_id' });
+    var checkIn = String(b.check_in || '').slice(0, 10);
+    var checkOut = String(b.check_out || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(checkIn) || !/^\d{4}-\d{2}-\d{2}$/.test(checkOut)) return res.status(400).json({ error: 'Fechas invalidas (check_in/check_out en YYYY-MM-DD)' });
+    if (!(checkOut > checkIn)) return res.status(400).json({ error: 'check_out debe ser posterior a check_in' });
+    // La unidad debe pertenecer a la cuenta (no cross-tenant).
+    try {
+      var uOwn = await supabase.from('hotel_unidades').select('id').eq('id', unitId).eq('user_id', ownerId).maybeSingle();
+      if (uOwn && uOwn.error && _invTablaFaltante(uOwn.error)) return res.status(503).json({ error: 'La tabla hotel_unidades no existe todavia.', tabla: 'hotel_unidades' });
+      if (!uOwn || !uOwn.data) return res.status(404).json({ error: 'Unidad no encontrada en esta cuenta' });
+    } catch (eU) {}
+    var status = (_HR_ESTADOS_INICIALES.indexOf(b.status) >= 0) ? b.status : 'tentative';
+    // ANTI-SOLAPE: solo si nace BLOQUEANTE.
+    if (_HR_BLOQUEANTES.indexOf(status) >= 0) {
+      try {
+        var conf = await _hrConflictosSolape(ownerId, unitId, checkIn, checkOut, null);
+        if (conf.length) return res.status(409).json({ error: 'La unidad ya tiene una reserva que solapa esas fechas.', conflicto: _hrConflictoOut(conf) });
+      } catch (eS) { if (eS && eS._tablaFaltante) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia. Corré la migracion de reservas.', tabla: 'hotel_reservas' }); }
+    }
+    var fila = {
+      user_id: ownerId, contact_id: contactId, unit_id: unitId, conversation_id: conversationId,
+      check_in: checkIn, check_out: checkOut,
+      adults: (b.adults != null ? (parseInt(b.adults, 10) || 0) : null),
+      children: (b.children != null ? (parseInt(b.children, 10) || 0) : null),
+      pets: (b.pets != null ? (parseInt(b.pets, 10) || 0) : null),
+      total_amount: (b.total_amount != null ? (Number(b.total_amount) || 0) : null),
+      currency: b.currency ? String(b.currency).slice(0, 8) : null,
+      status: status, source: b.source ? String(b.source).slice(0, 40) : 'manual',
+      internal_notes: (b.notas || b.internal_notes) ? String(b.notas || b.internal_notes).slice(0, 2000) : null,
+      created_by: userId
+    };
+    var ins = await supabase.from('hotel_reservas').insert(fila).select('*').single();
+    if (ins.error) {
+      if (_invTablaFaltante(ins.error)) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia. Corré la migracion de reservas.', tabla: 'hotel_reservas' });
+      return res.status(500).json({ error: ins.error.message });
+    }
+    var reserva = ins.data;
+    if (conversationId) { try { await supabase.from('conversations').update({ etapa_reserva: status }).eq('id', conversationId).eq('user_id', ownerId); } catch (eE) {} }
+    // Si nace confirmada -> cita espejo + housekeeping.
+    if (status === 'confirmed') {
+      var citaId = await _hrCrearCitaEspejo(ownerId, reserva);
+      if (citaId) { try { await supabase.from('hotel_reservas').update({ cita_id: citaId, updated_at: new Date().toISOString() }).eq('id', reserva.id); reserva.cita_id = citaId; } catch (eCi) {} }
+    }
+    return res.json({ ok: true, reserva: reserva });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/hotel/reservas/:id/estado -----------------------------------
+// GATEADO reservas_v1. Transicion de estado validada por grafo (forward-only +
+// cancelled/lost desde cualquier no-terminal). Al pasar a BLOQUEANTE re-chequea
+// solape (409). Al confirmar crea la cita espejo (housekeeping). Al cancelar,
+// cancela tareas pendientes de esa cita. cancelled exige cancellation_reason.
+app.post('/api/hotel/reservas/:id/estado', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _reservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas no esta activada para esta cuenta.', gate: 'reservas_v1' });
+    var id = req.params.id;
+    var b = req.body || {};
+    var nuevo = String(b.status || b.estado || '');
+    if (!nuevo) return res.status(400).json({ error: 'Falta status' });
+    var rr = await supabase.from('hotel_reservas').select('*').eq('id', id).eq('user_id', ownerId).maybeSingle();
+    if (rr.error) { if (_invTablaFaltante(rr.error)) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia.', tabla: 'hotel_reservas' }); return res.status(500).json({ error: rr.error.message }); }
+    if (!rr.data) return res.status(404).json({ error: 'Reserva no encontrada' });
+    var reserva = rr.data;
+    var actual = reserva.status;
+    // Validacion de grafo.
+    var esCancelLost = (nuevo === 'cancelled' || nuevo === 'lost');
+    var valido = false;
+    if (_HR_TERMINALES.indexOf(actual) >= 0) valido = false; // terminal: no se mueve
+    else if (esCancelLost) valido = true;
+    else if (Object.prototype.hasOwnProperty.call(_HR_ORDEN, actual) && Object.prototype.hasOwnProperty.call(_HR_ORDEN, nuevo) && _HR_ORDEN[nuevo] > _HR_ORDEN[actual]) valido = true;
+    if (!valido) return res.status(400).json({ error: 'Transicion no permitida: ' + actual + ' -> ' + nuevo });
+    if (nuevo === 'cancelled' && !String(b.cancellation_reason || '').trim()) return res.status(400).json({ error: 'cancelled exige cancellation_reason' });
+    // Al pasar a BLOQUEANTE, re-chequear solape (otro pudo ganar).
+    if (_HR_BLOQUEANTES.indexOf(nuevo) >= 0) {
+      try {
+        var conf = await _hrConflictosSolape(ownerId, reserva.unit_id, reserva.check_in, reserva.check_out, reserva.id);
+        if (conf.length) return res.status(409).json({ error: 'Otra reserva bloqueante gano esas fechas para la unidad.', conflicto: _hrConflictoOut(conf) });
+      } catch (eS) { if (eS && eS._tablaFaltante) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia.', tabla: 'hotel_reservas' }); }
+    }
+    var upd = { status: nuevo, updated_at: new Date().toISOString() };
+    if (nuevo === 'cancelled') upd.cancellation_reason = String(b.cancellation_reason).slice(0, 500);
+    var citaIdNueva = null;
+    if (nuevo === 'confirmed' && !reserva.cita_id) {
+      citaIdNueva = await _hrCrearCitaEspejo(ownerId, reserva);
+      if (citaIdNueva) upd.cita_id = citaIdNueva;
+    }
+    var wr = await supabase.from('hotel_reservas').update(upd).eq('id', reserva.id).eq('user_id', ownerId).select('*').single();
+    if (wr.error) return res.status(500).json({ error: wr.error.message });
+    if (reserva.conversation_id) { try { await supabase.from('conversations').update({ etapa_reserva: nuevo }).eq('id', reserva.conversation_id).eq('user_id', ownerId); } catch (eE) {} }
+    // Al cancelar -> cancelar tareas pendientes de la cita espejo + marcar cita cancelada (best-effort).
+    if (nuevo === 'cancelled' && reserva.cita_id) {
+      try { await cancelarTareasDeEvento(ownerId, reserva.cita_id); } catch (eT) {}
+      try { await supabase.from('citas').update({ estado: 'cancelada', actualizado_en: new Date().toISOString() }).eq('id', reserva.cita_id).eq('user_id', ownerId); } catch (eCc) {}
+    }
+    return res.json({ ok: true, reserva: wr.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/hotel/reservas/:id/pago -------------------------------------
+// GATEADO reservas_v1. Registra un pago en hotel_pagos y recalcula deposit/balance/
+// payment_status de la reserva. Si estaba deposit_pending y entra un pago approved ->
+// AUTO-CONFIRMA (sena recibida = confirmada + bloquear calendario via cita espejo).
+// Comprobante: proof_data_url (data URL base64, se sube al bucket media) o proof_url.
+app.post('/api/hotel/reservas/:id/pago', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _reservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas no esta activada para esta cuenta.', gate: 'reservas_v1' });
+    var id = req.params.id;
+    var b = req.body || {};
+    var rr = await supabase.from('hotel_reservas').select('*').eq('id', id).eq('user_id', ownerId).maybeSingle();
+    if (rr.error) { if (_invTablaFaltante(rr.error)) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia.', tabla: 'hotel_reservas' }); return res.status(500).json({ error: rr.error.message }); }
+    if (!rr.data) return res.status(404).json({ error: 'Reserva no encontrada' });
+    var reserva = rr.data;
+    var amount = Number(b.amount);
+    if (!(amount > 0)) return res.status(400).json({ error: 'amount invalido (debe ser > 0)' });
+    var METODOS = ['efectivo', 'transferencia', 'mercadopago', 'tarjeta', 'otro'];
+    var method = (METODOS.indexOf(b.method) >= 0) ? b.method : 'otro';
+    var ESTADOS_PAGO = ['pending', 'approved', 'rejected', 'refunded'];
+    var status = (ESTADOS_PAGO.indexOf(b.status) >= 0) ? b.status : 'approved';
+    // Comprobante: data URL base64 -> subir al bucket 'media'; o proof_url ya subido.
+    var proofUrl = null;
+    if (b.proof_data_url && String(b.proof_data_url).indexOf('data:') === 0) { try { proofUrl = await subirImagenSoporte(b.proof_data_url, 'cliente'); } catch (ePu) {} }
+    else if (b.proof_url && typeof b.proof_url === 'string') proofUrl = String(b.proof_url).slice(0, 1000);
+    var filaPago = {
+      reservation_id: reserva.id, user_id: ownerId, amount: amount,
+      currency: b.currency ? String(b.currency).slice(0, 8) : (reserva.currency || null),
+      method: method, status: status, proof_url: proofUrl,
+      notes: b.notes ? String(b.notes).slice(0, 1000) : null,
+      paid_at: (status === 'approved') ? new Date().toISOString() : null,
+      created_by: userId
+    };
+    var ip = await supabase.from('hotel_pagos').insert(filaPago).select('*').single();
+    if (ip.error) {
+      if (_invTablaFaltante(ip.error)) return res.status(503).json({ error: 'La tabla hotel_pagos no existe todavia. Corré la migracion de reservas.', tabla: 'hotel_pagos' });
+      return res.status(500).json({ error: ip.error.message });
+    }
+    var montos = await _hrRecalcularMontos(ownerId, reserva.id, reserva.total_amount);
+    // AUTO-CONFIRMAR: deposit_pending + pago approved -> confirmed (misma logica de cita espejo).
+    var confirmada = false, citaIdNueva = null, avisoSolape = null;
+    var huboApproved = (status === 'approved') || (montos && montos.aprobado > 0);
+    if (reserva.status === 'deposit_pending' && huboApproved) {
+      var conflicto = [];
+      try { conflicto = await _hrConflictosSolape(ownerId, reserva.unit_id, reserva.check_in, reserva.check_out, reserva.id); } catch (eS) { conflicto = []; }
+      if (conflicto.length) {
+        avisoSolape = 'La sena quedo registrada pero la reserva NO se confirmo automaticamente: otra reserva bloqueante solapa esas fechas.';
+      } else {
+        if (!reserva.cita_id) { citaIdNueva = await _hrCrearCitaEspejo(ownerId, reserva); }
+        var updC = { status: 'confirmed', updated_at: new Date().toISOString() };
+        if (citaIdNueva) updC.cita_id = citaIdNueva;
+        try { await supabase.from('hotel_reservas').update(updC).eq('id', reserva.id).eq('user_id', ownerId); confirmada = true; } catch (eUc) {}
+        if (confirmada && reserva.conversation_id) { try { await supabase.from('conversations').update({ etapa_reserva: 'confirmed' }).eq('id', reserva.conversation_id).eq('user_id', ownerId); } catch (eE) {} }
+      }
+    }
+    return res.json({ ok: true, pago: ip.data, montos: montos, confirmada: confirmada, cita_id: citaIdNueva, aviso: avisoSolape });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- GET /api/hotel/rack ----------------------------------------------------
+// Unidades de la cuenta + reservas BLOQUEANTES que solapan [desde, hasta), listo
+// para pintar la grilla de F4. Acotado a ownerId. Sin gate (solo lectura).
+app.get('/api/hotel/rack', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    var query = req.query || {};
+    var desde = query.desde ? String(query.desde).slice(0, 10) : null;
+    var hasta = query.hasta ? String(query.hasta).slice(0, 10) : null;
+    var ur = await supabase.from('hotel_unidades').select('id, title, numero, type, capacidad, activa').eq('user_id', ownerId).order('title', { ascending: true });
+    if (ur.error && _invTablaFaltante(ur.error)) return res.status(503).json({ error: 'La tabla hotel_unidades no existe todavia.', tabla: 'hotel_unidades' });
+    var unidades = ur.data || [];
+    var q = supabase.from('hotel_reservas').select('id, unit_id, contact_id, check_in, check_out, status, internal_notes').eq('user_id', ownerId).in('status', _HR_BLOQUEANTES);
+    if (hasta) q = q.lt('check_in', hasta);
+    if (desde) q = q.gt('check_out', desde);
+    q = q.order('check_in', { ascending: true }).limit(5000);
+    var rr = await q;
+    if (rr.error) { if (_invTablaFaltante(rr.error)) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia.', tabla: 'hotel_reservas' }); return res.status(500).json({ error: rr.error.message }); }
+    var reservas = rr.data || [];
+    var cIds = []; reservas.forEach(function (x) { if (x.contact_id) cIds.push(x.contact_id); });
+    var contactosMap = {};
+    if (cIds.length) { try { var cr = await supabase.from('contacts').select('id, name, nombre_manual').in('id', Array.from(new Set(cIds))); (cr.data || []).forEach(function (c) { contactosMap[c.id] = c.nombre_manual || c.name || null; }); } catch (eC) {} }
+    var reservasOut = reservas.map(function (x) { return Object.assign({}, x, { huesped: x.contact_id ? (contactosMap[x.contact_id] || null) : null }); });
+    return res.json({ ok: true, desde: desde, hasta: hasta, unidades: unidades, reservas: reservasOut });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/hotel/reservas/:id/editar -----------------------------------
+// GATEADO reservas_v1. Edita fechas/unidad/montos/huespedes. Re-chequea solape si
+// la reserva es bloqueante y cambio el calendario. Si tiene cita espejo y cambio
+// fecha/unidad, sincroniza la cita y recalcula las tareas de housekeeping.
+app.post('/api/hotel/reservas/:id/editar', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _reservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas no esta activada para esta cuenta.', gate: 'reservas_v1' });
+    var id = req.params.id;
+    var b = req.body || {};
+    var rr = await supabase.from('hotel_reservas').select('*').eq('id', id).eq('user_id', ownerId).maybeSingle();
+    if (rr.error) { if (_invTablaFaltante(rr.error)) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia.', tabla: 'hotel_reservas' }); return res.status(500).json({ error: rr.error.message }); }
+    if (!rr.data) return res.status(404).json({ error: 'Reserva no encontrada' });
+    var reserva = rr.data;
+    var nuevoUnit = (typeof b.unit_id !== 'undefined' && b.unit_id) ? String(b.unit_id) : reserva.unit_id;
+    var nuevoIn = (typeof b.check_in !== 'undefined') ? String(b.check_in).slice(0, 10) : String(reserva.check_in).slice(0, 10);
+    var nuevoOut = (typeof b.check_out !== 'undefined') ? String(b.check_out).slice(0, 10) : String(reserva.check_out).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(nuevoIn) || !/^\d{4}-\d{2}-\d{2}$/.test(nuevoOut)) return res.status(400).json({ error: 'Fechas invalidas' });
+    if (!(nuevoOut > nuevoIn)) return res.status(400).json({ error: 'check_out debe ser posterior a check_in' });
+    if (nuevoUnit !== reserva.unit_id) {
+      try { var uOwn = await supabase.from('hotel_unidades').select('id').eq('id', nuevoUnit).eq('user_id', ownerId).maybeSingle(); if (!uOwn || !uOwn.data) return res.status(404).json({ error: 'Unidad no encontrada en esta cuenta' }); } catch (eU) {}
+    }
+    var cambioCalendario = (nuevoUnit !== reserva.unit_id) || (nuevoIn !== String(reserva.check_in).slice(0, 10)) || (nuevoOut !== String(reserva.check_out).slice(0, 10));
+    if (cambioCalendario && _HR_BLOQUEANTES.indexOf(reserva.status) >= 0) {
+      try {
+        var conf = await _hrConflictosSolape(ownerId, nuevoUnit, nuevoIn, nuevoOut, reserva.id);
+        if (conf.length) return res.status(409).json({ error: 'La unidad ya tiene una reserva que solapa esas fechas.', conflicto: _hrConflictoOut(conf) });
+      } catch (eS) { if (eS && eS._tablaFaltante) return res.status(503).json({ error: 'La tabla hotel_reservas no existe todavia.', tabla: 'hotel_reservas' }); }
+    }
+    var upd = { unit_id: nuevoUnit, check_in: nuevoIn, check_out: nuevoOut, updated_at: new Date().toISOString() };
+    if (typeof b.adults !== 'undefined') upd.adults = (b.adults != null ? (parseInt(b.adults, 10) || 0) : null);
+    if (typeof b.children !== 'undefined') upd.children = (b.children != null ? (parseInt(b.children, 10) || 0) : null);
+    if (typeof b.pets !== 'undefined') upd.pets = (b.pets != null ? (parseInt(b.pets, 10) || 0) : null);
+    var totalCambio = false;
+    if (typeof b.total_amount !== 'undefined') { upd.total_amount = (b.total_amount != null ? (Number(b.total_amount) || 0) : null); totalCambio = true; }
+    if (typeof b.currency !== 'undefined') upd.currency = b.currency ? String(b.currency).slice(0, 8) : null;
+    if (typeof b.notas !== 'undefined' || typeof b.internal_notes !== 'undefined') upd.internal_notes = String(b.notas || b.internal_notes || '').slice(0, 2000) || null;
+    var wr = await supabase.from('hotel_reservas').update(upd).eq('id', reserva.id).eq('user_id', ownerId).select('*').single();
+    if (wr.error) return res.status(500).json({ error: wr.error.message });
+    var reservaFinal = wr.data;
+    if (totalCambio) { try { await _hrRecalcularMontos(ownerId, reserva.id, reservaFinal.total_amount); } catch (eRb) {} }
+    // Sincronizar cita espejo (si existe) + recalcular tareas de housekeeping.
+    if (reserva.cita_id && cambioCalendario) {
+      var ci = _hrFechaISOmediodia(nuevoIn), co = _hrFechaISOmediodia(nuevoOut);
+      try {
+        var wc = await supabase.from('citas').update({ fecha_hora: ci, fecha_fin: co, unidad_id: nuevoUnit, actualizado_en: new Date().toISOString() }).eq('id', reserva.cita_id).eq('user_id', ownerId);
+        if (wc.error) { await supabase.from('citas').update({ fecha_hora: ci, fecha_fin: co }).eq('id', reserva.cita_id).eq('user_id', ownerId); }
+      } catch (eWc) {}
+      try { await recalcularTareasAlquiler(ownerId, reserva.cita_id, ci, co, null); } catch (eRt) {}
+    }
+    return res.json({ ok: true, reserva: reservaFinal });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // ===== SCRAPER CORREGIDO: extraccion completa por propiedad =====
 // M20: alias de limpiarHTML (mismo set de entidades, unico implementador). Se mantiene el nombre por compat
 // con todos los callers existentes (no se tocan). Antes era una copia byte-identica del set completo.

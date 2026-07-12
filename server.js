@@ -16576,6 +16576,18 @@ app.post('/api/hotel/reservas/crear', async function (req, res) {
     if (!contactId && conversationId) {
       try { var cv = await supabase.from('conversations').select('contact_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle(); if (cv && cv.data) contactId = cv.data.contact_id || null; } catch (eCv) {}
     }
+    // F4: alta rapida desde el rack (walk-in). Si no hay contacto ligado y vino un nombre/telefono,
+    // crear un contacto minimo para nombrar la reserva. Defensivo: si falla, la reserva se crea sin contacto.
+    if (!contactId && (b.huesped_nombre || b.huesped_telefono)) {
+      try {
+        var _hnom = b.huesped_nombre ? String(b.huesped_nombre).slice(0, 120) : null;
+        var _htel = b.huesped_telefono ? String(b.huesped_telefono).slice(0, 40) : null;
+        var _base = _hnom || _htel || 'Huésped';
+        var ncc = await supabase.from('contacts').insert({ user_id: ownerId, name: _base, phone: _htel, nombre_manual: _hnom, channel: 'manual' }).select('id').single();
+        if (ncc.error) { var ncc2 = await supabase.from('contacts').insert({ user_id: ownerId, name: _base, phone: _htel, channel: 'manual' }).select('id').single(); if (ncc2 && ncc2.data) contactId = ncc2.data.id; }
+        else if (ncc.data) contactId = ncc.data.id;
+      } catch (eHc) { /* sin contacto: la reserva igual se crea */ }
+    }
     var unitId = b.unit_id || null;
     if (!unitId) return res.status(400).json({ error: 'Falta unit_id' });
     var checkIn = String(b.check_in || '').slice(0, 10);
@@ -16615,8 +16627,11 @@ app.post('/api/hotel/reservas/crear', async function (req, res) {
     }
     var reserva = ins.data;
     if (conversationId) { try { await supabase.from('conversations').update({ etapa_reserva: status }).eq('id', conversationId).eq('user_id', ownerId); } catch (eE) {} }
-    // Si nace confirmada -> cita espejo + housekeeping.
-    if (status === 'confirmed') {
+    // Si nace confirmada -> cita espejo + housekeeping. EXCEPTO un bloqueo manual de mantenimiento
+    // (F4.2: sin contacto + internal_notes "BLOQUEO: ..."), que solo bloquea el calendario y NO debe
+    // generar cita espejo ni tareas de limpieza.
+    var _esBloqueoManual = (!contactId) && /^BLOQUEO:/.test(String(fila.internal_notes || ''));
+    if (status === 'confirmed' && !_esBloqueoManual) {
       var citaId = await _hrCrearCitaEspejo(ownerId, reserva);
       if (citaId) { try { await supabase.from('hotel_reservas').update({ cita_id: citaId, updated_at: new Date().toISOString() }).eq('id', reserva.id); reserva.cita_id = citaId; } catch (eCi) {} }
     }

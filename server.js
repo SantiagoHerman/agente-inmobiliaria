@@ -21131,6 +21131,261 @@ app.post('/api/public/inventario/sync', async function(req, res){
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// ===== ETAPA 5 — SALIDAS PUBLICAS: FEED READ-ONLY + CATALOGO + CONSULTA ======
+// ============================================================================
+// Token PUBLICO dedicado por cuenta (business_settings.feed_token). MISMO patron que
+// ical_token: NO se reusa inventario_api_key (esa da ESCRITURA). El feed es SOLO LECTURA
+// del inventario activo, por rubro. La "gate" es la EXISTENCIA del token: sin token
+// generado -> 404 (nada publico). El dueno genera/regenera su link desde la app.
+// CERO IA / CERO tokens (solo lee inventario y sirve JSON). Rutas PLANAS (:token obligatorio).
+function _nuevoFeedToken() { return 'feed_' + _cryptoInv.randomBytes(24).toString('hex'); }
+
+// Normaliza el campo images (array de strings, o de objetos {url|src}) a array de URLs (cap).
+function _feedImgs(x) {
+  try {
+    if (!Array.isArray(x)) return [];
+    var out = [];
+    for (var i = 0; i < x.length && out.length < 12; i++) {
+      var it = x[i];
+      if (typeof it === 'string' && it.trim()) out.push(it.trim());
+      else if (it && typeof it === 'object') { var u = it.url || it.src || it.href; if (u && typeof u === 'string') out.push(u.trim()); }
+    }
+    return out;
+  } catch (e) { return []; }
+}
+function _feedNum(v) { if (v == null || v === '') return null; var n = Number(v); return isNaN(n) ? null : n; }
+
+// ---- INMOBILIARIA: properties activas -> items normalizados. Defensivo (select '*'). ----
+async function _buildFeedInmobiliaria(ownerId) {
+  var items = [];
+  try {
+    var r = await supabase.from('properties').select('*').eq('user_id', ownerId).eq('activa', true).order('numero').range(0, 499);
+    if (r.error) return items;
+    (r.data || []).forEach(function (p) {
+      // Precio a mostrar: primera operacion activa con precio (venta > alquiler anual > temporal).
+      var precio = null, moneda = 'USD', operacion = null;
+      if (p.venta_activa !== false && _feedNum(p.venta_precio) != null) { precio = _feedNum(p.venta_precio); operacion = 'Venta'; }
+      else if (p.anual_activa && _feedNum(p.anual_precio) != null) { precio = _feedNum(p.anual_precio); operacion = 'Alquiler'; }
+      else if (p.temporal_activa && _feedNum(p.temporal_precio_dia) != null) { precio = _feedNum(p.temporal_precio_dia); operacion = 'Alquiler temporal'; moneda = 'ARS'; }
+      items.push({
+        tipo: 'propiedad', id: String(p.id), titulo: p.title || ('Propiedad ' + (p.numero || '')), subtipo: p.type || null,
+        operacion: operacion || (p.operation || null), zona: p.zone || null,
+        precio: precio, moneda: moneda, precio_texto: (precio != null ? (moneda + ' ' + precio.toLocaleString('es-AR')) : 'Consultar'),
+        dormitorios: _feedNum(p.dormitorios) != null ? _feedNum(p.dormitorios) : _feedNum(p.rooms),
+        banos: _feedNum(p.banos), cocheras: _feedNum(p.cocheras),
+        superficie: _feedNum(p.superficie_cubierta) || _feedNum(p.superficie_total) || null,
+        descripcion: p.description || p.descripcion || p.caracteristicas || null,
+        fotos: _feedImgs(p.images), link: p.link || null
+      });
+    });
+  } catch (e) { /* defensivo: si falta una tabla/columna -> feed vacio de ese rubro */ }
+  return items;
+}
+
+// ---- HOTEL: hotel_unidades activas + tarifas -> items normalizados. ----
+async function _buildFeedHotel(ownerId) {
+  var items = [];
+  try {
+    var r = await supabase.from('hotel_unidades').select('*').eq('user_id', ownerId).eq('activa', true).order('title').range(0, 499);
+    if (r.error) return items;
+    var uds = r.data || [];
+    var ids = uds.map(function (u) { return u.id; });
+    var tarPorU = {};
+    if (ids.length) {
+      try {
+        var tr = await supabase.from('hotel_tarifa').select('unidad_id, temporada, fecha_desde, fecha_hasta, precio_noche, moneda, min_noches').in('unidad_id', ids).eq('user_id', ownerId);
+        if (!tr.error) (tr.data || []).forEach(function (t) { (tarPorU[t.unidad_id] = tarPorU[t.unidad_id] || []).push(t); });
+      } catch (eT) {}
+    }
+    uds.forEach(function (u) {
+      var tarifas = (tarPorU[u.id] || []).map(function (t) {
+        return { temporada: t.temporada || 'Tarifa', precio: _feedNum(t.precio_noche), moneda: t.moneda || u.moneda || 'ARS', min_noches: _feedNum(t.min_noches), desde: t.fecha_desde || null, hasta: t.fecha_hasta || null };
+      });
+      // Precio de referencia: minima tarifa con precio, o precio_base.
+      var minTar = null, minMon = u.moneda || 'ARS';
+      tarifas.forEach(function (t) { if (t.precio != null && (minTar === null || t.precio < minTar)) { minTar = t.precio; minMon = t.moneda; } });
+      var precio = (minTar != null) ? minTar : _feedNum(u.precio_base);
+      var at = (u.atributos && typeof u.atributos === 'object') ? u.atributos : {};
+      items.push({
+        tipo: 'unidad', id: String(u.id), titulo: u.title || ('Unidad ' + (u.numero || '')), subtipo: u.type || null,
+        capacidad: _feedNum(u.capacidad), precio: precio, moneda: minMon,
+        precio_texto: (precio != null ? (minMon + ' ' + precio.toLocaleString('es-AR') + '/noche') : 'Consultar'),
+        descripcion: u.descripcion || null, fotos: _feedImgs(u.images), tarifas: tarifas,
+        dormitorios: _feedNum(at.dormitorios), banos: _feedNum(at.banos)
+      });
+    });
+  } catch (e) {}
+  return items;
+}
+
+// ---- DESARROLLADORA: developments activos + unidades DISPONIBLES anidadas. ----
+async function _buildFeedDesarrolladora(ownerId) {
+  var items = [];
+  try {
+    var r = await supabase.from('developments').select('*').eq('user_id', ownerId).eq('activo', true).order('nombre').range(0, 299);
+    if (r.error) return items;
+    var devs = r.data || [];
+    var ids = devs.map(function (d) { return d.id; });
+    var uPorDev = {};
+    if (ids.length) {
+      try {
+        var ur = await supabase.from('development_units').select('*').in('development_id', ids).eq('user_id', ownerId).range(0, 999);
+        if (!ur.error) (ur.data || []).forEach(function (u) { (uPorDev[u.development_id] = uPorDev[u.development_id] || []).push(u); });
+      } catch (eU) {}
+    }
+    devs.forEach(function (d) {
+      var dd = (d.dev_data && typeof d.dev_data === 'object') ? d.dev_data : {};
+      var disp = (uPorDev[d.id] || []).filter(function (u) { return (u.estado || 'disponible') === 'disponible'; });
+      var unidades = disp.slice(0, 200).map(function (u) {
+        // Decision Diego E5: mostrar precio, salvo precio_estado='a_consultar' -> "Consultar".
+        var showPrecio = (u.precio_estado !== 'a_consultar') && (_feedNum(u.precio) != null);
+        return {
+          id: String(u.id), numero: u.numero || null, tipologia: u.tipologia || u.tipo_producto || null,
+          m2: _feedNum(u.m2_cubiertos) || _feedNum(u.m2_totales) || _feedNum(u.superficie_terreno) || null,
+          precio: showPrecio ? _feedNum(u.precio) : null, moneda: u.moneda || 'USD',
+          precio_texto: showPrecio ? ((u.moneda || 'USD') + ' ' + _feedNum(u.precio).toLocaleString('es-AR')) : 'Consultar'
+        };
+      });
+      items.push({
+        tipo: 'emprendimiento', id: String(d.id), titulo: d.nombre || 'Emprendimiento', subtipo: d.tipo || null,
+        zona: [d.ciudad, d.zona].filter(Boolean).join(' ') || d.zona || null,
+        estado_obra: d.estado_obra || null, avance_pct: _feedNum(d.avance_pct), entrega: d.fecha_entrega || null,
+        descripcion: d.descripcion || null, fotos: _feedImgs(dd.images), link: d.link || null,
+        disponibles: unidades.length, unidades: unidades
+      });
+    });
+  } catch (e) {}
+  return items;
+}
+
+// GET /api/inventario/feed-link — owner-only (JWT). Genera (lazy) el feed_token y
+// devuelve el token + el link del feed JSON. El link del CATALOGO publico lo arma el
+// front con su propio origin (/p/<token>). DEFENSIVO: si falta la columna -> 503 claro.
+app.get('/api/inventario/feed-link', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(uid);
+    var bs = await supabase.from('business_settings').select('feed_token').eq('user_id', ownerId).maybeSingle();
+    if (bs && bs.error) return res.status(503).json({ error: 'Falta la columna feed_token (corré migracion-feed-token.sql).' });
+    var token = bs && bs.data && bs.data.feed_token;
+    if (!token) {
+      token = _nuevoFeedToken();
+      var up = await supabase.from('business_settings').update({ feed_token: token }).eq('user_id', ownerId);
+      if (up && up.error) return res.status(503).json({ error: 'Falta la columna feed_token (corré migracion-feed-token.sql).' });
+    }
+    var base = 'https://' + (req.get('host') || 'agente-inmobiliaria-production-7e1c.up.railway.app');
+    return res.json({ ok: true, token: token, feed_url: base + '/api/public/feed/' + token, catalogo_path: '/p/' + token });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/inventario/feed-link/regenerar — owner-only. Invalida el token anterior
+// (el link viejo deja de funcionar) y devuelve uno nuevo.
+app.post('/api/inventario/feed-link/regenerar', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(uid);
+    var token = _nuevoFeedToken();
+    var up = await supabase.from('business_settings').update({ feed_token: token }).eq('user_id', ownerId);
+    if (up && up.error) return res.status(503).json({ error: 'Falta la columna feed_token (corré migracion-feed-token.sql).' });
+    var base = 'https://' + (req.get('host') || 'agente-inmobiliaria-production-7e1c.up.railway.app');
+    return res.json({ ok: true, token: token, feed_url: base + '/api/public/feed/' + token, catalogo_path: '/p/' + token });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/public/feed/:token — PUBLICO (sin sesion). Auth por token en la ruta. 404
+// GENERICO si el token no resuelve (no filtra si existe o no). JSON del inventario ACTIVO
+// por rubro + branding minimo (nombre + color). Cache-Control public max-age=600 (como el
+// iCal). Ruta PLANA (:token obligatorio). CERO IA.
+app.get('/api/public/feed/:token', async function (req, res) {
+  try {
+    var token = String(req.params.token || '').trim();
+    if (!token || token.length < 12) return res.status(404).json({ error: 'No encontrado' });
+    var bs = await supabase.from('business_settings').select('user_id, rubro, company_name').eq('feed_token', token).maybeSingle();
+    if (bs && bs.error) return res.status(404).json({ error: 'No encontrado' }); // columna ausente -> 404 (aun no habilitado)
+    if (!bs || !bs.data || !bs.data.user_id) return res.status(404).json({ error: 'No encontrado' });
+    var ownerId = bs.data.user_id;
+    var rubro = normalizarRubro(bs.data.rubro || 'inmobiliaria');
+    var items = [];
+    if (rubro === 'hotel_cabanas') items = await _buildFeedHotel(ownerId);
+    else if (rubro === 'desarrolladora') items = await _buildFeedDesarrolladora(ownerId);
+    else items = await _buildFeedInmobiliaria(ownerId);
+    var negocio = { nombre: (bs.data.company_name && String(bs.data.company_name).trim()) || 'Catálogo', color: '#0E7A5F' };
+    res.set('Cache-Control', 'public, max-age=600');
+    return res.status(200).json({ ok: true, rubro: rubro, negocio: negocio, count: items.length, items: items, updated_at: new Date().toISOString() });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
+// Rate-limit MUY simple por IP (memoria del proceso, best-effort anti-spam) para la consulta publica.
+var _feedConsultaHits = {};
+function _feedClientIp(req) { try { var xf = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim(); return xf || req.ip || 'na'; } catch (e) { return 'na'; } }
+function _feedRateOk(ip) {
+  try {
+    var ahora = Date.now(); var ventana = 10 * 60 * 1000; var maxHits = 6;
+    var arr = (_feedConsultaHits[ip] || []).filter(function (t) { return (ahora - t) < ventana; });
+    arr.push(ahora); _feedConsultaHits[ip] = arr;
+    // Prune ocasional para no crecer sin fin.
+    if (Math.random() < 0.02) { Object.keys(_feedConsultaHits).forEach(function (k) { _feedConsultaHits[k] = (_feedConsultaHits[k] || []).filter(function (t) { return (ahora - t) < ventana; }); if (!_feedConsultaHits[k].length) delete _feedConsultaHits[k]; }); }
+    return arr.length <= maxHits;
+  } catch (e) { return true; }
+}
+
+// POST /api/public/feed/:token/consulta — PUBLICO. Form del catalogo (nombre+telefono+mensaje).
+// Crea contacto + conversacion + mensaje entrante como LEAD ENTRANTE que cae al flujo normal
+// (queda listo para que un humano lo atienda; NO dispara IA -> CERO gasto de tokens). Anti-spam:
+// honeypot (campo 'website' oculto) + rate-limit por IP. Respuesta GENERICA (no filtra tenant).
+// Ruta PLANA (:token obligatorio).
+app.post('/api/public/feed/:token/consulta', async function (req, res) {
+  try {
+    var token = String(req.params.token || '').trim();
+    if (!token || token.length < 12) return res.status(404).json({ error: 'No encontrado' });
+    var b = req.body || {};
+    // Honeypot: un bot rellena 'website'. Si viene con algo -> fingimos OK y no creamos nada.
+    if (b.website && String(b.website).trim()) return res.json({ ok: true });
+    var ip = _feedClientIp(req);
+    if (!_feedRateOk(ip)) return res.status(429).json({ error: 'Demasiadas consultas, probá de nuevo en un rato.' });
+    var nombre = (b.nombre != null ? String(b.nombre) : '').trim().slice(0, 120);
+    var telefono = (b.telefono != null ? String(b.telefono) : '').replace(/[^\d+]/g, '').slice(0, 32);
+    var mensaje = (b.mensaje != null ? String(b.mensaje) : '').trim().slice(0, 1500);
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    if (!telefono || telefono.replace(/\D/g, '').length < 6) return res.status(400).json({ error: 'Teléfono inválido' });
+    // Resolver tenant por token (sin exponer si existe).
+    var bs = await supabase.from('business_settings').select('user_id').eq('feed_token', token).maybeSingle();
+    if (!bs || bs.error || !bs.data || !bs.data.user_id) return res.status(404).json({ error: 'No encontrado' });
+    var ownerId = bs.data.user_id;
+    var canal = 'catalogo';
+    // 1) Contacto: buscar-o-crear por (owner, phone). Defensivo con nombre_manual.
+    var contacto = null, contactoNuevo = false;
+    try { var ex = await supabase.from('contacts').select('id').eq('user_id', ownerId).eq('phone', telefono).maybeSingle(); if (ex && ex.data) contacto = ex.data; } catch (eEx) {}
+    if (!contacto) {
+      try { var ins = await supabase.from('contacts').insert({ user_id: ownerId, name: nombre, nombre_manual: nombre, phone: telefono, channel: canal }).select('id').single(); if (ins && ins.data) { contacto = ins.data; contactoNuevo = true; } } catch (eI) {}
+      if (!contacto) { try { var ins2 = await supabase.from('contacts').insert({ user_id: ownerId, name: nombre, phone: telefono, channel: canal }).select('id').single(); if (ins2 && ins2.data) { contacto = ins2.data; contactoNuevo = true; } } catch (eI2) {} }
+    }
+    if (!contacto) return res.status(500).json({ error: 'No se pudo registrar la consulta' });
+    // 2) Conversacion: buscar-o-crear por (owner, contact). NUEVA -> listo_humano + IA off (0-IA).
+    var conv = null, convNueva = false;
+    try { var cvx = await supabase.from('conversations').select('id').eq('user_id', ownerId).eq('contact_id', contacto.id).maybeSingle(); if (cvx && cvx.data) conv = cvx.data; } catch (eCv) {}
+    if (!conv) {
+      var payload = { user_id: ownerId, contact_id: contacto.id, channel: canal, status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() };
+      try { var cIns = await supabase.from('conversations').insert(payload).select('id').single(); if (cIns && cIns.data) { conv = cIns.data; convNueva = true; } } catch (eC) {}
+      if (!conv) { try { var cRe = await supabase.from('conversations').select('id').eq('user_id', ownerId).eq('contact_id', contacto.id).maybeSingle(); if (cRe && cRe.data) conv = cRe.data; } catch (eCr) {} }
+    }
+    if (!conv) return res.status(500).json({ error: 'No se pudo registrar la consulta' });
+    // 3) Mensaje entrante del lead (role 'contact') + traza de sistema. Best-effort.
+    var textoLead = mensaje || ('Consulta desde el catálogo web (' + nombre + ')');
+    try {
+      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'contact', content: textoLead });
+      await supabase.from('conversations').update({ last_message: textoLead, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    } catch (eM) {}
+    try { await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: 'Nueva consulta desde el catálogo web público.', enviado_por: 'Sistema' }); } catch (eS) {}
+    // 4) Aviso interno al equipo (canal Todos). CERO IA.
+    try { await _postearAvisoInterno(ownerId, 'general', 'Nueva consulta desde el catálogo web: ' + nombre + ' (' + telefono + ')' + (mensaje ? ' — ' + mensaje.slice(0, 160) : '')); } catch (eAv) {}
+    return res.json({ ok: true, nuevo: (contactoNuevo || convNueva) });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
 app.get('/api/ui-flags', async function(req, res){
   try{
     var user_id = await verificarUsuario(req);

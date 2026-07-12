@@ -4101,7 +4101,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       if (convC) {
         if (convC.memoria_viva && String(convC.memoria_viva).trim()) memoriaViva = String(convC.memoria_viva).trim();
         if (convC.contact_id) {
-          const { data: cont } = await supabase.from('contacts').select('name, interest, budget, notes').eq('id', convC.contact_id).maybeSingle();
+          // E2: incluimos perfil_comprador (desarrolladora). DEFENSIVO: si la columna aun no existe (migracion sin
+          // correr) el select falla -> reintentamos SIN esa columna para no perder name/interest/budget/notes.
+          let cont = null;
+          try {
+            const _r1 = await supabase.from('contacts').select('name, interest, budget, notes, perfil_comprador').eq('id', convC.contact_id).maybeSingle();
+            if (_r1.error) throw _r1.error;
+            cont = _r1.data;
+          } catch (ePc) {
+            try { const _r2 = await supabase.from('contacts').select('name, interest, budget, notes').eq('id', convC.contact_id).maybeSingle(); cont = _r2.data; } catch (ePc2) {}
+          }
           if (cont) datosLead = cont;
         }
       }
@@ -4248,12 +4257,25 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             if (_pl.length > 0) _planesTxt = ' | financiacion: ' + _pl.join(' ; ');
           } catch (ePl) { _planesTxt = ''; }
           const _amen = (d.dev_data && Array.isArray(d.dev_data.amenities) && d.dev_data.amenities.length > 0) ? (' | amenities: ' + d.dev_data.amenities.join(', ')) : '';
+          // E2: precios por ETAPA (lista dev_data.etapas [{nombre, ajuste_pct, desde_fecha}]) mostrados como texto
+          // para que la IA los cite (0 IA extra: es solo mas texto de input). La IA NO cotiza cuotas (evita gasto).
+          let _etapasTxt = '';
+          try {
+            const _et = (d.dev_data && Array.isArray(d.dev_data.etapas)) ? d.dev_data.etapas : [];
+            const _els = _et.filter(function(e){ return e && (e.nombre || e.ajuste_pct); }).map(function(e){
+              const _pp = [];
+              if (e.ajuste_pct !== undefined && e.ajuste_pct !== null && String(e.ajuste_pct).trim() !== '') _pp.push('ajuste ' + e.ajuste_pct + '%');
+              if (e.desde_fecha) _pp.push('desde ' + e.desde_fecha);
+              return (e.nombre || 'Etapa') + (_pp.length ? ' (' + _pp.join(', ') + ')' : '');
+            });
+            if (_els.length > 0) _etapasTxt = ' | etapas de precio: ' + _els.join(' ; ');
+          } catch (eEt) { _etapasTxt = ''; }
           const _cab = '* EMPRENDIMIENTO: ' + (d.nombre || 'Sin nombre') + (d.tipo ? ' (' + d.tipo + ')' : '') +
             (d.zona ? ' | zona: ' + d.zona : '') +
             (d.estado_obra ? ' | obra: ' + (_ESTADO_OBRA_TXT[d.estado_obra] || d.estado_obra) : '') +
             (d.avance_pct ? ' | avance: ' + d.avance_pct + '%' : '') +
             (d.fecha_entrega ? ' | entrega estimada: ' + d.fecha_entrega : '') +
-            _planesTxt + _amen +
+            _planesTxt + _amen + _etapasTxt +
             (d.link ? ' | link: ' + d.link : '') +
             (d.descripcion ? ' | ' + d.descripcion : '');
           const _resTxt = _resumen.length > 0 ? ('\n  Disponibilidad: ' + _resumen.join(' ; ')) : '\n  Disponibilidad: consultar (sin unidades disponibles cargadas)';
@@ -4395,6 +4417,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     if (datosLead.name && String(datosLead.name).trim()) _partes.push('nombre=' + String(datosLead.name).trim());
     if (datosLead.interest && String(datosLead.interest).trim()) _partes.push('interes=' + String(datosLead.interest).trim());
     if (datosLead.budget && String(datosLead.budget).trim()) _partes.push('presupuesto=' + String(datosLead.budget).trim());
+    // E2 (desarrolladora): perfil de compra capturado por la IA (vivienda|inversion) -> ayuda al agente a enfocar
+    // el pitch (renta/rentabilidad para inversor; uso/entrega para vivienda). Solo se inyecta si esta cargado.
+    if (datosLead.perfil_comprador && String(datosLead.perfil_comprador).trim()) {
+      const _pcv = String(datosLead.perfil_comprador).trim().toLowerCase();
+      const _pcTxt = _pcv === 'inversion' ? 'inversor (compra para invertir/renta)' : (_pcv === 'vivienda' ? 'vivienda propia (para vivir)' : String(datosLead.perfil_comprador).trim());
+      _partes.push('perfil de compra=' + _pcTxt);
+    }
     if (datosLead.notes && String(datosLead.notes).trim()) _partes.push('notas=' + String(datosLead.notes).trim());
     if (_partes.length > 0) {
       bloqueDatosLead = 'DATOS YA CONOCIDOS DEL LEAD (no los vuelvas a preguntar ni te re-presentes si ya sabes el nombre): ' + _partes.join('; ') + '.';
@@ -4928,7 +4957,7 @@ async function clasificarEstado(mensajeCliente, user_id) {
 // esHotel (F1.2, opcional, default false): si es una cuenta rubro hotel_cabanas, el MISMO llamado (sin llamada de
 // IA extra, costo ~0) extrae ademas fechas de estadia y huespedes para guardarlos en conversations.cal_*. Con
 // esHotel=false el prompt y la salida son BYTE-IDENTICOS al comportamiento actual (inmobiliaria/desarrolladora).
-async function extraerDatosLead(texto, datosPrevios, user_id, esHotel) {
+async function extraerDatosLead(texto, datosPrevios, user_id, esHotel, esDesarrolladora) {
   try {
     if (!texto || !texto.trim()) return { nombre: '', origen: '', interes: '', presupuesto: '' };
     const prev = datosPrevios || {};
@@ -4938,11 +4967,14 @@ async function extraerDatosLead(texto, datosPrevios, user_id, esHotel) {
       'A partir del MENSAJE del cliente, devolve SOLO un JSON con estos campos (string):',
       esHotel
         ? '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "", "fecha_ingreso": "", "fecha_salida": "", "adultos": "", "ninos": "", "mascotas": "", "tipo_alojamiento": "" }'
-        : '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "" }',
+        : (esDesarrolladora
+          ? '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "", "perfil_comprador": "" }'
+          : '{ "nombre": "", "origen": "", "interes": "", "presupuesto": "" }'),
       '- nombre: el nombre de pila/nombre propio SOLO si el cliente lo dice (ej: "soy Juan", "me llamo Ana"). Si no lo dice, "".',
       '- origen: de donde viene o como llego (ej: "Instagram", "Facebook", "un anuncio", "me recomendo un amigo", una ciudad/pais). Si no lo dice, "".',
       '- interes: que busca o le interesa (ej: "departamento 2 ambientes en Palermo", "casa para alquilar", "cabana para 4 personas el finde"). Si no lo dice, "".',
       '- presupuesto: cuanto puede/quiere gastar si lo menciona (ej: "USD 80000", "hasta 200 mil pesos por mes"). Si no lo dice, "".',
+      esDesarrolladora ? '- perfil_comprador: "inversion" si el cliente da senales de que compra para INVERTIR (renta, reventa, "para alquilar", "inversion", "para poner en alquiler", "revender", rentabilidad); "vivienda" si es para VIVIR el o su familia ("para mudarme", "para vivir", "mi casa", "para mi familia"). Si no queda claro, "".' : '',
       esHotel ? ('HOY es ' + _hoyISO + ' (formato YYYY-MM-DD). Usalo para resolver el ano de las fechas.') : '',
       esHotel ? '- fecha_ingreso: fecha de check-in / llegada si la menciona, SIEMPRE en formato YYYY-MM-DD. Resolve expresiones tipo "del 15 al 20 de enero" tomando el ano de la PROXIMA ocurrencia futura respecto de HOY. Si no da una fecha o no se puede armar la fecha completa, "".' : '',
       esHotel ? '- fecha_salida: fecha de check-out / salida en formato YYYY-MM-DD (misma logica de ano que fecha_ingreso). Si no la dice, "".' : '',
@@ -4955,7 +4987,7 @@ async function extraerDatosLead(texto, datosPrevios, user_id, esHotel) {
       (prev.nombre || prev.interes || prev.presupuesto) ? ('Datos ya conocidos (no hace falta repetirlos, solo agrega lo nuevo): ' + JSON.stringify({ nombre: prev.nombre || '', interes: prev.interes || '', presupuesto: prev.presupuesto || '' })) : '',
       'Mensaje del cliente: ' + JSON.stringify(texto)
     ].filter(Boolean).join('\n');
-    const r = await anthropic.messages.create({ model: MODELO_INTERNO, max_tokens: esHotel ? 220 : 150, messages: [{ role: 'user', content: prompt }] }); // Haiku: extraccion INTERNA de datos (regla de modelos). Errar a vacio es seguro.
+    const r = await anthropic.messages.create({ model: MODELO_INTERNO, max_tokens: esHotel ? 220 : (esDesarrolladora ? 180 : 150), messages: [{ role: 'user', content: prompt }] }); // Haiku: extraccion INTERNA de datos (regla de modelos). Errar a vacio es seguro.
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'extraer_datos', PRECIO_HAIKU); } catch(e){}
     let out = (r && r.content && r.content[0] && r.content[0].type === 'text') ? r.content[0].text.trim() : '';
     // por si la IA envuelve en ```json ... ```
@@ -4977,6 +5009,9 @@ async function extraerDatosLead(texto, datosPrevios, user_id, esHotel) {
       _res.ninos = limpiar(parsed.ninos);
       _res.mascotas = limpiar(parsed.mascotas);
       _res.tipo_alojamiento = limpiar(parsed.tipo_alojamiento);
+    }
+    if (esDesarrolladora) {
+      _res.perfil_comprador = limpiar(parsed.perfil_comprador);
     }
     return _res;
   } catch (e) { console.error('Error extrayendo datos del lead:', e && e.message); return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
@@ -6369,7 +6404,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // F1.2: en cuentas hotel, el MISMO llamado extrae ademas fechas/huespedes (costo IA ~0). rubro viene del
           // _bsGate ya leido (0 queries extra). En otros rubros esHotel=false => extractor byte-identico al actual.
           const _esHotelLead = normalizarRubro(_bsGate && _bsGate.rubro) === 'hotel_cabanas';
-          const ext = await extraerDatosLead(contentLead, datosPrevios, user_id, _esHotelLead);
+          // E2: en cuentas desarrolladora, el MISMO llamado captura ademas perfil_comprador (vivienda|inversion),
+          // costo IA ~0 (un campo mas). En otros rubros esDesarrolladora=false => extractor byte-identico al actual.
+          const _esDesarrolladoraLead = normalizarRubro(_bsGate && _bsGate.rubro) === 'desarrolladora';
+          const ext = await extraerDatosLead(contentLead, datosPrevios, user_id, _esHotelLead, _esDesarrolladoraLead);
           if (!ext) return;
           // F1.2: guardar fechas de estadia y huespedes en conversations.cal_* (UPDATE DEFENSIVO). Solo escribe los
           // campos que el lead menciono explicitamente (los vacios NO pisan lo ya guardado). Si alguna columna cal_*
@@ -6413,6 +6451,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           }
           if (Object.keys(updContacto).length > 0) {
             await supabase.from('contacts').update(updContacto).eq('id', contacto.id);
+          }
+          // E2: perfil_comprador (desarrolladora). UPDATE SEPARADO y DEFENSIVO: si la columna aun no existe
+          // (migracion migracion-dev-reservas.sql sin correr), el error se ignora sin afectar los updates de
+          // arriba (interest/budget/notes). Solo escribe valores validos ('vivienda'|'inversion'). 0 IA extra.
+          if (_esDesarrolladoraLead && ext.perfil_comprador) {
+            const _pc = String(ext.perfil_comprador).trim().toLowerCase();
+            if (_pc === 'vivienda' || _pc === 'inversion') {
+              try { const { error: _ePc } = await supabase.from('contacts').update({ perfil_comprador: _pc }).eq('id', contacto.id); if (_ePc) console.error('perfil_comprador (columna ausente?):', _ePc.message); } catch (ePcE) {}
+            }
           }
         } catch (eMem) { console.error('memoria lead:', eMem && eMem.message); }
       })();
@@ -16163,6 +16210,9 @@ async function guardarDesarrolladora(user_id, b, opts) {
     dev_data: {
       amenities: devData.amenities || [],
       planes: devData.planes || [],
+      // E2: precios por etapa [{nombre, ajuste_pct, desde_fecha}] (editable en el form manual). El SCRAPER no manda
+      // etapas -> en re-scrape se PRESERVAN las manuales (ver rama de edicion mas abajo). 0 IA.
+      etapas: Array.isArray(devData.etapas) ? devData.etapas : [],
       legal: devData.legal || {},
       material: devData.material || {}
     }
@@ -16182,7 +16232,7 @@ async function guardarDesarrolladora(user_id, b, opts) {
   // 1) EMPRENDIMIENTO (developments): UPDATE si edicion, INSERT si alta nueva.
   // ---------------------------------------------------------------------------
   if (esEdicion) {
-    var dOwn = await supabase.from('developments').select('user_id').eq('id', devEditId).maybeSingle();
+    var dOwn = await supabase.from('developments').select('user_id, dev_data').eq('id', devEditId).maybeSingle();
     if (dOwn.error) {
       if (_invTablaFaltante(dOwn.error)) return { ok: false, status: 503, error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' };
       return { ok: false, status: 500, error: 'Error verificando el emprendimiento: ' + dOwn.error.message };
@@ -16190,10 +16240,17 @@ async function guardarDesarrolladora(user_id, b, opts) {
     if (!dOwn.data) return { ok: false, status: 404, error: 'El emprendimiento a editar no existe', development_id: devEditId };
     if (dOwn.data.user_id !== user_id) return { ok: false, status: 403, error: 'El emprendimiento no pertenece a tu cuenta' };
 
+    // E2: PRESERVAR las etapas de precio MANUALES cuando el origen es el SCRAPER (que no las manda).
+    // El scraper reemplaza dev_data completo; sin esto perderiamos las etapas cargadas a mano en cada re-scrape.
+    var _devDataUpd = filaDev.dev_data;
+    if (origen === 'scraper' && !Array.isArray(devData.etapas)) {
+      var _exEt = (dOwn.data && dOwn.data.dev_data && Array.isArray(dOwn.data.dev_data.etapas)) ? dOwn.data.dev_data.etapas : [];
+      _devDataUpd = Object.assign({}, filaDev.dev_data, { etapas: _exEt });
+    }
     var filaDevUpd = {
       nombre: filaDev.nombre, tipo: filaDev.tipo, zona: filaDev.zona,
       descripcion: filaDev.descripcion, link: filaDev.link, estado_obra: filaDev.estado_obra,
-      avance_pct: filaDev.avance_pct, fecha_entrega: filaDev.fecha_entrega, dev_data: filaDev.dev_data
+      avance_pct: filaDev.avance_pct, fecha_entrega: filaDev.fecha_entrega, dev_data: _devDataUpd
     };
     var dUpd = await supabase.from('developments').update(filaDevUpd).eq('id', devEditId).eq('user_id', user_id).select('id').maybeSingle();
     if (dUpd.error) {
@@ -16659,6 +16716,268 @@ app.post('/api/inventario/desarrollo/unidad-estado', async function (req, res) {
   } catch (e) {
     return res.status(500).json({ error: e && e.message });
   }
+});
+
+// ============================================================================
+// ===== ETAPA 2 — DESARROLLADORA: RESERVA/SEÑA DE UNIDAD (sin pagos linkeados) =
+// ============================================================================
+// TODO gateado por business_settings.dev_reservas_v1 en los endpoints que MUTAN
+// (crear/estado/sena); el GET (listar) responde acotado al tenant (ownerId) sin
+// exponer datos de otras cuentas. Auth verificarUsuario + ownerId por admin_id
+// (un asesor opera sobre la cuenta del dueño). DEFENSIVO: si falta la tabla
+// dev_reservas -> 503 con mensaje claro en los mutantes; el GET devuelve lista
+// vacia (no rompe la UI). NO cambia el comportamiento de inmobiliaria/hotel ni de
+// una desarrolladora con dev_reservas_v1 OFF. CERO IA / CERO tokens.
+// RESTRICCION MAESTRA: la seña se registra SOLO por COMPROBANTE subido
+// (comprobante_url via subirImagenSoporte, patron hotel_pagos). PROHIBIDO MercadoPago.
+// Rutas PLANAS (Express 5): solo segmentos :param OBLIGATORIOS, sin ? ni *.
+
+// Estados de una reserva de unidad. ACTIVA (bloquea la unidad) = senada|confirmada.
+var _DR_ACTIVAS = ['senada', 'confirmada'];
+// Orden del ciclo "hacia adelante". 'caida' es terminal y sale de cualquier no-terminal.
+var _DR_ORDEN = { tentativa: 0, senada: 1, confirmada: 2 };
+var _DR_ESTADOS = ['tentativa', 'senada', 'confirmada', 'caida'];
+// Estados con los que una reserva puede NACER (carga manual puede nacer ya señada/confirmada).
+var _DR_ESTADOS_INICIALES = ['tentativa', 'senada', 'confirmada'];
+
+// Gate maestro dev_reservas_v1 (mirror de _reservasV1Activo). Ante error o columna
+// ausente -> false (comportamiento actual). NUNCA rompe.
+async function _devReservasV1Activo(user_id) {
+  try {
+    if (!user_id) return false;
+    var r = await supabase.from('business_settings').select('dev_reservas_v1').eq('user_id', user_id).maybeSingle();
+    if (r.error) return false; // columna ausente u otro error -> flag OFF
+    return !!(r.data && r.data.dev_reservas_v1 === true);
+  } catch (e) { return false; }
+}
+
+// Mapea el estado de la RESERVA al estado que debe tener la UNIDAD (sync E2->E1).
+//   senada -> reservado ; confirmada -> vendido ; caida -> disponible.
+//   tentativa -> null (no toca la unidad: es solo un interes/hold blando).
+function _devEstadoUnidadPara(estadoReserva) {
+  if (estadoReserva === 'senada') return 'reservado';
+  if (estadoReserva === 'confirmada') return 'vendido';
+  if (estadoReserva === 'caida') return 'disponible';
+  return null;
+}
+
+// Sincroniza el estado de la unidad via el UPDATE defensivo de E1 (_devUpdateUnidad):
+// si la columna estado_updated_at aun no existe, reintenta sin ella. Best-effort: si
+// falla, la reserva NO se revierte (loguea y sigue). Devuelve true/false.
+async function _devReservaSyncUnidad(ownerId, unit_id, estadoReserva) {
+  try {
+    var eu = _devEstadoUnidadPara(estadoReserva);
+    if (!eu || !unit_id) return false;
+    var r = await _devUpdateUnidad(unit_id, ownerId, { estado: eu }, true);
+    if (r && r.error) { console.error('_devReservaSyncUnidad:', r.error.message); return false; }
+    return true;
+  } catch (e) { console.error('_devReservaSyncUnidad:', e && e.message); return false; }
+}
+
+// Busca reservas ACTIVAS (senada|confirmada) de una unidad, excluyendo una propia
+// (excludeId). Devuelve el array (vacio = libre). Si la tabla falta -> tira
+// { _tablaFaltante:true } para que el caller responda 503.
+async function _devReservaActivaEnUnidad(ownerId, unit_id, excludeId) {
+  var r = await supabase.from('dev_reservas')
+    .select('id, estado, contact_id, created_at')
+    .eq('user_id', ownerId).eq('unit_id', unit_id).in('estado', _DR_ACTIVAS);
+  if (r.error) { if (_invTablaFaltante(r.error)) throw { _tablaFaltante: true, tabla: 'dev_reservas' }; throw r.error; }
+  return (r.data || []).filter(function (x) { return String(x.id) !== String(excludeId || ''); });
+}
+
+// Verifica que la unidad pertenezca al desarrollo Y al dueño. Devuelve la fila de la
+// unidad o null. Si la tabla falta -> tira { _tablaFaltante:true }.
+async function _devUnidadDeDesarrollo(ownerId, development_id, unit_id) {
+  var r = await supabase.from('development_units').select('id, estado, numero, tipologia')
+    .eq('id', unit_id).eq('development_id', development_id).eq('user_id', ownerId).maybeSingle();
+  if (r.error) { if (_invTablaFaltante(r.error)) throw { _tablaFaltante: true, tabla: 'development_units' }; throw r.error; }
+  return r.data || null;
+}
+
+// ---- POST /api/dev/reservas/crear ------------------------------------------
+// GATEADO dev_reservas_v1. Crea una reserva de unidad. body: { development_id, unit_id,
+// contact_id? | conversation_id?, estado?, monto_sena?, moneda?, notas? }.
+// ANTI-DOBLE: rechaza (409) si la unidad ya tiene una reserva ACTIVA (senada|confirmada).
+// Si nace señada/confirmada -> sincroniza el estado de la unidad (reservado/vendido).
+app.post('/api/dev/reservas/crear', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _devReservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas de desarrollo no esta activada para esta cuenta.', gate: 'dev_reservas_v1' });
+    var b = req.body || {};
+    var development_id = (b.development_id != null) ? String(b.development_id) : '';
+    var unit_id = (b.unit_id != null) ? String(b.unit_id) : '';
+    if (!development_id) return res.status(400).json({ error: 'Falta development_id' });
+    if (!unit_id) return res.status(400).json({ error: 'Falta unit_id' });
+    var contactId = b.contact_id || null;
+    var conversationId = b.conversation_id || null;
+    // Derivar el contacto desde la conversacion si no vino contact_id (acotado al tenant).
+    if (!contactId && conversationId) {
+      try { var cv = await supabase.from('conversations').select('contact_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle(); if (cv && cv.data) contactId = cv.data.contact_id || null; } catch (eCv) {}
+    }
+    // La unidad debe pertenecer al desarrollo y al dueño.
+    var unidad;
+    try { unidad = await _devUnidadDeDesarrollo(ownerId, development_id, unit_id); }
+    catch (eU) { if (eU && eU._tablaFaltante) return res.status(503).json({ error: 'La tabla ' + eU.tabla + ' no existe todavia. Corré la migracion.', tabla: eU.tabla }); return res.status(500).json({ error: 'Error verificando la unidad' }); }
+    if (!unidad) return res.status(404).json({ error: 'La unidad no existe en este emprendimiento (o no es de tu cuenta)' });
+    var estado = (_DR_ESTADOS_INICIALES.indexOf(b.estado) >= 0) ? b.estado : 'tentativa';
+    // ANTI-DOBLE: si nace ACTIVA, o si simplemente hay otra reserva activa en la unidad -> 409.
+    // (Una tentativa NO bloquea; pero NO se puede crear una nueva si ya hay una señada/confirmada.)
+    try {
+      var activas = await _devReservaActivaEnUnidad(ownerId, unit_id, null);
+      if (activas.length) return res.status(409).json({ error: 'La unidad ya tiene una reserva activa (señada o confirmada).', reserva_activa: activas[0] });
+    } catch (eA) { if (eA && eA._tablaFaltante) return res.status(503).json({ error: 'La tabla dev_reservas no existe todavia. Corré la migracion migracion-dev-reservas.sql.', tabla: 'dev_reservas' }); return res.status(500).json({ error: 'Error verificando reservas de la unidad' }); }
+    var fila = {
+      user_id: ownerId, development_id: development_id, unit_id: unit_id,
+      contact_id: contactId, conversation_id: conversationId,
+      estado: estado,
+      monto_sena: (b.monto_sena != null && b.monto_sena !== '') ? (Number(b.monto_sena) || 0) : null,
+      moneda: b.moneda ? String(b.moneda).slice(0, 8) : 'USD',
+      notas: (b.notas || b.internal_notes) ? String(b.notas || b.internal_notes).slice(0, 2000) : null,
+      created_by: userId
+    };
+    var ins = await supabase.from('dev_reservas').insert(fila).select('*').single();
+    if (ins.error) {
+      if (_invTablaFaltante(ins.error)) return res.status(503).json({ error: 'La tabla dev_reservas no existe todavia. Corré la migracion migracion-dev-reservas.sql.', tabla: 'dev_reservas' });
+      return res.status(500).json({ error: ins.error.message });
+    }
+    var reserva = ins.data;
+    // Sync de la unidad si nace ACTIVA (señada -> reservado; confirmada -> vendido). Best-effort.
+    if (_DR_ACTIVAS.indexOf(estado) >= 0) { await _devReservaSyncUnidad(ownerId, unit_id, estado); }
+    return res.json({ ok: true, reserva: reserva });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/dev/reservas/:id/estado -------------------------------------
+// GATEADO dev_reservas_v1. Transicion de estado validada por grafo:
+//   tentativa -> senada -> confirmada (forward-only), y cualquiera-no-terminal -> caida
+//   (con motivo_caida OBLIGATORIO). 'caida' es terminal. Al pasar a ACTIVA re-chequea
+//   anti-doble (409). Sincroniza el estado de la unidad. Ruta PLANA (:id obligatorio).
+app.post('/api/dev/reservas/:id/estado', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _devReservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas de desarrollo no esta activada para esta cuenta.', gate: 'dev_reservas_v1' });
+    var id = req.params.id;
+    var b = req.body || {};
+    var nuevo = String(b.estado || b.status || '');
+    if (_DR_ESTADOS.indexOf(nuevo) < 0) return res.status(400).json({ error: 'Estado invalido. Debe ser uno de: ' + _DR_ESTADOS.join(', ') });
+    var rr = await supabase.from('dev_reservas').select('*').eq('id', id).eq('user_id', ownerId).maybeSingle();
+    if (rr.error) { if (_invTablaFaltante(rr.error)) return res.status(503).json({ error: 'La tabla dev_reservas no existe todavia. Corré la migracion migracion-dev-reservas.sql.', tabla: 'dev_reservas' }); return res.status(500).json({ error: rr.error.message }); }
+    if (!rr.data) return res.status(404).json({ error: 'Reserva no encontrada' });
+    var reserva = rr.data;
+    var actual = reserva.estado;
+    // Validacion de grafo.
+    var esCaida = (nuevo === 'caida');
+    var valido = false;
+    if (actual === 'caida') valido = false; // terminal: no se mueve
+    else if (esCaida) valido = true;        // cualquiera-no-terminal -> caida
+    else if (Object.prototype.hasOwnProperty.call(_DR_ORDEN, actual) && Object.prototype.hasOwnProperty.call(_DR_ORDEN, nuevo) && _DR_ORDEN[nuevo] > _DR_ORDEN[actual]) valido = true;
+    if (!valido) return res.status(400).json({ error: 'Transicion no permitida: ' + actual + ' -> ' + nuevo });
+    if (esCaida && !String(b.motivo_caida || b.motivo || '').trim()) return res.status(400).json({ error: 'caida exige un motivo (motivo_caida)' });
+    // Al pasar a ACTIVA, re-chequear anti-doble (otra reserva pudo ganar la unidad).
+    if (_DR_ACTIVAS.indexOf(nuevo) >= 0) {
+      try {
+        var activas = await _devReservaActivaEnUnidad(ownerId, reserva.unit_id, reserva.id);
+        if (activas.length) return res.status(409).json({ error: 'Otra reserva activa gano esta unidad.', reserva_activa: activas[0] });
+      } catch (eA) { if (eA && eA._tablaFaltante) return res.status(503).json({ error: 'La tabla dev_reservas no existe todavia.', tabla: 'dev_reservas' }); }
+    }
+    var upd = { estado: nuevo, updated_at: new Date().toISOString() };
+    if (esCaida) upd.motivo_caida = String(b.motivo_caida || b.motivo).slice(0, 500);
+    var wr = await supabase.from('dev_reservas').update(upd).eq('id', reserva.id).eq('user_id', ownerId).select('*').single();
+    if (wr.error) return res.status(500).json({ error: wr.error.message });
+    // Sync de la unidad (senada->reservado; confirmada->vendido; caida->disponible). Best-effort.
+    if (reserva.unit_id) { await _devReservaSyncUnidad(ownerId, reserva.unit_id, nuevo); }
+    return res.json({ ok: true, reserva: wr.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/dev/reservas/:id/sena ---------------------------------------
+// GATEADO dev_reservas_v1. Registra la SEÑA de una reserva con COMPROBANTE subido
+// (foto/PDF). body: { monto_sena, moneda?, comprobante_data_url? (data URL base64) |
+// comprobante_url? (ya subido), notas? }. Sube el comprobante al bucket 'media' via
+// subirImagenSoporte (mismo patron que hotel_pagos). PROHIBIDO MercadoPago/checkout.
+// Si la reserva estaba 'tentativa' -> AUTO-AVANZA a 'senada' (seña recibida = unidad
+// reservada), re-chequeando anti-doble. Ruta PLANA (:id obligatorio).
+app.post('/api/dev/reservas/:id/sena', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _devReservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas de desarrollo no esta activada para esta cuenta.', gate: 'dev_reservas_v1' });
+    var id = req.params.id;
+    var b = req.body || {};
+    var rr = await supabase.from('dev_reservas').select('*').eq('id', id).eq('user_id', ownerId).maybeSingle();
+    if (rr.error) { if (_invTablaFaltante(rr.error)) return res.status(503).json({ error: 'La tabla dev_reservas no existe todavia. Corré la migracion migracion-dev-reservas.sql.', tabla: 'dev_reservas' }); return res.status(500).json({ error: rr.error.message }); }
+    if (!rr.data) return res.status(404).json({ error: 'Reserva no encontrada' });
+    var reserva = rr.data;
+    if (reserva.estado === 'caida') return res.status(400).json({ error: 'La reserva esta caida: no se puede registrar una seña.' });
+    var monto = Number(b.monto_sena != null ? b.monto_sena : b.amount);
+    if (!(monto > 0)) return res.status(400).json({ error: 'monto_sena invalido (debe ser > 0)' });
+    // COMPROBANTE: data URL base64 -> subir al bucket 'media'; o comprobante_url ya subido.
+    // NUNCA una pasarela de pago (restriccion maestra): solo el comprobante que sube el equipo.
+    var comprobanteUrl = null;
+    var _dataUrl = b.comprobante_data_url || b.proof_data_url;
+    if (_dataUrl && String(_dataUrl).indexOf('data:') === 0) { try { comprobanteUrl = await subirImagenSoporte(_dataUrl, 'cliente'); } catch (ePu) {} }
+    else if (b.comprobante_url && typeof b.comprobante_url === 'string') comprobanteUrl = String(b.comprobante_url).slice(0, 1000);
+    // Si la reserva sigue tentativa, la seña la lleva a 'senada' -> re-chequear anti-doble.
+    var nuevoEstado = reserva.estado;
+    if (reserva.estado === 'tentativa') {
+      try {
+        var activas = await _devReservaActivaEnUnidad(ownerId, reserva.unit_id, reserva.id);
+        if (activas.length) return res.status(409).json({ error: 'La unidad ya tiene otra reserva activa: no se puede señar esta.', reserva_activa: activas[0] });
+      } catch (eA) { if (eA && eA._tablaFaltante) return res.status(503).json({ error: 'La tabla dev_reservas no existe todavia.', tabla: 'dev_reservas' }); }
+      nuevoEstado = 'senada';
+    }
+    var upd = {
+      monto_sena: monto,
+      moneda: b.moneda ? String(b.moneda).slice(0, 8) : (reserva.moneda || 'USD'),
+      estado: nuevoEstado, updated_at: new Date().toISOString()
+    };
+    if (comprobanteUrl) upd.comprobante_url = comprobanteUrl;
+    if (b.notas != null) upd.notas = String(b.notas).slice(0, 2000);
+    var wr = await supabase.from('dev_reservas').update(upd).eq('id', reserva.id).eq('user_id', ownerId).select('*').single();
+    if (wr.error) return res.status(500).json({ error: wr.error.message });
+    // Sync unidad si la seña la dejo ACTIVA (señada -> reservado). Best-effort.
+    if (_DR_ACTIVAS.indexOf(nuevoEstado) >= 0 && reserva.unit_id) { await _devReservaSyncUnidad(ownerId, reserva.unit_id, nuevoEstado); }
+    return res.json({ ok: true, reserva: wr.data, comprobante_url: comprobanteUrl });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- GET /api/dev/reservas -------------------------------------------------
+// Lista de reservas del tenant con filtro por ?development_id= o ?conversation_id=.
+// Join liviano a contacts (nombre/tel) y development_units (numero/tipologia). Acotado
+// a ownerId (no expone otras cuentas). Sin gate (leer no muta). DEFENSIVO: si la tabla
+// dev_reservas no existe todavia -> lista vacia (no rompe la UI).
+app.get('/api/dev/reservas', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    var query = req.query || {};
+    var q = supabase.from('dev_reservas').select('*').eq('user_id', ownerId);
+    if (query.development_id) q = q.eq('development_id', String(query.development_id));
+    if (query.conversation_id) q = q.eq('conversation_id', String(query.conversation_id));
+    if (query.estado) q = q.eq('estado', String(query.estado));
+    q = q.order('created_at', { ascending: false }).limit(2000);
+    var r = await q;
+    if (r.error) { if (_invTablaFaltante(r.error)) return res.json({ ok: true, reservas: [] }); return res.status(500).json({ error: r.error.message }); }
+    var reservas = r.data || [];
+    var cIds = [], uIds = [];
+    reservas.forEach(function (x) { if (x.contact_id) cIds.push(x.contact_id); if (x.unit_id) uIds.push(x.unit_id); });
+    var contactosMap = {}, unidadesMap = {};
+    if (cIds.length) { try { var cr = await supabase.from('contacts').select('id, name, nombre_manual, phone').in('id', Array.from(new Set(cIds))); (cr.data || []).forEach(function (c) { contactosMap[c.id] = { nombre: c.nombre_manual || c.name || null, telefono: c.phone || null }; }); } catch (eC) {} }
+    if (uIds.length) { try { var ur = await supabase.from('development_units').select('id, numero, tipologia, tipo_producto').in('id', Array.from(new Set(uIds))); (ur.data || []).forEach(function (u) { unidadesMap[u.id] = { numero: u.numero || null, tipologia: u.tipologia || u.tipo_producto || null }; }); } catch (eU) {} }
+    var out = reservas.map(function (x) {
+      return Object.assign({}, x, {
+        contacto: x.contact_id ? (contactosMap[x.contact_id] || null) : null,
+        unidad_ref: x.unit_id ? (unidadesMap[x.unit_id] || null) : null
+      });
+    });
+    return res.json({ ok: true, reservas: out });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
 // ---- GET /api/inventario/cargar -------------------------------------------
@@ -20513,8 +20832,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _rv = await supabase.from('business_settings').select('reservas_v1').eq('user_id', user_id).maybeSingle();
       if (_rv && _rv.data) reservas_v1 = _rv.data.reservas_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1 });
-  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false }); }
+    // dev_reservas_v1 (gate del vertical desarrolladora, Etapa 2): query SEPARADA y defensiva.
+    // Ausente/error -> false (comportamiento actual: sin boton "Reservar unidad" ni lista de reservas).
+    var dev_reservas_v1 = false;
+    try {
+      var _drv = await supabase.from('business_settings').select('dev_reservas_v1').eq('user_id', user_id).maybeSingle();
+      if (_drv && _drv.data) dev_reservas_v1 = _drv.data.dev_reservas_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1 });
+  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false }); }
 });
 
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.

@@ -7988,6 +7988,228 @@ app.delete('/api/oportunidades/:id', async (req, res) => {
 });
 
 // ============================================================================
+// ===== ETAPA 4 — INMOBILIARIA: TIMELINE DEL LEAD + MATCHING (0 IA) ===========
+// ============================================================================
+// (1) GET /api/conversaciones/timeline?conversation_id= -> historial UNIFICADO de UNA
+//     conversacion: sus CITAS (agenda) + los PASES de asesor (mensajes de sistema,
+//     role='sistema' con la firma de registrarPaseAsesor) + la nota_asesor. Los mensajes
+//     de chat ya los tiene el front; esto suma lo que NO viaja en la lista de mensajes.
+//     Tenant-scoped (ownerId por admin_id) + scoping por asesor (MIRROR de GET /api/citas:
+//     un asesor comun solo ve las citas asignadas a el). Ruta PLANA. 100% DEFENSIVO:
+//     tablas/columnas ausentes -> arrays vacios (nunca rompe). CERO IA.
+// (2) MATCHING propiedad<->lead: gate business_settings.matching_v1 (default false).
+//     Generaliza el matcher de reportes (zona+tipo+presupuesto 0.8x-1.3x sobre
+//     interest/budget/notes) para correr al ALTA/edicion de una propiedad (o al pasar
+//     una unidad de desarrollo a 'disponible') -> lista de conversation_ids candidatos.
+//     Salida SEGURA anti-baneo: crea/actualiza una OPORTUNIDAD en 'borrador' (custom_ids
+//     = candidatos) + aviso interno al dueno. NO auto-envia: el dueno la revisa y la lanza
+//     desde el panel Oportunidades (goteo/dedupe/tope ya resueltos). Universo = leads CON
+//     conversacion (limitacion conocida, aceptada). CERO IA.
+// ============================================================================
+
+// GET /api/conversaciones/timeline?conversation_id= — historial de UNA conversacion.
+app.get('/api/conversaciones/timeline', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    // Scoping IDENTICO a GET /api/citas: ownerId + (si es asesor comun) soloAsesorId.
+    var ownerId = userId, soloAsesorId = null, esAdmin = true;
+    try {
+      var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+      if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; esAdmin = esAdministrador(ase.data); if (!esAdmin) soloAsesorId = ase.data.id; }
+    } catch (eAse) {}
+    var convId = String((req.query && req.query.conversation_id) || '').trim();
+    if (!convId) return res.status(400).json({ error: 'Falta conversation_id' });
+    // Cargar la conversacion (tenant-scoped) para obtener contact_id + nota_asesor. 404 si no es del tenant.
+    var conv = null;
+    try {
+      var cq = await supabase.from('conversations').select('id, contact_id, nota_asesor, asesor_id').eq('id', convId).eq('user_id', ownerId).maybeSingle();
+      conv = (cq && cq.data) ? cq.data : null;
+    } catch (eC) { conv = null; }
+    if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
+    var contactId = conv.contact_id || null;
+    // ---- CITAS de esta conversacion (o de su contacto). Scoping por asesor: MIRROR de GET /api/citas. ----
+    var citas = [];
+    try {
+      var orParts = ['conversation_id.eq.' + convId];
+      if (contactId) orParts.push('contact_id.eq.' + contactId);
+      var qc = supabase.from('citas')
+        .select('id, fecha_hora, fecha_fin, tipo, titulo, estado, notas, lead_nombre, asesor_id, origen, unidad, lugar')
+        .eq('user_id', ownerId).or(orParts.join(','))
+        .order('fecha_hora', { ascending: true }).limit(200);
+      if (soloAsesorId) qc = qc.eq('asesor_id', soloAsesorId);
+      var rc = await qc;
+      if (!(rc && rc.error)) citas = rc.data || [];
+    } catch (eCit) { citas = []; }
+    // ---- PASES de asesor: mensajes de SISTEMA de esta conversacion (append-only, registrarPaseAsesor). ----
+    //      Se devuelven aparte para el "Historial" del panel (el front ya muestra los mensajes de chat).
+    var pases = [];
+    try {
+      var rp = await supabase.from('messages').select('id, content, created_at')
+        .eq('user_id', ownerId).eq('conversation_id', convId).eq('role', 'sistema')
+        .order('created_at', { ascending: true }).limit(200);
+      if (!(rp && rp.error)) pases = (rp.data || []).filter(function (m) { return m && typeof m.content === 'string' && m.content.indexOf('🔁') >= 0; });
+    } catch (eP) { pases = []; }
+    return res.json({ ok: true, conversation_id: convId, nota_asesor: conv.nota_asesor || null, citas: citas, pases: pases });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Gate matching_v1 (mirror de _reservasV1Activo): ausente/error -> false (comportamiento actual). NUNCA rompe.
+async function _matchingV1Activo(ownerId) {
+  try {
+    if (!ownerId) return false;
+    var r = await supabase.from('business_settings').select('matching_v1').eq('user_id', ownerId).maybeSingle();
+    if (r && r.error) return false; // columna ausente u otro error -> flag OFF
+    return !!(r && r.data && r.data.matching_v1 === true);
+  } catch (e) { return false; }
+}
+
+// Normalizacion compartida (misma logica que el matcher de reportes ~server.js:5622+).
+function _mtchNorm(s) { return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+function _mtchTokensZona(s) { return _mtchNorm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(function (w) { return w.length >= 4; }); }
+function _mtchNums(s) { var m = _mtchNorm(s).replace(/\./g, '').match(/\d{4,}/g); return m ? m.map(Number) : []; }
+
+// Umbral del matching. score: zona exacta=+2, zona~(token)=+1, tipo=+1, presupuesto en rango=+1.
+// MIN=2 => zona exacta sola, o (zona~ + tipo), o (zona~ + presupuesto), o (tipo + presupuesto).
+// Conservador para reducir falsos positivos (la salida es un BORRADOR que el dueno filtra). CERO IA.
+var MATCH_MIN_SCORE = 2;
+var MATCH_MAX_LEADS = 20000; // techo de leads a evaluar (paginado por chunks). Universo = leads CON conversacion.
+
+// Corre el matcher de UNA propiedad {zone,type,price} contra los leads CON conversacion (no cerrados)
+// del tenant. Devuelve [{ conversation_id, contact_id, lead, estado, score, motivos }] ordenado por score.
+async function _matchLeadsParaPropiedad(ownerId, prop) {
+  var out = [];
+  try {
+    var zonaP = _mtchNorm(prop && prop.zone), tipoP = _mtchNorm(prop && prop.type), tokP = _mtchTokensZona(prop && prop.zone);
+    var precioP = (prop && typeof prop.price === 'number') ? prop.price : (Number(String((prop && prop.price) || '').replace(/[^0-9]/g, '')) || 0);
+    if (!zonaP && !tipoP && !(precioP > 0) && !(tokP && tokP.length)) return []; // sin ninguna senal util -> no matchear
+    // 1) conversations del tenant (id, contact_id, status) PAGINADAS. Nos quedamos con la 1a conv NO cerrada por contacto.
+    var convByContact = {};
+    var from = 0, size = 1000, cap = 200000;
+    while (from < cap) {
+      var cq = await supabase.from('conversations').select('id, contact_id, status').eq('user_id', ownerId).range(from, from + size - 1);
+      if (cq && cq.error) break;
+      var rows = (cq && cq.data) ? cq.data : [];
+      rows.forEach(function (c) { if (c && c.contact_id && c.status !== 'cerrado' && !convByContact[c.contact_id]) convByContact[c.contact_id] = { conversation_id: c.id, status: c.status || '' }; });
+      if (rows.length < size) break;
+      from += size;
+    }
+    var contactIds = Object.keys(convByContact);
+    if (!contactIds.length) return [];
+    if (contactIds.length > MATCH_MAX_LEADS) contactIds = contactIds.slice(0, MATCH_MAX_LEADS);
+    // 2) contacts de esos ids (interest/budget/notes) por chunks. Score y filtro por umbral.
+    for (var i = 0; i < contactIds.length; i += 300) {
+      var chunk = contactIds.slice(i, i + 300);
+      var lq = await supabase.from('contacts').select('id, name, interest, budget, notes').eq('user_id', ownerId).in('id', chunk);
+      if (lq && lq.error) continue;
+      (lq && lq.data ? lq.data : []).forEach(function (l) {
+        var meta = convByContact[l.id]; if (!meta) return;
+        var texto = _mtchNorm((l.interest || '') + ' ' + (l.notes || '') + ' ' + (l.budget || ''));
+        if (!texto.trim()) return;
+        var score = 0; var motivos = [];
+        if (zonaP && texto.indexOf(zonaP) >= 0) { score += 2; motivos.push('zona'); }
+        else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
+        if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
+        if (precioP > 0) {
+          var presup = _mtchNums((l.budget || '') + ' ' + (l.interest || ''));
+          if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
+        }
+        if (score >= MATCH_MIN_SCORE) out.push({ conversation_id: meta.conversation_id, contact_id: l.id, lead: l.name || ('contacto ' + l.id), estado: meta.status, score: score, motivos: motivos.join('+') });
+      });
+    }
+    out.sort(function (a, b) { return b.score - a.score; });
+  } catch (e) { console.error('_matchLeadsParaPropiedad:', e && e.message); }
+  return out;
+}
+
+// Resolvers {prop,label} desde una propiedad (inmobiliaria) o unidad de desarrollo. null si no existe/no es del tenant.
+async function _propMatchDesdeProperty(ownerId, propertyId) {
+  try {
+    // select('*') defensivo: las columnas de precio del form manual (venta_precio/anual_precio/
+    // temporal_precio_dia) pueden no existir en cuentas viejas; con '*' no rompe. price = la 1a util.
+    var pq = await supabase.from('properties').select('*').eq('id', String(propertyId)).eq('user_id', ownerId).maybeSingle();
+    if (!pq || pq.error || !pq.data) return null;
+    var p = pq.data;
+    var precio = p.price || p.venta_precio || p.anual_precio || p.temporal_precio_dia || null;
+    return { prop: { zone: p.zone, type: p.type, price: precio }, label: (p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : '') };
+  } catch (e) { return null; }
+}
+async function _propMatchDesdeUnidad(ownerId, developmentId, unitId) {
+  try {
+    var uq = await supabase.from('development_units').select('id, numero, tipologia, tipo_producto, precio').eq('id', String(unitId)).eq('development_id', String(developmentId)).eq('user_id', ownerId).maybeSingle();
+    if (!uq || uq.error || !uq.data) return null;
+    var u = uq.data;
+    var zonaDev = '';
+    try { var dq = await supabase.from('developments').select('*').eq('id', String(developmentId)).eq('user_id', ownerId).maybeSingle(); if (dq && dq.data) zonaDev = [dq.data.ciudad, dq.data.zona].filter(Boolean).join(' ') || ''; } catch (eDev) {}
+    return { prop: { zone: zonaDev, type: u.tipologia || u.tipo_producto, price: u.precio }, label: (u.tipologia || u.tipo_producto || 'unidad') + (u.numero ? (' N' + u.numero) : '') };
+  } catch (e) { return null; }
+}
+
+// Core reutilizable: corre el matcher y, si hay candidatos, crea/actualiza la oportunidad BORRADOR
+// + avisa al dueno. NO chequea el gate (el caller lo hace). Devuelve { candidatos, oportunidad_id, propiedad }.
+async function _ejecutarMatchingPropiedad(ownerId, prop, label) {
+  var candidatos = await _matchLeadsParaPropiedad(ownerId, prop);
+  var convIds = candidatos.map(function (c) { return c.conversation_id; }).filter(Boolean);
+  var seen = {}; convIds = convIds.filter(function (id) { if (seen[id]) return false; seen[id] = true; return true; });
+  if (!convIds.length) return { candidatos: 0, oportunidad_id: null, propiedad: label };
+  var nombreOp = ('Auto-match: ' + label).slice(0, 200);
+  var oportunidad = null;
+  // DEDUPE: si ya hay un BORRADOR de auto-match de ESTA propiedad, se actualizan sus custom_ids (no se apila).
+  try {
+    var ex = await supabase.from('oportunidades').select('id').eq('user_id', ownerId).eq('nombre', nombreOp).eq('estado', 'borrador').order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (ex && ex.data && ex.data.id) {
+      var updr = await supabase.from('oportunidades').update({ custom_ids: convIds, total: convIds.length, updated_at: new Date().toISOString() }).eq('id', ex.data.id).eq('user_id', ownerId).select('id').maybeSingle();
+      oportunidad = (updr && updr.data) ? updr.data : { id: ex.data.id };
+    }
+  } catch (eEx) {}
+  if (!oportunidad) {
+    var prioridad = 1;
+    try { var mx = await supabase.from('oportunidades').select('prioridad').eq('user_id', ownerId).order('prioridad', { ascending: false }).limit(1).maybeSingle(); if (mx && mx.data && Number.isFinite(Number(mx.data.prioridad))) prioridad = Number(mx.data.prioridad) + 1; } catch (eMx) {}
+    var fila = { user_id: ownerId, nombre: nombreOp, estado: 'borrador', prioridad: prioridad, segmentos: [], custom_ids: convIds, mensaje: null, media: null, link: null, max_dia: null, horario: 'oficina', ritmo: 'normal', programado_para: null, total: convIds.length, enviados: 0, enviados_hoy: 0 };
+    var ins = await supabase.from('oportunidades').insert(fila).select('id').maybeSingle();
+    if (ins && ins.error) throw new Error(ins.error.message);
+    oportunidad = (ins && ins.data) ? ins.data : null;
+  }
+  // Aviso interno al dueno (canal "Todos"). Best-effort: nunca rompe. 0 IA.
+  try {
+    await _postearAvisoInterno(ownerId, 'general', 'Hay ' + convIds.length + ' lead' + (convIds.length === 1 ? '' : 's') + ' que matchean ' + label + '. Quedo un borrador en Oportunidades: revisalo y lanzalo.');
+  } catch (eAv) {}
+  return { candidatos: convIds.length, oportunidad_id: (oportunidad && oportunidad.id) ? oportunidad.id : null, propiedad: label };
+}
+
+// POST /api/matching/propiedad { property_id } | { development_id, unit_id } -> genera oportunidad borrador.
+// GATEADO matching_v1 (default OFF -> 403). El front lo llama fire-and-forget al guardar una propiedad.
+app.post('/api/matching/propiedad', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(uid);
+    if (!(await _matchingV1Activo(ownerId))) return res.status(403).json({ error: 'El matching no esta activado para esta cuenta.', gate: 'matching_v1' });
+    var b = req.body || {};
+    var resuelto = null;
+    if (b.property_id) resuelto = await _propMatchDesdeProperty(ownerId, b.property_id);
+    else if (b.development_id && b.unit_id) resuelto = await _propMatchDesdeUnidad(ownerId, b.development_id, b.unit_id);
+    else return res.status(400).json({ error: 'Falta property_id (o development_id + unit_id)' });
+    if (!resuelto) return res.status(404).json({ error: 'No se encontro la propiedad/unidad' });
+    var r = await _ejecutarMatchingPropiedad(ownerId, resuelto.prop, resuelto.label);
+    return res.json({ ok: true, candidatos: r.candidatos, propiedad: r.propiedad, oportunidad_id: r.oportunidad_id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Fire-and-forget: si una unidad de desarrollo quedo DISPONIBLE y el tenant tiene matching_v1 ON,
+// buscar leads que matcheen y dejar un borrador. Best-effort ABSOLUTO: nunca afecta al caller. CERO IA.
+function _maybeMatchUnidadDisponible(ownerId, developmentId, unitId, estado) {
+  if (estado !== 'disponible') return;
+  (async function () {
+    try {
+      if (!(await _matchingV1Activo(ownerId))) return;
+      var rz = await _propMatchDesdeUnidad(ownerId, developmentId, unitId);
+      if (rz) await _ejecutarMatchingPropiedad(ownerId, rz.prop, rz.label);
+    } catch (eMx) { console.error('matching unidad-estado:', eMx && eMx.message); }
+  })();
+}
+
+// ============================================================================
 // AVISO DEL MAESTRO -> banner (y modal si es critico) en TODOS los dashboards.
 // El Maestro publica un mensaje global; los clientes lo leen por polling en su
 // dashboard (GET /api/aviso-activo). Solo puede haber UN aviso activo a la vez:
@@ -16804,10 +17026,12 @@ app.post('/api/inventario/desarrollo/unidad-estado', async function (req, res) {
         return res.status(500).json({ error: 'Error actualizando la unidad: ' + upd2.error.message });
       }
       if (!upd2.data || !upd2.data.length) return res.status(404).json({ error: 'La unidad no existe en este emprendimiento', unit_id: unit_id });
+      _maybeMatchUnidadDisponible(ownerId, development_id, unit_id, estado); // E4: matching (gated matching_v1, best-effort)
       return res.json({ ok: true, unit_id: unit_id, estado: estado, estado_updated_at: false });
     }
     if (upd.error) return res.status(500).json({ error: 'Error actualizando la unidad: ' + upd.error.message });
     if (!upd.data || !upd.data.length) return res.status(404).json({ error: 'La unidad no existe en este emprendimiento', unit_id: unit_id });
+    _maybeMatchUnidadDisponible(ownerId, development_id, unit_id, estado); // E4: matching (gated matching_v1, best-effort)
     return res.json({ ok: true, unit_id: unit_id, estado: estado, estado_updated_at: true });
   } catch (e) {
     return res.status(500).json({ error: e && e.message });
@@ -20935,8 +21159,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _drv = await supabase.from('business_settings').select('dev_reservas_v1').eq('user_id', user_id).maybeSingle();
       if (_drv && _drv.data) dev_reservas_v1 = _drv.data.dev_reservas_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1 });
-  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false }); }
+    // matching_v1 (gate del matcher propiedad<->lead, Etapa 4): query SEPARADA y defensiva.
+    // Ausente/error -> false (comportamiento actual: el front no dispara el matching al guardar).
+    var matching_v1 = false;
+    try {
+      var _mv = await supabase.from('business_settings').select('matching_v1').eq('user_id', user_id).maybeSingle();
+      if (_mv && _mv.data) matching_v1 = _mv.data.matching_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1 });
+  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false }); }
 });
 
 // ============================================================================

@@ -21476,6 +21476,14 @@ app.get('/api/meta/ig/oauth/callback', async function(req, res) {
       }
     } catch (e) { console.error('ig oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
 
+    // 4) SUSCRIBIR la cuenta de IG a los webhooks de mensajes. Sin esto Meta puede no enviar los DMs de esa cuenta.
+    //    Best-effort (no rompe la conexion si falla). Log del resultado para diagnosticar.
+    try {
+      const subR = await fetch('https://graph.instagram.com/v21.0/' + encodeURIComponent(igUserId) + '/subscribed_apps?subscribed_fields=messages&access_token=' + encodeURIComponent(igToken), { method: 'POST' });
+      const subJ = await subR.json().catch(function(){ return null; });
+      console.log('[IG subscribe] ig_user_id=' + igUserId + ' ok=' + subR.ok + ' resp=' + JSON.stringify(subJ).slice(0, 200));
+    } catch (eSub) { console.error('ig subscribe:', eSub && eSub.message); }
+
     return res.status(200).send(_oauthCierreHtml('Instagram conectado', 'Activalo desde Integraciones para empezar a responder los DMs.', true));
   } catch (e) { console.error('GET /api/meta/ig/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Instagram.', false)); }
 });

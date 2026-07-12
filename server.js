@@ -4270,12 +4270,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // Cómo se nombra el negocio segun rubro (para que la IA NO se presente siempre como "la inmobiliaria").
   const _negocioLabel = _esHotel ? 'el alojamiento' : (normalizarRubro(rubro) === 'desarrolladora' ? 'la desarrolladora' : 'la inmobiliaria');
   let inventarioHotel = '';
+  // F6.3: unidades hotel con fotos, accesibles desde el handler de la tool enviar_foto_propiedad
+  // (se llena dentro del bloque _esHotel; para inmobiliaria/desarrolladora queda [] = sin efecto).
+  let _hotelUnidsFoto = [];
   if (_esHotel) try {
     const { data: _uds, error: _udErr } = await supabase.from('hotel_unidades')
-      .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos')
+      .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos, images')
       .eq('user_id', user_id).eq('activa', true);
     if (!_udErr && _uds && _uds.length > 0) {
       const _udIds = _uds.map(function(u){ return u.id; });
+      _hotelUnidsFoto = _uds; // F6.3: fuente para la tool de fotos (unidades con images)
       const { data: _tars } = await supabase.from('hotel_tarifa')
         .select('unidad_id, temporada, fecha_desde, fecha_hasta, precio_noche, moneda, min_noches, ocupacion_base')
         .in('unidad_id', _udIds).eq('user_id', user_id);
@@ -4317,7 +4321,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _precioTxt = _tarsTxt.length ? _tarsTxt.join(' ; ') : (u.precio_base != null ? (u.moneda || 'ARS') + ' ' + u.precio_base + '/noche' : 'consultar');
         let _amenTxt = '';
         try { const _am = at.amenities || {}; const _ks = Object.keys(_am).filter(function(k){ return _am[k]; }); if (_ks.length) _amenTxt = ' | amenities: ' + _ks.join(', '); } catch (eAm) {}
-        const _lineaBase = '- ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + (u.descripcion ? ' | ' + u.descripcion : '');
+        let _fotosTxtH = '';
+        try { const _imH = Array.isArray(u.images) ? u.images : []; if (_imH.length > 0) _fotosTxtH = ' | fotos disponibles: si'; } catch (eFH) {}
+        const _lineaBase = '- ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + (u.descripcion ? ' | ' + u.descripcion : '') + _fotosTxtH;
         // F1.1: anexar una linea "OCUPADA del X al Y" por cada reserva bloqueante (fechas semiabiertas: check_out es dia de salida = libre).
         const _ocupU = _ocupadasPorU[u.id] || [];
         const _ocupTxt = _ocupU.map(function(r){ return String.fromCharCode(10) + '    OCUPADA del ' + r.check_in + ' al ' + r.check_out; }).join('');
@@ -4481,13 +4487,19 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // Tool para que la IA pueda enviar una foto de una propiedad cuando el lead la pide.
   // ADITIVO: si la IA no la usa, el flujo es exactamente el mismo de antes (respuesta de texto).
   const CATEGORIAS_FOTO = ['dormitorio', 'bano', 'cocina', 'comedor', 'living', 'parque', 'frente', 'pileta', 'cochera', 'exterior', 'otra'];
+  // F6.3: la misma tool sirve para HOTEL (unidad/cabaña/habitacion). Descripcion rubrizada:
+  // el nombre de "la cosa" y como se identifica cambian, pero el NOMBRE de la tool y el handler son iguales.
+  const _fotoCosa = _esHotel ? 'unidad (cabaña / habitación)' : 'propiedad';
+  const _fotoNumDesc = _esHotel
+    ? 'El nombre o numero de la unidad tal como figura en el inventario (ej: "Cabaña 3" o 5).'
+    : 'El numero de la propiedad tal como figura en el inventario (ej: 12).';
   const toolsAgente = [{
     name: 'enviar_foto_propiedad',
-    description: 'Envia al lead una foto de una propiedad por WhatsApp. Usala SOLO cuando el lead pide ver una foto concreta (ej: mandame una del dormitorio, mostrame la pileta). Indica el numero de la propiedad (campo numero del inventario) y la categoria de foto pedida.',
+    description: 'Envia al lead una foto de una ' + _fotoCosa + ' por WhatsApp. Usala SOLO cuando el lead pide ver una foto concreta (ej: mandame una del dormitorio, mostrame la pileta). Indica ' + (_esHotel ? 'la unidad' : 'el numero de la propiedad') + ' y la categoria de foto pedida.',
     input_schema: {
       type: 'object',
       properties: {
-        numero: { type: 'string', description: 'El numero de la propiedad tal como figura en el inventario (ej: 12).' },
+        numero: { type: 'string', description: _fotoNumDesc },
         categoria: { type: 'string', enum: CATEGORIAS_FOTO, description: 'La categoria de foto pedida por el lead.' }
       },
       required: ['numero', 'categoria']
@@ -4650,7 +4662,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const numPedido = String(toolUse.input.numero == null ? '' : toolUse.input.numero).trim();
         fotoCategoria = String(toolUse.input.categoria == null ? '' : toolUse.input.categoria).trim();
         // Buscar la propiedad por numero entre las YA cargadas (no re-consultamos la DB).
-        const propFoto = (properties || []).find(function(p){ return p.numero != null && String(p.numero).trim() === numPedido; });
+        let propFoto = (properties || []).find(function(p){ return p.numero != null && String(p.numero).trim() === numPedido; });
+        // F6.3: HOTEL — si no matcheo una propiedad, buscar una UNIDAD por numero o por nombre (title contiene lo pedido).
+        if (!propFoto && _esHotel) {
+          const _pedNorm = numPedido.toLowerCase();
+          const _uH = (_hotelUnidsFoto || []).find(function(u){
+            return (u.numero != null && String(u.numero).trim() === numPedido) ||
+                   (u.title && String(u.title).toLowerCase().indexOf(_pedNorm) >= 0);
+          });
+          if (_uH) propFoto = { numero: (_uH.numero != null ? _uH.numero : _uH.title), images: _uH.images };
+        }
         if (propFoto) {
           const imgs = Array.isArray(propFoto.images) ? propFoto.images : [];
           if (imgs.length > 0) {
@@ -10449,6 +10470,14 @@ setTimeout(hacerBackup, 90 * 1000);
 setInterval(enviarAvisosEstadia, 30 * 60 * 1000);
 setTimeout(enviarAvisosEstadia, 100 * 1000);
 
+// F6.2: import iCal de OTAs -> bloqueos source='ical'. INERTE salvo ICAL_IMPORT_ENABLED==='true'
+// (borra/re-crea bloqueos ical: se habilita cuando Diego lo apruebe). Cada 60 min + corrida ~120s tras arrancar.
+if (process.env.ICAL_IMPORT_ENABLED === 'true') {
+  setInterval(importarICalOTAs, 60 * 60 * 1000);
+  setTimeout(importarICalOTAs, 120 * 1000);
+  console.log('[iCal import] Habilitado (cada 60 min).');
+}
+
 // WATCHDOG WhatsApp/Evolution (FASE 1: monitor+alerta). GATEADO OFF: el interval SOLO se
 // registra si WATCHDOG_ENABLED === 'true'. Con el flag apagado (default) no corre nada ->
 // desplegar es INERTE. Intervalo configurable por WATCHDOG_INTERVAL_MIN (default 5 min).
@@ -16223,7 +16252,9 @@ app.post('/api/inventario/guardar', async function (req, res) {
           regimenes: atributos.regimenes || [],
           franjas: atributos.franjas || {},
           politicas: atributos.politicas || {},
-          extras: extras
+          extras: extras,
+          // F6.2: URLs iCal de OTAs (Airbnb/Booking) para el import de bloqueos. Solo strings http(s).
+          ical_import_urls: Array.isArray(atributos.ical_import_urls) ? atributos.ical_import_urls.filter(function(u){ return typeof u === 'string' && /^https?:\/\//i.test(u); }) : []
         }
       };
       var pIns = await supabase.from('hotel_unidades').insert(filaUnidadH).select('id').maybeSingle();
@@ -16908,6 +16939,328 @@ app.get('/api/hotel/reservas/:id/pagos', async function (req, res) {
     return res.json({ ok: true, pagos: r.data || [] });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+
+// ============================================================================
+// F6 — SEGUNDA OLA (vertical HOTEL). Todo ADITIVO + DEFENSIVO. CERO IA / CERO
+// tokens (solo SQL + storage + fetch de iCal). Rutas PLANAS (Express 5): solo
+// segmentos :param OBLIGATORIOS, sin ? ni *. NO cambia el comportamiento de
+// inmobiliaria/desarrolladora ni de hoteles con el gate OFF.
+// ============================================================================
+
+// Helper: la cuenta (ownerId) es rubro hotel_cabanas? Defensivo: ante error/columna
+// ausente -> false (no habilita nada). Se usa para gatear import/fotos de unidades
+// (que NO dependen de reservas_v1, igual que el alta manual de unidades).
+async function _esCuentaHotel(ownerId) {
+  try {
+    if (!ownerId) return false;
+    var r = await supabase.from('business_settings').select('rubro').eq('user_id', ownerId).maybeSingle();
+    if (r && r.error) return false;
+    return !!(r && r.data && normalizarRubro(r.data.rubro) === 'hotel_cabanas');
+  } catch (e) { return false; }
+}
+
+// ---- POST /api/hotel/imagen -------------------------------------------------
+// Sube UNA imagen (data URL base64) al bucket 'media' y devuelve su URL publica.
+// Reusa subirImagenSoporte (mismo patron que los comprobantes de pago F2 y las
+// imagenes de soporte). Owner-only (JWT). Sirve para la galeria de fotos por unidad
+// del FormHotel. NO gateado por reservas_v1 (es carga de inventario, como el alta de
+// unidades). Ruta PLANA. CERO IA.
+app.post('/api/hotel/imagen', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    var dataUrl = b.imagen || b.data_url || b.dataUrl;
+    if (!dataUrl || String(dataUrl).indexOf('data:') !== 0) return res.status(400).json({ error: 'Falta la imagen (data URL base64)' });
+    var url = await subirImagenSoporte(dataUrl, 'cliente');
+    if (!url) return res.status(400).json({ error: 'No se pudo subir la imagen (¿formato o tamaño? tope 8MB).' });
+    return res.json({ ok: true, url: url });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- POST /api/hotel/unidades/import ----------------------------------------
+// Import masivo de unidades de hotel. body: { items: [ {numero,title,type,capacidad,
+// descripcion,precio_base,moneda,activa,atributos}, ... ] }. Reusa el motor de UPSERT
+// _syncInvHotel (el mismo del sync publico por API key), por 'numero' (o title). Owner-only,
+// SOLO rubro hotel (no reservas_v1: es carga de inventario). Ruta PLANA. CERO IA.
+app.post('/api/hotel/unidades/import', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _esCuentaHotel(ownerId))) return res.status(403).json({ error: 'Esta cuenta no es de rubro hotel/cabañas.' });
+    var items = Array.isArray(req.body && req.body.items) ? req.body.items : (Array.isArray(req.body) ? req.body : null);
+    if (!items) return res.status(400).json({ error: 'Falta el array "items" en el body' });
+    if (items.length > 2000) return res.status(400).json({ error: 'Maximo 2000 unidades por import' });
+    if (items.length === 0) return res.json({ ok: true, creadas: 0, actualizadas: 0, errores: 0, total: 0 });
+    var out = await _syncInvHotel(ownerId, items);
+    return res.json(Object.assign({ ok: true }, out));
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- GET /api/hotel/metricas ------------------------------------------------
+// Metricas de ocupacion/ingresos/estados para Reportes (rubro hotel). Rango por
+// ?desde=&hasta= (YYYY-MM-DD) o ?mes=YYYY-MM; default = mes actual. Acotado a ownerId
+// (no expone otras cuentas). Solo lectura (sin gate: sin reservas devuelve ceros = inerte).
+// DEFENSIVO: tablas ausentes -> ceros. CERO IA.
+app.get('/api/hotel/metricas', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    var query = req.query || {};
+    // Resolver rango. mes=YYYY-MM tiene prioridad; sino desde/hasta; sino mes actual.
+    var desde, hasta;
+    function _finDeMes(y, m0) { return new Date(Date.UTC(y, m0 + 1, 1)); } // primer dia del mes siguiente (exclusivo)
+    if (/^\d{4}-\d{2}$/.test(String(query.mes || ''))) {
+      var _p = String(query.mes).split('-'); var _y = parseInt(_p[0], 10), _m = parseInt(_p[1], 10) - 1;
+      desde = _p[0] + '-' + _p[1] + '-01';
+      var _f = _finDeMes(_y, _m); hasta = _f.toISOString().slice(0, 10);
+    } else if (/^\d{4}-\d{2}-\d{2}$/.test(String(query.desde || '')) && /^\d{4}-\d{2}-\d{2}$/.test(String(query.hasta || ''))) {
+      desde = String(query.desde).slice(0, 10); hasta = String(query.hasta).slice(0, 10);
+    } else {
+      var _now = new Date(); var _yy = _now.getUTCFullYear(), _mm = _now.getUTCMonth();
+      desde = _yy + '-' + String(_mm + 1).padStart(2, '0') + '-01';
+      hasta = _finDeMes(_yy, _mm).toISOString().slice(0, 10);
+    }
+    // Dias del rango (semiabierto [desde, hasta)).
+    var _msDia = 24 * 60 * 60 * 1000;
+    var _dDesde = new Date(desde + 'T00:00:00.000Z').getTime();
+    var _dHasta = new Date(hasta + 'T00:00:00.000Z').getTime();
+    var diasRango = Math.max(0, Math.round((_dHasta - _dDesde) / _msDia));
+    // Unidades activas de la cuenta (denominador de ocupacion).
+    var unidadesCount = 0;
+    try {
+      var ur = await supabase.from('hotel_unidades').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).eq('activa', true);
+      if (!(ur && ur.error)) unidadesCount = ur.count || 0;
+    } catch (eU) {}
+    // Reservas que SOLAPAN el rango (semiabierto): check_in < hasta AND check_out > desde.
+    var reservas = [];
+    var tablaFalta = false;
+    try {
+      var rr = await supabase.from('hotel_reservas')
+        .select('id, unit_id, status, check_in, check_out, total_amount, deposit_amount, currency')
+        .eq('user_id', ownerId)
+        .lt('check_in', hasta).gt('check_out', desde)
+        .limit(5000);
+      if (rr && rr.error) { if (_invTablaFaltante(rr.error)) tablaFalta = true; } else { reservas = rr.data || []; }
+    } catch (eR) {}
+    var BLOQ = ['deposit_pending', 'confirmed', 'checked_in', 'checked_out'];
+    // Noches ocupadas dentro del rango (clamp de cada reserva bloqueante al rango).
+    var nochesOcupadas = 0;
+    var ingresoEstimado = 0, ingresoCobrado = 0;
+    var porEstado = {};
+    var monedaTop = null; var _monedaCount = {};
+    reservas.forEach(function (r) {
+      porEstado[r.status] = (porEstado[r.status] || 0) + 1;
+      var esBloq = BLOQ.indexOf(r.status) >= 0;
+      if (esBloq) {
+        var ci = new Date(String(r.check_in).slice(0, 10) + 'T00:00:00.000Z').getTime();
+        var co = new Date(String(r.check_out).slice(0, 10) + 'T00:00:00.000Z').getTime();
+        var a = Math.max(ci, _dDesde), b2 = Math.min(co, _dHasta);
+        if (b2 > a) nochesOcupadas += Math.round((b2 - a) / _msDia);
+        if (r.total_amount != null) ingresoEstimado += Number(r.total_amount) || 0;
+        if (r.deposit_amount != null) ingresoCobrado += Number(r.deposit_amount) || 0;
+        var _cur = r.currency || 'ARS'; _monedaCount[_cur] = (_monedaCount[_cur] || 0) + 1;
+      }
+    });
+    Object.keys(_monedaCount).forEach(function (k) { if (monedaTop == null || _monedaCount[k] > _monedaCount[monedaTop]) monedaTop = k; });
+    var capacidadNoches = unidadesCount * diasRango;
+    var ocupacionPct = capacidadNoches > 0 ? Math.round((nochesOcupadas / capacidadNoches) * 1000) / 10 : 0;
+    return res.json({
+      ok: true, tabla_faltante: tablaFalta,
+      rango: { desde: desde, hasta: hasta, dias: diasRango },
+      unidades_activas: unidadesCount,
+      noches_ocupadas: nochesOcupadas, capacidad_noches: capacidadNoches, ocupacion_pct: ocupacionPct,
+      ingreso_estimado: Math.round(ingresoEstimado), ingreso_cobrado: Math.round(ingresoCobrado),
+      moneda: monedaTop || 'ARS',
+      reservas_por_estado: porEstado, total_reservas: reservas.length
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ---- iCal EXPORT (F6.2) -----------------------------------------------------
+// Token PUBLICO por cuenta (business_settings.ical_token, DEDICADO — NO se reusa la
+// inventario_api_key que da acceso de escritura). El dueño obtiene sus links por unidad
+// desde /api/hotel/ical-links; los pega en Airbnb/Booking para que esas OTAs vean las
+// fechas ocupadas. El .ics no expone datos del huesped (solo fechas + "Reservado"/"No
+// disponible"). Rutas PLANAS. CERO IA.
+function _icalDate(d) { var s = String(d || '').slice(0, 10); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s.replace(/-/g, '') : null; }
+function _icalEsc(t) { return String(t == null ? '' : t).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n'); }
+function _icalBuild(unitTitle, reservas) {
+  var now = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  var out = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Raices CRM//Hotel//ES', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:' + _icalEsc(unitTitle || 'Unidad')];
+  (reservas || []).forEach(function (r) {
+    var di = _icalDate(r.check_in), df = _icalDate(r.check_out);
+    if (!di || !df) return;
+    var esBloqueoManual = (!r.contact_id) && /^BLOQUEO/i.test(String(r.internal_notes || ''));
+    var resumen = esBloqueoManual ? 'No disponible' : 'Reservado';
+    out.push('BEGIN:VEVENT');
+    out.push('UID:' + String(r.id) + '@raicescrm');
+    out.push('DTSTAMP:' + now);
+    out.push('DTSTART;VALUE=DATE:' + di);
+    out.push('DTEND;VALUE=DATE:' + df); // exclusivo: check_out = dia de salida (libre)
+    out.push('SUMMARY:' + _icalEsc(resumen));
+    out.push('TRANSP:OPAQUE');
+    out.push('END:VEVENT');
+  });
+  out.push('END:VCALENDAR');
+  return out.join('\r\n') + '\r\n';
+}
+
+// GET /api/hotel/ical-links — owner-only. Genera (lazy) el ical_token y devuelve un link
+// .ics por unidad activa. GATEADO reservas_v1 (es parte del motor de reservas). DEFENSIVO:
+// si falta la columna ical_token -> 503 con mensaje claro (correr la migracion).
+app.get('/api/hotel/ical-links', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    if (!(await _reservasV1Activo(ownerId))) return res.status(403).json({ error: 'La gestion de reservas no esta activada para esta cuenta.', gate: 'reservas_v1' });
+    var bs = await supabase.from('business_settings').select('ical_token').eq('user_id', ownerId).maybeSingle();
+    if (bs && bs.error) return res.status(503).json({ error: 'Falta la columna ical_token (corré migracion-hotel-ical-token.sql).' });
+    var token = bs && bs.data && bs.data.ical_token;
+    if (!token) {
+      token = 'ical_' + _cryptoInv.randomBytes(24).toString('hex');
+      var up = await supabase.from('business_settings').update({ ical_token: token }).eq('user_id', ownerId);
+      if (up && up.error) return res.status(503).json({ error: 'Falta la columna ical_token (corré migracion-hotel-ical-token.sql).' });
+    }
+    var base = 'https://' + (req.get('host') || 'agente-inmobiliaria-production-7e1c.up.railway.app');
+    var ur = await supabase.from('hotel_unidades').select('id, title, numero, activa').eq('user_id', ownerId).order('title', { ascending: true });
+    if (ur && ur.error && _invTablaFaltante(ur.error)) return res.status(503).json({ error: 'La tabla hotel_unidades no existe todavia.', tabla: 'hotel_unidades' });
+    var unidades = (ur && ur.data || []).map(function (u) {
+      return { unit_id: u.id, title: u.title || u.numero || 'Unidad', activa: u.activa !== false, url: base + '/api/public/ical/' + token + '/' + u.id + '.ics' };
+    });
+    return res.json({ ok: true, token: token, unidades: unidades });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/public/ical/:token/:unitid — PUBLICO (sin sesion). Auth por token en la ruta.
+// :unitid puede venir con sufijo ".ics" (se strippea). Devuelve el .ics de las reservas
+// BLOQUEANTES de esa unidad. Rutas PLANAS (dos :param OBLIGATORIOS). Si el gate reservas_v1
+// esta OFF o faltan tablas -> devuelve un VCALENDAR VACIO valido (las OTAs no rompen).
+app.get('/api/public/ical/:token/:unitid', async function (req, res) {
+  try {
+    var token = String(req.params.token || '').trim();
+    var unitId = String(req.params.unitid || '').replace(/\.ics$/i, '').trim();
+    if (!token || token.length < 8 || !unitId) return res.status(404).type('text/plain').send('Not found');
+    var bs = await supabase.from('business_settings').select('user_id, rubro, reservas_v1').eq('ical_token', token).maybeSingle();
+    if (bs && bs.error) return res.status(404).type('text/plain').send('Not found'); // columna ausente -> 404 (aun no habilitado)
+    if (!bs || !bs.data || !bs.data.user_id) return res.status(404).type('text/plain').send('Not found');
+    var ownerId = bs.data.user_id;
+    // La unidad debe pertenecer a la cuenta del token (no cross-tenant).
+    var uTitle = 'Unidad';
+    try {
+      var uq = await supabase.from('hotel_unidades').select('id, title, numero').eq('id', unitId).eq('user_id', ownerId).maybeSingle();
+      if (!uq || uq.error || !uq.data) return res.status(404).type('text/plain').send('Not found');
+      uTitle = uq.data.title || uq.data.numero || 'Unidad';
+    } catch (eU) { return res.status(404).type('text/plain').send('Not found'); }
+    var reservas = [];
+    // Gate OFF -> calendario vacio (inerte). Con el gate ON, listar bloqueantes futuras/actuales.
+    if (bs.data.reservas_v1 === true) {
+      try {
+        var hoy = _fechaLocalArg();
+        var rr = await supabase.from('hotel_reservas')
+          .select('id, check_in, check_out, status, contact_id, internal_notes')
+          .eq('user_id', ownerId).eq('unit_id', unitId)
+          .in('status', _HR_BLOQUEANTES)
+          .gte('check_out', hoy)
+          .order('check_in', { ascending: true }).limit(2000);
+        if (!(rr && rr.error)) reservas = rr.data || [];
+      } catch (eR) { reservas = []; }
+    }
+    var ics = _icalBuild(uTitle, reservas);
+    res.set('Content-Type', 'text/calendar; charset=utf-8');
+    res.set('Content-Disposition', 'inline; filename="' + unitId + '.ics"');
+    res.set('Cache-Control', 'public, max-age=600');
+    return res.status(200).send(ics);
+  } catch (e) { return res.status(500).type('text/plain').send('Error'); }
+});
+
+// ---- iCal IMPORT (F6.2) — cron que lee iCal de OTAs -> bloqueos source='ical' ----
+// Lee las URLs iCal configuradas por unidad en hotel_unidades.atributos.ical_import_urls
+// (array de strings) y crea/actualiza bloqueos (status confirmed, contact null, source
+// 'ical', internal_notes "BLOQUEO OTA") en hotel_reservas. Idempotente: por unidad, si al
+// menos una feed responde, REEMPLAZA los bloqueos ical FUTUROS de esa unidad (nunca toca
+// reservas reales: el filtro exige source='ical'). GATEADO reservas_v1 (solo hoteles con el
+// motor activo). INERTE por defecto: el cron SOLO se registra si ICAL_IMPORT_ENABLED==='true'.
+// CERO IA / CERO tokens (fetch + SQL). Defensivo end-to-end.
+function _parseICalBloques(texto) {
+  // Devuelve [{ check_in:'YYYY-MM-DD', check_out:'YYYY-MM-DD' }] de cada VEVENT. Soporta
+  // DTSTART;VALUE=DATE:YYYYMMDD y DTSTART:YYYYMMDDT... (toma solo la fecha). Line-unfolding RFC5545.
+  var out = [];
+  try {
+    if (!texto || typeof texto !== 'string') return out;
+    var raw = texto.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    var lineas = [];
+    raw.forEach(function (l) { if (l.length && (l[0] === ' ' || l[0] === '\t')) { if (lineas.length) lineas[lineas.length - 1] += l.slice(1); } else lineas.push(l); });
+    var cur = null;
+    function _fecha(v) { var m = /(\d{4})(\d{2})(\d{2})/.exec(String(v || '')); return m ? (m[1] + '-' + m[2] + '-' + m[3]) : null; }
+    lineas.forEach(function (l) {
+      var up = l.toUpperCase();
+      if (up.indexOf('BEGIN:VEVENT') === 0) { cur = { check_in: null, check_out: null }; return; }
+      if (up.indexOf('END:VEVENT') === 0) { if (cur && cur.check_in && cur.check_out && cur.check_out > cur.check_in) out.push(cur); cur = null; return; }
+      if (!cur) return;
+      if (up.indexOf('DTSTART') === 0) { var i = l.indexOf(':'); if (i >= 0) cur.check_in = _fecha(l.slice(i + 1)); }
+      else if (up.indexOf('DTEND') === 0) { var j = l.indexOf(':'); if (j >= 0) cur.check_out = _fecha(l.slice(j + 1)); }
+    });
+  } catch (e) { console.error('_parseICalBloques:', e && e.message); }
+  return out;
+}
+async function _fetchTextoConTimeout(url, ms) {
+  try {
+    var ctrl = new AbortController();
+    var t = setTimeout(function () { ctrl.abort(); }, ms || 15000);
+    var r = await fetch(url, { signal: ctrl.signal, redirect: 'follow', headers: { 'User-Agent': 'RaicesCRM-iCal/1.0' } });
+    clearTimeout(t);
+    if (!r || !r.ok) return null;
+    var txt = await r.text();
+    return (txt && txt.indexOf('BEGIN:VCALENDAR') >= 0) ? txt : null;
+  } catch (e) { return null; }
+}
+async function importarICalOTAs() {
+  try {
+    // Cuentas hotel con el gate ON (query separada y defensiva: si la columna reservas_v1 no existe -> nada).
+    var rc = await supabase.from('business_settings').select('user_id, rubro').eq('reservas_v1', true);
+    if (!rc || rc.error) return;
+    var cuentas = (rc.data || []).filter(function (b) { return normalizarRubro(b.rubro) === 'hotel_cabanas'; });
+    if (!cuentas.length) return;
+    var hoy = _fechaLocalArg();
+    for (var ci = 0; ci < cuentas.length; ci++) {
+      var ownerId = cuentas[ci].user_id;
+      var uq;
+      try { uq = await supabase.from('hotel_unidades').select('id, atributos').eq('user_id', ownerId).eq('activa', true).limit(1000); } catch (eUq) { continue; }
+      if (!uq || uq.error || !uq.data) continue;
+      for (var ui = 0; ui < uq.data.length; ui++) {
+        var unidad = uq.data[ui];
+        var at = (unidad && unidad.atributos && typeof unidad.atributos === 'object') ? unidad.atributos : {};
+        var urls = Array.isArray(at.ical_import_urls) ? at.ical_import_urls.filter(function (u) { return typeof u === 'string' && /^https?:\/\//i.test(u); }) : [];
+        if (!urls.length) continue; // unidad sin feeds -> inerte
+        var eventos = [], algunaOk = false;
+        for (var k = 0; k < urls.length && k < 10; k++) {
+          var txt = await _fetchTextoConTimeout(urls[k], 15000);
+          if (txt == null) continue;
+          algunaOk = true;
+          var bloques = _parseICalBloques(txt);
+          bloques.forEach(function (b) { if (b.check_out >= hoy) eventos.push(b); });
+        }
+        if (!algunaOk) continue; // ninguna feed respondio -> NO tocar (evita borrar en un outage)
+        // Reemplazo idempotente: borra SOLO los bloqueos ical futuros de esta unidad, luego inserta los frescos.
+        try { await supabase.from('hotel_reservas').delete().eq('user_id', ownerId).eq('unit_id', unidad.id).eq('source', 'ical').gte('check_out', hoy); } catch (eDel) {}
+        for (var ei = 0; ei < eventos.length && ei < 500; ei++) {
+          var ev = eventos[ei];
+          try {
+            await supabase.from('hotel_reservas').insert({
+              user_id: ownerId, unit_id: unidad.id, contact_id: null,
+              check_in: ev.check_in, check_out: ev.check_out,
+              status: 'confirmed', source: 'ical', internal_notes: 'BLOQUEO OTA', created_by: null
+            });
+          } catch (eIns) {}
+        }
+      }
+    }
+  } catch (e) { console.error('importarICalOTAs:', e && e.message); }
+}
 
 // ============================================================================
 // F5.2 — MENSAJES AUTOMATICOS DE ESTADIA (vertical HOTEL). 0 IA / 0 tokens:

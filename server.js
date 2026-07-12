@@ -4226,12 +4226,24 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             const r = _byTip[k];
             return 'Quedan ' + r.count + ' de ' + k + (r.min !== null ? ' desde ' + r.moneda + ' ' + r.min : '');
           });
-          // Planes de pago (anticipo + cuotas + ajuste) si fueron cargados en dev_data.
+          // Planes de pago (anticipo + cuotas + ajuste + refuerzos) si fueron cargados en dev_data.
+          // Tolerante a 2 shapes: ARRAY [{nombre,anticipo,cuotas,ajuste,refuerzos,moneda}] (form/scraper nuevo)
+          // u OBJETO legacy {financiacion,...} (rows viejas del scraper aun sin re-guardar) => se
+          // convierte la financiacion a un plan para que llegue igual a la IA. 0 IA.
           let _planesTxt = '';
           try {
-            const _planes = d.dev_data && Array.isArray(d.dev_data.planes) ? d.dev_data.planes : [];
-            const _pl = _planes.filter(function(p){ return p && (p.nombre || p.anticipo || p.cuotas); }).map(function(p){
-              return (p.nombre || 'Plan') + ': ' + (p.anticipo ? 'anticipo ' + p.anticipo : '') + (p.cuotas ? (p.anticipo ? ' + ' : '') + p.cuotas + ' cuotas' : '') + (p.ajuste && p.ajuste !== 'fijo' ? ' (ajuste ' + p.ajuste + ')' : '') + (p.moneda ? ' [' + p.moneda + ']' : '');
+            const _raw = d.dev_data && d.dev_data.planes;
+            let _planes = [];
+            if (Array.isArray(_raw)) _planes = _raw;
+            else if (_raw && typeof _raw === 'object' && _raw.financiacion) _planes = [{ nombre: 'Financiación', refuerzos: String(_raw.financiacion) }];
+            const _pl = _planes.filter(function(p){ return p && (p.nombre || p.anticipo || p.cuotas || p.refuerzos); }).map(function(p){
+              const _partes = [];
+              if (p.anticipo) _partes.push('anticipo ' + p.anticipo);
+              if (p.cuotas) _partes.push(p.cuotas + ' cuotas');
+              if (p.ajuste && p.ajuste !== 'fijo') _partes.push('ajuste ' + p.ajuste);
+              if (p.refuerzos) _partes.push(String(p.refuerzos));
+              const _cuerpo = _partes.join(' + ');
+              return (p.nombre || 'Plan') + (_cuerpo ? ': ' + _cuerpo : '') + (p.moneda ? ' [' + p.moneda + ']' : '');
             });
             if (_pl.length > 0) _planesTxt = ' | financiacion: ' + _pl.join(' ; ');
           } catch (ePl) { _planesTxt = ''; }
@@ -15513,22 +15525,26 @@ function _mapScrapeAGuardar(data, sourceUrl) {
     fecha_entrega: emp.fecha_entrega || ''
   };
 
-  // dev_data: todo lo rico del scraper que no tiene columna propia (no se pierde).
+  // FIX Etapa 1 (bug planes): el prompt de la IA (armarInventarioDesarrollos) lee
+  // dev_data.planes como ARRAY de {nombre,anticipo,cuotas,ajuste,refuerzos,moneda}. Antes el
+  // scraper guardaba `planes` como OBJETO {financiacion,contacto,tipologias} => la financiacion
+  // scrapeada NUNCA llegaba a la IA ni se podia editar en el form. Ahora la financiacion se
+  // guarda como un PLAN en el array (mismo shape que el form: nombre 'Financiación' + refuerzos),
+  // y contacto/tipologias se mueven a `material` (que guardarDesarrolladora persiste igual) para
+  // no perder nada. 0 IA.
+  var _finTxt = emp.financiacion ? String(emp.financiacion).trim() : '';
   var dev_data = {
     amenities: Array.isArray(emp.amenities) ? emp.amenities : [],
-    // "planes" reutiliza el jsonb existente para guardar financiacion + contacto + tipologias (info comercial).
-    planes: {
-      financiacion: emp.financiacion || '',
-      contacto: emp.contacto || '',
-      tipologias: Array.isArray(data.tipologias) ? data.tipologias : []
-    },
-    // "material" reutiliza el jsonb existente para el material descriptivo scrapeado.
+    planes: _finTxt ? [{ nombre: 'Financiación', anticipo: '', cuotas: '', ajuste: 'fijo', refuerzos: _finTxt, moneda: '' }] : [],
+    // "material" reutiliza el jsonb existente para el material descriptivo scrapeado + contacto/tipologias.
     material: {
       resumen: resumen,
       master_plan: Array.isArray(data.master_plan) ? data.master_plan : [],
       equipo: Array.isArray(data.equipo) ? data.equipo : [],
       ubicacion_detalle: data.ubicacion_detalle || {},
-      resumen_lotes: data.resumen_lotes || {}
+      resumen_lotes: data.resumen_lotes || {},
+      contacto: emp.contacto || '',
+      tipologias: Array.isArray(data.tipologias) ? data.tipologias : []
     },
     legal: {}
   };
@@ -15573,8 +15589,10 @@ async function actualizarDevelopment(devId, ownerId, sourceUrl, opts) {
   var body = _mapScrapeAGuardar(scr.data, sourceUrl);
   body.development_id = devId;
 
-  // 3) UPDATE + reemplazo de sectores/unidades (misma logica que /api/inventario/guardar).
-  var g = await guardarDesarrolladora(ownerId, body);
+  // 3) MERGE de sectores/unidades (misma logica que /api/inventario/guardar) pero con
+  //    origen 'scraper': NUNCA borra unidades, NUNCA pisa `estado` manual, y si el scrape
+  //    devolvio unidades=[] NO toca las unidades (IDs estables — Etapa 1).
+  var g = await guardarDesarrolladora(ownerId, body, { origen: 'scraper' });
   if (!g.ok) return { ok: false, status: g.status || 500, error: g.error, tabla: g.tabla, development_id: g.development_id };
 
   // 4) Marcar ultimo_scrape (best-effort; si la columna no existe todavia, no rompe).
@@ -15997,18 +16015,133 @@ function _invTablaFaltante(err) {
   return /does not exist|could not find the table|relation .* does not exist|schema cache|pgrst205|pgrst204|42p01|undefined table/i.test(m);
 }
 
+// ============================================================================
+// ETAPA 1 — Helpers de MERGE de unidades/sectores de desarrollo (IDs ESTABLES)
+// ----------------------------------------------------------------------------
+// El guardado de EDICION (form manual y scraper) hacia DELETE-ALL + REINSERT ->
+// los IDs de cada unidad cambiaban en cada guardado (nada podia referenciarla) y
+// el scraper con unidades=[] borraba todo. Ahora se hace MERGE por `id` (el form
+// manual round-trip-ea el id) o por `numero` (el scraper): update de existentes,
+// insert de nuevas y borrado de las que ya no vienen SOLO cuando el origen es el
+// form MANUAL. El SCRAPER NUNCA borra y NUNCA pisa `estado` manual.
+// ============================================================================
+// Clave de match por numero: trim + lowercase (robusto ante mayusculas/espacios).
+function _devNumKey(v) {
+  if (v === null || v === undefined) return '';
+  return String(v).trim().toLowerCase();
+}
+// Compara un valor de la fila existente contra el valor calculado del payload.
+// null/undefined equivalentes; comparacion numerica cuando alguno es numero.
+function _devEqVal(a, b) {
+  if (a === undefined) a = null;
+  if (b === undefined) b = null;
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  if (typeof a === 'number' || typeof b === 'number') { return Number(a) === Number(b); }
+  return String(a) === String(b);
+}
+// ¿los campos del payload difieren de la fila existente? (solo las claves del payload)
+function _devUnidadCambio(row, fields) {
+  var ks = Object.keys(fields);
+  for (var i = 0; i < ks.length; i++) { if (!_devEqVal(row[ks[i]], fields[ks[i]])) return true; }
+  return false;
+}
+// Fila COMPLETA para INSERT de una unidad nueva (defaults; unit_data/images vacios).
+function _devFilaUnidadInsert(un, development_id, user_id) {
+  un = un || {};
+  return {
+    development_id: development_id,
+    sector_id: null,
+    user_id: user_id,
+    tipo_producto: _invStr(un.tipo_producto),
+    numero: _invStr(un.numero),
+    tipologia: _invStr(un.tipologia),
+    m2_cubiertos: _invNum(un.m2_cubiertos),
+    m2_totales: _invNum(un.m2_totales),
+    superficie_terreno: _invNum(un.superficie_terreno),
+    frente: _invNum(un.frente),
+    fondo: _invNum(un.fondo),
+    orientacion: _invStr(un.orientacion),
+    piso: _invStr(un.piso),
+    precio: _invNum(un.precio),
+    precio_estado: _invStr(un.precio_estado) || 'a_consultar',
+    moneda: _invStr(un.moneda) || 'USD',
+    estado: _invStr(un.estado) || 'disponible',
+    unit_data: {},
+    images: []
+  };
+}
+// Campos para UPDATE de una unidad existente. NO incluye unit_data/images (para no
+// pisar fotos/datos guardados) ni id/development_id/user_id. `estado` SOLO se incluye
+// cuando el origen es el form MANUAL (el scraper NUNCA pisa el estado manual).
+function _devFilaUnidadUpdate(un, origen) {
+  un = un || {};
+  var f = {
+    tipo_producto: _invStr(un.tipo_producto),
+    numero: _invStr(un.numero),
+    tipologia: _invStr(un.tipologia),
+    m2_cubiertos: _invNum(un.m2_cubiertos),
+    m2_totales: _invNum(un.m2_totales),
+    superficie_terreno: _invNum(un.superficie_terreno),
+    frente: _invNum(un.frente),
+    fondo: _invNum(un.fondo),
+    orientacion: _invStr(un.orientacion),
+    piso: _invStr(un.piso),
+    precio: _invNum(un.precio),
+    precio_estado: _invStr(un.precio_estado) || 'a_consultar',
+    moneda: _invStr(un.moneda) || 'USD'
+  };
+  if (origen !== 'scraper') f.estado = _invStr(un.estado) || 'disponible';
+  return f;
+}
+// Trae TODAS las filas hijas de un desarrollo (paginado .range: PostgREST corta en 1000).
+async function _devCargarHijos(tabla, cols, development_id, user_id) {
+  var out = [];
+  var page = 0, size = 1000;
+  for (;;) {
+    var r = await supabase.from(tabla).select(cols)
+      .eq('development_id', development_id).eq('user_id', user_id)
+      .range(page * size, page * size + size - 1);
+    if (r.error) return { data: null, error: r.error };
+    var rows = r.data || [];
+    out = out.concat(rows);
+    if (rows.length < size) break;
+    page++;
+    if (page > 100) break; // tope de seguridad (100k filas)
+  }
+  return { data: out, error: null };
+}
+// UPDATE defensivo de una unidad: si se pide estado_updated_at y la columna aun no
+// existe (migracion E1 sin correr), reintenta sin ella (no rompe el guardado).
+async function _devUpdateUnidad(id, user_id, fields, tocarEstadoTs) {
+  var payload = Object.assign({}, fields);
+  if (tocarEstadoTs) payload.estado_updated_at = new Date().toISOString();
+  var r = await supabase.from('development_units').update(payload).eq('id', id).eq('user_id', user_id);
+  if (r.error && tocarEstadoTs && _invTablaFaltante(r.error)) {
+    delete payload.estado_updated_at;
+    r = await supabase.from('development_units').update(payload).eq('id', id).eq('user_id', user_id);
+  }
+  return r;
+}
+
 // ---- FUNCION COMPARTIDA: guardar/actualizar un EMPRENDIMIENTO (desarrolladora) --
 // Extraida del branch desarrolladora de /api/inventario/guardar para poder REUSARLA
 // desde el endpoint de ACTUALIZAR por scraping y desde el cron de auto-update.
 // NO usa req/res. Recibe (user_id, body) con el MISMO shape del endpoint
 //   { development:{...}, dev_data:{...}, sectores:[...], unidades:[...], development_id? }
 // y devuelve { ok:true, status:200, development_id, sectores_guardados, unidades_guardadas,
-//   unidades_con_error, actualizado } o { ok:false, status, error, ... }.
+//   unidades_actualizadas, unidades_insertadas, unidades_eliminadas, unidades_sin_cambio,
+//   unidades_con_error, actualizado, origen } o { ok:false, status, error, ... }.
 // Si trae development_id (o development.id) => UPDATE del dev existente (verifica tenant)
-// + REEMPLAZO total de sectores/unidades. Sin id => INSERT nuevo. Comportamiento
-// identico al original (solo movido a funcion). Los errores esperables (tabla faltante,
-// dev ajeno) vuelven como { ok:false, status } en vez de tirar.
-async function guardarDesarrolladora(user_id, b) {
+// + MERGE de sectores/unidades por id/numero (Etapa 1: IDs ESTABLES). El 3er arg opcional
+// `opts.origen` ('manual'|'scraper', default 'manual') define si se puede BORRAR lo que ya no
+// viene y pisar `estado`: el SCRAPER nunca borra ni pisa estado, y con unidades=[] no toca nada.
+// Sin development_id => INSERT nuevo (unidades por chunks). Los errores esperables (tabla
+// faltante, dev ajeno) vuelven como { ok:false, status } en vez de tirar.
+async function guardarDesarrolladora(user_id, b, opts) {
+  // origen: 'manual' (form) => puede cambiar estado y BORRAR unidades que ya no vienen.
+  //         'scraper'        => NUNCA borra unidades y NUNCA pisa `estado`; unidades=[] no toca nada.
+  var origen = (opts && opts.origen === 'scraper') ? 'scraper' : 'manual';
   var dev = b.development || {};
   var devData = b.dev_data || {};
   var sectores = Array.isArray(b.sectores) ? b.sectores : [];
@@ -16036,13 +16169,19 @@ async function guardarDesarrolladora(user_id, b) {
   };
 
   // ¿Edicion? Si el body trae development_id => UPDATE del emprendimiento existente
-  // y reemplazo de sus sectores/unidades. Sin development_id => INSERT nuevo (comportamiento actual intacto).
+  // y MERGE de sus sectores/unidades. Sin development_id => INSERT nuevo.
   var devEditId = _invStr(b.development_id) || _invStr(dev.id);
   var esEdicion = !!devEditId;
   var development_id;
 
+  // Contadores (se completan segun la rama).
+  var sectoresOk = 0, unidadesOk = 0, unidadesErr = 0;
+  var unidadesActualizadas = 0, unidadesInsertadas = 0, unidadesEliminadas = 0, unidadesSinCambio = 0;
+
+  // ---------------------------------------------------------------------------
+  // 1) EMPRENDIMIENTO (developments): UPDATE si edicion, INSERT si alta nueva.
+  // ---------------------------------------------------------------------------
   if (esEdicion) {
-    // 1a) Tenant safety: el emprendimiento debe pertenecer al user del token.
     var dOwn = await supabase.from('developments').select('user_id').eq('id', devEditId).maybeSingle();
     if (dOwn.error) {
       if (_invTablaFaltante(dOwn.error)) return { ok: false, status: 503, error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' };
@@ -16051,17 +16190,10 @@ async function guardarDesarrolladora(user_id, b) {
     if (!dOwn.data) return { ok: false, status: 404, error: 'El emprendimiento a editar no existe', development_id: devEditId };
     if (dOwn.data.user_id !== user_id) return { ok: false, status: 403, error: 'El emprendimiento no pertenece a tu cuenta' };
 
-    // 1b) UPDATE del emprendimiento (no tocamos user_id: se mantiene el dueño original).
     var filaDevUpd = {
-      nombre: filaDev.nombre,
-      tipo: filaDev.tipo,
-      zona: filaDev.zona,
-      descripcion: filaDev.descripcion,
-      link: filaDev.link,
-      estado_obra: filaDev.estado_obra,
-      avance_pct: filaDev.avance_pct,
-      fecha_entrega: filaDev.fecha_entrega,
-      dev_data: filaDev.dev_data
+      nombre: filaDev.nombre, tipo: filaDev.tipo, zona: filaDev.zona,
+      descripcion: filaDev.descripcion, link: filaDev.link, estado_obra: filaDev.estado_obra,
+      avance_pct: filaDev.avance_pct, fecha_entrega: filaDev.fecha_entrega, dev_data: filaDev.dev_data
     };
     var dUpd = await supabase.from('developments').update(filaDevUpd).eq('id', devEditId).eq('user_id', user_id).select('id').maybeSingle();
     if (dUpd.error) {
@@ -16069,16 +16201,7 @@ async function guardarDesarrolladora(user_id, b) {
       return { ok: false, status: 500, error: 'Error actualizando el emprendimiento: ' + dUpd.error.message };
     }
     development_id = (dUpd.data && dUpd.data.id) || devEditId;
-
-    // 1c) Reemplazo: borramos sectores y unidades actuales para reescribir exactamente lo que mando el form/scraper.
-    var uDel = await supabase.from('development_units').delete().eq('development_id', development_id).eq('user_id', user_id);
-    if (uDel.error && _invTablaFaltante(uDel.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
-    if (uDel.error) return { ok: false, status: 500, error: 'Error limpiando unidades previas: ' + uDel.error.message, development_id: development_id };
-    var sDel = await supabase.from('development_sectors').delete().eq('development_id', development_id).eq('user_id', user_id);
-    if (sDel.error && _invTablaFaltante(sDel.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id };
-    if (sDel.error) return { ok: false, status: 500, error: 'Error limpiando sectores previos: ' + sDel.error.message, development_id: development_id };
   } else {
-    // 1) Emprendimiento -> developments (lo extra a dev_data jsonb)
     var dIns = await supabase.from('developments').insert(filaDev).select('id').maybeSingle();
     if (dIns.error) {
       if (_invTablaFaltante(dIns.error)) return { ok: false, status: 503, error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' };
@@ -16087,10 +16210,7 @@ async function guardarDesarrolladora(user_id, b) {
     development_id = dIns.data && dIns.data.id;
   }
 
-  // 1d) Columnas de auto-update v2 (source_url / auto_scrape / scrape_cada_horas) — BEST-EFFORT
-  //     y SEPARADO del write principal: si la migracion v2 no corrio todavia, la columna no existe
-  //     y este update falla con PGRST204; lo tragamos para NO romper el guardado normal.
-  //     Solo escribimos las claves que el front realmente mando (no pisamos con defaults).
+  // 1d) Columnas de auto-update v2 (source_url / auto_scrape / scrape_cada_horas) — BEST-EFFORT.
   var v2 = {};
   if (dev.source_url !== undefined) v2.source_url = _invStr(dev.source_url);
   if (dev.auto_scrape !== undefined) v2.auto_scrape = !!dev.auto_scrape;
@@ -16099,57 +16219,129 @@ async function guardarDesarrolladora(user_id, b) {
     try { await supabase.from('developments').update(v2).eq('id', development_id).eq('user_id', user_id); } catch (eV2) { /* columna ausente -> ignorar */ }
   }
 
-  // 2) Sectores -> development_sectors.
-  var sectorIds = [];
-  var sectoresOk = 0;
-  for (var s = 0; s < sectores.length; s++) {
-    var sec = sectores[s] || {};
-    if (!_invStr(sec.nombre)) { sectorIds.push(null); continue; }
-    var filaSec = {
-      development_id: development_id,
-      user_id: user_id,
-      nombre: _invStr(sec.nombre),
-      tipo: _invStr(sec.tipo),
-      fecha_entrega: _invStr(sec.fecha_entrega),
-      sector_data: {}
-    };
-    var sIns = await supabase.from('development_sectors').insert(filaSec).select('id').maybeSingle();
-    if (sIns.error) {
-      if (_invTablaFaltante(sIns.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id };
-      sectorIds.push(null);
-    } else { sectorIds.push(sIns.data && sIns.data.id); sectoresOk++; }
+  // ---------------------------------------------------------------------------
+  // 2) SECTORES (development_sectors)
+  //    Edicion => MERGE por id/nombre (scraper nunca borra). Alta => INSERT.
+  // ---------------------------------------------------------------------------
+  if (!esEdicion) {
+    for (var s = 0; s < sectores.length; s++) {
+      var sec = sectores[s] || {};
+      if (!_invStr(sec.nombre)) continue;
+      var sIns = await supabase.from('development_sectors').insert({
+        development_id: development_id, user_id: user_id,
+        nombre: _invStr(sec.nombre), tipo: _invStr(sec.tipo), fecha_entrega: _invStr(sec.fecha_entrega), sector_data: {}
+      }).select('id').maybeSingle();
+      if (sIns.error) {
+        if (_invTablaFaltante(sIns.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id };
+      } else sectoresOk++;
+    }
+  } else if (origen === 'scraper' && sectores.length === 0) {
+    console.log('[guardarDesarrolladora] scraper sin sectores para dev', development_id, '-> sectores INTACTOS');
+  } else {
+    var secEx = await _devCargarHijos('development_sectors', 'id, nombre', development_id, user_id);
+    if (secEx.error) {
+      if (_invTablaFaltante(secEx.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id };
+      return { ok: false, status: 500, error: 'Error leyendo sectores previos: ' + secEx.error.message, development_id: development_id };
+    }
+    var secRows = secEx.data || [];
+    var secById = {}, secByNom = {};
+    for (var si = 0; si < secRows.length; si++) { var sr = secRows[si]; secById[String(sr.id)] = sr; var snk = _devNumKey(sr.nombre); if (snk) { (secByNom[snk] = secByNom[snk] || []).push(sr); } }
+    var secConsumed = {};
+    for (var s2 = 0; s2 < sectores.length; s2++) {
+      var sc = sectores[s2] || {};
+      if (!_invStr(sc.nombre)) continue;
+      var secFields = { nombre: _invStr(sc.nombre), tipo: _invStr(sc.tipo), fecha_entrega: _invStr(sc.fecha_entrega) };
+      var secTarget = null;
+      var secIncId = _invStr(sc.id);
+      if (secIncId && secById[secIncId] && !secConsumed[secIncId]) secTarget = secById[secIncId];
+      if (!secTarget) { var snk2 = _devNumKey(sc.nombre); if (snk2 && secByNom[snk2]) { for (var sj = 0; sj < secByNom[snk2].length; sj++) { var scd = secByNom[snk2][sj]; if (!secConsumed[String(scd.id)]) { secTarget = scd; break; } } } }
+      if (secTarget) {
+        secConsumed[String(secTarget.id)] = true;
+        var su = await supabase.from('development_sectors').update(secFields).eq('id', secTarget.id).eq('user_id', user_id);
+        if (!su.error) sectoresOk++;
+      } else {
+        var scIns = await supabase.from('development_sectors').insert({ development_id: development_id, user_id: user_id, nombre: secFields.nombre, tipo: secFields.tipo, fecha_entrega: secFields.fecha_entrega, sector_data: {} }).select('id').maybeSingle();
+        if (scIns.error) { if (_invTablaFaltante(scIns.error)) return { ok: false, status: 503, error: 'La tabla development_sectors no existe todavia. Corré la migracion.', tabla: 'development_sectors', development_id: development_id }; }
+        else sectoresOk++;
+      }
+    }
+    // Borrar sectores no vistos SOLO en manual (el scraper NUNCA borra).
+    if (origen !== 'scraper') {
+      var secDel = [];
+      for (var si2 = 0; si2 < secRows.length; si2++) { if (!secConsumed[String(secRows[si2].id)]) secDel.push(secRows[si2].id); }
+      for (var sd = 0; sd < secDel.length; sd += 100) {
+        await supabase.from('development_sectors').delete().in('id', secDel.slice(sd, sd + 100)).eq('user_id', user_id);
+      }
+    }
   }
 
-  // 3) Unidades -> development_units (lo extra a unit_data jsonb)
-  var unidadesOk = 0, unidadesErr = 0;
-  for (var u = 0; u < unidades.length; u++) {
-    var un = unidades[u] || {};
-    var filaUn = {
-      development_id: development_id,
-      sector_id: null, // el form/scraper aun no liga unidad->sector (documentado en el resumen)
-      user_id: user_id,
-      tipo_producto: _invStr(un.tipo_producto),
-      numero: _invStr(un.numero),
-      tipologia: _invStr(un.tipologia),
-      m2_cubiertos: _invNum(un.m2_cubiertos),
-      m2_totales: _invNum(un.m2_totales),
-      superficie_terreno: _invNum(un.superficie_terreno),
-      frente: _invNum(un.frente),
-      fondo: _invNum(un.fondo),
-      orientacion: _invStr(un.orientacion),
-      piso: _invStr(un.piso),
-      precio: _invNum(un.precio),
-      precio_estado: _invStr(un.precio_estado) || 'a_consultar',
-      moneda: _invStr(un.moneda) || 'USD',
-      estado: _invStr(un.estado) || 'disponible',
-      unit_data: {},
-      images: []
-    };
-    var uIns = await supabase.from('development_units').insert(filaUn);
-    if (uIns.error) {
-      if (_invTablaFaltante(uIns.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
-      unidadesErr++;
-    } else unidadesOk++;
+  // ---------------------------------------------------------------------------
+  // 3) UNIDADES (development_units)
+  //    Edicion => MERGE por id/numero (IDs estables; scraper nunca borra ni pisa estado).
+  //    Alta => INSERT por CHUNKS. `unidades=[]` del scraper => NO toca unidades.
+  // ---------------------------------------------------------------------------
+  if (!esEdicion) {
+    var insertsNew = unidades.map(function (un) { return _devFilaUnidadInsert(un, development_id, user_id); });
+    for (var ci0 = 0; ci0 < insertsNew.length; ci0 += 100) {
+      var chunk0 = insertsNew.slice(ci0, ci0 + 100);
+      var ins0 = await supabase.from('development_units').insert(chunk0);
+      if (ins0.error) {
+        if (_invTablaFaltante(ins0.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
+        unidadesErr += chunk0.length;
+      } else { unidadesInsertadas += chunk0.length; unidadesOk += chunk0.length; }
+    }
+  } else if (origen === 'scraper' && unidades.length === 0) {
+    console.log('[guardarDesarrolladora] scraper devolvio unidades=[] para dev', development_id, '-> unidades INTACTAS (no se borra nada)');
+  } else {
+    var uEx = await _devCargarHijos('development_units', 'id, numero, estado, tipo_producto, tipologia, m2_cubiertos, m2_totales, superficie_terreno, frente, fondo, orientacion, piso, precio, precio_estado, moneda', development_id, user_id);
+    if (uEx.error) {
+      if (_invTablaFaltante(uEx.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
+      return { ok: false, status: 500, error: 'Error leyendo unidades previas: ' + uEx.error.message, development_id: development_id };
+    }
+    var uRows = uEx.data || [];
+    var uById = {}, uByNum = {};
+    for (var ui = 0; ui < uRows.length; ui++) { var ur = uRows[ui]; uById[String(ur.id)] = ur; var unk = _devNumKey(ur.numero); if (unk) { (uByNum[unk] = uByNum[unk] || []).push(ur); } }
+    var uConsumed = {};
+    var insertsU = [];
+    for (var u = 0; u < unidades.length; u++) {
+      var un = unidades[u] || {};
+      var target = null;
+      var incId = _invStr(un.id);
+      if (incId && uById[incId] && !uConsumed[incId]) target = uById[incId];
+      if (!target) { var unk2 = _devNumKey(un.numero); if (unk2 && uByNum[unk2]) { for (var uj = 0; uj < uByNum[unk2].length; uj++) { var uc = uByNum[unk2][uj]; if (!uConsumed[String(uc.id)]) { target = uc; break; } } } }
+      if (target) {
+        uConsumed[String(target.id)] = true;
+        var fields = _devFilaUnidadUpdate(un, origen);
+        if (!_devUnidadCambio(target, fields)) { unidadesSinCambio++; unidadesOk++; continue; }
+        var tocarTs = (origen !== 'scraper') && (String(target.estado || '') !== String(fields.estado || ''));
+        var ru = await _devUpdateUnidad(target.id, user_id, fields, tocarTs);
+        if (ru.error) {
+          if (_invTablaFaltante(ru.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
+          unidadesErr++;
+        } else { unidadesActualizadas++; unidadesOk++; }
+      } else {
+        insertsU.push(_devFilaUnidadInsert(un, development_id, user_id));
+      }
+    }
+    // INSERT de nuevas por CHUNKS (~100/req).
+    for (var ci = 0; ci < insertsU.length; ci += 100) {
+      var chunk = insertsU.slice(ci, ci + 100);
+      var ins = await supabase.from('development_units').insert(chunk);
+      if (ins.error) {
+        if (_invTablaFaltante(ins.error)) return { ok: false, status: 503, error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units', development_id: development_id };
+        unidadesErr += chunk.length;
+      } else { unidadesInsertadas += chunk.length; unidadesOk += chunk.length; }
+    }
+    // BORRAR las que ya no vienen SOLO en manual (el scraper NUNCA borra).
+    if (origen !== 'scraper') {
+      var uDelIds = [];
+      for (var ui2 = 0; ui2 < uRows.length; ui2++) { if (!uConsumed[String(uRows[ui2].id)]) uDelIds.push(uRows[ui2].id); }
+      for (var di = 0; di < uDelIds.length; di += 100) {
+        var slice = uDelIds.slice(di, di + 100);
+        var ddel = await supabase.from('development_units').delete().in('id', slice).eq('user_id', user_id);
+        if (!ddel.error) unidadesEliminadas += slice.length;
+      }
+    }
   }
 
   return {
@@ -16160,7 +16352,12 @@ async function guardarDesarrolladora(user_id, b) {
     sectores_guardados: sectoresOk,
     unidades_guardadas: unidadesOk,
     unidades_con_error: unidadesErr,
-    actualizado: esEdicion
+    unidades_actualizadas: unidadesActualizadas,
+    unidades_insertadas: unidadesInsertadas,
+    unidades_eliminadas: unidadesEliminadas,
+    unidades_sin_cambio: unidadesSinCambio,
+    actualizado: esEdicion,
+    origen: origen
   };
 }
 
@@ -16389,6 +16586,76 @@ app.post('/api/inventario/desarrollo/eliminar', async function (req, res) {
     }
 
     return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message });
+  }
+});
+
+// ---- POST /api/inventario/desarrollo/unidad-estado ------------------------
+// Etapa 1: cambiar el ESTADO de UNA unidad de desarrollo SIN re-guardar todo el
+// emprendimiento (evita la reescritura completa de unidades). Body:
+//   { development_id, unit_id, estado }  con estado ∈ disponible|reservado|vendido|bloqueado.
+// Auth con verificarUsuario + resolver DUENO por admin_id (patron estandar). Tenant safety:
+// el emprendimiento debe pertenecer al dueño y la unidad debe pertenecer a ese emprendimiento.
+// Setea development_units.estado + estado_updated_at (defensivo: si la columna aun no existe,
+// reintenta sin ella). Ruta PLANA (sin :param opcional) — Express 5.
+app.post('/api/inventario/desarrollo/unidad-estado', async function (req, res) {
+  try {
+    // 1) AUTH
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+
+    // 2) DUENO del tenant (asesor -> admin_id; dueño -> su propio uid).
+    var ownerId = uid;
+    try {
+      var ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+      if (ase && ase.data && ase.data.admin_id) ownerId = ase.data.admin_id;
+    } catch (e1) {}
+
+    // 3) BODY + validacion de enum.
+    var b = req.body || {};
+    var development_id = (b.development_id != null) ? String(b.development_id) : '';
+    var unit_id = (b.unit_id != null) ? String(b.unit_id) : '';
+    var estado = (b.estado != null) ? String(b.estado).trim().toLowerCase() : '';
+    if (!development_id) return res.status(400).json({ error: 'Falta development_id' });
+    if (!unit_id) return res.status(400).json({ error: 'Falta unit_id' });
+    var ESTADOS_OK = ['disponible', 'reservado', 'vendido', 'bloqueado'];
+    if (ESTADOS_OK.indexOf(estado) < 0) return res.status(400).json({ error: 'Estado invalido. Debe ser uno de: ' + ESTADOS_OK.join(', ') });
+
+    // 4) TENANT: el emprendimiento debe pertenecer al dueño.
+    var dOwn;
+    try {
+      dOwn = await supabase.from('developments').select('user_id').eq('id', development_id).maybeSingle();
+    } catch (eSel) {
+      return res.status(500).json({ error: 'Error verificando el emprendimiento' });
+    }
+    if (dOwn && dOwn.error) {
+      if (_invTablaFaltante(dOwn.error)) return res.status(503).json({ error: 'La tabla developments no existe todavia. Corré la migracion migracion-inventario-multirubro.sql.', tabla: 'developments' });
+      return res.status(500).json({ error: 'Error verificando el emprendimiento: ' + dOwn.error.message });
+    }
+    if (!dOwn || !dOwn.data) return res.status(404).json({ error: 'El emprendimiento no existe', development_id: development_id });
+    if (dOwn.data.user_id !== ownerId) return res.status(403).json({ error: 'El emprendimiento no pertenece a tu cuenta' });
+
+    // 5) UPDATE de la unidad (scoped por unit_id + development_id + user_id del dueño).
+    //    estado_updated_at defensivo: si la columna aun no existe (migracion E1 sin correr),
+    //    _devUpdateUnidad reintenta sin ella. Verificamos con .select para saber si matcheo.
+    var payload = { estado: estado, estado_updated_at: new Date().toISOString() };
+    var upd = await supabase.from('development_units')
+      .update(payload).eq('id', unit_id).eq('development_id', development_id).eq('user_id', ownerId).select('id');
+    if (upd.error && _invTablaFaltante(upd.error)) {
+      // Puede ser la tabla ausente O la columna estado_updated_at ausente -> reintentar solo estado.
+      var upd2 = await supabase.from('development_units')
+        .update({ estado: estado }).eq('id', unit_id).eq('development_id', development_id).eq('user_id', ownerId).select('id');
+      if (upd2.error) {
+        if (_invTablaFaltante(upd2.error)) return res.status(503).json({ error: 'La tabla development_units no existe todavia. Corré la migracion.', tabla: 'development_units' });
+        return res.status(500).json({ error: 'Error actualizando la unidad: ' + upd2.error.message });
+      }
+      if (!upd2.data || !upd2.data.length) return res.status(404).json({ error: 'La unidad no existe en este emprendimiento', unit_id: unit_id });
+      return res.json({ ok: true, unit_id: unit_id, estado: estado, estado_updated_at: false });
+    }
+    if (upd.error) return res.status(500).json({ error: 'Error actualizando la unidad: ' + upd.error.message });
+    if (!upd.data || !upd.data.length) return res.status(404).json({ error: 'La unidad no existe en este emprendimiento', unit_id: unit_id });
+    return res.json({ ok: true, unit_id: unit_id, estado: estado, estado_updated_at: true });
   } catch (e) {
     return res.status(500).json({ error: e && e.message });
   }

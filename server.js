@@ -20926,6 +20926,29 @@ async function _resolverCredMeta(canal, idCuenta) {
 // Reusa el patron del webhook de WhatsApp (contacto -> conversacion -> messages -> gates ->
 // generarRespuestaAgente) pero MAS SIMPLE: solo texto, sin debounce ni media (TODO mas abajo).
 // channel = 'messenger' | 'instagram'. senderId = PSID (Messenger) o IGSID (Instagram).
+// Resuelve el NOMBRE del remitente en Meta (Messenger/IG) desde su PSID/IGSID via Graph API. Best-effort: si falla
+// (permisos, red, cuenta sin nombre) devuelve null y se cae al ID como nombre (comportamiento previo). Messenger:
+// graph.facebook.com/{psid}?fields=first_name,last_name. Instagram: graph.instagram.com/{igsid}?fields=name,username.
+async function _nombreRemitenteMeta(canal, senderId, creds) {
+  try {
+    const token = creds && creds.page_access_token;
+    if (!token || !senderId) return null;
+    let url;
+    if (canal === 'instagram') {
+      url = 'https://graph.instagram.com/' + encodeURIComponent(String(senderId)) + '?fields=name,username&access_token=' + encodeURIComponent(token);
+    } else {
+      url = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/' + encodeURIComponent(String(senderId)) + '?fields=first_name,last_name,name&access_token=' + encodeURIComponent(token);
+    }
+    const r = await fetch(url);
+    const j = await r.json().catch(function () { return null; });
+    if (!r.ok || !j) return null;
+    const nombre = (j.name && String(j.name).trim())
+      || [j.first_name, j.last_name].filter(Boolean).join(' ').trim()
+      || (j.username ? ('@' + j.username) : '');
+    return nombre ? String(nombre).slice(0, 120) : null;
+  } catch (e) { return null; }
+}
+
 async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) {
   try {
     if (!tenantUserId || !senderId || !texto) return;
@@ -20936,11 +20959,16 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     //    El set de columnas de la conv existente es el MISMO que leia este webhook ('id, ai_enabled, status,
     //    asesor_id'); Meta no usa convExistente mas abajo (solo conv). ETAPA 6: con reparto_v2 ON no se asigna
     //    asesor al crear; con flag OFF -> EAGER (elegirAsesorActivo). Misma logica defensiva que antes.
-    const _ocrearMeta = await obtenerOcrearConvDeCanal(tenantUserId, String(senderId), canal, String(senderId), 'id, ai_enabled, status, asesor_id');
+    // Resolver el NOMBRE real del remitente (antes se guardaba el PSID/IGSID como nombre -> aparecia un codigo).
+    const _nombreMeta = await _nombreRemitenteMeta(canal, senderId, creds);
+    const _ocrearMeta = await obtenerOcrearConvDeCanal(tenantUserId, String(senderId), canal, (_nombreMeta || String(senderId)), 'id, ai_enabled, status, asesor_id');
     let contacto = _ocrearMeta.contacto;
     if (!contacto) return;
     let conv = _ocrearMeta.conv;
     if (!conv) return;
+    // Si resolvimos un nombre real y el contacto todavia tiene el ID como nombre (o vacio), actualizarlo. Solo pisa
+    // cuando el nombre actual == el PSID/IGSID -> nunca piso un nombre que un humano haya editado a mano.
+    if (_nombreMeta) { try { await supabase.from('contacts').update({ name: _nombreMeta }).eq('id', contacto.id).or('name.is.null,name.eq.' + String(senderId)); } catch (eNom) {} }
 
     // ===== GATE TEMPRANO (mismas columnas que el webhook WA, sin alterarlas) =====
     let _bsGate = null;

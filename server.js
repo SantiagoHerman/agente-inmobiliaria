@@ -21085,12 +21085,6 @@ app.post('/api/webhook/meta', function(req, res) {
             // Soportamos AMBAS formas para robustez (Meta envia messaging[] para DMs de IG).
             const cambios = Array.isArray(entry.changes) ? entry.changes : [];
             const igUserId = entry.id; // en IG, entry.id es el ig_user_id de la cuenta
-            // [IGDEBUG TEMPORAL 2026-07-12 — QUITAR tras diagnosticar] loguea el ID real que manda Meta + si matchea credencial + si la firma valida.
-            try {
-              const _dbgCred = await _resolverCredMeta('instagram', igUserId);
-              const _dbgFirma = _metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], [_dbgCred && _dbgCred.app_secret, process.env.META_IG_APP_SECRET]);
-              console.log('[IGDEBUG] entry.id=' + igUserId + ' cred=' + (!!_dbgCred) + ' firma_ok=' + _dbgFirma + ' messaging=' + Array.isArray(entry.messaging) + ' changes=' + Array.isArray(entry.changes) + ' ig_secret_env=' + (!!process.env.META_IG_APP_SECRET));
-            } catch (_edbg) { console.log('[IGDEBUG] entry.id=' + igUserId + ' ERR=' + (_edbg && _edbg.message)); }
             // a) formato messaging[] (DMs de Instagram, igual estructura que Messenger)
             const mensajesIg = Array.isArray(entry.messaging) ? entry.messaging : [];
             for (let m = 0; m < mensajesIg.length; m++) {

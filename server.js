@@ -21296,6 +21296,16 @@ const META_OAUTH_SCOPES = 'pages_show_list,pages_messaging,pages_manage_metadata
 const META_LOGIN_CONFIG_ID = process.env.META_LOGIN_CONFIG_ID || '1814526292646301';
 function _metaOauthConfigurado() { return !!(META_APP_ID && META_APP_SECRET); }
 
+// --- INSTAGRAM (flujo "Instagram API con inicio de sesion de Instagram") ---
+// IG usa una APP DE INSTAGRAM SEPARADA (Raices-IG, id 1003865422423472) con su PROPIA clave secreta. El OAuth de IG
+// es distinto al de Facebook: authorize en www.instagram.com/oauth/authorize, token en api.instagram.com/oauth/access_token,
+// long-lived en graph.instagram.com/access_token. La redirect URL (…/api/meta/ig/oauth/callback) ya esta cargada en Meta.
+// GATEADO por META_IG_APP_SECRET (el id tiene default). Sin el secret -> 503, el boton del front no arranca nada.
+const META_IG_APP_ID = process.env.META_IG_APP_ID || '1003865422423472';
+const META_IG_OAUTH_REDIRECT = process.env.META_IG_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta/ig/oauth/callback');
+const META_IG_OAUTH_SCOPES = 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments';
+function _igOauthConfigurado() { return !!(META_IG_APP_ID && process.env.META_IG_APP_SECRET); }
+
 // GET /api/meta/oauth/start — arranca el OAuth (redirige a Meta). Auth por JWT (?token= o Bearer).
 // El user_id va firmado en el `state` (CSRF + identidad), no hay tabla intermedia.
 app.get('/api/meta/oauth/start', async function(req, res) {
@@ -21393,6 +21403,75 @@ app.get('/api/meta/oauth/callback', async function(req, res) {
     const aviso = (paginas.length > 1) ? (' Se conecto "' + (pagina.name || pagina.id) + '". Tenes ' + paginas.length + ' Paginas; si queres otra, reconectá.') : (' Pagina conectada: ' + (pagina.name || pagina.id) + '.');
     return res.status(200).send(_oauthCierreHtml('Messenger conectado', 'Activala desde Integraciones para empezar a responder.' + aviso, true));
   } catch (e) { console.error('GET /api/meta/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Messenger.', false)); }
+});
+
+// ============================================================================
+// INSTAGRAM OAUTH (conectar la cuenta de Instagram del cliente — flujo Instagram Login)
+// Espeja el de Messenger pero contra la app de Instagram (id/secret propios) y los endpoints de Instagram.
+// El webhook /api/webhook/meta ya enruta los DMs por ig_user_id y valida la firma con META_IG_APP_SECRET.
+// ============================================================================
+app.get('/api/meta/ig/oauth/start', async function(req, res) {
+  try {
+    if (!_igOauthConfigurado()) return res.status(503).json({ error: 'Instagram OAuth no configurado (falta META_IG_APP_SECRET).' });
+    let uid = await verificarUsuario(req);
+    if (!uid && req.query.token) { try { const { data } = await supabase.auth.getUser(String(req.query.token)); if (data && data.user) uid = data.user.id; } catch (e) {} }
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const state = _oauthStateFirmar(uid, 'ig');
+    if (!state) return res.status(500).json({ error: 'No se pudo iniciar el flujo' });
+    const url = 'https://www.instagram.com/oauth/authorize' +
+      '?client_id=' + encodeURIComponent(META_IG_APP_ID) +
+      '&redirect_uri=' + encodeURIComponent(META_IG_OAUTH_REDIRECT) +
+      '&response_type=code' +
+      '&scope=' + encodeURIComponent(META_IG_OAUTH_SCOPES) +
+      '&state=' + encodeURIComponent(state);
+    return res.redirect(url);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.get('/api/meta/ig/oauth/estado', async function(req, res) {
+  try { return res.json({ ok: true, disponible: _igOauthConfigurado() }); } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.get('/api/meta/ig/oauth/callback', async function(req, res) {
+  try {
+    if (!_igOauthConfigurado()) return res.status(503).send(_oauthCierreHtml('Instagram no configurado', 'Falta la clave secreta de la app de Instagram.', false));
+    if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a Instagram.', false));
+    const code = req.query.code ? String(req.query.code) : '';
+    const uid = _oauthStateLeer(req.query.state, 'ig');
+    if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido de conexion vencio o no es valido. Reintentá desde Raices CRM.', false));
+
+    // 1) code -> short-lived IG access token (POST form-urlencoded a api.instagram.com). Devuelve access_token + user_id.
+    const _igBody = new URLSearchParams({ client_id: META_IG_APP_ID, client_secret: String(process.env.META_IG_APP_SECRET || ''), grant_type: 'authorization_code', redirect_uri: META_IG_OAUTH_REDIRECT, code: code });
+    const tr = await fetch('https://api.instagram.com/oauth/access_token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: _igBody.toString() });
+    const tj = await tr.json().catch(function(){ return null; });
+    if (!tr.ok || !tj || !tj.access_token || !tj.user_id) { console.error('ig oauth token:', JSON.stringify(tj).slice(0, 300)); return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'Instagram no devolvio un token de acceso. Reintentá.', false)); }
+    let igToken = tj.access_token;
+    const igUserId = String(tj.user_id);
+
+    // 2) (best-effort) intercambiar a long-lived token (60 dias).
+    try {
+      const llUrl = 'https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=' + encodeURIComponent(String(process.env.META_IG_APP_SECRET || '')) + '&access_token=' + encodeURIComponent(igToken);
+      const lr = await fetch(llUrl); const lj = await lr.json().catch(function(){ return null; });
+      if (lr.ok && lj && lj.access_token) igToken = lj.access_token;
+    } catch (e) {}
+
+    // 3) Guardar en messenger_credentials (canal='instagram'). El webhook enruta por ig_user_id y valida la firma con
+    //    META_IG_APP_SECRET (env). activo=false: el cliente lo activa desde Integraciones (no auto-encender).
+    const fila = { user_id: uid, canal: 'instagram', ig_user_id: igUserId, page_access_token: String(igToken), app_secret: String(process.env.META_IG_APP_SECRET || ''), activo: false };
+    try {
+      const { data: existe } = await supabase.from('messenger_credentials').select('id, activo').eq('user_id', uid).eq('canal', 'instagram').maybeSingle();
+      if (existe) {
+        if (typeof existe.activo === 'boolean') fila.activo = existe.activo;
+        const { error } = await supabase.from('messenger_credentials').update(fila).eq('id', existe.id);
+        if (error) { console.error('ig oauth save update:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+      } else {
+        const { error } = await supabase.from('messenger_credentials').insert(fila);
+        if (error) { console.error('ig oauth save insert:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+      }
+    } catch (e) { console.error('ig oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
+
+    return res.status(200).send(_oauthCierreHtml('Instagram conectado', 'Activalo desde Integraciones para empezar a responder los DMs.', true));
+  } catch (e) { console.error('GET /api/meta/ig/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Instagram.', false)); }
 });
 
 // ============================================================================

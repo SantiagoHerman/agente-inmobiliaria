@@ -16824,6 +16824,22 @@ app.post('/api/hotel/reservas/:id/editar', async function (req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ---- GET /api/hotel/reservas/:id/pagos --------------------------------------
+// Lista los pagos de una reserva (para el detalle de la UI F3). Acotado a ownerId
+// (no expone otras cuentas). Sin gate (solo lectura). DEFENSIVO: si la tabla
+// hotel_pagos no existe todavia -> lista vacia (no rompe). Ruta PLANA (:id obligatorio).
+app.get('/api/hotel/reservas/:id/pagos', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+    var id = req.params.id;
+    var r = await supabase.from('hotel_pagos').select('*').eq('user_id', ownerId).eq('reservation_id', id).order('created_at', { ascending: true }).limit(500);
+    if (r.error) { if (_invTablaFaltante(r.error)) return res.json({ ok: true, pagos: [] }); return res.status(500).json({ error: r.error.message }); }
+    return res.json({ ok: true, pagos: r.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // ===== SCRAPER CORREGIDO: extraccion completa por propiedad =====
 // M20: alias de limpiarHTML (mismo set de entidades, unico implementador). Se mantiene el nombre por compat
 // con todos los callers existentes (no se tocan). Antes era una copia byte-identica del set completo.
@@ -19584,8 +19600,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _bs = await supabase.from('business_settings').select('ui_moderno, reparto_v2, rubro').eq('user_id', user_id).maybeSingle();
       if (_bs && _bs.data) { ui_moderno = _bs.data.ui_moderno === true; reparto_v2 = _bs.data.reparto_v2 === true; if (_bs.data.rubro) rubro = normalizarRubro(_bs.data.rubro); }
     } catch (e) { /* columna ausente / error -> false (fail-open) */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro });
-  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria' }); }
+    // reservas_v1 (gate maestro del vertical hotel): query SEPARADA y defensiva para que, si la columna faltara,
+    // NO tire abajo los flags de arriba. Ausente/error -> false (comportamiento actual).
+    var reservas_v1 = false;
+    try {
+      var _rv = await supabase.from('business_settings').select('reservas_v1').eq('user_id', user_id).maybeSingle();
+      if (_rv && _rv.data) reservas_v1 = _rv.data.reservas_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1 });
+  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false }); }
 });
 
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.

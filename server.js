@@ -9776,14 +9776,14 @@ async function _enviarRecontactosV2(ahoraMs) {
     try {
       const r = await supabase
         .from('business_settings')
-        .select('user_id, horario_oficina, recontacto_horario, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+        .select('user_id, rubro, horario_oficina, recontacto_horario, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
         .eq('recontacto_v2', true);
       if (r.error) throw r.error;
       cuentasV2 = Array.isArray(r.data) ? r.data : [];
     } catch (eRH) {
       const { data: cc } = await supabase
         .from('business_settings')
-        .select('user_id, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+        .select('user_id, rubro, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
         .eq('recontacto_v2', true);
       cuentasV2 = Array.isArray(cc) ? cc : [];
     }
@@ -9793,6 +9793,9 @@ async function _enviarRecontactosV2(ahoraMs) {
   for (const bs of cuentasV2) {
     try {
       const uid = bs.user_id;
+      // F5.1: SOLO las cuentas rubro hotel aplican la regla de fecha de estadia sobre el recontacto
+      // (priorizar antes de la fecha de ingreso; no recontactar si ya paso). El resto queda EXACTO.
+      const _esHotelCuenta = normalizarRubro(bs.rubro) === 'hotel_cabanas';
       // PAUSAS de cuenta (mismas reglas que legacy + pausa propia de recontacto)
       if (_pausaGlobal === true || bs.crm_pausado === true || bs.agente_pausado === true || bs.eliminado_at) continue;
       if (bs.recontacto_pausado === true) continue;
@@ -9846,12 +9849,25 @@ async function _enviarRecontactosV2(ahoraMs) {
       const subcupoFriosDia = Math.max(0, Math.floor(topeDiarioBase * Math.max(0, Math.min(100, subPct)) / 100));
 
       // --- Candidatas de esta cuenta en estado recontacto ---
-      const { data: convs } = await supabase
-        .from('conversations')
-        // recontacto_congelado (R1, gated): humano congelo la conv -> el motor v2 tampoco debe recontactarla.
-        .select('id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido, recontacto_congelado')
-        .eq('user_id', uid)
-        .eq('status', 'recontacto');
+      // recontacto_congelado (R1, gated): humano congelo la conv -> el motor v2 tampoco debe recontactarla.
+      const _selConvsBase = 'id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido, recontacto_congelado';
+      let convs = null;
+      if (_esHotelCuenta) {
+        // F5.1 (solo hotel): tambien necesitamos cal_fecha_ingreso para la regla de fecha. DEFENSIVO: si la
+        // columna no existe todavia (migracion no corrida), el select falla y caemos al select base -> sin
+        // regla de fecha = comportamiento ACTUAL EXACTO (nunca rompe).
+        try {
+          const rh = await supabase.from('conversations').select(_selConvsBase + ', cal_fecha_ingreso').eq('user_id', uid).eq('status', 'recontacto');
+          if (rh.error) throw rh.error;
+          convs = rh.data;
+        } catch (eCalSel) {
+          const { data: cbase } = await supabase.from('conversations').select(_selConvsBase).eq('user_id', uid).eq('status', 'recontacto');
+          convs = cbase;
+        }
+      } else {
+        const { data: cbase } = await supabase.from('conversations').select(_selConvsBase).eq('user_id', uid).eq('status', 'recontacto');
+        convs = cbase;
+      }
       if (!convs || convs.length === 0) continue;
       // R1 (gated, default OFF): resolver el flag reglas_v2 UNA vez por cuenta v2 (la cuenta ya esta cargada aca).
       const _reglasOnCuenta = await _reglasRecontactoV2(uid);
@@ -9888,7 +9904,23 @@ async function _enviarRecontactosV2(ahoraMs) {
         return Number.isFinite(_t) ? _t : 0;
       };
       const _prioCat = function(c) { return ((c.recontacto_categoria === 'viejo') ? 0 : 1); }; // viejo antes que frio
+      // F5.1 (SOLO hotel): fecha de ingreso FUTURA -> prioridad ALTA, cuanto MAS CERCA antes se ofrece (para
+      // llegar ANTES de esa fecha). Devuelve el timestamp de la fecha de ingreso si es futura; null si no aplica
+      // (no-hotel, sin fecha, o fecha ya pasada -> ademas se saltea en el loop de abajo). En no-hotel devuelve
+      // SIEMPRE null => el orden queda EXACTO como hoy.
+      const _fechaIngresoMs = function(c) {
+        if (!_esHotelCuenta || !c || !c.cal_fecha_ingreso) return null;
+        const _s = String(c.cal_fecha_ingreso).slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(_s) || _s < hoyStr) return null; // pasada o invalida: no prioriza
+        const _t = new Date(_s + 'T00:00:00.000Z').getTime();
+        return Number.isFinite(_t) ? _t : null;
+      };
       convs.sort(function(a, b) {
+        // 0) HOTEL: fecha de ingreso futura primero (mas cercana antes). Las que no tienen fecha futura van despues.
+        const _fa = _fechaIngresoMs(a), _fb = _fechaIngresoMs(b);
+        if (_fa !== null && _fb !== null) { if (_fa !== _fb) return _fa - _fb; }
+        else if (_fa !== null) return -1;
+        else if (_fb !== null) return 1;
         const _pa = _prioCat(a), _pb = _prioCat(b);
         if (_pa !== _pb) return _pa - _pb;                // 1) categoria: viejo (0) antes que frio (1)
         return _dueSinceMs(a) - _dueSinceMs(b);           // 2) oldest-due-first (menor timestamp primero)
@@ -9916,6 +9948,13 @@ async function _enviarRecontactosV2(ahoraMs) {
         if (_reglasOnCuenta && conv.recontacto_congelado === true) continue;
         // Exclusiones / pausas por conversacion
         if (conv.recontacto_excluido === true || conv.recontacto_pausado_lead === true) continue;
+        // F5.1 (SOLO hotel): si la fecha de ingreso YA PASO -> NO recontactar (regla explicita de Diego: no
+        // preguntar despues de la fecha si consiguio). La conv sigue en 'recontacto' (no 'cerrado'), asi que
+        // no la cerramos: solo la saltamos. En no-hotel _esHotelCuenta=false => nunca aplica (comportamiento actual).
+        if (_esHotelCuenta && conv.cal_fecha_ingreso) {
+          const _fiStr = String(conv.cal_fecha_ingreso).slice(0, 10);
+          if (/^\d{4}-\d{2}-\d{2}$/.test(_fiStr) && _fiStr < hoyStr) continue;
+        }
         // Maximo de recontactos por conversacion. Al AGOTARLO (decision del dueno): en vez de dejar el lead
         // colgado en 'recontacto' (recontactado en vano cada dia), CERRAR la conversacion (status='cerrado')
         // para que el motor deje de recontactarlo. Si el lead VUELVE A ESCRIBIR, el webhook la reactiva con la
@@ -10401,6 +10440,10 @@ setTimeout(enviarAvisosTareas, 80 * 1000);
 // Backup automatico cada 30 minutos (foto completa de todos los datos por user)
 setInterval(hacerBackup, 30 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
+// F5.2: mensajes automaticos de estadia (HOTEL + reservas_v1). Cada 30 min + una corrida ~100s tras arrancar.
+// INERTE si ninguna cuenta tiene reservas_v1 ON (el cron consulta y sale). 0 IA / 0 tokens (plantillas fijas).
+setInterval(enviarAvisosEstadia, 30 * 60 * 1000);
+setTimeout(enviarAvisosEstadia, 100 * 1000);
 
 // WATCHDOG WhatsApp/Evolution (FASE 1: monitor+alerta). GATEADO OFF: el interval SOLO se
 // registra si WATCHDOG_ENABLED === 'true'. Con el flag apagado (default) no corre nada ->
@@ -16634,6 +16677,9 @@ app.post('/api/hotel/reservas/crear', async function (req, res) {
     if (status === 'confirmed' && !_esBloqueoManual) {
       var citaId = await _hrCrearCitaEspejo(ownerId, reserva);
       if (citaId) { try { await supabase.from('hotel_reservas').update({ cita_id: citaId, updated_at: new Date().toISOString() }).eq('id', reserva.id); reserva.cita_id = citaId; } catch (eCi) {} }
+      // F5.2: aviso de estadia "confirmacion" inmediato (best-effort, no bloquea la respuesta). Gateado
+      // reservas_v1 + rubro hotel dentro del helper; idempotente por avisos.confirmacion.
+      try { _estadiaConfirmacionInline(ownerId, reserva.id).catch(function () {}); } catch (eEc) {}
     }
     return res.json({ ok: true, reserva: reserva });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
@@ -16689,6 +16735,8 @@ app.post('/api/hotel/reservas/:id/estado', async function (req, res) {
       try { await cancelarTareasDeEvento(ownerId, reserva.cita_id); } catch (eT) {}
       try { await supabase.from('citas').update({ estado: 'cancelada', actualizado_en: new Date().toISOString() }).eq('id', reserva.cita_id).eq('user_id', ownerId); } catch (eCc) {}
     }
+    // F5.2: al confirmar, aviso de estadia "confirmacion" inmediato (best-effort, no bloquea la respuesta).
+    if (nuevo === 'confirmed') { try { _estadiaConfirmacionInline(ownerId, reserva.id).catch(function () {}); } catch (eEc) {} }
     return res.json({ ok: true, reserva: wr.data });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -16748,6 +16796,8 @@ app.post('/api/hotel/reservas/:id/pago', async function (req, res) {
         if (citaIdNueva) updC.cita_id = citaIdNueva;
         try { await supabase.from('hotel_reservas').update(updC).eq('id', reserva.id).eq('user_id', ownerId); confirmada = true; } catch (eUc) {}
         if (confirmada && reserva.conversation_id) { try { await supabase.from('conversations').update({ etapa_reserva: 'confirmed' }).eq('id', reserva.conversation_id).eq('user_id', ownerId); } catch (eE) {} }
+        // F5.2: sena recibida = confirmada -> aviso de estadia "confirmacion" inmediato (best-effort).
+        if (confirmada) { try { _estadiaConfirmacionInline(ownerId, reserva.id).catch(function () {}); } catch (eEc) {} }
       }
     }
     return res.json({ ok: true, pago: ip.data, montos: montos, confirmada: confirmada, cita_id: citaIdNueva, aviso: avisoSolape });
@@ -16854,6 +16904,223 @@ app.get('/api/hotel/reservas/:id/pagos', async function (req, res) {
     return res.json({ ok: true, pagos: r.data || [] });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+
+// ============================================================================
+// F5.2 — MENSAJES AUTOMATICOS DE ESTADIA (vertical HOTEL). 0 IA / 0 tokens:
+// plantillas fijas + cron. GATEADO por reservas_v1 y SOLO rubro hotel_cabanas.
+// Idempotente por hotel_reservas.avisos (jsonb): cada tipo se marca al enviarse
+// para no repetir. Guard de conexion Evolution por cuenta (no envia si el
+// WhatsApp del cliente esta caido -> reintenta cuando reconecta). DEFENSIVO: si
+// faltan las columnas avisos/estadia_config o la tabla, NO rompe y NO spamea
+// (claim-before-send: si no puede MARCAR el aviso, tampoco lo ENVIA).
+// NO cambia el comportamiento de inmobiliaria/desarrolladora ni de hoteles con
+// reservas_v1 OFF (el cron los saltea; la config solo se muestra en esas cuentas).
+// ----------------------------------------------------------------------------
+
+// Tipos de aviso de estadia (orden del ciclo) y sus DEFAULTS (editables por cuenta
+// en Configuracion -> Estadia). Placeholders: {huesped} {alojamiento} {checkin}
+// {checkout} {noches} {empresa} {resena_link}.
+var _ESTADIA_TIPOS = ['confirmacion', 'pre_checkin', 'bienvenida', 'checkout_recordatorio', 'post_checkout'];
+var _ESTADIA_DEFAULTS = {
+  confirmacion:          { on: true,          texto: 'Hola {huesped}! Confirmamos tu reserva en {alojamiento} del {checkin} al {checkout} ({noches}). Te esperamos! Cualquier cosa que necesites, escribinos por aca. - {empresa}' },
+  pre_checkin:           { on: true, dias: 1, texto: 'Hola {huesped}! Te escribimos de {empresa}. Se acerca tu llegada a {alojamiento} el {checkin}. El check-in es a partir de las 14 hs. Si necesitas indicaciones para llegar o coordinar el horario, avisanos. Buen viaje!' },
+  bienvenida:            { on: true,          texto: 'Bienvenido/a {huesped}! Hoy comienza tu estadia en {alojamiento}. Que la disfrutes muchisimo. Estamos a disposicion para lo que necesites. - {empresa}' },
+  checkout_recordatorio: { on: true,          texto: 'Hola {huesped}! Te recordamos que manana es tu check-out de {alojamiento}, hasta las 10 hs. Fue un gusto tenerte. Si necesitas coordinar el horario de salida, avisanos. - {empresa}' },
+  post_checkout:         { on: true,          texto: 'Gracias por elegirnos, {huesped}! Esperamos que hayas disfrutado tu estadia en {alojamiento}. Si nos dejas tu opinion nos ayudas un monton: {resena_link} Te esperamos de nuevo! - {empresa}' }
+};
+
+// Merge de la config guardada (jsonb) con los defaults. NUNCA rompe: si es null/invalida usa defaults.
+// Cada tipo: on (default true salvo false explicito) + texto (default si vacio). pre_checkin.dias 0..30.
+function _estadiaConfigMerge(raw) {
+  var cfg = (raw && typeof raw === 'object') ? raw : {};
+  var out = {};
+  _ESTADIA_TIPOS.forEach(function (k) {
+    var d = _ESTADIA_DEFAULTS[k], c = (cfg[k] && typeof cfg[k] === 'object') ? cfg[k] : {};
+    out[k] = {
+      on: (c.on === false) ? false : true,
+      texto: (typeof c.texto === 'string' && c.texto.trim()) ? c.texto : d.texto
+    };
+    if (k === 'pre_checkin') {
+      var nd = Number(c.dias);
+      out[k].dias = (Number.isFinite(nd) && nd >= 0 && nd <= 30) ? Math.floor(nd) : d.dias;
+    }
+  });
+  out.resena_link = (typeof cfg.resena_link === 'string') ? cfg.resena_link.slice(0, 500) : '';
+  return out;
+}
+
+// Hoy 'YYYY-MM-DD' en huso Argentina (mismo criterio que los demas crons).
+function _estadiaHoyStr() {
+  var a = new Date(); var u = a.getTime() + a.getTimezoneOffset() * 60000; var arg = new Date(u - 3 * 60 * 60000); return arg.toISOString().slice(0, 10);
+}
+// Suma dias a una fecha 'YYYY-MM-DD' (UTC puro, sin corrimiento de TZ). null si invalida.
+function _estadiaAddDias(fechaStr, dias) {
+  var s = String(fechaStr || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  var d = new Date(s + 'T00:00:00.000Z'); d.setUTCDate(d.getUTCDate() + (Number(dias) || 0));
+  return d.toISOString().slice(0, 10);
+}
+function _estadiaFmtDDMM(fechaStr) {
+  var s = String(fechaStr || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  return s.slice(8, 10) + '/' + s.slice(5, 7);
+}
+// Reemplaza los placeholders de una plantilla con los datos de la reserva.
+function _estadiaTexto(plantilla, ctx) {
+  var noches = '';
+  try {
+    var ci = new Date(String(ctx.check_in).slice(0, 10) + 'T00:00:00.000Z').getTime();
+    var co = new Date(String(ctx.check_out).slice(0, 10) + 'T00:00:00.000Z').getTime();
+    if (isFinite(ci) && isFinite(co) && co > ci) { var n = Math.round((co - ci) / 86400000); noches = n + (n === 1 ? ' noche' : ' noches'); }
+  } catch (eN) {}
+  return String(plantilla || '')
+    .replace(/\{huesped\}/g, ctx.huesped || 'Hola')
+    .replace(/\{alojamiento\}/g, ctx.alojamiento || 'tu alojamiento')
+    .replace(/\{checkin\}/g, _estadiaFmtDDMM(ctx.check_in))
+    .replace(/\{checkout\}/g, _estadiaFmtDDMM(ctx.check_out))
+    .replace(/\{noches\}/g, noches)
+    .replace(/\{empresa\}/g, ctx.empresa || '')
+    .replace(/\{resena_link\}/g, ctx.resena_link || '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+// Procesa UNA reserva: calcula que avisos corresponden HOY y los envia. Idempotente por reserva.avisos.
+// claim-before-send: MARCA en avisos ANTES de enviar; si no puede marcar (columna ausente/error) NO envia
+// (evita spam cuando la migracion no corrio). tiposPermitidos: subconjunto de _ESTADIA_TIPOS (null = todos).
+// Requiere que la instancia YA este verificada conectada por el caller. Devuelve la cantidad enviada.
+async function _estadiaProcesarReserva(ownerId, reserva, config, empresa, instancia, tiposPermitidos) {
+  try {
+    if (!reserva || !reserva.id) return 0;
+    var hoy = _estadiaHoyStr();
+    var st = reserva.status;
+    var avisos = (reserva.avisos && typeof reserva.avisos === 'object') ? reserva.avisos : {};
+    var permit = Array.isArray(tiposPermitidos) ? tiposPermitidos : _ESTADIA_TIPOS;
+    var ci = String(reserva.check_in || '').slice(0, 10);
+    var co = String(reserva.check_out || '').slice(0, 10);
+    function pend(tipo) { return permit.indexOf(tipo) >= 0 && config[tipo] && config[tipo].on !== false && !avisos[tipo]; }
+    var due = [];
+    // confirmacion: confirmada y AUN NO llego el huesped (check_in hoy o futuro). El guard ci>=hoy evita mandar
+    // "confirmamos tu reserva" a estadias ya en curso o pasadas (anti-spam si se activa reservas_v1 sobre una
+    // cuenta con reservas viejas ya cargadas).
+    if (pend('confirmacion') && st === 'confirmed' && ci && ci >= hoy) due.push('confirmacion');
+    // pre_checkin: ventana [check_in - N dias, check_in). N configurable (default 1).
+    if (pend('pre_checkin') && (st === 'confirmed' || st === 'checked_in')) {
+      var nd = (config.pre_checkin && Number.isFinite(Number(config.pre_checkin.dias))) ? Math.floor(Number(config.pre_checkin.dias)) : 1;
+      var desde = _estadiaAddDias(ci, -Math.max(0, nd));
+      if (desde && hoy >= desde && hoy < ci) due.push('pre_checkin');
+    }
+    // bienvenida: el dia del check_in.
+    if (pend('bienvenida') && (st === 'confirmed' || st === 'checked_in') && ci && hoy === ci) due.push('bienvenida');
+    // checkout_recordatorio: el dia anterior al check_out.
+    if (pend('checkout_recordatorio') && (st === 'confirmed' || st === 'checked_in') && co && hoy === _estadiaAddDias(co, -1)) due.push('checkout_recordatorio');
+    // post_checkout: el dia del check_out o despues.
+    if (pend('post_checkout') && (st === 'confirmed' || st === 'checked_in' || st === 'checked_out') && co && hoy >= co) due.push('post_checkout');
+    if (!due.length) return 0;
+    // Huesped (nombre/telefono). Sin telefono no hay a quien enviar (ej. bloqueo manual sin contacto).
+    var huesped = null, telefono = null;
+    if (reserva.contact_id) { try { var cRow = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', reserva.contact_id).maybeSingle(); if (cRow && cRow.data) { huesped = cRow.data.nombre_manual || cRow.data.name || null; telefono = cRow.data.phone || null; } } catch (eC) {} }
+    if (!telefono) return 0;
+    var alojamiento = null;
+    if (reserva.unit_id) { try { var uRow = await supabase.from('hotel_unidades').select('title, numero').eq('id', reserva.unit_id).maybeSingle(); if (uRow && uRow.data) alojamiento = uRow.data.title || uRow.data.numero || null; } catch (eU) {} }
+    // CLAIM: marcar TODOS los due ANTES de enviar. Si el update falla (columna avisos ausente) -> NO enviar
+    // (best-effort anti-spam). Si funciona, aunque un envio puntual falle, no se reintentara (best-effort).
+    var ahora = new Date().toISOString();
+    var nuevos = Object.assign({}, avisos);
+    due.forEach(function (tp) { nuevos[tp] = ahora; });
+    try {
+      var wr = await supabase.from('hotel_reservas').update({ avisos: nuevos, updated_at: ahora }).eq('id', reserva.id).eq('user_id', ownerId);
+      if (wr.error) { console.log('[estadia] no se pudo marcar avisos (falta la columna? corre migracion-hotel-avisos.sql) -> no envio. ' + (wr.error.message || '')); return 0; }
+    } catch (eMk) { return 0; }
+    reserva.avisos = nuevos; // en memoria: evita re-procesar en la misma corrida
+    var ctx = { huesped: huesped, alojamiento: alojamiento, check_in: ci, check_out: co, empresa: empresa || '', resena_link: config.resena_link || '' };
+    var enviados = 0;
+    for (var i = 0; i < due.length; i++) {
+      var tipo = due[i];
+      var texto = _estadiaTexto(config[tipo] && config[tipo].texto, ctx);
+      if (!texto || !texto.trim()) continue;
+      var msgId = null;
+      // Trazabilidad: registrar el mensaje en la conversacion (si esta ligada). role 'ai' NO dispara la IA
+      // (esta solo reacciona a mensajes ENTRANTES por el webhook). Best-effort.
+      if (reserva.conversation_id) {
+        try { var mi = await supabase.from('messages').insert({ conversation_id: reserva.conversation_id, user_id: ownerId, role: 'ai', content: texto, enviado_por: 'Sistema estadia', estado_envio: 'enviando' }).select('id').single(); if (mi && mi.data) msgId = mi.data.id; } catch (eIns) {}
+      }
+      try {
+        var salio = await enviarWhatsapp(instancia, telefono, texto, msgId);
+        if (salio !== false) enviados++;
+        if (reserva.conversation_id) { try { await supabase.from('conversations').update({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', reserva.conversation_id).eq('user_id', ownerId); } catch (eLm) {} }
+        console.log('[estadia] ' + tipo + ' -> reserva ' + reserva.id + ' (cuenta ' + ownerId + ') salio=' + (salio !== false));
+      } catch (eSend) { console.error('[estadia] envio ' + tipo + ':', eSend && eSend.message); }
+      // Gap suave entre mensajes de la misma reserva (raro que haya >1 el mismo dia).
+      if (i < due.length - 1) await new Promise(function (r) { setTimeout(r, 1500 + Math.floor(Math.random() * 2500)); });
+    }
+    return enviados;
+  } catch (e) { console.error('_estadiaProcesarReserva:', e && e.message); return 0; }
+}
+
+// Envio INMEDIATO de la confirmacion al pasar una reserva a 'confirmed' (F5.2). Best-effort, NO bloquea la
+// respuesta del endpoint (se llama sin await). Gateado reservas_v1 + rubro hotel. Idempotente (avisos.confirmacion).
+async function _estadiaConfirmacionInline(ownerId, reservaId) {
+  try {
+    if (!ownerId || !reservaId) return;
+    var bsr = await supabase.from('business_settings').select('rubro, reservas_v1, estadia_config, company_name, crm_pausado, eliminado_at').eq('user_id', ownerId).maybeSingle();
+    var bs = bsr && bsr.data;
+    if (!bs || bs.reservas_v1 !== true) return;                        // gate maestro
+    if (normalizarRubro(bs.rubro) !== 'hotel_cabanas') return;         // solo hotel
+    if (bs.eliminado_at || bs.crm_pausado === true) return;
+    var config = _estadiaConfigMerge(bs.estadia_config);
+    if (!config.confirmacion || config.confirmacion.on === false) return; // confirmacion desactivada por el cliente
+    var instancia = nombreInstancia(ownerId);
+    try { var conn = await instanciaConectada(instancia); if (conn !== true) return; } catch (eConn) { return; } // WA caido: lo toma el cron
+    var rr = await supabase.from('hotel_reservas').select('*').eq('id', reservaId).eq('user_id', ownerId).maybeSingle();
+    if (rr.error || !rr.data) return;
+    await _estadiaProcesarReserva(ownerId, rr.data, config, bs.company_name || '', instancia, ['confirmacion']);
+  } catch (e) { console.error('_estadiaConfirmacionInline:', e && e.message); }
+}
+
+// CRON F5.2: barre las cuentas HOTEL con reservas_v1 ON y envia los avisos de estadia que correspondan HOY.
+// Idempotente (avisos jsonb). Guard de conexion por cuenta. INERTE si ninguna cuenta tiene el flag (default OFF).
+async function enviarAvisosEstadia() {
+  try {
+    if (typeof _pausaGlobal !== 'undefined' && _pausaGlobal === true) return;
+    var cuentas = [];
+    try {
+      var rc = await supabase.from('business_settings').select('user_id, rubro, estadia_config, company_name, crm_pausado, agente_pausado, eliminado_at').eq('reservas_v1', true);
+      if (rc.error) return; // columna reservas_v1 ausente u otro error -> nada que procesar (inerte)
+      cuentas = Array.isArray(rc.data) ? rc.data : [];
+    } catch (eSel) { return; }
+    if (!cuentas.length) return;
+    var hoy = _estadiaHoyStr();
+    var desdeCheckout = _estadiaAddDias(hoy, -3); // ventana: reservas vivas o que terminaron hace <=3 dias (post_checkout)
+    for (var ciX = 0; ciX < cuentas.length; ciX++) {
+      var bs = cuentas[ciX];
+      try {
+        if (normalizarRubro(bs.rubro) !== 'hotel_cabanas') continue;   // SOLO hotel
+        if (bs.eliminado_at || bs.crm_pausado === true) continue;      // cuenta borrada/pausada -> no enviar
+        var uid = bs.user_id;
+        var instancia = nombreInstancia(uid);
+        // Guard anti-baneo: si el WhatsApp del cliente esta caido, saltear la cuenta (retoma al reconectar).
+        try { var conn = await instanciaConectada(instancia); if (conn !== true) continue; } catch (eConn) { continue; }
+        var config = _estadiaConfigMerge(bs.estadia_config);
+        var empresa = bs.company_name || '';
+        var rr = await supabase.from('hotel_reservas').select('*')
+          .eq('user_id', uid).in('status', ['confirmed', 'checked_in', 'checked_out'])
+          .gte('check_out', desdeCheckout)
+          .order('check_in', { ascending: true }).limit(2000);
+        if (rr.error) continue; // tabla ausente u otro error -> saltear cuenta (defensivo)
+        var reservas = rr.data || [];
+        // CAP anti-baneo por cuenta y por corrida: si al activar reservas_v1 hubiera muchas reservas ya cargadas,
+        // no disparamos un aluvion de WhatsApps de golpe. El resto se envia en las proximas corridas (cada 30 min).
+        var CAP_ESTADIA_CUENTA = 25;
+        var enviadosCuenta = 0;
+        for (var riX = 0; riX < reservas.length; riX++) {
+          if (enviadosCuenta >= CAP_ESTADIA_CUENTA) break;
+          try { enviadosCuenta += await _estadiaProcesarReserva(uid, reservas[riX], config, empresa, instancia, null); } catch (eR) {}
+        }
+      } catch (eCuenta) { console.error('[estadia] cuenta ' + (bs && bs.user_id) + ':', eCuenta && eCuenta.message); }
+    }
+  } catch (e) { console.error('enviarAvisosEstadia:', e && e.message); }
+}
 
 // ===== SCRAPER CORREGIDO: extraccion completa por propiedad =====
 // M20: alias de limpiarHTML (mismo set de entidades, unico implementador). Se mantiene el nombre por compat

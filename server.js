@@ -20889,13 +20889,19 @@ async function _metaVerifyTokenValido(tokenRecibido) {
 // funcionando una config minima. Si hay app_secret y la firma no coincide -> se rechaza ese tenant.
 function _metaFirmaOk(rawBody, firmaHeader, appSecret) {
   try {
-    if (!appSecret) return false; // sin secret configurado NO se procesa: app_secret es obligatorio (evita payloads falsificados)
     if (!firmaHeader || !rawBody) return false;
-    const esperado = 'sha256=' + _cripto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+    // appSecret puede ser un string (Messenger) o un ARRAY de secrets candidatos (Instagram: el de la credencial +
+    // el de la app de Instagram por env). Valido contra CADA uno y acepto si ALGUNO matchea. Sin ningun secret -> no
+    // se procesa (app_secret es obligatorio; evita payloads falsificados). Retrocompatible con el uso previo (string).
+    const secrets = (Array.isArray(appSecret) ? appSecret : [appSecret]).filter(Boolean);
+    if (!secrets.length) return false;
     const a = Buffer.from(firmaHeader);
-    const b = Buffer.from(esperado);
-    if (a.length !== b.length) return false;
-    return _cripto.timingSafeEqual(a, b);
+    for (let i = 0; i < secrets.length; i++) {
+      const esperado = 'sha256=' + _cripto.createHmac('sha256', secrets[i]).update(rawBody).digest('hex');
+      const b = Buffer.from(esperado);
+      if (a.length === b.length && _cripto.timingSafeEqual(a, b)) return true;
+    }
+    return false;
   } catch (e) { return false; }
 }
 
@@ -21088,7 +21094,9 @@ app.post('/api/webhook/meta', function(req, res) {
               if (!texto || (ev.message && ev.message.is_echo)) continue;
               const creds = await _resolverCredMeta('instagram', igUserId);
               if (!creds) continue;
-              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], creds.app_secret)) continue;
+              // IG (Instagram Login) firma el webhook con el secret de la APP DE INSTAGRAM (≠ el de Facebook). Acepto el
+              // secret de la credencial Y el de la app de IG por env (META_IG_APP_SECRET) -> antes se descartaba en silencio.
+              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], [creds.app_secret, process.env.META_IG_APP_SECRET])) continue;
               await procesarMensajeMeta('instagram', creds.user_id, senderId, texto, creds);
             }
             // b) formato changes[] (suscripcion de campo 'messages')
@@ -21101,7 +21109,8 @@ app.post('/api/webhook/meta', function(req, res) {
               if (!texto || !senderId || (val.message && val.message.is_echo)) continue;
               const creds = await _resolverCredMeta('instagram', igUserId);
               if (!creds) continue;
-              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], creds.app_secret)) continue;
+              // Mismo criterio que arriba: firma valida contra el secret de la credencial O el de la app de IG (env).
+              if (!_metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], [creds.app_secret, process.env.META_IG_APP_SECRET])) continue;
               await procesarMensajeMeta('instagram', creds.user_id, senderId, texto, creds);
             }
           }
@@ -21281,6 +21290,10 @@ const META_APP_SECRET = process.env.META_APP_SECRET || '';
 const META_OAUTH_REDIRECT = process.env.META_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta/oauth/callback');
 // Scopes minimos para Messenger: leer las Paginas del usuario y mensajear desde ellas.
 const META_OAUTH_SCOPES = 'pages_show_list,pages_messaging,pages_manage_metadata,business_management';
+// La app de Raices usa "Facebook Login FOR BUSINESS" = modelo config_id (una "configuracion" creada en la consola de
+// Meta que ya trae los permisos elegidos), NO el flujo clasico scope=. config_id de la config "Raices - Conectar"
+// (creada 2026-07-11). Overridable por env. Si quedara vacio, se cae al flujo clasico scope= (retrocompat).
+const META_LOGIN_CONFIG_ID = process.env.META_LOGIN_CONFIG_ID || '1814526292646301';
 function _metaOauthConfigurado() { return !!(META_APP_ID && META_APP_SECRET); }
 
 // GET /api/meta/oauth/start — arranca el OAuth (redirige a Meta). Auth por JWT (?token= o Bearer).
@@ -21294,12 +21307,14 @@ app.get('/api/meta/oauth/start', async function(req, res) {
     if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
     const state = _oauthStateFirmar(uid, 'meta');
     if (!state) return res.status(500).json({ error: 'No se pudo iniciar el flujo' });
+    // For-Business: se pasa config_id (la config ya define los permisos). El scope= clasico queda de fallback si algun
+    // dia se vacia META_LOGIN_CONFIG_ID (app migrada a login clasico).
     const url = 'https://www.facebook.com/' + META_GRAPH_VERSION + '/dialog/oauth' +
       '?client_id=' + encodeURIComponent(META_APP_ID) +
       '&redirect_uri=' + encodeURIComponent(META_OAUTH_REDIRECT) +
       '&state=' + encodeURIComponent(state) +
       '&response_type=code' +
-      '&scope=' + encodeURIComponent(META_OAUTH_SCOPES);
+      (META_LOGIN_CONFIG_ID ? ('&config_id=' + encodeURIComponent(META_LOGIN_CONFIG_ID)) : ('&scope=' + encodeURIComponent(META_OAUTH_SCOPES)));
     return res.redirect(url);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

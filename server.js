@@ -9776,14 +9776,14 @@ async function _enviarRecontactosV2(ahoraMs) {
     try {
       const r = await supabase
         .from('business_settings')
-        .select('user_id, rubro, horario_oficina, recontacto_horario, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+        .select('user_id, rubro, reservas_v1, horario_oficina, recontacto_horario, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
         .eq('recontacto_v2', true);
       if (r.error) throw r.error;
       cuentasV2 = Array.isArray(r.data) ? r.data : [];
     } catch (eRH) {
       const { data: cc } = await supabase
         .from('business_settings')
-        .select('user_id, rubro, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
+        .select('user_id, rubro, reservas_v1, horario_oficina, crm_pausado, agente_pausado, eliminado_at, company_name, agent_name, recontacto_v2, recontacto_pausado, recontacto_warmup_dia, recontacto_enviados_hoy, recontacto_enviados_fecha, recontacto_tope_max, recontacto_agresividad, recontacto_subcupo_frio')
         .eq('recontacto_v2', true);
       cuentasV2 = Array.isArray(cc) ? cc : [];
     }
@@ -9793,9 +9793,13 @@ async function _enviarRecontactosV2(ahoraMs) {
   for (const bs of cuentasV2) {
     try {
       const uid = bs.user_id;
-      // F5.1: SOLO las cuentas rubro hotel aplican la regla de fecha de estadia sobre el recontacto
-      // (priorizar antes de la fecha de ingreso; no recontactar si ya paso). El resto queda EXACTO.
-      const _esHotelCuenta = normalizarRubro(bs.rubro) === 'hotel_cabanas';
+      // F5.1: SOLO las cuentas rubro hotel CON EL GATE MAESTRO reservas_v1===true aplican la regla de fecha
+      // de estadia sobre el recontacto (priorizar antes de la fecha de ingreso; no recontactar si ya paso).
+      // Gatear tambien por reservas_v1 evita que un hotel con el gate OFF (ej. Tequendama HOY) cambie su
+      // recontacto por leads que ya tengan cal_fecha_ingreso (el extractor F1.2 la llena rubro-only). El resto
+      // (inmobiliaria/desarrolladora, y hoteles con reservas_v1 OFF) queda EXACTO. Si la columna faltara,
+      // bs.reservas_v1 === undefined => false => comportamiento actual (direccion segura).
+      const _esHotelCuenta = normalizarRubro(bs.rubro) === 'hotel_cabanas' && bs.reservas_v1 === true;
       // PAUSAS de cuenta (mismas reglas que legacy + pausa propia de recontacto)
       if (_pausaGlobal === true || bs.crm_pausado === true || bs.agente_pausado === true || bs.eliminado_at) continue;
       if (bs.recontacto_pausado === true) continue;

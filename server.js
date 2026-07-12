@@ -4714,6 +4714,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           if (_uH) propFoto = { numero: (_uH.numero != null ? _uH.numero : _uH.title), images: _uH.images };
         }
         if (propFoto) {
+          // E3: consulta concreta sobre esta propiedad/unidad -> alimentar "propiedades mas consultadas". 0 IA, best-effort.
+          try { _contarConsultaPropiedad(user_id, numPedido, (propFoto.title || null)).catch(function(){}); } catch (eCnt) {}
           const imgs = Array.isArray(propFoto.images) ? propFoto.images : [];
           if (imgs.length > 0) {
             // 1) intentar por categoria exacta
@@ -4811,6 +4813,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: _enviadoPor }
     ]);
     await supabase.from('conversations').update({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // E3: marcar la 1a respuesta (IA) para la metrica "tiempo de 1a respuesta". Fire-and-forget, 0 IA, defensivo.
+    _marcarPrimeraRespuesta(conversation_id).catch(function(){});
   }
 
   // COBRO v2: flags para que el caller cobre +1 si hubo traducción saliente y +1 si la IA usó una tool (foto/consultar).
@@ -5353,6 +5357,57 @@ app.post('/api/agent/respond', async (req, res) => {
   }
 });
 
+// ============================================================================
+// ===== ETAPA 3 — CAPTURA DE DATOS PARA REPORTES (0 IA, DEFENSIVO) ============
+// ============================================================================
+// Todo lo de aca es best-effort y NUNCA rompe el flujo llamante: si la columna/
+// tabla nueva todavia no existe (migracion-reportes-e3.sql sin correr), el write
+// falla en silencio y no pasa nada. CERO tokens de IA (solo SQL liviano).
+
+// Marca la 1a RESPUESTA saliente (IA o humano) de una conversacion, UNA sola vez.
+// primera_respuesta_ms = latencia desde la creacion de la conversacion (1er contacto)
+// hasta esta respuesta. Se llama fire-and-forget desde los puntos de envio (no bloquea).
+async function _marcarPrimeraRespuesta(conversationId) {
+  try {
+    if (!conversationId) return;
+    // Leer created_at + el marcador actual. Si la columna no existe -> error -> catch -> no rompe.
+    const { data: cv, error } = await supabase.from('conversations')
+      .select('created_at, primera_respuesta_at').eq('id', conversationId).maybeSingle();
+    if (error || !cv) return;
+    if (cv.primera_respuesta_at) return; // ya marcada -> no re-escribir
+    const nowMs = Date.now();
+    const upd = { primera_respuesta_at: new Date(nowMs).toISOString() };
+    if (cv.created_at) {
+      const c = new Date(cv.created_at).getTime();
+      if (c && nowMs > c) upd.primera_respuesta_ms = nowMs - c;
+    }
+    // .is('primera_respuesta_at', null) evita pisar si dos respuestas casi-simultaneas corren la carrera.
+    await supabase.from('conversations').update(upd).eq('id', conversationId).is('primera_respuesta_at', null);
+  } catch (e) { /* defensivo: columna ausente / error -> no rompe el envio */ }
+}
+
+// Incrementa el contador de "propiedad mas consultada" (tabla property_consultas).
+// Se llama cuando la IA resuelve un pedido de foto/info sobre una propiedad/unidad
+// concreta (tool enviar_foto_propiedad). Read-modify-write (best-effort; baja frecuencia).
+async function _contarConsultaPropiedad(ownerId, propKey, propLabel) {
+  try {
+    if (!ownerId || propKey == null || String(propKey).trim() === '') return;
+    const key = String(propKey).trim().slice(0, 120);
+    const label = propLabel != null ? String(propLabel).slice(0, 200) : null;
+    const { data: ex, error } = await supabase.from('property_consultas')
+      .select('id, consultas').eq('user_id', ownerId).eq('prop_key', key).maybeSingle();
+    if (error) return; // tabla ausente / error -> skip (defensivo)
+    if (ex && ex.id) {
+      await supabase.from('property_consultas')
+        .update({ consultas: (ex.consultas || 0) + 1, prop_label: label, updated_at: new Date().toISOString() })
+        .eq('id', ex.id);
+    } else {
+      await supabase.from('property_consultas')
+        .insert({ user_id: ownerId, prop_key: key, prop_label: label, consultas: 1 });
+    }
+  } catch (e) { /* best-effort: nunca rompe la respuesta de la IA */ }
+}
+
 // ============ WEBHOOK ENTRANTE DE WHATSAPP (Evolution API) ============
 async function enviarReportesProgramados() {
   try {
@@ -5377,7 +5432,7 @@ async function enviarReportesProgramados() {
       else if (cfg.mensual && diaMes === 1 && envios.mensual !== hoyStr) toca = 'mensual';
       if (!toca) continue;
       try {
-        const textoReporte = await generarReporteAdmin(cta.user_id, cfg);
+        const textoReporte = await generarReporteAdmin(cta.user_id, cfg, toca);
         const encabezado = (toca === 'diario' ? 'Reporte diario' : toca === 'semanal' ? 'Reporte semanal' : 'Reporte mensual');
         await enviarWhatsapp(nombreInstancia(cta.user_id), cfg.whatsapp, encabezado + String.fromCharCode(10) + String.fromCharCode(10) + textoReporte);
         // marcar como enviado
@@ -5390,61 +5445,100 @@ async function enviarReportesProgramados() {
   } catch (e) { /* silencioso */ }
 }
 
+// E3 (escala): antes traia TODAS las conversations de TODOS los tenants en UNA query sin paginar
+// -> PostgREST corta en 1000 filas, asi que solo se snapshoteaban los primeros ~1000 registros (los
+// tenants pasado ese corte quedaban SIN snapshot). Ahora se itera POR TENANT con conteos head:true
+// (cero filas traidas, acotado por cuenta): correcto a cualquier escala. Sigue guardando snapshot solo
+// para cuentas CON conversaciones (igual que antes). CERO IA.
 async function guardarSnapshotDiario() {
   try {
     const hoyStr = new Date().toISOString().substring(0, 10);
-    // traer todas las conversaciones agrupando por user_id
-    const { data: convs } = await supabase.from('conversations').select('user_id, status');
-    if (!convs || !convs.length) return;
-    // agrupar por user_id
-    const porUser = {};
-    for (const cv of convs) {
-      if (!cv.user_id) continue;
-      if (!porUser[cv.user_id]) porUser[cv.user_id] = { conversaciones:0, interesados:0, listo_humano:0, cierres:0, recontactos:0 };
-      const u = porUser[cv.user_id];
-      u.conversaciones++;
-      if (cv.status === 'interesado') u.interesados++;
-      else if (cv.status === 'listo_humano') u.listo_humano++;
-      else if (cv.status === 'cerrado') u.cierres++;
-      else if (cv.status === 'recontacto') u.recontactos++;
-    }
-    // contar mensajes por user (una query por user para no traer todo)
-    for (const uid of Object.keys(porUser)) {
-      let totalMsgs = 0;
+    // 1) Lista de tenants (business_settings) PAGINADA (.range) por si supera las 1000 filas.
+    const tenants = [];
+    try {
+      let from = 0; const size = 1000; const cap = 50000;
+      while (from < cap) {
+        const { data, error } = await supabase.from('business_settings').select('user_id').range(from, from + size - 1);
+        if (error) break;
+        const rows = data || [];
+        rows.forEach(function (r) { if (r && r.user_id) tenants.push(r.user_id); });
+        if (rows.length < size) break;
+        from += size;
+      }
+    } catch (eT) { return; }
+    if (!tenants.length) return;
+    // 2) Por tenant: conteos por estado (head:true) + mensajes. No trae filas -> escala sin problemas.
+    for (const uid of tenants) {
       try {
-        const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', uid);
-        totalMsgs = count || 0;
-      } catch (e) { totalMsgs = 0; }
-      const m = porUser[uid];
-      await supabase.from('reportes_snapshots').upsert({
-        user_id: uid, fecha: hoyStr,
-        conversaciones: m.conversaciones, interesados: m.interesados, listo_humano: m.listo_humano,
-        cierres: m.cierres, recontactos: m.recontactos, mensajes: totalMsgs
-      }, { onConflict: 'user_id,fecha' });
+        const base = function () { return supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', uid); };
+        const _c = function (q) { return q.then(function (r) { return (r && r.count) || 0; }).catch(function () { return 0; }); };
+        const _res = await Promise.all([
+          _c(base()),
+          _c(base().eq('status', 'interesado')),
+          _c(base().eq('status', 'listo_humano')),
+          _c(base().eq('status', 'cerrado')),
+          _c(base().eq('status', 'recontacto'))
+        ]);
+        const conversaciones = _res[0];
+        if (conversaciones === 0) continue; // sin conversaciones -> no snapshot (comportamiento previo)
+        let totalMsgs = 0;
+        try { const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', uid); totalMsgs = count || 0; } catch (eMsg) { totalMsgs = 0; }
+        await supabase.from('reportes_snapshots').upsert({
+          user_id: uid, fecha: hoyStr,
+          conversaciones: conversaciones, interesados: _res[1], listo_humano: _res[2],
+          cierres: _res[3], recontactos: _res[4], mensajes: totalMsgs
+        }, { onConflict: 'user_id,fecha' });
+      } catch (ePer) { /* seguir con el siguiente tenant */ }
     }
   } catch (e) { /* silencioso */ }
 }
 
-async function generarReporteAdmin(user_id, cfg) {
+// E3: reporte con DELTAS del periodo (diario/semanal/mensual) usando reportes_snapshots como baseline.
+// Antes mostraba solo TOTALES acumulados (no se distinguia lo nuevo del periodo). Ahora, si hay un snapshot
+// al inicio del periodo, muestra "+N (total M)"; si es el 1er reporte (sin baseline) cae a totales con nota.
+// CERO IA (solo SQL + string). periodo lo pasa el cron segun lo que toca enviar; default 'diario'.
+async function generarReporteAdmin(user_id, cfg, periodo) {
   // cfg = reportes_config (info: que incluir). Devuelve texto ASCII del reporte.
+  periodo = (periodo === 'semanal' || periodo === 'mensual') ? periodo : 'diario';
   const info = (cfg && cfg.info) || {};
   const lineas = [];
   lineas.push('*Reporte Raices CRM*');
+  const _periodoTxt = periodo === 'semanal' ? 'novedades de los ultimos 7 dias' : periodo === 'mensual' ? 'novedades de los ultimos 30 dias' : 'novedades del ultimo dia';
+  lineas.push('_' + _periodoTxt + '_');
   lineas.push('');
   try {
-    // traer conversaciones del user con su status
+    // Valores ACTUALES (totales acumulados a hoy).
     const { data: convs } = await supabase.from('conversations').select('status').eq('user_id', user_id);
     const lista = convs || [];
-    const cuenta = function(st){ return lista.filter(function(x){ return x.status === st; }).length; };
-    if (info.conversaciones_nuevas) lineas.push('Conversaciones totales: ' + lista.length);
-    if (info.interesados) lineas.push('Interesados: ' + cuenta('interesado'));
-    if (info.listo_humano) lineas.push('Listos para humano: ' + cuenta('listo_humano'));
-    if (info.cierres) lineas.push('Cierres: ' + cuenta('cerrado'));
-    if (info.recontactos) lineas.push('En recontacto: ' + cuenta('recontacto'));
-    if (info.mensajes) {
-      const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
-      lineas.push('Mensajes totales: ' + (count || 0));
-    }
+    const cuenta = function (st) { return lista.filter(function (x) { return x.status === st; }).length; };
+    const actual = { conversaciones: lista.length, interesado: cuenta('interesado'), listo_humano: cuenta('listo_humano'), cerrado: cuenta('cerrado'), recontacto: cuenta('recontacto') };
+    let mensajesTotal = null;
+    if (info.mensajes) { try { const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', user_id); mensajesTotal = count || 0; } catch (eMsg) {} }
+    // BASELINE: snapshot mas reciente en/antes del inicio del periodo -> para calcular DELTAS.
+    const dias = periodo === 'semanal' ? 7 : periodo === 'mensual' ? 30 : 1;
+    const baseFecha = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    let base = null;
+    try {
+      const { data: snapBase } = await supabase.from('reportes_snapshots').select('*').eq('user_id', user_id).lte('fecha', baseFecha).order('fecha', { ascending: false }).limit(1);
+      base = (snapBase && snapBase[0]) || null;
+    } catch (eSnap) {}
+    // Cada linea: "+N (total M)" si hay baseline; si no, solo el total.
+    const linea = function (label, actualVal, baseKey) {
+      if (base && base[baseKey] != null) {
+        const d = actualVal - base[baseKey];
+        const signo = d >= 0 ? ('+' + d) : String(d);
+        lineas.push(label + ': ' + signo + ' (total ' + actualVal + ')');
+      } else {
+        lineas.push(label + ': ' + actualVal);
+      }
+    };
+    if (info.conversaciones_nuevas) linea('Conversaciones', actual.conversaciones, 'conversaciones');
+    if (info.interesados) linea('Interesados', actual.interesado, 'interesados');
+    if (info.listo_humano) linea('Listos para humano', actual.listo_humano, 'listo_humano');
+    if (info.cierres) linea('Cierres', actual.cerrado, 'cierres');
+    if (info.recontactos) linea('En recontacto', actual.recontacto, 'recontactos');
+    if (info.mensajes && mensajesTotal != null) linea('Mensajes', mensajesTotal, 'mensajes');
+    if (!base) { lineas.push(''); lineas.push('_(Primer reporte: se muestran totales. Los proximos van a mostrar las novedades del periodo.)_'); }
   } catch (e) {
     lineas.push('(No se pudieron cargar todos los datos)');
   }
@@ -7116,6 +7210,8 @@ app.post('/api/whatsapp/send', async (req, res) => {
       { select: 'id', single: true }
     );
     await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // E3: marcar la 1a respuesta (humano) para la metrica "tiempo de 1a respuesta". Fire-and-forget, 0 IA, defensivo.
+    _marcarPrimeraRespuesta(conversation_id).catch(function(){});
     // FIX #2: RESET de la escalada SLA cuando un HUMANO responde. El escalado (revisarAvisosInternos #4) dedupea por
     // escalon con conversations.sla_avisos (jsonb persistente) + el Set en memoria _slaAvisoMem. Si nunca se limpian,
     // un NUEVO ciclo de espera (el lead vuelve a escribir tras esta respuesta humana) jamas re-dispararia los avisos.
@@ -20843,6 +20939,171 @@ app.get('/api/ui-flags', async function(req, res){
   }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false }); }
 });
 
+// ============================================================================
+// ===== ETAPA 3 — GET /api/reportes/metricas (tenant-scoped, auth) ============
+// ============================================================================
+// UN endpoint que sirve TODAS las tarjetas de Reportes con la SERVICE KEY del
+// backend (evita el RLS-null que sufren los ASESORES leyendo business_settings/
+// conversations desde el front). Auth verificarUsuario + ownerId por admin_id
+// (un asesor ve las metricas de la cuenta de su dueno). CERO IA / CERO tokens:
+// solo counts/lecturas agregadas. 100% DEFENSIVO: cada bloque va en su propio try;
+// si una columna/tabla nueva aun no existe (migracion-reportes-e3.sql sin correr),
+// ese campo viene vacio/null y el resto del reporte igual responde. Ruta PLANA.
+app.get('/api/reportes/metricas', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    var ownerId = await _resolverOwnerId(userId);
+
+    // Rubro (para gatear la tarjeta de absorcion de desarrolladora).
+    var rubro = 'inmobiliaria';
+    try {
+      var _bs = await supabase.from('business_settings').select('rubro').eq('user_id', ownerId).maybeSingle();
+      if (_bs && _bs.data && _bs.data.rubro) rubro = normalizarRubro(_bs.data.rubro);
+    } catch (eR) {}
+
+    // ── Conteos por estado (head:true = no trae filas). status NULL cuenta como en_conversacion. ──
+    var base = function () { return supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', ownerId); };
+    var _cnt = function (q) { return q.then(function (r) { return (r && r.count) || 0; }).catch(function () { return 0; }); };
+    var _r = await Promise.all([
+      _cnt(base()),
+      _cnt(base().is('status', null)),
+      _cnt(base().eq('status', 'en_conversacion')),
+      _cnt(base().eq('status', 'interesado')),
+      _cnt(base().eq('status', 'listo_humano')),
+      _cnt(base().eq('status', 'cerrado')),
+      _cnt(base().eq('status', 'recontacto'))
+    ]);
+    var total = _r[0], cNull = _r[1], cEnConv = _r[2], cInter = _r[3], cListo = _r[4], cCerr = _r[5], cRecon = _r[6];
+    var por_estado = { en_conversacion: cEnConv + cNull, interesado: cInter, listo_humano: cListo, cerrado: cCerr, recontacto: cRecon };
+
+    // ── Totales sueltos (mensajes / contactos). ──
+    var mensajes = 0, contactos = 0;
+    try { var rm = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', ownerId); mensajes = (rm && rm.count) || 0; } catch (eM) {}
+    try { var rc = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('user_id', ownerId); contactos = (rc && rc.count) || 0; } catch (eC) {}
+
+    // ── Mix de canal (organico): paginado real (.range) hasta un tope, agrupado en JS. ──
+    var canales = [], canalesMuestra = 0;
+    try {
+      var _conteoCanal = {}; var _from = 0; var _size = 1000; var _cap = 5000;
+      while (_from < _cap) {
+        var rcanal = await supabase.from('conversations').select('contacts(channel)').eq('user_id', ownerId).range(_from, _from + _size - 1);
+        if (rcanal && rcanal.error) break;
+        var rows = (rcanal && rcanal.data) || [];
+        rows.forEach(function (f) { var c = (f && f.contacts && f.contacts.channel) ? String(f.contacts.channel) : 'otro'; _conteoCanal[c] = (_conteoCanal[c] || 0) + 1; });
+        canalesMuestra += rows.length;
+        if (rows.length < _size) break;
+        _from += _size;
+      }
+      canales = Object.keys(_conteoCanal).map(function (k) { return { canal: k, n: _conteoCanal[k] }; }).sort(function (a, b) { return b.n - a.n; });
+    } catch (eCanal) {}
+
+    // ── Tiempo de 1a respuesta (promedio + mediana) desde conversations.primera_respuesta_ms. ──
+    // disponible=false si la columna aun no existe (migracion sin correr) -> el front muestra "proximamente".
+    var primera_respuesta = { disponible: false, muestras: 0, promedio_ms: 0, mediana_ms: 0 };
+    try {
+      var _ms = []; var _f2 = 0; var _s2 = 1000; var _cap2 = 10000; var _colFalta = false;
+      while (_f2 < _cap2) {
+        var rpr = await supabase.from('conversations').select('primera_respuesta_ms').eq('user_id', ownerId).not('primera_respuesta_ms', 'is', null).range(_f2, _f2 + _s2 - 1);
+        if (rpr && rpr.error) { _colFalta = true; break; }
+        var rws = (rpr && rpr.data) || [];
+        rws.forEach(function (r) { if (r && r.primera_respuesta_ms != null) { var v = Number(r.primera_respuesta_ms); if (!isNaN(v) && v >= 0) _ms.push(v); } });
+        if (rws.length < _s2) break;
+        _f2 += _s2;
+      }
+      if (!_colFalta) {
+        if (_ms.length) {
+          var _sum = _ms.reduce(function (a, b) { return a + b; }, 0);
+          _ms.sort(function (a, b) { return a - b; });
+          var _mid = Math.floor(_ms.length / 2);
+          var _med = _ms.length % 2 ? _ms[_mid] : Math.round((_ms[_mid - 1] + _ms[_mid]) / 2);
+          primera_respuesta = { disponible: true, muestras: _ms.length, promedio_ms: Math.round(_sum / _ms.length), mediana_ms: _med };
+        } else {
+          primera_respuesta = { disponible: true, muestras: 0, promedio_ms: 0, mediana_ms: 0 };
+        }
+      }
+    } catch (ePr) {}
+
+    // ── Leads calientes por asesor (temperatura='caliente' + asesor_id). ──
+    var calientes_por_asesor = [];
+    try {
+      var rcal = await supabase.from('conversations').select('asesor_id').eq('user_id', ownerId).eq('temperatura', 'caliente').limit(5000);
+      if (!(rcal && rcal.error)) {
+        var _byAse = {}; ((rcal && rcal.data) || []).forEach(function (c) { var k = c.asesor_id || '_sin'; _byAse[k] = (_byAse[k] || 0) + 1; });
+        var _nom = {};
+        try { var rase = await supabase.from('asesores').select('id, nombre, usuario').eq('admin_id', ownerId); ((rase && rase.data) || []).forEach(function (a) { _nom[a.id] = a.nombre || a.usuario || '—'; }); } catch (eN) {}
+        calientes_por_asesor = Object.keys(_byAse).map(function (k) {
+          return { asesor_id: (k === '_sin' ? null : k), nombre: (k === '_sin' ? 'Sin asignar' : (_nom[k] || '—')), n: _byAse[k] };
+        }).sort(function (a, b) { return b.n - a.n; });
+      }
+    } catch (eCal) {}
+
+    // ── Motivos de perdida (conversations.motivo_perdida). null si la columna aun no existe. ──
+    var motivos_perdida = null;
+    try {
+      var rmot = await supabase.from('conversations').select('motivo_perdida').eq('user_id', ownerId).not('motivo_perdida', 'is', null).limit(10000);
+      if (rmot && rmot.error) { motivos_perdida = null; }
+      else { var _m = {}; ((rmot && rmot.data) || []).forEach(function (c) { if (c && c.motivo_perdida) _m[c.motivo_perdida] = (_m[c.motivo_perdida] || 0) + 1; }); motivos_perdida = _m; }
+    } catch (eMot) { motivos_perdida = null; }
+
+    // ── Propiedades mas consultadas (property_consultas top 10). null si la tabla aun no existe. ──
+    var propiedades_consultadas = null;
+    try {
+      var rprop = await supabase.from('property_consultas').select('prop_key, prop_label, consultas').eq('user_id', ownerId).order('consultas', { ascending: false }).limit(10);
+      if (rprop && rprop.error) { propiedades_consultadas = null; }
+      else { propiedades_consultadas = ((rprop && rprop.data) || []).map(function (p) { return { key: p.prop_key, label: p.prop_label || p.prop_key, n: p.consultas || 0 }; }); }
+    } catch (eProp) { propiedades_consultadas = null; }
+
+    // ── Absorcion / velocidad de venta (SOLO desarrolladora): unidades vendidas por mes por tipologia. ──
+    // Usa development_units.estado='vendido' + estado_updated_at (Etapa 1). Las vendidas ANTES de la
+    // migracion no tienen timestamp -> se reportan aparte (sin_timestamp), sin inventar el mes.
+    var absorcion = null;
+    if (rubro === 'desarrolladora') {
+      try {
+        var rabs = await supabase.from('development_units').select('tipologia, tipo_producto, estado_updated_at').eq('user_id', ownerId).eq('estado', 'vendido').limit(10000);
+        if (rabs && rabs.error) { absorcion = null; }
+        else {
+          var _g = {}; var _sinTs = 0;
+          ((rabs && rabs.data) || []).forEach(function (u) {
+            if (!u.estado_updated_at) { _sinTs++; return; }
+            var mes = String(u.estado_updated_at).slice(0, 7); // YYYY-MM
+            var tip = u.tipologia || u.tipo_producto || 'unidad';
+            if (!_g[mes]) _g[mes] = {};
+            _g[mes][tip] = (_g[mes][tip] || 0) + 1;
+          });
+          var _meses = Object.keys(_g).sort().slice(-12);
+          absorcion = {
+            vendidas_total: ((rabs && rabs.data) || []).length,
+            sin_timestamp: _sinTs,
+            meses: _meses.map(function (m) {
+              var tot = 0; Object.keys(_g[m]).forEach(function (t) { tot += _g[m][t]; });
+              return { mes: m, por_tipologia: _g[m], total: tot };
+            })
+          };
+        }
+      } catch (eAbs) { absorcion = null; }
+    }
+
+    return res.json({
+      ok: true,
+      rubro: rubro,
+      totales: {
+        conversaciones: total, interesados: cInter, listo_humano: cListo,
+        cierres: cCerr, recontactos: cRecon, mensajes: mensajes, contactos: contactos
+      },
+      por_estado: por_estado,
+      canales: canales,
+      canales_muestra: canalesMuestra,
+      intervencion_humana: { humano: cListo, total: total, pct: (total > 0 ? Math.round((cListo / total) * 100) : 0) },
+      primera_respuesta: primera_respuesta,
+      calientes_por_asesor: calientes_por_asesor,
+      motivos_perdida: motivos_perdida,
+      propiedades_consultadas: propiedades_consultadas,
+      absorcion: absorcion
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.
 // Borra el token del usuario autenticado. Se filtra por user_id + token para que nadie borre tokens ajenos.
 app.post('/api/push/baja-token', async function(req, res){
@@ -21217,6 +21478,13 @@ app.post('/api/conversations/cerrar', async function(req, res){
       updated_at: new Date().toISOString()
     }).eq('id', conversation_id);
     if (upd && upd.error) return res.status(409).json({ ok: false, error: 'No se pudo cerrar: ' + (upd.error.message || 'error de esquema') });
+    // E3: MOTIVO DE PERDIDA (opcional, para la tarjeta "Motivos de perdida"). Se escribe en un update SEPARADO y
+    // best-effort: si la columna motivo_perdida aun no existe (migracion sin correr), el cierre NO se rompe.
+    var _MOTIVOS_PERDIDA = ['precio', 'zona', 'dejo_de_responder', 'comprado_otro', 'otro'];
+    var _motivo = (req.body && req.body.motivo_perdida) ? String(req.body.motivo_perdida).trim() : '';
+    if (_motivo && _MOTIVOS_PERDIDA.indexOf(_motivo) >= 0) {
+      try { await supabase.from('conversations').update({ motivo_perdida: _motivo }).eq('id', conversation_id); } catch (eMot) { /* columna ausente -> el cierre igual quedo hecho */ }
+    }
     return res.json({ ok: true, status: 'cerrado', asesor_id: null, ai_enabled: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });

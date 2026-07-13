@@ -15959,10 +15959,15 @@ app.post('/api/inventario/hotel/unidad/actualizar', async function (req, res) {
     if (b.moneda !== undefined) fila.moneda = (b.moneda === 'USD' ? 'USD' : 'ARS');
     if (b.activa !== undefined) fila.activa = !!b.activa;
     if (Array.isArray(b.images)) fila.images = b.images.filter(function (im) { return im && im.url; }).map(function (im) { return { url: im.url, categoria: im.categoria || '' }; });
-    // atributos: merge (preserva lo existente; actualiza servicios/capacidad si vienen).
+    if (b.complejo_id !== undefined) fila.complejo_id = b.complejo_id || null; // mover de complejo (o desvincular)
+    // atributos: merge canonico. amenities como flags; servicios_texto = servicios libres; camas/dorm/banos/m2/vista/regimenes.
     var atr = Object.assign({}, (cur.data.atributos && typeof cur.data.atributos === 'object') ? cur.data.atributos : {});
-    if (b.servicios !== undefined) atr.servicios = b.servicios || null;
-    if (b.capacidad !== undefined) atr.capacidad = b.capacidad || null;
+    if (b.amenities !== undefined && b.amenities && typeof b.amenities === 'object') atr.amenities = b.amenities;
+    if (b.servicios !== undefined) atr.servicios_texto = b.servicios || '';
+    ['camas', 'dormitorios', 'banos'].forEach(function (k) { if (b[k] !== undefined) atr[k] = (parseInt(b[k], 10) || null); });
+    if (b.m2 !== undefined) atr.m2 = _sInvN(b.m2);
+    if (b.vista !== undefined) atr.vista = b.vista || null;
+    if (b.regimenes !== undefined && Array.isArray(b.regimenes)) atr.regimenes = b.regimenes;
     fila.atributos = atr;
     var up = await supabase.from('hotel_unidades').update(fila).eq('id', id).eq('user_id', ownerId);
     if (up.error) return res.status(500).json({ error: up.error.message });

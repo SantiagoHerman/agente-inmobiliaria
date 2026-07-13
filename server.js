@@ -4308,8 +4308,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // (se llena dentro del bloque _esHotel; para inmobiliaria/desarrolladora queda [] = sin efecto).
   let _hotelUnidsFoto = [];
   if (_esHotel) try {
+    // F1: la IA tambien lee los COMPLEJOS (info general del hotel/cabaña) para poder responder
+    // "que servicios/amenities/politicas tiene el hotel" y, con cadena, distinguir cada complejo.
+    const { data: _complejos } = await supabase.from('hotel_complejos').select('id, nombre, atributos').eq('user_id', user_id);
+    const _compsById = {}; (_complejos || []).forEach(function (c) { _compsById[c.id] = c; });
     const { data: _uds, error: _udErr } = await supabase.from('hotel_unidades')
-      .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos, images')
+      .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos, images, complejo_id')
       .eq('user_id', user_id).eq('activa', true);
     if (!_udErr && _uds && _uds.length > 0) {
       const _udIds = _uds.map(function(u){ return u.id; });
@@ -4346,6 +4350,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           at.camas ? at.camas + ' camas' : '',
           at.dormitorios ? at.dormitorios + ' dorm' : '',
           at.banos ? at.banos + ' banos' : '',
+          at.m2 ? at.m2 + ' m2' : '',
           at.vista ? 'vista ' + at.vista : ''
         ].filter(Boolean).join(', ');
         const _tarsTxt = (_tarsPorU[u.id] || []).map(function(t){
@@ -4353,17 +4358,52 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           return (t.temporada || 'tarifa') + ': ' + (t.precio_noche != null ? (t.moneda || 'ARS') + ' ' + t.precio_noche + '/noche' : 'consultar') + (t.min_noches ? ' (min ' + t.min_noches + ' noches)' : '') + _rango;
         });
         const _precioTxt = _tarsTxt.length ? _tarsTxt.join(' ; ') : (u.precio_base != null ? (u.moneda || 'ARS') + ' ' + u.precio_base + '/noche' : 'consultar');
+        // amenities como ETIQUETAS legibles (solo on:true) + servicios_texto (lo que no matcheo a un flag).
         let _amenTxt = '';
-        try { const _am = at.amenities || {}; const _ks = Object.keys(_am).filter(function(k){ return _am[k]; }); if (_ks.length) _amenTxt = ' | amenities: ' + _ks.join(', '); } catch (eAm) {}
+        try {
+          const _am = at.amenities || {};
+          const _ks = Object.keys(_am).filter(function (k) { return _am[k] && (_am[k] === true || _am[k].on); }).map(function (k) { return _AMEN_LABEL[k] || k; });
+          const _servExtra = (at.servicios_texto || (typeof at.servicios === 'string' ? at.servicios : '') || '').trim();
+          const _all = _ks.concat(_servExtra ? [_servExtra] : []);
+          if (_all.length) _amenTxt = ' | servicios: ' + _all.join(', ');
+        } catch (eAm) {}
+        let _regTxt = '';
+        try { if (Array.isArray(at.regimenes) && at.regimenes.length) _regTxt = ' | regimen: ' + at.regimenes.join(', '); } catch (eReg) {}
+        let _extraTxt = '';
+        try { if (Array.isArray(at.extras) && at.extras.length) { const _ex = at.extras.map(function (e) { return e && e.nombre ? (e.nombre + (e.precio ? ' (' + (e.moneda || 'ARS') + ' ' + e.precio + ')' : '')) : ''; }).filter(Boolean); if (_ex.length) _extraTxt = ' | extras: ' + _ex.join(', '); } } catch (eEx) {}
         let _fotosTxtH = '';
         try { const _imH = Array.isArray(u.images) ? u.images : []; if (_imH.length > 0) _fotosTxtH = ' | fotos disponibles: si'; } catch (eFH) {}
-        const _lineaBase = '- ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + (u.descripcion ? ' | ' + u.descripcion : '') + _fotosTxtH;
+        const _lineaBase = '  - ' + (u.title || 'Unidad') + (u.numero ? ' N' + u.numero : '') + (u.type ? ' (' + u.type + ')' : '') + (specs ? ' | ' + specs : '') + ' | tarifas: ' + _precioTxt + _amenTxt + _regTxt + _extraTxt + (u.descripcion ? ' | ' + u.descripcion : '') + _fotosTxtH;
         // F1.1: anexar una linea "OCUPADA del X al Y" por cada reserva bloqueante (fechas semiabiertas: check_out es dia de salida = libre).
         const _ocupU = _ocupadasPorU[u.id] || [];
-        const _ocupTxt = _ocupU.map(function(r){ return String.fromCharCode(10) + '    OCUPADA del ' + r.check_in + ' al ' + r.check_out; }).join('');
-        return _lineaBase + _ocupTxt;
+        const _ocupTxt = _ocupU.map(function(r){ return String.fromCharCode(10) + '      OCUPADA del ' + r.check_in + ' al ' + r.check_out; }).join('');
+        return { cid: u.complejo_id || null, line: _lineaBase + _ocupTxt };
       });
-      if (_bloquesH.length > 0) inventarioHotel = _bloquesH.join(String.fromCharCode(10));
+      // F1.2/1.3: agrupar las unidades por COMPLEJO y anteponer el header del complejo (info general).
+      // Unidades sin complejo van en un bloque aparte. Con varios complejos, la IA distingue cada hotel.
+      const _NL = String.fromCharCode(10);
+      const _lineasPorComp = {}, _lineasSinComp = [];
+      _bloquesH.forEach(function (b) { if (b.cid && _compsById[b.cid]) (_lineasPorComp[b.cid] = _lineasPorComp[b.cid] || []).push(b.line); else _lineasSinComp.push(b.line); });
+      const _headerComp = function (c) {
+        const a = (c && c.atributos) || {}; const _pol = a.politicas || {};
+        const _polTxt = [_pol.checkin ? 'check-in ' + _pol.checkin : '', _pol.checkout ? 'check-out ' + _pol.checkout : '', _pol.cancelacion ? 'cancelacion: ' + _pol.cancelacion : '', _pol.sena ? 'seña ' + _pol.sena : '', _pol.pagos ? 'pagos: ' + _pol.pagos : ''].filter(Boolean).join(' | ');
+        return 'COMPLEJO: ' + (c.nombre || 'Alojamiento') + (a.subtipo ? ' (' + a.subtipo + ')' : '')
+          + (a.direccion ? _NL + '  Ubicacion: ' + a.direccion : '')
+          + (a.descripcion ? _NL + '  ' + a.descripcion : '')
+          + (a.amenities ? _NL + '  Amenities del complejo: ' + a.amenities : '')
+          + (a.servicios ? _NL + '  Servicios: ' + a.servicios : '')
+          + (a.beneficios ? _NL + '  Beneficios: ' + a.beneficios : '')
+          + (_polTxt ? _NL + '  Politicas: ' + _polTxt : '');
+      };
+      const _bloques = [];
+      (_complejos || []).forEach(function (c) {
+        const _ls = _lineasPorComp[c.id] || [];
+        _bloques.push(_headerComp(c) + (_ls.length ? (_NL + '  Unidades:' + _NL + _ls.join(_NL)) : (_NL + '  (sin unidades cargadas)')));
+      });
+      if (_lineasSinComp.length) _bloques.push('UNIDADES (sin complejo asignado):' + _NL + _lineasSinComp.join(_NL));
+      if (_bloques.length > 0) inventarioHotel = _bloques.join(_NL + _NL);
+      // F1.4: fotos GENERALES del complejo -> disponibles para la tool enviar_foto (etiquetadas).
+      try { (_complejos || []).forEach(function (c) { const _cim = (c.atributos && Array.isArray(c.atributos.images)) ? c.atributos.images : []; if (_cim.length) _hotelUnidsFoto.push({ id: 'complejo_' + c.id, title: (c.nombre || 'Complejo') + ' (fotos generales)', images: _cim, atributos: {}, type: 'complejo' }); }); } catch (eCF) {}
     }
   } catch (eHot) { console.error('inventario hotel:', eHot && eHot.message); inventarioHotel = ''; }
 
@@ -14368,12 +14408,17 @@ async function scrapeUrlPermitida(user_id, urlPedida) {
   try {
     const cfg = await supabase.from('scraping_config').select('fuente_url').eq('user_id', user_id).maybeSingle();
     if (cfg && cfg.error) return { ok: false, error: 'No se pudo validar el origen, intenta de nuevo' }; // fail-closed
-    const domConfig = (cfg && cfg.data && cfg.data.fuente_url) ? _dominioDe(cfg.data.fuente_url) : '';
-    if (!domConfig) {
+    // fuente_url puede tener VARIOS dominios (cadena de hoteles), separados por coma/espacio/;. Inmobiliaria = 1 solo.
+    const _raw = (cfg && cfg.data && cfg.data.fuente_url) ? String(cfg.data.fuente_url) : '';
+    const _doms = _raw.split(/[\s,;]+/).map(_dominioDe).filter(Boolean);
+    if (!_doms.length) {
       try { await supabase.from('scraping_config').upsert({ user_id: user_id, fuente_url: urlPedida }, { onConflict: 'user_id' }); } catch (eU) {}
       return { ok: true };
     }
-    if (domPedido !== domConfig) return { ok: false, error: 'Solo podes importar desde tu propio sitio (' + domConfig + '). Para cambiarlo, actualiza la URL en la configuracion de importacion.' };
+    if (_doms.indexOf(domPedido) === -1) {
+      // dominio nuevo del propio tenant (ej. otro hotel de la cadena): lo SUMAMOS a su lista y permitimos.
+      try { await supabase.from('scraping_config').upsert({ user_id: user_id, fuente_url: (_raw.trim() + ', ' + urlPedida) }, { onConflict: 'user_id' }); } catch (eU2) {}
+    }
     return { ok: true };
   } catch (e) { return { ok: false, error: 'No se pudo validar el origen, intenta de nuevo' }; } // fail-closed (M4)
 }
@@ -15184,27 +15229,15 @@ app.post('/api/scrape/universal', async function(req, res) {
     var _rubScrape = 'inmobiliaria';
     try { var _bsScr = await supabase.from('business_settings').select('rubro').eq('user_id', user_id).maybeSingle(); _rubScrape = normalizarRubro((_bsScr.data && _bsScr.data.rubro) || 'inmobiliaria'); } catch (eR) {}
     if (_rubScrape === 'hotel_cabanas') {
-      if (modo === 'reset') { try { await supabase.from('hotel_unidades').delete().eq('user_id', user_id); } catch (eDel) {} }
-      var hCre = 0, hAct = 0, hErr = 0;
-      for (var kh = 0; kh < props.length; kh++) {
-        var ph = props[kh];
-        var filaH = {
-          user_id: user_id,
-          title: ph.titulo || 'Unidad',
-          type: ph.tipo || null,
-          descripcion: ph.descripcion || null,
-          precio_base: _sInvN(ph.precio),
-          moneda: 'ARS',
-          activa: true,
-          atributos: { origen_url: ph.link || null, caracteristicas: ph.caracteristicas || null, zona: [ph.ciudad, ph.zona].filter(Boolean).join(' - ') || null }
-        };
-        try {
-          var exH = await supabase.from('hotel_unidades').select('id').eq('user_id', user_id).eq('title', filaH.title).maybeSingle();
-          if (exH.data && exH.data.id) { var upH = await supabase.from('hotel_unidades').update(filaH).eq('id', exH.data.id); if (upH.error) hErr++; else hAct++; }
-          else { var insH = await supabase.from('hotel_unidades').insert(filaH); if (insH.error) hErr++; else hCre++; }
-        } catch (eH) { hErr++; }
-      }
-      return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: props.length, creados: hCre, actualizados: hAct, errores: hErr });
+      // UNIFICADO: el hotel usa el camino COMPLETO (complejo + habitaciones + fotos + tarifas), no el path plano viejo.
+      var _baseH; try { var _uH = new URL(sitio); _baseH = _uH.protocol + '//' + _uH.host; } catch (eBH) { _baseH = sitio; }
+      var _ownerH = user_id;
+      try { var _aseH = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle(); if (_aseH && _aseH.data && _aseH.data.admin_id) _ownerH = _aseH.data.admin_id; } catch (eOH) {}
+      var _resH = await _scrapeAlojamientoCompleto(_baseH, sitio, _ownerH, true);
+      if (modo === 'reset') { try { await supabase.from('hotel_unidades').delete().eq('user_id', _ownerH); } catch (eDel) {} }
+      var _gH = await _guardarComplejoYUnidades(_ownerH, _resH, sitio, modo);
+      var _totH = (_resH.complejos || []).reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+      return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: _totH, creados: _gH.creados, actualizados: _gH.actualizados, errores: _gH.errores, estrategia: _resH.estrategia, deteccion: _resH.deteccion });
     }
 
     // modo reset: borrar el inventario actual del usuario antes de cargar
@@ -15479,10 +15512,12 @@ async function correrScrapingAlojamiento(cfg, permitirIA) {
     if (!sitio) return { ok: false, motivo: 'sin url' };
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
     var base; try { var u = new URL(sitio); base = u.protocol + '//' + u.host; } catch (e) { return { ok: false, motivo: 'url invalida' }; }
-    var unidades = await obtenerAlojamientosUniversal(base, sitio, cfg.user_id, !!permitirIA);
-    if (!unidades.length) return { ok: false, motivo: 'sin unidades', estrategia: '' };
-    var g = await _guardarUnidadesAlojamiento(cfg.user_id, unidades, 'update', sitio);
-    return { ok: true, estrategia: unidades._estrategia || '', creados: g.creados, actualizados: g.actualizados, errores: g.errores };
+    // UNIFICADO: mismo camino que el boton Importar (complejo + habitaciones + fotos + tarifas), NO el path plano viejo.
+    var res1 = await _scrapeAlojamientoCompleto(base, sitio, cfg.user_id, !!permitirIA);
+    var totalUn = (res1.complejos || []).reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+    if (!totalUn && !(res1.complejos && res1.complejos[0] && res1.complejos[0].nombre)) return { ok: false, motivo: 'sin unidades', estrategia: res1.estrategia };
+    var g = await _guardarComplejoYUnidades(cfg.user_id, res1, sitio, 'update');
+    return { ok: true, estrategia: res1.estrategia, creados: g.creados, actualizados: g.actualizados, errores: g.errores };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 
@@ -15573,7 +15608,69 @@ function _detectarAlojamiento(htmls, fotos) {
   };
 }
 
-// IA (Sonnet): devuelve {complejo:{...}, unidades:[...]} — el complejo general + cada habitacion/tipo.
+// ============================================================================
+// F0 — CONTRATO DE DATOS UNICO de una UNIDAD de hotel. TODO guardado (scraper, form,
+// editor, CSV) pasa por normalizarUnidadHotel() -> la estructura es SIEMPRE la misma y
+// la IA lee lo mismo venga de donde venga. amenities se guarda SIEMPRE como OBJETO de
+// flags {clave:{on:true}} (igual que _FormHotel); lo que no matchea a un flag va a
+// servicios_texto. Claves = las de _FormHotel AMENITIES_UNIDAD.
+// ============================================================================
+var _AMEN_DICT = [
+  ['calef_lena', /le[ñn]a|salamandra|hogar a le/i],
+  ['calef_radiadores', /radiador/i],
+  ['calef_fancoil', /fan.?coil/i],
+  ['ac', /aire\s*acond|climatiz|\bsplit\b|\ba\/?c\b/i],
+  ['cocina', /cocina|kitchenette|cocinita/i],
+  ['horno', /\bhorno\b/i],
+  ['hidromasaje_int', /hidromasaje\s*(?:interior|int)\b|jacuzzi\s*interior/i],
+  ['hidromasaje_ext', /hidromasaje|jacuzzi/i],
+  ['parrilla', /parrilla|quincho|asador/i],
+  ['deck', /\bdeck\b|terraza|balc[oó]n/i],
+  ['wifi', /wi-?fi|internet/i],
+  ['pileta', /pileta|piscina|alberca/i],
+  ['tv', /smart\s*tv|televis|\btv\b|cable\b/i],
+  ['cochera', /cochera|gara[gj]e|estacionamiento|parking/i]
+];
+// Etiquetas legibles de cada amenity (para el prompt de la IA).
+var _AMEN_LABEL = { calef_lena: 'calefaccion a leña', calef_radiadores: 'radiadores', calef_fancoil: 'fan coil', ac: 'aire acondicionado', cocina: 'cocina', horno: 'horno', hidromasaje_int: 'hidromasaje interior', hidromasaje_ext: 'hidromasaje exterior', parrilla: 'parrilla', deck: 'deck', wifi: 'wifi', pileta: 'pileta', tv: 'TV', cochera: 'cochera' };
+
+// Texto de servicios -> {flags:{clave:{on:true}}, resto:'lo que no matcheo'}.
+function _amenitiesDeTexto(texto) {
+  var flags = {}, resto = [];
+  var items = String(texto || '').split(/[,;|\n·]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i], matched = false;
+    for (var d = 0; d < _AMEN_DICT.length; d++) { if (_AMEN_DICT[d][1].test(it)) { flags[_AMEN_DICT[d][0]] = { on: true }; matched = true; break; } }
+    if (!matched) resto.push(it);
+  }
+  return { flags: flags, resto: resto.join(', ') };
+}
+
+// Normaliza los ATRIBUTOS de una unidad (venga del scraper, form, editor o CSV) al shape canonico.
+// prev = atributos existentes en la DB (para no perder amenities/tarifas/textos cargados a mano).
+function normalizarUnidadHotel(un, prev) {
+  un = un || {}; prev = (prev && typeof prev === 'object') ? prev : {};
+  var amen = Object.assign({}, (prev.amenities && typeof prev.amenities === 'object' && !Array.isArray(prev.amenities)) ? prev.amenities : {});
+  if (un.amenities && typeof un.amenities === 'object' && !Array.isArray(un.amenities)) amen = Object.assign(amen, un.amenities);
+  var servTxt = (typeof un.servicios === 'string') ? un.servicios : (prev.servicios_texto || (typeof prev.servicios === 'string' ? prev.servicios : ''));
+  if (servTxt) { var m = _amenitiesDeTexto(servTxt); amen = Object.assign({}, m.flags, amen); servTxt = m.resto; }
+  var _int = function (v, p) { var n = parseInt(v, 10); return (!isNaN(n) && n > 0) ? n : (p || null); };
+  var _numP = function (v, p) { var n = _sInvN(v); return (n != null) ? n : (p != null ? p : null); };
+  return {
+    camas: _int(un.camas, prev.camas), dormitorios: _int(un.dormitorios, prev.dormitorios),
+    banos: _int(un.banos, prev.banos), m2: _numP(un.m2, prev.m2),
+    vista: (un.vista || prev.vista || '') || null, categoria_comercial: (un.categoria_comercial || prev.categoria_comercial || '') || null,
+    amenities: amen,
+    regimenes: Array.isArray(un.regimenes) ? un.regimenes : (Array.isArray(prev.regimenes) ? prev.regimenes : []),
+    extras: Array.isArray(un.extras) ? un.extras : (Array.isArray(prev.extras) ? prev.extras : []),
+    servicios_texto: servTxt || prev.servicios_texto || '',
+    franjas: un.franjas || prev.franjas || {}, politicas: un.politicas || prev.politicas || {},
+    ical_import_urls: Array.isArray(prev.ical_import_urls) ? prev.ical_import_urls : [],
+    origen_url: un.origen_url || prev.origen_url || '', importado_por: un.importado_por || prev.importado_por || 'scraper_alojamiento'
+  };
+}
+
+// IA (Sonnet): devuelve {complejos:[{...unidades:[...]}]} — soporta CADENA (varios complejos en una pagina).
 async function _alojamientoIAcompleto(html, base, ownerId) {
   try {
     if (!process.env.ANTHROPIC_KEY) return { complejo: {}, unidades: [] };
@@ -15589,111 +15686,148 @@ async function _alojamientoIAcompleto(html, base, ownerId) {
         if (_seenImg[_iu]) continue; _seenImg[_iu] = 1; imgs.push(_iu);
       }
     } catch (eImg) {}
-    var sys = 'Sos un extractor EXHAUSTIVO de ALOJAMIENTOS turisticos (hoteles, cabañas, complejos). Te paso el TEXTO de las paginas de UN alojamiento y una LISTA DE IMAGENES. ' +
-      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejo":{"nombre","descripcion","direccion","amenities","servicios","beneficios"},"unidades":[{"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion","imagenes"}]}. ' +
-      'complejo = el hotel/complejo EN GENERAL: nombre, descripcion general COMPLETA, direccion/ubicacion, amenities (TODOS los servicios generales del complejo, coma-separados), servicios adicionales (coma-separado), beneficios (ventajas/promos, coma-separado). ' +
-      'unidades = TODAS las habitaciones/cabañas/tipos de alojamiento que aparezcan. NO omitas ninguna. Copia la descripcion COMPLETA y TODOS los servicios de cada una. ' +
-      'tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping. capacidad = personas (numero). precio = tarifa por noche (solo numero) o "". moneda ARS o USD. servicios = coma-separados. ' +
-      'imagenes = array de URLs de fotos de ESA unidad, copiadas TEXTUAL de la LISTA DE IMAGENES; si no podes asociar, []. ' +
-      'Si un dato no aparece deja "". NO inventes datos ni URLs. Devolve el objeto aunque unidades sea [].';
+    var sys = 'Sos un extractor EXHAUSTIVO de ALOJAMIENTOS turisticos (hoteles, cabañas, complejos, incluso CADENAS con varios hoteles). Te paso el TEXTO de las paginas y una LISTA DE IMAGENES. ' +
+      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejos":[{"nombre","subtipo","descripcion","direccion","amenities","servicios","beneficios","politicas","unidades":[{"nombre","tipo","capacidad","dormitorios","banos","m2","precio","moneda","servicios","descripcion","imagenes","tarifas"}]}]}. ' +
+      'complejos = TODOS los hoteles/complejos que aparezcan (si es una CADENA con varios, devolve varios; si es uno solo, un array de 1). Cada complejo: nombre, subtipo (hotel|apart|cabañas|complejo|hosteria|posada), descripcion general COMPLETA, direccion/ubicacion, amenities (servicios generales del complejo, coma-separados), servicios adicionales (coma-separado), beneficios/promos (coma-separado), politicas (check-in, check-out, cancelacion, seña, formas de pago; texto libre corto). ' +
+      'unidades (DENTRO de cada complejo) = TODAS las habitaciones/cabañas/tipos. NO omitas ninguna. Copia la descripcion COMPLETA y TODOS los servicios de cada una. ' +
+      'tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping. capacidad/dormitorios/banos = numeros; m2 = numero o "". precio = tarifa por noche (solo numero) o "". moneda ARS o USD. servicios = coma-separados. imagenes = URLs de fotos de ESA unidad copiadas TEXTUAL de la LISTA; si no podes asociar, []. ' +
+      'tarifas = si el sitio publica precios POR TEMPORADA, array [{"temporada","desde","hasta","precio","moneda","min_noches"}] (fechas ISO YYYY-MM-DD o ""); si no hay temporadas, []. ' +
+      'Si un dato no aparece deja "". NO inventes datos ni URLs. Devolve el objeto aunque no haya unidades.';
     var _userMsg = 'TEXTO:\n' + limpio;
     if (imgs.length) _userMsg += '\n\nLISTA DE IMAGENES (URLs, elegi de aca para "imagenes"):\n' + imgs.map(function (u, i) { return (i + 1) + '. ' + u; }).join('\n');
     var r = await anthropic.messages.create({ model: MODELO_CLIENTE, max_tokens: 8000, system: sys, messages: [{ role: 'user', content: _userMsg }] });
     try { if (ownerId && r && r.usage) await registrarUsoTokens(ownerId, r.usage, 'scraper_alojamiento', PRECIO_IA); } catch (eU) {}
     var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
     var o = _parseJsonObjetoDefensivo(txt) || {};
-    var complejo = (o.complejo && typeof o.complejo === 'object') ? o.complejo : {};
-    var unidades = Array.isArray(o.unidades) ? o.unidades : [];
-    for (var _k = 0; _k < unidades.length; _k++) {
-      var _pu = unidades[_k] || {};
-      _pu.imagenes = Array.isArray(_pu.imagenes) ? _pu.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).slice(0, 40) : [];
+    // Soporta el shape nuevo {complejos:[...]} y el viejo {complejo, unidades} (retro-compat).
+    var complejos = Array.isArray(o.complejos) ? o.complejos : (o.complejo ? [Object.assign({}, o.complejo, { unidades: Array.isArray(o.unidades) ? o.unidades : [] })] : []);
+    for (var _c = 0; _c < complejos.length; _c++) {
+      var _cp = complejos[_c] || {}; var _uds = Array.isArray(_cp.unidades) ? _cp.unidades : [];
+      for (var _k = 0; _k < _uds.length; _k++) {
+        var _pu = _uds[_k] || {};
+        _pu.imagenes = Array.isArray(_pu.imagenes) ? _pu.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).slice(0, 40) : [];
+        _pu.tarifas = Array.isArray(_pu.tarifas) ? _pu.tarifas : [];
+      }
+      _cp.unidades = _uds;
     }
-    return { complejo: complejo, unidades: unidades };
+    return { complejos: complejos };
   } catch (e) { console.error('[scraper alojamiento completo] IA:', e && e.message); return { complejo: {}, unidades: [] }; }
 }
 
-// Orquesta el Paso 1 (estatico). Devuelve {complejo, unidades, deteccion, estrategia}. Asigna fotos por habitacion.
+// Orquesta el Paso 1 (estatico). Devuelve {complejos:[...], deteccion, estrategia}. Asigna fotos por unidad.
 async function _scrapeAlojamientoCompleto(base, sitio, ownerId, permitirIA) {
   var pag = await _fetchPaginasAlojamiento(base);
   var fotos = _extraerFotosAlojamiento(pag.htmls, base);
   var deteccion = _detectarAlojamiento(pag.htmls, fotos);
-  var complejo = {}, unidades = [], estrategia = 'estatico';
+  var complejos = [], estrategia = 'estatico';
   if (permitirIA) {
     var htmlIA = pag.htmls.slice().reverse().join('\n\n\n');
     var data = await _alojamientoIAcompleto(htmlIA, base, ownerId);
-    complejo = data.complejo || {}; unidades = data.unidades || [];
-    if (unidades.length) {
+    complejos = Array.isArray(data.complejos) ? data.complejos : [];
+    var _tot = complejos.reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+    if (complejos.length || _tot) {
       estrategia = 'ia';
       try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3); } catch (eCob) {}
     }
   }
-  // Fotos del complejo (las de company/library; si no hay, las primeras generales).
-  complejo.images = (fotos.complejo.length ? fotos.complejo : fotos.todas.slice(0, 8)).slice(0, 20);
-  // Fotos por habitacion: grupo pxsol P<id> si lo hay; si no, las que eligio la IA (sitios no-pxsol no se pierden fotos).
+  if (!complejos.length) complejos = [{ nombre: '', unidades: [] }];
+  // Fotos: grupos pxsol P<id> repartidos a las unidades EN ORDEN GLOBAL (complejo -> unidad).
   var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
-  for (var i = 0; i < unidades.length; i++) {
-    var _g = grupos[i];
-    if (_g && _g.length) unidades[i].imagenes = _g.slice(0, 40);
-    else unidades[i].imagenes = Array.isArray(unidades[i].imagenes) ? unidades[i].imagenes.slice(0, 40) : [];
+  var _gi = 0;
+  for (var c = 0; c < complejos.length; c++) {
+    var cp = complejos[c]; var uds = Array.isArray(cp.unidades) ? cp.unidades : [];
+    for (var i = 0; i < uds.length; i++) {
+      var _g = grupos[_gi++];
+      if (_g && _g.length) uds[i].imagenes = _g.slice(0, 40);
+      else uds[i].imagenes = Array.isArray(uds[i].imagenes) ? uds[i].imagenes.slice(0, 40) : [];
+    }
+    // fotos generales del complejo (company/library; con 1 solo complejo, las primeras genericas).
+    cp.images = (fotos.complejo.length ? fotos.complejo : (complejos.length === 1 ? fotos.todas.slice(0, 8) : [])).slice(0, 20);
   }
-  return { complejo: complejo, unidades: unidades, deteccion: deteccion, estrategia: estrategia };
+  return { complejos: complejos, deteccion: deteccion, estrategia: estrategia };
 }
 
-// Guarda complejo (hotel_complejos.atributos) + habitaciones (hotel_unidades.complejo_id). Preserva ediciones manuales.
-async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
-  var creados = 0, actualizados = 0, errores = 0, complejoId = null;
-  var comp = data.complejo || {};
-  var nombreComp = String(comp.nombre || 'Mi alojamiento').slice(0, 200);
-  // Complejo: buscar por nombre; si existe, mergear atributos (preservar images si ya hay); si no, insertar.
+// Upsert de UNA unidad de hotel al shape canonico (normalizarUnidadHotel) + tarifas. Devuelve 'creado'|'actualizado'|'error'.
+async function _upsertUnidadHotel(ownerId, complejoId, un, sitio) {
   try {
-    var cEx = await supabase.from('hotel_complejos').select('id, atributos').eq('user_id', ownerId).eq('nombre', nombreComp).maybeSingle();
-    var atrComp = { descripcion: comp.descripcion || '', direccion: comp.direccion || '', amenities: comp.amenities || '', servicios: comp.servicios || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
-    if (cEx.data && cEx.data.id) {
-      complejoId = cEx.data.id;
-      var atrPrev = (cEx.data.atributos && typeof cEx.data.atributos === 'object') ? cEx.data.atributos : {};
-      var merged = Object.assign({}, atrPrev, atrComp);
-      if (Array.isArray(atrPrev.images) && atrPrev.images.length) merged.images = atrPrev.images; // preservar fotos manuales del complejo
-      ['descripcion', 'direccion', 'amenities', 'servicios', 'beneficios'].forEach(function (kk) { if (String(atrPrev[kk] || '').length > String(atrComp[kk] || '').length) merged[kk] = atrPrev[kk]; }); // no degradar: queda la version mas completa
-      await supabase.from('hotel_complejos').update({ atributos: merged }).eq('id', complejoId).eq('user_id', ownerId);
-    } else {
-      var cIns = await supabase.from('hotel_complejos').insert({ user_id: ownerId, nombre: nombreComp, tipo: 'hotel_cabanas', atributos: atrComp }).select('id').maybeSingle();
-      if (!cIns.error && cIns.data) complejoId = cIns.data.id;
-    }
-  } catch (eC) {}
-  // Habitaciones -> hotel_unidades (complejo_id), upsert por title, preservando precio/fotos manuales.
-  var unidades = Array.isArray(data.unidades) ? data.unidades : [];
-  for (var i = 0; i < unidades.length; i++) {
-    var un = unidades[i] || {};
+    var title = String(un.nombre || 'Unidad').slice(0, 200);
     var imgs = Array.isArray(un.imagenes) ? un.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).map(function (u) { return { url: u, categoria: '' }; }) : [];
+    var ex = await supabase.from('hotel_unidades').select('id, precio_base, images, descripcion, type, capacidad, complejo_id, atributos').eq('user_id', ownerId).eq('title', title).maybeSingle();
+    var prevAtr = (ex.data && ex.data.atributos && typeof ex.data.atributos === 'object') ? ex.data.atributos : {};
+    var atrNorm = normalizarUnidadHotel({ camas: un.camas, dormitorios: un.dormitorios, banos: un.banos, m2: un.m2, vista: un.vista, servicios: un.servicios, origen_url: sitio, importado_por: 'scraper_alojamiento' }, prevAtr);
     var fila = {
-      user_id: ownerId, complejo_id: complejoId,
-      title: String(un.nombre || 'Unidad').slice(0, 200),
+      user_id: ownerId, complejo_id: complejoId, title: title,
       type: un.tipo || null, capacidad: (parseInt(un.capacidad, 10) || null),
       descripcion: un.descripcion || null, precio_base: _sInvN(un.precio),
-      moneda: (un.moneda === 'USD' ? 'USD' : 'ARS'), images: imgs, activa: true,
-      atributos: { origen_url: sitio, servicios: un.servicios || null, importado_por: 'scraper_alojamiento' }
+      moneda: (un.moneda === 'USD' ? 'USD' : 'ARS'), images: imgs, activa: true, atributos: atrNorm
     };
+    var unidadId = null, resultado;
+    if (ex.data && ex.data.id) {
+      unidadId = ex.data.id;
+      var upd = Object.assign({}, fila);
+      if (ex.data.precio_base !== null && ex.data.precio_base !== undefined) delete upd.precio_base;
+      if (Array.isArray(ex.data.images) && ex.data.images.length) delete upd.images;
+      if (String(ex.data.descripcion || '').length > String(fila.descripcion || '').length) delete upd.descripcion;
+      if (ex.data.capacidad && !fila.capacidad) delete upd.capacidad;
+      if (ex.data.type && !fila.type) delete upd.type;
+      if (!complejoId && ex.data.complejo_id) delete upd.complejo_id; // no desvincular si ya pertenece a un complejo
+      var up = await supabase.from('hotel_unidades').update(upd).eq('id', unidadId);
+      resultado = up.error ? 'error' : 'actualizado';
+    } else {
+      var ins = await supabase.from('hotel_unidades').insert(fila).select('id').maybeSingle();
+      unidadId = ins.data && ins.data.id; resultado = ins.error ? 'error' : 'creado';
+    }
+    // Tarifas por temporada -> hotel_tarifa. NO pisa las manuales: inserta solo temporadas/fechas que no existan.
+    if (unidadId && Array.isArray(un.tarifas) && un.tarifas.length) {
+      try {
+        var exTar = await supabase.from('hotel_tarifa').select('temporada, fecha_desde').eq('user_id', ownerId).eq('unidad_id', unidadId);
+        var vistas = {}; (exTar.data || []).forEach(function (t) { vistas[(t.temporada || '') + '|' + (t.fecha_desde || '')] = 1; });
+        for (var t = 0; t < un.tarifas.length; t++) {
+          var ta = un.tarifas[t] || {}; var pr = _sInvN(ta.precio); if (pr == null) continue;
+          var key = (ta.temporada || '') + '|' + (ta.desde || ''); if (vistas[key]) continue;
+          await supabase.from('hotel_tarifa').insert({ user_id: ownerId, unidad_id: unidadId, temporada: ta.temporada || 'Temporada', fecha_desde: ta.desde || null, fecha_hasta: ta.hasta || null, precio_noche: pr, moneda: (ta.moneda === 'USD' ? 'USD' : 'ARS'), min_noches: (parseInt(ta.min_noches, 10) || null) });
+          vistas[key] = 1;
+        }
+      } catch (eTar) {}
+    }
+    return resultado;
+  } catch (e) { return 'error'; }
+}
+
+// Guarda un ARRAY de complejos (cadena) + sus habitaciones. Preserva ediciones manuales, no degrada. Todo pasa por el contrato canonico.
+async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
+  var creados = 0, actualizados = 0, errores = 0, complejosGuardados = [];
+  var complejos = Array.isArray(data.complejos) ? data.complejos : (data.complejo ? [Object.assign({}, data.complejo, { unidades: data.unidades || [] })] : []);
+  for (var c = 0; c < complejos.length; c++) {
+    var comp = complejos[c] || {}; var complejoId = null;
+    var nombreComp = String(comp.nombre || 'Mi alojamiento').slice(0, 200);
     try {
-      var ex = await supabase.from('hotel_unidades').select('id, precio_base, images, descripcion, type, capacidad, atributos').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
-      if (ex.data && ex.data.id) {
-        var upd = Object.assign({}, fila);
-        if (ex.data.precio_base !== null && ex.data.precio_base !== undefined) delete upd.precio_base;
-        if (Array.isArray(ex.data.images) && ex.data.images.length) delete upd.images;
-        // No degradar: quedarse con lo mas completo entre lo viejo y lo nuevo.
-        if (String(ex.data.descripcion || '').length > String(fila.descripcion || '').length) delete upd.descripcion;
-        if (ex.data.capacidad && !fila.capacidad) delete upd.capacidad;
-        if (ex.data.type && !fila.type) delete upd.type;
-        var _atrMerged = Object.assign({}, (ex.data.atributos && typeof ex.data.atributos === 'object') ? ex.data.atributos : {}, fila.atributos);
-        var _servV = (ex.data.atributos && ex.data.atributos.servicios) || '';
-        if (String(_servV).length > String(fila.atributos.servicios || '').length) _atrMerged.servicios = _servV;
-        upd.atributos = _atrMerged;
-        var up = await supabase.from('hotel_unidades').update(upd).eq('id', ex.data.id); if (up.error) errores++; else actualizados++;
+      var cEx = await supabase.from('hotel_complejos').select('id, atributos').eq('user_id', ownerId).eq('nombre', nombreComp).maybeSingle();
+      var atrComp = { descripcion: comp.descripcion || '', direccion: comp.direccion || '', amenities: comp.amenities || '', servicios: comp.servicios || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
+      if (comp.subtipo) atrComp.subtipo = comp.subtipo;
+      if (comp.politicas && typeof comp.politicas === 'object') atrComp.politicas = comp.politicas;
+      if (cEx.data && cEx.data.id) {
+        complejoId = cEx.data.id;
+        var atrPrev = (cEx.data.atributos && typeof cEx.data.atributos === 'object') ? cEx.data.atributos : {};
+        var merged = Object.assign({}, atrPrev, atrComp);
+        if (Array.isArray(atrPrev.images) && atrPrev.images.length) merged.images = atrPrev.images;
+        ['descripcion', 'direccion', 'amenities', 'servicios', 'beneficios'].forEach(function (kk) { if (String(atrPrev[kk] || '').length > String(atrComp[kk] || '').length) merged[kk] = atrPrev[kk]; });
+        if (atrPrev.politicas && (!comp.politicas || typeof comp.politicas !== 'object')) merged.politicas = atrPrev.politicas;
+        if (atrPrev.subtipo && !comp.subtipo) merged.subtipo = atrPrev.subtipo;
+        await supabase.from('hotel_complejos').update({ atributos: merged }).eq('id', complejoId).eq('user_id', ownerId);
       } else {
-        var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creados++;
+        var cIns = await supabase.from('hotel_complejos').insert({ user_id: ownerId, nombre: nombreComp, tipo: 'hotel_cabanas', atributos: atrComp }).select('id').maybeSingle();
+        if (!cIns.error && cIns.data) complejoId = cIns.data.id;
       }
-    } catch (eU) { errores++; }
+    } catch (eC) {}
+    complejosGuardados.push({ id: complejoId, nombre: nombreComp });
+    var unidades = Array.isArray(comp.unidades) ? comp.unidades : [];
+    for (var i = 0; i < unidades.length; i++) {
+      var _r = await _upsertUnidadHotel(ownerId, complejoId, unidades[i] || {}, sitio);
+      if (_r === 'creado') creados++; else if (_r === 'actualizado') actualizados++; else errores++;
+    }
   }
-  return { complejoId: complejoId, creados: creados, actualizados: actualizados, errores: errores };
+  return { complejos: complejosGuardados, complejoId: (complejosGuardados[0] && complejosGuardados[0].id) || null, creados: creados, actualizados: actualizados, errores: errores };
 }
 
 app.post('/api/scrape/alojamiento', async function (req, res) {
@@ -15716,12 +15850,13 @@ app.post('/api/scrape/alojamiento', async function (req, res) {
 
     // PASO 1 (estatico): complejo + habitaciones + fotos por habitacion + deteccion para el Paso 2.
     var res1 = await _scrapeAlojamientoCompleto(base, sitio, ownerId, true);
-    var totalUn = (res1.unidades || []).length;
-    if (!totalUn && !(res1.complejo && res1.complejo.nombre)) {
+    var totalUn = (res1.complejos || []).reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+    var _nomComp = (res1.complejos && res1.complejos[0] && res1.complejos[0].nombre) || null;
+    if (!totalUn && !_nomComp) {
       return res.json({ ok: false, total: 0, deteccion: res1.deteccion, mensaje: 'No se encontraron alojamientos en la pagina. La web puede requerir JavaScript (probá el scrape profundo) o cargá las unidades a mano.' });
     }
     var g = await _guardarComplejoYUnidades(ownerId, res1, sitio, modo);
-    return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: totalUn, creados: g.creados, actualizados: g.actualizados, errores: g.errores, estrategia: res1.estrategia, complejo: (res1.complejo && res1.complejo.nombre) || null, deteccion: res1.deteccion });
+    return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: totalUn, complejos: (g.complejos || []).length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, estrategia: res1.estrategia, complejo: _nomComp, deteccion: res1.deteccion });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -15780,12 +15915,18 @@ app.post('/api/scrape/alojamiento/profundo', async function (req, res) {
     var data = await _alojamientoIAcompleto(rendered.slice().reverse().join('\n\n\n'), base, ownerId);
     // Cobro al cliente (opt-in): la cantidad de mensajes la puede mandar el front (costoMsgs), cap 20.
     try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, Math.min(20, (req.body && parseInt(req.body.costoMsgs, 10)) || 5)); } catch (eCob) {}
-    data.complejo = data.complejo || {};
-    data.complejo.images = (fotos.complejo.length ? fotos.complejo : fotos.todas.slice(0, 10)).slice(0, 30);
+    var complejos = Array.isArray(data.complejos) ? data.complejos : [];
+    if (!complejos.length) complejos = [{ nombre: '', unidades: [] }];
     var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
-    for (var j = 0; j < (data.unidades || []).length; j++) data.unidades[j].imagenes = (grupos[j] || []).slice(0, 40);
-    var g = await _guardarComplejoYUnidades(ownerId, data, sitio, modo);
-    return res.json({ ok: true, profundo: true, via: via, total: (data.unidades || []).length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejo: data.complejo.nombre || null, fotosTotales: fotos.todas.length });
+    var _gi = 0;
+    for (var c = 0; c < complejos.length; c++) {
+      var cp = complejos[c]; var uds = Array.isArray(cp.unidades) ? cp.unidades : [];
+      for (var j = 0; j < uds.length; j++) { var _g = grupos[_gi++]; if (_g && _g.length) uds[j].imagenes = _g.slice(0, 40); else uds[j].imagenes = Array.isArray(uds[j].imagenes) ? uds[j].imagenes.slice(0, 40) : []; }
+      cp.images = (fotos.complejo.length ? fotos.complejo : (complejos.length === 1 ? fotos.todas.slice(0, 10) : [])).slice(0, 30);
+    }
+    var _totUn = complejos.reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+    var g = await _guardarComplejoYUnidades(ownerId, { complejos: complejos }, sitio, modo);
+    return res.json({ ok: true, profundo: true, via: via, total: _totUn, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejo: (complejos[0] && complejos[0].nombre) || null, fotosTotales: fotos.todas.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

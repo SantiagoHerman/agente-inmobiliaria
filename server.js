@@ -15251,6 +15251,246 @@ app.post('/api/scrape/universal', async function(req, res) {
 
 
 // ============================================================================
+// SCRAPER DE ALOJAMIENTO  —  POST /api/scrape/alojamiento   (rubro hotel_cabanas)
+// ----------------------------------------------------------------------------
+// MISMA arquitectura que el scraper inmobiliaria (cascada de estrategias, la IA
+// SOLO como ULTIMO recurso) pero ADAPTADA a alojamiento temporal (hoteles,
+// cabañas, aparts, complejos). Guarda en hotel_unidades (las MISMAS tablas que
+// lee la IA de hotel). NO toca properties ni el scraper inmobiliaria.
+// Cascada (corta en la primera que trae unidades):
+//   (1) WordPress wp-json: post types de plugins de hotel (mphb_room_type, etc.)  -> gratis
+//   (2) JSON-LD schema.org: Hotel / LodgingBusiness / HotelRoom / Accommodation   -> gratis
+//   (3) IA (Haiku = MODELO_INTERNO) sobre el texto de la pagina -> JSON de unidades  [🔴 gasto]
+// Campos por unidad: nombre, tipo, capacidad, precio/noche, servicios, descripcion.
+// ============================================================================
+
+// (1) wp-json de un post type de alojamiento. Devuelve [] si el type no existe.
+async function _wpAlojamiento(base, tipo) {
+  var out = [];
+  try {
+    var r = await fetchScrape(base + '/wp-json/wp/v2/' + tipo + '?per_page=50&_embed=1', { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+    if (!r || !r.ok) return out;
+    var data; try { data = JSON.parse(await r.text()); } catch (e) { return out; }
+    if (!Array.isArray(data)) return out;
+    for (var i = 0; i < data.length; i++) {
+      var p = data[i] || {};
+      var emb = p._embedded || {};
+      var media = emb['wp:featuredmedia'] || [];
+      out.push({
+        nombre: (limpiarHTML(p.title && p.title.rendered) || 'Unidad'),
+        tipo: '', capacidad: '', precio: null, moneda: 'ARS', dormitorios: '', banos: '', servicios: '',
+        descripcion: (limpiarHTML(p.content && p.content.rendered) || limpiarHTML(p.excerpt && p.excerpt.rendered) || ''),
+        link: p.link || (base + '/?p=' + p.id),
+        foto: (media[0] && media[0].source_url) || null
+      });
+    }
+  } catch (e) {}
+  return out;
+}
+
+// (2) JSON-LD (schema.org). Busca nodos de alojamiento (Hotel/LodgingBusiness/Resort/HotelRoom/
+// Accommodation/Apartment/House/Cabin) con nombre, y sus habitaciones anidadas. Gratis. [] si nada.
+function _alojamientosJsonLd(htmls, base) {
+  var out = [], vistos = {};
+  // esUnidad = tipos que son una UNIDAD alquilable (habitacion/cabaña/depto). OJO: el nodo "Hotel"/"LodgingBusiness"/
+  // "Resort" es el ESTABLECIMIENTO, NO una unidad -> NO se agrega (si no, se crearia 1 sola unidad = el hotel entero,
+  // y la cascada cortaria sin llegar a la IA). De un Hotel solo tomamos sus habitaciones anidadas (containsPlace/etc).
+  function esUnidad(t) { return /hotelroom|suite|accommodation|apartment|\bhouse\b|cabin|lodgingunit|\broom\b/i.test(String(t || '')); }
+  function precioDe(node) {
+    try {
+      var of = node.offers || node.makesOffer; if (Array.isArray(of)) of = of[0];
+      if (of) return of.price || (of.priceSpecification && (of.priceSpecification.price || of.priceSpecification.minPrice)) || null;
+    } catch (e) {}
+    return null;
+  }
+  function push(node) {
+    if (!node || typeof node !== 'object') return;
+    var tipo = node['@type']; if (Array.isArray(tipo)) tipo = tipo.join(' ');
+    var nombre = (typeof node.name === 'string') ? node.name.trim() : '';
+    if (esUnidad(tipo) && nombre && !vistos[nombre.toLowerCase()]) {
+      vistos[nombre.toLowerCase()] = 1;
+      var cap = ''; try { cap = (node.occupancy && (node.occupancy.maxValue || node.occupancy.value)) || node.numberOfBeds || ''; } catch (e) {}
+      out.push({ nombre: nombre, tipo: '', capacidad: cap || '', precio: precioDe(node) || '', moneda: 'ARS', dormitorios: '', banos: '', servicios: '', descripcion: (typeof node.description === 'string' ? node.description.slice(0, 500) : ''), link: node.url || base });
+    }
+    var kids = node.containsPlace || node.hasPart || node.makesOffer;
+    if (Array.isArray(kids)) for (var i = 0; i < kids.length; i++) push(kids[i] && (kids[i].itemOffered || kids[i]));
+  }
+  for (var h = 0; h < htmls.length; h++) {
+    var blocks = (htmls[h] || '').match(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || [];
+    for (var b = 0; b < blocks.length; b++) {
+      var m = blocks[b].match(/>([\s\S]*?)<\/script>/i); if (!m) continue;
+      var data; try { data = JSON.parse(m[1].trim()); } catch (e) { continue; }
+      var nodes = Array.isArray(data) ? data : (data['@graph'] && Array.isArray(data['@graph']) ? data['@graph'] : [data]);
+      for (var n = 0; n < nodes.length; n++) push(nodes[n]);
+    }
+  }
+  return out;
+}
+
+// (3) IA (Haiku) — ULTIMO recurso. Manda el texto limpio de la pagina y pide TODAS las unidades
+// de alojamiento como JSON. Cap de HTML + registro de tokens (control de costo). [] si no hay key.
+async function _alojamientosIA(html, base, ownerId) {
+  try {
+    if (!process.env.ANTHROPIC_KEY) { console.log('[scraper alojamiento] sin ANTHROPIC_KEY, se omite IA'); return []; }
+    var limpio = _htmlParaIA(html, 100000);
+    if (limpio.length < 150) return [];
+    var sys = 'Sos un extractor de ALOJAMIENTOS turisticos (hoteles, cabañas, aparts, complejos, posadas). Te paso el TEXTO de una pagina web de un alojamiento. ' +
+      'Devolve EXCLUSIVAMENTE un JSON array (sin markdown, sin texto alrededor) con TODAS las unidades que ofrece para alquilar por noche (habitaciones, cabañas, departamentos, suites, bungalows). ' +
+      'Cada item: {"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion"}. ' +
+      'tipo: uno de Cabaña|Habitación|Departamento|Suite|Bungalow|Casa. capacidad: cantidad de personas (numero). precio: tarifa por NOCHE (solo numero, sin simbolos ni miles). moneda: ARS o USD. ' +
+      'servicios: lista corta separada por comas (wifi, pileta, parrilla, cochera, aire, desayuno, etc.). Si un dato no aparece, deja "". NO inventes unidades. Si la pagina no ofrece alojamiento, devolve [].';
+    var r = await anthropic.messages.create({
+      model: MODELO_CLIENTE, // Sonnet: mejor extraccion de alojamiento ("todo, no parte"). El costo corre por cuenta del cliente.
+      max_tokens: 3000,
+      system: sys,
+      messages: [{ role: 'user', content: 'TEXTO DE LA PAGINA:\n' + limpio }]
+    });
+    try { if (ownerId && r && r.usage) await registrarUsoTokens(ownerId, r.usage, 'scraper_alojamiento', PRECIO_IA); } catch (eU) {}
+    var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+    var arr = _parseJsonArrayDefensivo(txt);
+    if (!Array.isArray(arr)) return [];
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+      var p = arr[i] || {};
+      var nombre = String(p.nombre || '').trim();
+      if (!nombre) continue;
+      out.push({ nombre: nombre, tipo: p.tipo || '', capacidad: p.capacidad || '', precio: (p.precio === 0 ? 0 : (p.precio || '')), moneda: (p.moneda === 'USD' ? 'USD' : 'ARS'), dormitorios: p.dormitorios || '', banos: p.banos || '', servicios: p.servicios || '', descripcion: p.descripcion || '', link: base });
+    }
+    return out;
+  } catch (e) { console.error('[scraper alojamiento] _alojamientosIA:', e && e.message); return []; }
+}
+
+// Orquesta la cascada de alojamiento. Devuelve un array de unidades + arr._estrategia con la via usada.
+// permitirIA (default true): si es false NO se usa la IA (solo estrategias gratis). El cron de
+// auto-update lo llama con false -> costo de IA = 0 en el camino automatico.
+async function obtenerAlojamientosUniversal(base, sitio, ownerId, permitirIA) {
+  if (permitirIA === undefined) permitirIA = true;
+  // (1) wp-json de plugins de hotel conocidos
+  var WP_TYPES = ['mphb_room_type', 'accommodation', 'hotel_room', 'room', 'rooms', 'lodging', 'cabin', 'cabana'];
+  for (var t = 0; t < WP_TYPES.length; t++) {
+    var wp = await _wpAlojamiento(base, WP_TYPES[t]);
+    if (wp.length) { wp._estrategia = 'wp-json:' + WP_TYPES[t]; return wp; }
+  }
+  // Descargar HTML de la home + rutas tipicas de alojamiento (para JSON-LD e IA)
+  var rutas = ['/', '/habitaciones', '/habitaciones/', '/cabanas', '/cabanas/', '/alojamiento', '/alojamientos', '/unidades', '/rooms', '/accommodation', '/tarifas', '/reservas', '/precios'];
+  var homeHtml = '', htmls = [];
+  for (var ri = 0; ri < rutas.length; ri++) {
+    try {
+      var rr = await fetchScrape(base + rutas[ri], { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+      if (rr && rr.ok) { var h = await rr.text(); if (ri === 0) homeHtml = h; if (h && h.length > 500) htmls.push(h); }
+    } catch (e) {}
+  }
+  if (!htmls.length && homeHtml) htmls.push(homeHtml);
+  // DESCUBRIR links internos de la home que parezcan paginas de unidades (habitaciones/domos/cabañas/tarifas).
+  // Cubre sitios estaticos u otras rutas que las fijas no aciertan (ej: /habitaciones.html, /domos.html). Cap 8.
+  try {
+    if (homeHtml) {
+      var hrefs = (homeHtml.match(/href\s*=\s*["']([^"']+)["']/gi) || []).map(function (m) { return m.replace(/^href\s*=\s*["']|["']$/gi, ''); });
+      var vistosL = {}, extra = [];
+      for (var li = 0; li < hrefs.length && extra.length < 8; li++) {
+        var hf = hrefs[li];
+        if (!hf || /^(#|mailto:|tel:|javascript:)/i.test(hf)) continue;
+        if (!/habitaci|domo|caba[nñ]|suite|bungalow|apart|aloj|tarifa|\broom|accommodation|unidad|precio/i.test(hf)) continue;
+        var abs; try { abs = new URL(hf, base + '/').toString(); } catch (e) { continue; }
+        if (abs.indexOf(base) !== 0) continue; // solo el dominio propio
+        if (vistosL[abs]) continue; vistosL[abs] = 1;
+        extra.push(abs);
+      }
+      for (var ei = 0; ei < extra.length; ei++) {
+        try { var re = await fetchScrape(extra[ei], { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } }); if (re && re.ok) { var he = await re.text(); if (he && he.length > 500) htmls.push(he); } } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  // (2) JSON-LD (gratis)
+  try { var ld = _alojamientosJsonLd(htmls, base); if (ld.length) { ld._estrategia = 'json-ld'; return ld; } } catch (e) {}
+  // (3) IA (Haiku) — ULTIMO recurso y SOLO si permitirIA (el cron de auto-update lo pasa en false -> costo 0).
+  if (permitirIA) {
+    try {
+      // Le pasamos TODAS las paginas relevantes concatenadas (paginas de unidades primero, home al final).
+      // _alojamientosIA limpia y recorta; asi Sonnet ve /habitaciones + /domos + home, no una sola pagina.
+      var htmlIA = htmls.slice().reverse().join('\n\n\n');
+      var ia = await _alojamientosIA(htmlIA, base, ownerId);
+      if (ia.length) {
+        // Cobro al cliente: descuenta de SUS mensajes (igual que el scraper de inventario). Gateado por suscripcion.
+        try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3); } catch (eCob) {}
+        ia._estrategia = 'ia'; return ia;
+      }
+    } catch (e) {}
+  }
+  return [];
+}
+
+// Upsert de unidades de alojamiento en hotel_unidades (por title -> no duplica). Compartido por el
+// endpoint manual y el cron de auto-update. Devuelve {creados, actualizados, errores}.
+async function _guardarUnidadesAlojamiento(ownerId, unidades, modo, sitio) {
+  if (modo === 'reset') { try { await supabase.from('hotel_unidades').delete().eq('user_id', ownerId); } catch (eDel) {} }
+  var creados = 0, actualizados = 0, errores = 0;
+  for (var i = 0; i < unidades.length; i++) {
+    var un = unidades[i] || {};
+    var fila = {
+      user_id: ownerId,
+      title: String(un.nombre || 'Unidad').slice(0, 200),
+      type: un.tipo || null,
+      descripcion: un.descripcion || null,
+      precio_base: _sInvN(un.precio),
+      moneda: (un.moneda === 'USD' ? 'USD' : 'ARS'),
+      activa: true,
+      atributos: { origen_url: un.link || sitio, capacidad: un.capacidad || null, servicios: un.servicios || null, dormitorios: un.dormitorios || null, banos: un.banos || null, importado_por: 'scraper_alojamiento' }
+    };
+    try {
+      var ex = await supabase.from('hotel_unidades').select('id').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
+      if (ex.data && ex.data.id) { var up = await supabase.from('hotel_unidades').update(fila).eq('id', ex.data.id); if (up.error) errores++; else actualizados++; }
+      else { var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creados++; }
+    } catch (eU) { errores++; }
+  }
+  return { creados: creados, actualizados: actualizados, errores: errores };
+}
+
+// Corre el scraper de alojamiento para una cuenta (cfg de scraping_config). Lo usan el cron de
+// auto-update (permitirIA=false -> 0 gasto) y correr-ahora (permitirIA=true, lo dispara el dueño).
+async function correrScrapingAlojamiento(cfg, permitirIA) {
+  try {
+    var sitio = (cfg && cfg.fuente_url ? String(cfg.fuente_url) : '').trim();
+    if (!sitio) return { ok: false, motivo: 'sin url' };
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    var base; try { var u = new URL(sitio); base = u.protocol + '//' + u.host; } catch (e) { return { ok: false, motivo: 'url invalida' }; }
+    var unidades = await obtenerAlojamientosUniversal(base, sitio, cfg.user_id, !!permitirIA);
+    if (!unidades.length) return { ok: false, motivo: 'sin unidades', estrategia: '' };
+    var g = await _guardarUnidadesAlojamiento(cfg.user_id, unidades, 'update', sitio);
+    return { ok: true, estrategia: unidades._estrategia || '', creados: g.creados, actualizados: g.actualizados, errores: g.errores };
+  } catch (e) { return { ok: false, motivo: e && e.message }; }
+}
+
+app.post('/api/scrape/alojamiento', async function (req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // Un asesor opera sobre la cuenta del dueño: resolvemos ownerId para leer/escribir el inventario del TENANT.
+    var ownerId = user_id;
+    try { var ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle(); if (ase && ase.data && ase.data.admin_id) ownerId = ase.data.admin_id; } catch (eO) {}
+
+    var sitio = (req.body && req.body.url ? String(req.body.url) : '').trim();
+    var modo = (req.body && req.body.modo === 'reset') ? 'reset' : 'update';
+    if (!sitio) return res.status(400).json({ error: 'Falta la url del sitio' });
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    var base; try { var u = new URL(sitio); base = u.protocol + '//' + u.host; } catch (e) { return res.status(400).json({ error: 'URL invalida' }); }
+
+    // Restringir al dominio propio del tenant (anti-scrape de competencia / explosion de costo IA).
+    var _perm = await scrapeUrlPermitida(ownerId, sitio);
+    if (!_perm.ok) return res.status(400).json({ error: _perm.error });
+
+    var unidades = await obtenerAlojamientosUniversal(base, sitio, ownerId);
+    if (!unidades.length) {
+      return res.json({ ok: false, total: 0, mensaje: 'No se encontraron alojamientos en la pagina (probamos wp-json de hotel, datos estructurados e IA). La web puede no ser compatible o requerir JavaScript. Podes cargar las unidades a mano.' });
+    }
+    var estrategia = unidades._estrategia || '';
+    var g = await _guardarUnidadesAlojamiento(ownerId, unidades, modo, sitio);
+    return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: unidades.length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, estrategia: estrategia });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+
+// ============================================================================
 // SCRAPER DESARROLLADORA  —  POST /api/scrape/desarrollo   (ADITIVO)
 // ----------------------------------------------------------------------------
 // Lee la pagina de UN proyecto de una desarrolladora (texto + fotos/planos/renders)
@@ -19252,15 +19492,21 @@ app.post('/api/scraping-config/correr-ahora', async function(req, res) {
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
     var q = await supabase.from('scraping_config').select('*').eq('user_id', user_id).maybeSingle();
     if (!q.data) return res.json({ ok: false, mensaje: 'No hay configuracion guardada' });
+    // Rubro de la cuenta: hotel_cabanas corre el scraper de ALOJAMIENTO (a hotel_unidades); el resto, propiedades.
+    var _rubCA = 'inmobiliaria';
+    try { var _bsCA = await supabase.from('business_settings').select('rubro').eq('user_id', user_id).maybeSingle(); _rubCA = normalizarRubro((_bsCA.data && _bsCA.data.rubro) || 'inmobiliaria'); } catch (eCA) {}
     // Un scrape completo puede tardar varios minutos (baja la lista + ficha + galeria por propiedad).
     // Respondemos YA y corremos en segundo plano: evita que el request HTTP quede colgado / lo corte el proxy.
     // El frontend ya muestra "se esta ejecutando en segundo plano" y no espera este resultado.
     res.json({ ok: true, corriendo: true, mensaje: 'La actualizacion se esta ejecutando en segundo plano.' });
     (async function () {
       try {
-        var r = (q.data.modo === 'directo') ? await correrScrapingDeUsuario(q.data) : await correrScrapingPendiente(q.data);
+        // "Actualizar ahora" lo dispara el dueño a mano -> en hotel permitimos IA (igual que el boton Importar).
+        var r = (_rubCA === 'hotel_cabanas')
+          ? await correrScrapingAlojamiento(q.data, true)
+          : ((q.data.modo === 'directo') ? await correrScrapingDeUsuario(q.data) : await correrScrapingPendiente(q.data));
         await supabase.from('scraping_config').update({ ultimo_scraping: new Date().toISOString() }).eq('user_id', user_id);
-        console.log('[correr-ahora] user', user_id, 'resultado', JSON.stringify(r));
+        console.log('[correr-ahora] user', user_id, 'rubro', _rubCA, 'resultado', JSON.stringify(r));
       } catch (e) { console.error('[correr-ahora bg]', e && e.message); }
     })();
   } catch (e) { try { return res.status(500).json({ error: e && e.message }); } catch (e2) {} }
@@ -19323,13 +19569,16 @@ async function revisarScrapingsAutomaticos() {
     var diaHoy = nombresDias[diaSemana];
     for (var i = 0; i < cuentas.length; i++) {
       var cfg = cuentas[i];
-      // GUARD POR RUBRO: este cron scrapea PROPERTIES (listados de inmobiliaria). Hotel no scrapea propiedades y
-      // desarrolladora tiene su propio cron (revisarScrapingsDesarrollo). Si la cuenta no es inmobiliaria, saltar
-      // (evita filas huerfanas en properties que la IA de ese rubro ignora). Defensivo: ante error, no bloquea.
+      // GUARD POR RUBRO: inmobiliaria scrapea PROPERTIES; hotel_cabanas scrapea a hotel_unidades (SIN IA en el
+      // cron -> costo 0); desarrolladora tiene su propio cron (revisarScrapingsDesarrollo) => se saltea aca.
+      // Defensivo: ante error, asumimos inmobiliaria (comportamiento actual).
+      var _rubCfg = 'inmobiliaria';
       try {
         var _bsRubro = await supabase.from('business_settings').select('rubro').eq('user_id', cfg.user_id).maybeSingle();
-        if (normalizarRubro((_bsRubro.data && _bsRubro.data.rubro) || 'inmobiliaria') !== 'inmobiliaria') continue;
+        _rubCfg = normalizarRubro((_bsRubro.data && _bsRubro.data.rubro) || 'inmobiliaria');
       } catch (eGuardR) {}
+      if (_rubCfg === 'desarrolladora') continue;
+      var _esHotelCfg = (_rubCfg === 'hotel_cabanas');
       var horarios = Array.isArray(cfg.horarios) ? cfg.horarios : [];
       var dias = Array.isArray(cfg.dias_semana) ? cfg.dias_semana : [];
       // determinar la hora objetivo segun frecuencia
@@ -19350,8 +19599,12 @@ async function revisarScrapingsAutomaticos() {
       if (!leToca) continue;
       // anti-repeticion: si ya corrio con esta marca, saltar
       if (cfg.ultimo_scraping && String(cfg.ultimo_scraping).indexOf(marca) >= 0) continue;
-      // correr el scraping (modo directo en esta version)
-      if (cfg.modo === 'directo') {
+      // correr el scraping segun el rubro. Hotel: siempre directo; usa IA (Sonnet) segun la preferencia del
+      // cliente (modo='ia'). Si usa IA, el costo se descuenta de SUS mensajes (como el scraper de inventario).
+      if (_esHotelCfg) {
+        var _iaHotel = (String(cfg.modo || '').indexOf('ia') >= 0);
+        await correrScrapingAlojamiento(cfg, _iaHotel);
+      } else if (cfg.modo === 'directo') {
         await correrScrapingDeUsuario(cfg);
       } else {
         await correrScrapingPendiente(cfg);

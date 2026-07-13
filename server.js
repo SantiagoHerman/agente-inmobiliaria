@@ -15334,16 +15334,30 @@ async function _alojamientosIA(html, base, ownerId) {
     if (!process.env.ANTHROPIC_KEY) { console.log('[scraper alojamiento] sin ANTHROPIC_KEY, se omite IA'); return []; }
     var limpio = _htmlParaIA(html, 100000);
     if (limpio.length < 150) return [];
-    var sys = 'Sos un extractor de ALOJAMIENTOS turisticos (hoteles, cabañas, aparts, complejos, posadas). Te paso el TEXTO de una pagina web de un alojamiento. ' +
-      'Devolve EXCLUSIVAMENTE un JSON array (sin markdown, sin texto alrededor) con TODAS las unidades que ofrece para alquilar por noche (habitaciones, cabañas, departamentos, suites, bungalows). ' +
-      'Cada item: {"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion"}. ' +
-      'tipo: uno de Cabaña|Habitación|Departamento|Suite|Bungalow|Casa. capacidad: cantidad de personas (numero). precio: tarifa por NOCHE (solo numero, sin simbolos ni miles). moneda: ARS o USD. ' +
-      'servicios: lista corta separada por comas (wifi, pileta, parrilla, cochera, aire, desayuno, etc.). Si un dato no aparece, deja "". NO inventes unidades. Si la pagina no ofrece alojamiento, devolve [].';
+    // Extraer URLs de imagenes del HTML crudo (antes de limpiar) para que la IA pueda asociar fotos a cada unidad.
+    var imgs = [], _seenImg = {};
+    try {
+      var _im, _reImg = /<img[^>]+src\s*=\s*["']([^"']+)["']/gi;
+      while ((_im = _reImg.exec(html)) !== null && imgs.length < 40) {
+        var _iu; try { _iu = new URL(_im[1], base + '/').toString(); } catch (e) { continue; }
+        if (!/^https?:/i.test(_iu) || /\.(svg|gif)(\?|$)/i.test(_iu) || /logo|icon|sprite|favicon|placeholder|blank|pixel/i.test(_iu)) continue;
+        if (_seenImg[_iu]) continue; _seenImg[_iu] = 1; imgs.push(_iu);
+      }
+    } catch (eImg) {}
+    var sys = 'Sos un extractor de ALOJAMIENTOS turisticos (hoteles, cabañas, aparts, complejos, posadas). Te paso el TEXTO de una pagina web de un alojamiento y una LISTA DE IMAGENES. ' +
+      'Devolve EXCLUSIVAMENTE un JSON array (sin markdown, sin texto alrededor) con TODAS las unidades que ofrece para alquilar por noche (habitaciones, cabañas, domos, departamentos, suites, bungalows). ' +
+      'Cada item: {"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion","imagenes"}. ' +
+      'tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping (elegi el mas parecido). capacidad: cantidad de personas (numero). precio: tarifa por NOCHE (solo numero, sin simbolos ni miles). moneda: ARS o USD. ' +
+      'servicios: lista corta separada por comas (wifi, pileta, parrilla, cochera, aire, desayuno, etc.). ' +
+      'imagenes: array con URLs de fotos de ESA unidad, copiadas TEXTUAL de la LISTA DE IMAGENES; si no podes asociar, deja []. ' +
+      'Si un dato no aparece, deja "". NO inventes unidades ni URLs. Si la pagina no ofrece alojamiento, devolve [].';
+    var _userMsg = 'TEXTO DE LA PAGINA:\n' + limpio;
+    if (imgs.length) _userMsg += '\n\nLISTA DE IMAGENES (URLs; elegí de aca para el campo "imagenes"):\n' + imgs.map(function (u, i) { return (i + 1) + '. ' + u; }).join('\n');
     var r = await anthropic.messages.create({
       model: MODELO_CLIENTE, // Sonnet: mejor extraccion de alojamiento ("todo, no parte"). El costo corre por cuenta del cliente.
-      max_tokens: 3000,
+      max_tokens: 4000,
       system: sys,
-      messages: [{ role: 'user', content: 'TEXTO DE LA PAGINA:\n' + limpio }]
+      messages: [{ role: 'user', content: _userMsg }]
     });
     try { if (ownerId && r && r.usage) await registrarUsoTokens(ownerId, r.usage, 'scraper_alojamiento', PRECIO_IA); } catch (eU) {}
     var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
@@ -15354,7 +15368,8 @@ async function _alojamientosIA(html, base, ownerId) {
       var p = arr[i] || {};
       var nombre = String(p.nombre || '').trim();
       if (!nombre) continue;
-      out.push({ nombre: nombre, tipo: p.tipo || '', capacidad: p.capacidad || '', precio: (p.precio === 0 ? 0 : (p.precio || '')), moneda: (p.moneda === 'USD' ? 'USD' : 'ARS'), dormitorios: p.dormitorios || '', banos: p.banos || '', servicios: p.servicios || '', descripcion: p.descripcion || '', link: base });
+      var _imgsU = Array.isArray(p.imagenes) ? p.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).slice(0, 12) : [];
+      out.push({ nombre: nombre, tipo: p.tipo || '', capacidad: p.capacidad || '', precio: (p.precio === 0 ? 0 : (p.precio || '')), moneda: (p.moneda === 'USD' ? 'USD' : 'ARS'), dormitorios: p.dormitorios || '', banos: p.banos || '', servicios: p.servicios || '', descripcion: p.descripcion || '', imagenes: _imgsU, link: base });
     }
     return out;
   } catch (e) { console.error('[scraper alojamiento] _alojamientosIA:', e && e.message); return []; }
@@ -15427,20 +15442,30 @@ async function _guardarUnidadesAlojamiento(ownerId, unidades, modo, sitio) {
   var creados = 0, actualizados = 0, errores = 0;
   for (var i = 0; i < unidades.length; i++) {
     var un = unidades[i] || {};
+    var _imgsUn = Array.isArray(un.imagenes) ? un.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).map(function (u) { return { url: u, categoria: '' }; }) : [];
     var fila = {
       user_id: ownerId,
       title: String(un.nombre || 'Unidad').slice(0, 200),
       type: un.tipo || null,
+      capacidad: (parseInt(un.capacidad, 10) || null),
       descripcion: un.descripcion || null,
       precio_base: _sInvN(un.precio),
       moneda: (un.moneda === 'USD' ? 'USD' : 'ARS'),
+      images: _imgsUn,
       activa: true,
       atributos: { origen_url: un.link || sitio, capacidad: un.capacidad || null, servicios: un.servicios || null, dormitorios: un.dormitorios || null, banos: un.banos || null, importado_por: 'scraper_alojamiento' }
     };
     try {
-      var ex = await supabase.from('hotel_unidades').select('id').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
-      if (ex.data && ex.data.id) { var up = await supabase.from('hotel_unidades').update(fila).eq('id', ex.data.id); if (up.error) errores++; else actualizados++; }
-      else { var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creados++; }
+      var ex = await supabase.from('hotel_unidades').select('id, precio_base, images').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
+      if (ex.data && ex.data.id) {
+        // Re-scrape NO pisa lo editado a mano: preserva precio y fotos si ya estaban cargados.
+        var upd = Object.assign({}, fila);
+        if (ex.data.precio_base !== null && ex.data.precio_base !== undefined) delete upd.precio_base;
+        if (Array.isArray(ex.data.images) && ex.data.images.length) delete upd.images;
+        var up = await supabase.from('hotel_unidades').update(upd).eq('id', ex.data.id); if (up.error) errores++; else actualizados++;
+      } else {
+        var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creados++;
+      }
     } catch (eU) { errores++; }
   }
   return { creados: creados, actualizados: actualizados, errores: errores };
@@ -15486,6 +15511,64 @@ app.post('/api/scrape/alojamiento', async function (req, res) {
     var estrategia = unidades._estrategia || '';
     var g = await _guardarUnidadesAlojamiento(ownerId, unidades, modo, sitio);
     return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: unidades.length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, estrategia: estrategia });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Resuelve el owner (un asesor opera sobre la cuenta del dueño). Devuelve el auth id del tenant o null.
+async function _ownerDe(req) {
+  var user_id = await verificarUsuario(req);
+  if (!user_id) return null;
+  try { var ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle(); if (ase && ase.data && ase.data.admin_id) return ase.data.admin_id; } catch (e) {}
+  return user_id;
+}
+
+// Editar UNA unidad de alojamiento (edicion manual desde /alojamiento). Owner-scoped. Solo toca los campos enviados.
+app.post('/api/inventario/hotel/unidad/actualizar', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    var id = b.id ? String(b.id) : '';
+    if (!id) return res.status(400).json({ error: 'Falta id' });
+    var cur = await supabase.from('hotel_unidades').select('user_id, atributos').eq('id', id).maybeSingle();
+    if (cur.error) return res.status(500).json({ error: cur.error.message });
+    if (!cur.data) return res.status(404).json({ error: 'Unidad no encontrada' });
+    if (cur.data.user_id !== ownerId) return res.status(403).json({ error: 'La unidad no pertenece a tu cuenta' });
+    var fila = {};
+    if (b.title !== undefined) fila.title = String(b.title || 'Sin nombre').slice(0, 200);
+    if (b.type !== undefined) fila.type = b.type || null;
+    if (b.capacidad !== undefined) fila.capacidad = (parseInt(b.capacidad, 10) || null);
+    if (b.descripcion !== undefined) fila.descripcion = b.descripcion || null;
+    if (b.precio_base !== undefined) fila.precio_base = (b.precio_base === '' || b.precio_base === null) ? null : _sInvN(b.precio_base);
+    if (b.moneda !== undefined) fila.moneda = (b.moneda === 'USD' ? 'USD' : 'ARS');
+    if (b.activa !== undefined) fila.activa = !!b.activa;
+    if (Array.isArray(b.images)) fila.images = b.images.filter(function (im) { return im && im.url; }).map(function (im) { return { url: im.url, categoria: im.categoria || '' }; });
+    // atributos: merge (preserva lo existente; actualiza servicios/capacidad si vienen).
+    var atr = Object.assign({}, (cur.data.atributos && typeof cur.data.atributos === 'object') ? cur.data.atributos : {});
+    if (b.servicios !== undefined) atr.servicios = b.servicios || null;
+    if (b.capacidad !== undefined) atr.capacidad = b.capacidad || null;
+    fila.atributos = atr;
+    var up = await supabase.from('hotel_unidades').update(fila).eq('id', id).eq('user_id', ownerId);
+    if (up.error) return res.status(500).json({ error: up.error.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Eliminar UNA unidad de alojamiento. Owner-scoped. Limpia tarifas huerfanas (best-effort).
+app.post('/api/inventario/hotel/unidad/eliminar', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var id = (req.body && req.body.id) ? String(req.body.id) : '';
+    if (!id) return res.status(400).json({ error: 'Falta id' });
+    var cur = await supabase.from('hotel_unidades').select('user_id').eq('id', id).maybeSingle();
+    if (cur.error) return res.status(500).json({ error: cur.error.message });
+    if (!cur.data) return res.status(404).json({ error: 'Unidad no encontrada' });
+    if (cur.data.user_id !== ownerId) return res.status(403).json({ error: 'La unidad no pertenece a tu cuenta' });
+    var del = await supabase.from('hotel_unidades').delete().eq('id', id).eq('user_id', ownerId);
+    if (del.error) return res.status(500).json({ error: del.error.message });
+    try { await supabase.from('hotel_tarifa').delete().eq('unidad_id', id).eq('user_id', ownerId); } catch (eT) {}
+    return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

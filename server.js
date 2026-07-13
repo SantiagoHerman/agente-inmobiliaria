@@ -15577,19 +15577,37 @@ function _detectarAlojamiento(htmls, fotos) {
 async function _alojamientoIAcompleto(html, base, ownerId) {
   try {
     if (!process.env.ANTHROPIC_KEY) return { complejo: {}, unidades: [] };
-    var limpio = _htmlParaIA(html, 100000);
+    var limpio = _htmlParaIA(html, 140000);
     if (limpio.length < 150) return { complejo: {}, unidades: [] };
-    var sys = 'Sos un extractor de ALOJAMIENTOS turisticos (hoteles, cabañas, complejos). Te paso el TEXTO de las paginas de UN alojamiento. ' +
-      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejo":{"nombre","descripcion","amenities","beneficios"},"unidades":[{"nombre","tipo","capacidad","precio","moneda","servicios","descripcion"}]}. ' +
-      'complejo = el hotel/complejo EN GENERAL: nombre, descripcion general, amenities (servicios generales del complejo, coma-separados), beneficios (ventajas/promos, coma-separado). ' +
-      'unidades = cada habitacion, cabaña o tipo de alojamiento. tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping. capacidad = personas (numero). precio = tarifa por noche (solo numero) o "". moneda ARS o USD. servicios = coma-separados. ' +
-      'Si un dato no aparece deja "". NO inventes. Devolve el objeto aunque unidades sea [].';
-    var r = await anthropic.messages.create({ model: MODELO_CLIENTE, max_tokens: 4000, system: sys, messages: [{ role: 'user', content: 'TEXTO:\n' + limpio }] });
+    // Lista de imagenes del HTML: para que la IA asigne fotos por unidad en sitios que NO son PXSOL.
+    var imgs = [], _seenImg = {};
+    try {
+      var _im, _reImg = /<img[^>]+src\s*=\s*["']([^"']+)["']/gi;
+      while ((_im = _reImg.exec(html)) !== null && imgs.length < 60) {
+        var _iu; try { _iu = new URL(_im[1], base + '/').toString(); } catch (e) { continue; }
+        if (!/^https?:/i.test(_iu) || /\.(svg|gif)(\?|$)/i.test(_iu) || /logo|icon|sprite|favicon|placeholder|blank|pixel|bnd_/i.test(_iu) || /rs:fill:(?:16|24|32|48|64):/i.test(_iu)) continue;
+        if (_seenImg[_iu]) continue; _seenImg[_iu] = 1; imgs.push(_iu);
+      }
+    } catch (eImg) {}
+    var sys = 'Sos un extractor EXHAUSTIVO de ALOJAMIENTOS turisticos (hoteles, cabañas, complejos). Te paso el TEXTO de las paginas de UN alojamiento y una LISTA DE IMAGENES. ' +
+      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejo":{"nombre","descripcion","amenities","beneficios"},"unidades":[{"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion","imagenes"}]}. ' +
+      'complejo = el hotel/complejo EN GENERAL: nombre, descripcion general COMPLETA, amenities (TODOS los servicios generales, coma-separados), beneficios (ventajas/promos, coma-separado). ' +
+      'unidades = TODAS las habitaciones/cabañas/tipos de alojamiento que aparezcan. NO omitas ninguna. Copia la descripcion COMPLETA y TODOS los servicios de cada una. ' +
+      'tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping. capacidad = personas (numero). precio = tarifa por noche (solo numero) o "". moneda ARS o USD. servicios = coma-separados. ' +
+      'imagenes = array de URLs de fotos de ESA unidad, copiadas TEXTUAL de la LISTA DE IMAGENES; si no podes asociar, []. ' +
+      'Si un dato no aparece deja "". NO inventes datos ni URLs. Devolve el objeto aunque unidades sea [].';
+    var _userMsg = 'TEXTO:\n' + limpio;
+    if (imgs.length) _userMsg += '\n\nLISTA DE IMAGENES (URLs, elegi de aca para "imagenes"):\n' + imgs.map(function (u, i) { return (i + 1) + '. ' + u; }).join('\n');
+    var r = await anthropic.messages.create({ model: MODELO_CLIENTE, max_tokens: 8000, system: sys, messages: [{ role: 'user', content: _userMsg }] });
     try { if (ownerId && r && r.usage) await registrarUsoTokens(ownerId, r.usage, 'scraper_alojamiento', PRECIO_IA); } catch (eU) {}
     var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
     var o = _parseJsonObjetoDefensivo(txt) || {};
     var complejo = (o.complejo && typeof o.complejo === 'object') ? o.complejo : {};
     var unidades = Array.isArray(o.unidades) ? o.unidades : [];
+    for (var _k = 0; _k < unidades.length; _k++) {
+      var _pu = unidades[_k] || {};
+      _pu.imagenes = Array.isArray(_pu.imagenes) ? _pu.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).slice(0, 40) : [];
+    }
     return { complejo: complejo, unidades: unidades };
   } catch (e) { console.error('[scraper alojamiento completo] IA:', e && e.message); return { complejo: {}, unidades: [] }; }
 }
@@ -15611,10 +15629,12 @@ async function _scrapeAlojamientoCompleto(base, sitio, ownerId, permitirIA) {
   }
   // Fotos del complejo (las de company/library; si no hay, las primeras generales).
   complejo.images = (fotos.complejo.length ? fotos.complejo : fotos.todas.slice(0, 8)).slice(0, 20);
-  // Fotos por habitacion: los grupos pxsol P<id> en orden -> a las unidades en orden (heuristica).
+  // Fotos por habitacion: grupo pxsol P<id> si lo hay; si no, las que eligio la IA (sitios no-pxsol no se pierden fotos).
   var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
   for (var i = 0; i < unidades.length; i++) {
-    unidades[i].imagenes = (grupos[i] || []).slice(0, 40);
+    var _g = grupos[i];
+    if (_g && _g.length) unidades[i].imagenes = _g.slice(0, 40);
+    else unidades[i].imagenes = Array.isArray(unidades[i].imagenes) ? unidades[i].imagenes.slice(0, 40) : [];
   }
   return { complejo: complejo, unidades: unidades, deteccion: deteccion, estrategia: estrategia };
 }
@@ -15633,6 +15653,7 @@ async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
       var atrPrev = (cEx.data.atributos && typeof cEx.data.atributos === 'object') ? cEx.data.atributos : {};
       var merged = Object.assign({}, atrPrev, atrComp);
       if (Array.isArray(atrPrev.images) && atrPrev.images.length) merged.images = atrPrev.images; // preservar fotos manuales del complejo
+      ['descripcion', 'amenities', 'beneficios'].forEach(function (kk) { if (String(atrPrev[kk] || '').length > String(atrComp[kk] || '').length) merged[kk] = atrPrev[kk]; }); // no degradar: queda la version mas completa
       await supabase.from('hotel_complejos').update({ atributos: merged }).eq('id', complejoId).eq('user_id', ownerId);
     } else {
       var cIns = await supabase.from('hotel_complejos').insert({ user_id: ownerId, nombre: nombreComp, tipo: 'hotel_cabanas', atributos: atrComp }).select('id').maybeSingle();
@@ -15653,11 +15674,19 @@ async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
       atributos: { origen_url: sitio, servicios: un.servicios || null, importado_por: 'scraper_alojamiento' }
     };
     try {
-      var ex = await supabase.from('hotel_unidades').select('id, precio_base, images').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
+      var ex = await supabase.from('hotel_unidades').select('id, precio_base, images, descripcion, type, capacidad, atributos').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
       if (ex.data && ex.data.id) {
         var upd = Object.assign({}, fila);
         if (ex.data.precio_base !== null && ex.data.precio_base !== undefined) delete upd.precio_base;
         if (Array.isArray(ex.data.images) && ex.data.images.length) delete upd.images;
+        // No degradar: quedarse con lo mas completo entre lo viejo y lo nuevo.
+        if (String(ex.data.descripcion || '').length > String(fila.descripcion || '').length) delete upd.descripcion;
+        if (ex.data.capacidad && !fila.capacidad) delete upd.capacidad;
+        if (ex.data.type && !fila.type) delete upd.type;
+        var _atrMerged = Object.assign({}, (ex.data.atributos && typeof ex.data.atributos === 'object') ? ex.data.atributos : {}, fila.atributos);
+        var _servV = (ex.data.atributos && ex.data.atributos.servicios) || '';
+        if (String(_servV).length > String(fila.atributos.servicios || '').length) _atrMerged.servicios = _servV;
+        upd.atributos = _atrMerged;
         var up = await supabase.from('hotel_unidades').update(upd).eq('id', ex.data.id); if (up.error) errores++; else actualizados++;
       } else {
         var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creados++;

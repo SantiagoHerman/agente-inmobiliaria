@@ -19909,6 +19909,11 @@ async function revisarScrapingsAutomaticos() {
         if (horasObjetivo.indexOf(horaActual) >= 0) { leToca = true; marca = hoyStr + '-' + horaActual; }
       } else if (cfg.frecuencia === 'dias_semana') {
         if (dias.indexOf(diaHoy) >= 0 && horaActual === horasObjetivo[0]) leToca = true;
+      } else if (cfg.frecuencia === 'diario') {
+        if (horaActual === horasObjetivo[0]) leToca = true;
+      } else if (cfg.frecuencia === 'dias_mes') {
+        // dias_semana reusado para guardar los dias DEL MES elegidos (numeros como string). No requiere migracion.
+        if (dias.indexOf(String(diaMes)) >= 0 && horaActual === horasObjetivo[0]) leToca = true;
       } else if (cfg.frecuencia === 'semanal') {
         if (diaSemana === 1 && horaActual === horasObjetivo[0]) leToca = true;
       } else if (cfg.frecuencia === 'mensual') {

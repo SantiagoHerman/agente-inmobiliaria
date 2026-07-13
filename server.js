@@ -15486,6 +15486,187 @@ async function correrScrapingAlojamiento(cfg, permitirIA) {
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 
+// ============================================================================
+// SCRAPER DE ALOJAMIENTO — VERSION COMPLETA (complejo + habitaciones + fotos).
+// AISLADO: SOLO se usa desde /api/scrape/alojamiento* (rubro hotel_cabanas).
+// NO toca inmobiliaria ni desarrolladora ni el boot del backend.
+// Paso 1 = estatico (esta seccion). Paso 3 = profundo/headless (gateado, mas abajo).
+// ============================================================================
+
+// Baja home + rutas tipicas + links internos de unidades. Devuelve {homeHtml, htmls}.
+async function _fetchPaginasAlojamiento(base) {
+  var rutas = ['/', '/habitaciones', '/habitaciones/', '/cabanas', '/cabanas/', '/alojamiento', '/alojamientos', '/unidades', '/rooms', '/accommodation', '/tarifas', '/reservas', '/precios', '/domos'];
+  var homeHtml = '', htmls = [];
+  for (var ri = 0; ri < rutas.length; ri++) {
+    try {
+      var rr = await fetchScrape(base + rutas[ri], { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+      if (rr && rr.ok) { var h = await rr.text(); if (ri === 0) homeHtml = h; if (h && h.length > 500) htmls.push(h); }
+    } catch (e) {}
+  }
+  if (!htmls.length && homeHtml) htmls.push(homeHtml);
+  // descubrir links internos de unidades (cubre .html u otras rutas)
+  try {
+    if (homeHtml) {
+      var hrefs = (homeHtml.match(/href\s*=\s*["']([^"']+)["']/gi) || []).map(function (m) { return m.replace(/^href\s*=\s*["']|["']$/gi, ''); });
+      var vistosL = {}, extra = [];
+      for (var li = 0; li < hrefs.length && extra.length < 8; li++) {
+        var hf = hrefs[li];
+        if (!hf || /^(#|mailto:|tel:|javascript:)/i.test(hf)) continue;
+        if (!/habitaci|domo|caba[nñ]|suite|bungalow|apart|aloj|tarifa|\broom|accommodation|unidad|precio/i.test(hf)) continue;
+        var abs; try { abs = new URL(hf, base + '/').toString(); } catch (e) { continue; }
+        if (abs.indexOf(base) !== 0) continue;
+        if (vistosL[abs]) continue; vistosL[abs] = 1; extra.push(abs);
+      }
+      for (var ei = 0; ei < extra.length; ei++) {
+        try { var re = await fetchScrape(extra[ei], { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } }); if (re && re.ok) { var he = await re.text(); if (he && he.length > 500) htmls.push(he); } } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return { homeHtml: homeHtml, htmls: htmls };
+}
+
+// Extrae fotos y las agrupa: por habitacion (patron pxsol .../P<id>/photos) y del complejo (company/library).
+// Fallback generico: junta todas las <img> http(s) que no sean iconos. {porRoom:{P123:[urls]}, complejo:[urls], todas:[urls]}.
+function _extraerFotosAlojamiento(htmls, base) {
+  var porRoom = {}, complejo = [], todas = [], seen = {};
+  for (var h = 0; h < htmls.length; h++) {
+    var html = htmls[h] || '';
+    var m, re = /<img[^>]+src\s*=\s*["']([^"']+)["']/gi;
+    while ((m = re.exec(html)) !== null) {
+      var abs; try { abs = new URL(m[1], base + '/').toString(); } catch (e) { continue; }
+      if (!/^https?:/i.test(abs)) continue;
+      if (/\.(svg|gif)(\?|$)/i.test(abs) || /logo|icon|sprite|favicon|placeholder|blank|pixel|bnd_/i.test(abs)) continue;
+      if (/rs:fill:(?:16|24|32|48|64):/i.test(abs)) continue; // pxsol: miniatura/icono
+      if (seen[abs]) continue; seen[abs] = 1; todas.push(abs);
+      var dec = ''; try { dec = decodeURIComponent(abs); } catch (e) { dec = abs; }
+      var pm = dec.match(/\/(P\d+)\/photos/i);
+      if (pm) { (porRoom[pm[1]] = porRoom[pm[1]] || []).push(abs); }
+      else if (/\/company\/library|\/company\//i.test(dec)) { complejo.push(abs); }
+    }
+  }
+  return { porRoom: porRoom, complejo: complejo, todas: todas };
+}
+
+// Detecta plataforma + cuantas habitaciones/galerias hay -> alimenta el Paso 2 (aviso de scrape profundo).
+function _detectarAlojamiento(htmls, fotos) {
+  var joined = htmls.join(' ');
+  var esPxsol = /pxsol\.com/i.test(joined);
+  var bookRooms = Array.from(new Set((joined.match(/bookRoom_(\d+)/g) || [])));
+  var roomsWidget = bookRooms.length;
+  var galeriasPorRoom = Object.keys(fotos.porRoom || {}).length;
+  var faltanGalerias = Math.max(0, roomsWidget - galeriasPorRoom);
+  var preciosPorJS = esPxsol; // en pxsol los precios los calcula el widget con fechas (no estan en el HTML)
+  var hayMas = (faltanGalerias > 0) || preciosPorJS;
+  var costoDeepMsgs = esPxsol ? Math.max(3, roomsWidget * 2) : 3;
+  return {
+    plataforma: esPxsol ? 'pxsol' : 'generico',
+    habitacionesWidget: roomsWidget,
+    galeriasEncontradas: galeriasPorRoom,
+    faltanGalerias: faltanGalerias,
+    preciosPorJS: preciosPorJS,
+    hayMas: hayMas,
+    deepDisponible: true,
+    costoDeepMsgs: costoDeepMsgs,
+    resumen: esPxsol
+      ? ('Este sitio usa PXSOL. Encontre ' + galeriasPorRoom + ' galeria(s) de ' + roomsWidget + ' habitacion(es); las tarifas y el resto de las fotos las carga por JavaScript. Un scrape profundo las trae (gasta ~' + costoDeepMsgs + ' mensajes IA).')
+      : (faltanGalerias > 0 ? 'Puede haber mas fotos o tarifas cargadas por JavaScript.' : '')
+  };
+}
+
+// IA (Sonnet): devuelve {complejo:{...}, unidades:[...]} — el complejo general + cada habitacion/tipo.
+async function _alojamientoIAcompleto(html, base, ownerId) {
+  try {
+    if (!process.env.ANTHROPIC_KEY) return { complejo: {}, unidades: [] };
+    var limpio = _htmlParaIA(html, 100000);
+    if (limpio.length < 150) return { complejo: {}, unidades: [] };
+    var sys = 'Sos un extractor de ALOJAMIENTOS turisticos (hoteles, cabañas, complejos). Te paso el TEXTO de las paginas de UN alojamiento. ' +
+      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejo":{"nombre","descripcion","amenities","beneficios"},"unidades":[{"nombre","tipo","capacidad","precio","moneda","servicios","descripcion"}]}. ' +
+      'complejo = el hotel/complejo EN GENERAL: nombre, descripcion general, amenities (servicios generales del complejo, coma-separados), beneficios (ventajas/promos, coma-separado). ' +
+      'unidades = cada habitacion, cabaña o tipo de alojamiento. tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping. capacidad = personas (numero). precio = tarifa por noche (solo numero) o "". moneda ARS o USD. servicios = coma-separados. ' +
+      'Si un dato no aparece deja "". NO inventes. Devolve el objeto aunque unidades sea [].';
+    var r = await anthropic.messages.create({ model: MODELO_CLIENTE, max_tokens: 4000, system: sys, messages: [{ role: 'user', content: 'TEXTO:\n' + limpio }] });
+    try { if (ownerId && r && r.usage) await registrarUsoTokens(ownerId, r.usage, 'scraper_alojamiento', PRECIO_IA); } catch (eU) {}
+    var txt = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
+    var o = _parseJsonObjetoDefensivo(txt) || {};
+    var complejo = (o.complejo && typeof o.complejo === 'object') ? o.complejo : {};
+    var unidades = Array.isArray(o.unidades) ? o.unidades : [];
+    return { complejo: complejo, unidades: unidades };
+  } catch (e) { console.error('[scraper alojamiento completo] IA:', e && e.message); return { complejo: {}, unidades: [] }; }
+}
+
+// Orquesta el Paso 1 (estatico). Devuelve {complejo, unidades, deteccion, estrategia}. Asigna fotos por habitacion.
+async function _scrapeAlojamientoCompleto(base, sitio, ownerId, permitirIA) {
+  var pag = await _fetchPaginasAlojamiento(base);
+  var fotos = _extraerFotosAlojamiento(pag.htmls, base);
+  var deteccion = _detectarAlojamiento(pag.htmls, fotos);
+  var complejo = {}, unidades = [], estrategia = 'estatico';
+  if (permitirIA) {
+    var htmlIA = pag.htmls.slice().reverse().join('\n\n\n');
+    var data = await _alojamientoIAcompleto(htmlIA, base, ownerId);
+    complejo = data.complejo || {}; unidades = data.unidades || [];
+    if (unidades.length) {
+      estrategia = 'ia';
+      try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3); } catch (eCob) {}
+    }
+  }
+  // Fotos del complejo (las de company/library; si no hay, las primeras generales).
+  complejo.images = (fotos.complejo.length ? fotos.complejo : fotos.todas.slice(0, 8)).slice(0, 20);
+  // Fotos por habitacion: los grupos pxsol P<id> en orden -> a las unidades en orden (heuristica).
+  var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
+  for (var i = 0; i < unidades.length; i++) {
+    unidades[i].imagenes = (grupos[i] || []).slice(0, 40);
+  }
+  return { complejo: complejo, unidades: unidades, deteccion: deteccion, estrategia: estrategia };
+}
+
+// Guarda complejo (hotel_complejos.atributos) + habitaciones (hotel_unidades.complejo_id). Preserva ediciones manuales.
+async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
+  var creados = 0, actualizados = 0, errores = 0, complejoId = null;
+  var comp = data.complejo || {};
+  var nombreComp = String(comp.nombre || 'Mi alojamiento').slice(0, 200);
+  // Complejo: buscar por nombre; si existe, mergear atributos (preservar images si ya hay); si no, insertar.
+  try {
+    var cEx = await supabase.from('hotel_complejos').select('id, atributos').eq('user_id', ownerId).eq('nombre', nombreComp).maybeSingle();
+    var atrComp = { descripcion: comp.descripcion || '', amenities: comp.amenities || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
+    if (cEx.data && cEx.data.id) {
+      complejoId = cEx.data.id;
+      var atrPrev = (cEx.data.atributos && typeof cEx.data.atributos === 'object') ? cEx.data.atributos : {};
+      var merged = Object.assign({}, atrPrev, atrComp);
+      if (Array.isArray(atrPrev.images) && atrPrev.images.length) merged.images = atrPrev.images; // preservar fotos manuales del complejo
+      await supabase.from('hotel_complejos').update({ atributos: merged }).eq('id', complejoId).eq('user_id', ownerId);
+    } else {
+      var cIns = await supabase.from('hotel_complejos').insert({ user_id: ownerId, nombre: nombreComp, tipo: 'hotel_cabanas', atributos: atrComp }).select('id').maybeSingle();
+      if (!cIns.error && cIns.data) complejoId = cIns.data.id;
+    }
+  } catch (eC) {}
+  // Habitaciones -> hotel_unidades (complejo_id), upsert por title, preservando precio/fotos manuales.
+  var unidades = Array.isArray(data.unidades) ? data.unidades : [];
+  for (var i = 0; i < unidades.length; i++) {
+    var un = unidades[i] || {};
+    var imgs = Array.isArray(un.imagenes) ? un.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).map(function (u) { return { url: u, categoria: '' }; }) : [];
+    var fila = {
+      user_id: ownerId, complejo_id: complejoId,
+      title: String(un.nombre || 'Unidad').slice(0, 200),
+      type: un.tipo || null, capacidad: (parseInt(un.capacidad, 10) || null),
+      descripcion: un.descripcion || null, precio_base: _sInvN(un.precio),
+      moneda: (un.moneda === 'USD' ? 'USD' : 'ARS'), images: imgs, activa: true,
+      atributos: { origen_url: sitio, servicios: un.servicios || null, importado_por: 'scraper_alojamiento' }
+    };
+    try {
+      var ex = await supabase.from('hotel_unidades').select('id, precio_base, images').eq('user_id', ownerId).eq('title', fila.title).maybeSingle();
+      if (ex.data && ex.data.id) {
+        var upd = Object.assign({}, fila);
+        if (ex.data.precio_base !== null && ex.data.precio_base !== undefined) delete upd.precio_base;
+        if (Array.isArray(ex.data.images) && ex.data.images.length) delete upd.images;
+        var up = await supabase.from('hotel_unidades').update(upd).eq('id', ex.data.id); if (up.error) errores++; else actualizados++;
+      } else {
+        var ins = await supabase.from('hotel_unidades').insert(fila); if (ins.error) errores++; else creados++;
+      }
+    } catch (eU) { errores++; }
+  }
+  return { complejoId: complejoId, creados: creados, actualizados: actualizados, errores: errores };
+}
+
 app.post('/api/scrape/alojamiento', async function (req, res) {
   try {
     var user_id = await verificarUsuario(req);
@@ -15504,13 +15685,67 @@ app.post('/api/scrape/alojamiento', async function (req, res) {
     var _perm = await scrapeUrlPermitida(ownerId, sitio);
     if (!_perm.ok) return res.status(400).json({ error: _perm.error });
 
-    var unidades = await obtenerAlojamientosUniversal(base, sitio, ownerId);
-    if (!unidades.length) {
-      return res.json({ ok: false, total: 0, mensaje: 'No se encontraron alojamientos en la pagina (probamos wp-json de hotel, datos estructurados e IA). La web puede no ser compatible o requerir JavaScript. Podes cargar las unidades a mano.' });
+    // PASO 1 (estatico): complejo + habitaciones + fotos por habitacion + deteccion para el Paso 2.
+    var res1 = await _scrapeAlojamientoCompleto(base, sitio, ownerId, true);
+    var totalUn = (res1.unidades || []).length;
+    if (!totalUn && !(res1.complejo && res1.complejo.nombre)) {
+      return res.json({ ok: false, total: 0, deteccion: res1.deteccion, mensaje: 'No se encontraron alojamientos en la pagina. La web puede requerir JavaScript (probá el scrape profundo) o cargá las unidades a mano.' });
     }
-    var estrategia = unidades._estrategia || '';
-    var g = await _guardarUnidadesAlojamiento(ownerId, unidades, modo, sitio);
-    return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: unidades.length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, estrategia: estrategia });
+    var g = await _guardarComplejoYUnidades(ownerId, res1, sitio, modo);
+    return res.json({ ok: true, rubro: 'hotel_cabanas', modo: modo, total: totalUn, creados: g.creados, actualizados: g.actualizados, errores: g.errores, estrategia: res1.estrategia, complejo: (res1.complejo && res1.complejo.nombre) || null, deteccion: res1.deteccion });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============================================================================
+// PASO 3 — SCRAPE PROFUNDO (headless). Renderiza el JS (PXSOL, etc.) para traer TODAS
+// las galerias. GATEADO + LAZY: el require de playwright es lazy adentro del handler;
+// si no esta instalado responde 503 SIN romper el boot ni afectar los otros rubros.
+// Opt-in del cliente (avisa gasto). Solo rubro hotel.
+// ============================================================================
+app.post('/api/scrape/alojamiento/profundo', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var sitio = (req.body && req.body.url ? String(req.body.url) : '').trim();
+    var modo = (req.body && req.body.modo === 'reset') ? 'reset' : 'update';
+    if (!sitio) return res.status(400).json({ error: 'Falta la url' });
+    if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+    var base; try { var u = new URL(sitio); base = u.protocol + '//' + u.host; } catch (e) { return res.status(400).json({ error: 'URL invalida' }); }
+    var _perm = await scrapeUrlPermitida(ownerId, sitio);
+    if (!_perm.ok) return res.status(400).json({ error: _perm.error });
+    // LAZY require: no se carga en el boot. Si falta playwright -> 503 claro (no rompe nada).
+    var chromium = null;
+    try { chromium = require('playwright').chromium; } catch (eReq) {
+      return res.status(503).json({ error: 'El scrape profundo (navegador headless) no esta habilitado en el servidor todavia. Falta instalar playwright/chromium en Railway.', necesita: 'playwright' });
+    }
+    // Renderizar home + paginas de unidades con JS ejecutado (captura galerias completas de PXSOL).
+    var rendered = [], browser = null;
+    try {
+      browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      var ctx = await browser.newContext({ userAgent: 'Mozilla/5.0 RaicesCRM' });
+      var rutas = ['/habitaciones.html', '/habitaciones', '/domos.html', '/domos', '/cabanas.html', '/cabanas', '/'];
+      var vistas = 0;
+      for (var i = 0; i < rutas.length && vistas < 5; i++) {
+        try {
+          var page = await ctx.newPage();
+          var r = await page.goto(base + rutas[i], { waitUntil: 'networkidle', timeout: 25000 });
+          if (r && r.ok()) { var html = await page.content(); if (html && html.length > 800) { rendered.push(html); vistas++; } }
+          await page.close();
+        } catch (ep) {}
+      }
+    } finally { try { if (browser) await browser.close(); } catch (eCl) {} }
+    if (!rendered.length) return res.json({ ok: false, mensaje: 'No se pudo renderizar el sitio (headless).' });
+    // Extraccion completa sobre el HTML RENDERIZADO (mas fotos y contenido que el estatico).
+    var fotos = _extraerFotosAlojamiento(rendered, base);
+    var data = await _alojamientoIAcompleto(rendered.slice().reverse().join('\n\n\n'), base, ownerId);
+    // Cobro al cliente (opt-in): la cantidad de mensajes la puede mandar el front (costoMsgs), cap 20.
+    try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, Math.min(20, (req.body && parseInt(req.body.costoMsgs, 10)) || 5)); } catch (eCob) {}
+    data.complejo = data.complejo || {};
+    data.complejo.images = (fotos.complejo.length ? fotos.complejo : fotos.todas.slice(0, 10)).slice(0, 30);
+    var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
+    for (var j = 0; j < (data.unidades || []).length; j++) data.unidades[j].imagenes = (grupos[j] || []).slice(0, 40);
+    var g = await _guardarComplejoYUnidades(ownerId, data, sitio, modo);
+    return res.json({ ok: true, profundo: true, total: (data.unidades || []).length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejo: data.complejo.nombre || null, fotosTotales: fotos.todas.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

@@ -15713,28 +15713,39 @@ app.post('/api/scrape/alojamiento/profundo', async function (req, res) {
     var base; try { var u = new URL(sitio); base = u.protocol + '//' + u.host; } catch (e) { return res.status(400).json({ error: 'URL invalida' }); }
     var _perm = await scrapeUrlPermitida(ownerId, sitio);
     if (!_perm.ok) return res.status(400).json({ error: _perm.error });
-    // LAZY require: no se carga en el boot. Si falta playwright -> 503 claro (no rompe nada).
-    var chromium = null;
-    try { chromium = require('playwright').chromium; } catch (eReq) {
-      return res.status(503).json({ error: 'El scrape profundo (navegador headless) no esta habilitado en el servidor todavia. Falta instalar playwright/chromium en Railway.', necesita: 'playwright' });
-    }
-    // Renderizar home + paginas de unidades con JS ejecutado (captura galerias completas de PXSOL).
-    var rendered = [], browser = null;
-    try {
-      browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
-      var ctx = await browser.newContext({ userAgent: 'Mozilla/5.0 RaicesCRM' });
-      var rutas = ['/habitaciones.html', '/habitaciones', '/domos.html', '/domos', '/cabanas.html', '/cabanas', '/'];
+    var rutas = ['/habitaciones.html', '/habitaciones', '/domos.html', '/domos', '/cabanas.html', '/cabanas', '/'];
+    var rendered = [], via = null;
+    // OPCION SEGURA (NO toca la infra/build del backend -> cero riesgo para inmobiliaria/desarrolladora):
+    // servicio de render tercerizado via env RENDER_API_URL (ej. browserless: https://chrome.browserless.io/content?token=XXX).
+    // El backend solo hace un fetch; NO instala chromium.
+    var RENDER_API = process.env.RENDER_API_URL || '';
+    if (RENDER_API) {
+      via = 'render-api';
       var vistas = 0;
       for (var i = 0; i < rutas.length && vistas < 5; i++) {
         try {
-          var page = await ctx.newPage();
-          var r = await page.goto(base + rutas[i], { waitUntil: 'networkidle', timeout: 25000 });
-          if (r && r.ok()) { var html = await page.content(); if (html && html.length > 800) { rendered.push(html); vistas++; } }
-          await page.close();
-        } catch (ep) {}
+          var rr = await fetch(RENDER_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: base + rutas[i], gotoOptions: { waitUntil: 'networkidle2', timeout: 25000 } }) });
+          if (rr && rr.ok) { var h = await rr.text(); if (h && h.length > 800) { rendered.push(h); vistas++; } }
+        } catch (eR) {}
       }
-    } finally { try { if (browser) await browser.close(); } catch (eCl) {} }
-    if (!rendered.length) return res.json({ ok: false, mensaje: 'No se pudo renderizar el sitio (headless).' });
+    } else {
+      // FALLBACK opcional: playwright LOCAL, solo si alguien instalo chromium en el server (lazy require, no afecta el boot).
+      var chromium = null;
+      try { chromium = require('playwright').chromium; } catch (eReq) {
+        return res.status(503).json({ error: 'El scrape profundo no esta habilitado. Configura un servicio de render (env RENDER_API_URL, ej. browserless) en el servidor.', necesita: 'render' });
+      }
+      via = 'playwright-local';
+      var browser = null;
+      try {
+        browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+        var ctx = await browser.newContext({ userAgent: 'Mozilla/5.0 RaicesCRM' });
+        var vistas2 = 0;
+        for (var j2 = 0; j2 < rutas.length && vistas2 < 5; j2++) {
+          try { var page = await ctx.newPage(); var pr = await page.goto(base + rutas[j2], { waitUntil: 'networkidle', timeout: 25000 }); if (pr && pr.ok()) { var ph = await page.content(); if (ph && ph.length > 800) { rendered.push(ph); vistas2++; } } await page.close(); } catch (ep) {}
+        }
+      } finally { try { if (browser) await browser.close(); } catch (eCl) {} }
+    }
+    if (!rendered.length) return res.json({ ok: false, via: via, mensaje: 'No se pudo renderizar el sitio.' });
     // Extraccion completa sobre el HTML RENDERIZADO (mas fotos y contenido que el estatico).
     var fotos = _extraerFotosAlojamiento(rendered, base);
     var data = await _alojamientoIAcompleto(rendered.slice().reverse().join('\n\n\n'), base, ownerId);
@@ -15745,7 +15756,7 @@ app.post('/api/scrape/alojamiento/profundo', async function (req, res) {
     var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
     for (var j = 0; j < (data.unidades || []).length; j++) data.unidades[j].imagenes = (grupos[j] || []).slice(0, 40);
     var g = await _guardarComplejoYUnidades(ownerId, data, sitio, modo);
-    return res.json({ ok: true, profundo: true, total: (data.unidades || []).length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejo: data.complejo.nombre || null, fotosTotales: fotos.todas.length });
+    return res.json({ ok: true, profundo: true, via: via, total: (data.unidades || []).length, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejo: data.complejo.nombre || null, fotosTotales: fotos.todas.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

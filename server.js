@@ -15860,6 +15860,48 @@ app.post('/api/scrape/alojamiento', async function (req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ---- POST /api/scrape/alojamiento/job --------------------------------------
+// Encola un scrape de hotel/cabañas en SEGUNDO PLANO (mismo patrón/tabla que desarrollo:
+// scrape_jobs, sin migración). Body: { url } (importar/actualizar por URL) o
+// { complejo_id } (relee la origen_url guardada del complejo). Devuelve { ok, job_id }
+// al INSTANTE; el runner procesarScrapeJobs lo corre y reporta progreso real por etapas.
+// El front pollea GET /api/scrape/job/:id para la barra de progreso.
+app.post('/api/scrape/alojamiento/job', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var owner = await _resolverOwner(uid);
+
+    var url = ((req.body && req.body.url) || '').trim();
+    var cid = _invStr((req.body && (req.body.complejo_id || req.body.id)));
+    var tipo, input;
+    if (cid) {
+      var cRow = await supabase.from('hotel_complejos').select('user_id, atributos').eq('id', cid).maybeSingle();
+      if (cRow.error) return res.status(500).json({ error: 'Error leyendo el complejo: ' + cRow.error.message });
+      if (!cRow.data) return res.status(404).json({ error: 'El complejo no existe', complejo_id: cid });
+      if (cRow.data.user_id !== owner) return res.status(403).json({ error: 'El complejo no pertenece a tu cuenta' });
+      var oUrl = (cRow.data.atributos && cRow.data.atributos.origen_url) ? String(cRow.data.atributos.origen_url).trim() : '';
+      if (!url && !oUrl) return res.status(400).json({ error: 'Este complejo no tiene URL de origen guardada. Importalo primero por URL.' });
+      tipo = 'alojamiento_update';
+      input = { complejo_id: cid, url: (url || oUrl), modo: 'update' };
+    } else if (url) {
+      tipo = 'alojamiento_nuevo';
+      input = { url: url, modo: (req.body && req.body.modo === 'reset') ? 'reset' : 'update' };
+    } else {
+      return res.status(400).json({ error: 'Falta la url del sitio (o complejo_id para actualizar)' });
+    }
+
+    var ins = await supabase.from('scrape_jobs').insert({
+      user_id: owner, tipo: tipo, input: input, estado: 'pendiente', progreso: 0, mensaje: 'En cola…'
+    }).select('id').single();
+    if (ins.error) {
+      if (_invTablaFaltante(ins.error)) return res.status(503).json({ error: 'La tabla scrape_jobs no existe todavía. Corré migracion-scrape-jobs.sql.', tabla: 'scrape_jobs' });
+      return res.status(500).json({ error: 'No se pudo encolar el trabajo: ' + ins.error.message });
+    }
+    return res.json({ ok: true, job_id: ins.data.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message ? e.message : 'Error interno' }); }
+});
+
 // ============================================================================
 // PASO 3 — SCRAPE PROFUNDO (headless). Renderiza el JS (PXSOL, etc.) para traer TODAS
 // las galerias. GATEADO + LAZY: el require de playwright es lazy adentro del handler;
@@ -17087,6 +17129,33 @@ async function procesarScrapeJobs() {
           error: null
         });
         console.log('[scrape-jobs runner] job', job.id, 'update OK dev', (r.development_id || devId));
+      } else if (job.tipo === 'alojamiento_nuevo' || job.tipo === 'alojamiento_update') {
+        // ---- HOTEL/CABAÑAS: scrapea + GUARDA directo (mismo camino que /api/scrape/alojamiento,
+        // pero en segundo plano para no timeoutear el request). Progreso real por etapas. ----
+        var sitioJ = (input.url || '').trim();
+        if (!sitioJ && input.complejo_id) {
+          var cRowJ = await supabase.from('hotel_complejos').select('atributos').eq('id', input.complejo_id).eq('user_id', job.user_id).maybeSingle();
+          sitioJ = (cRowJ.data && cRowJ.data.atributos && cRowJ.data.atributos.origen_url) ? String(cRowJ.data.atributos.origen_url).trim() : '';
+        }
+        if (!sitioJ) throw new Error('Job de alojamiento sin url (ni el complejo tiene origen_url)');
+        if (!sitioJ.startsWith('http')) sitioJ = 'https://' + sitioJ;
+        var baseJ; try { var uJ = new URL(sitioJ); baseJ = uJ.protocol + '//' + uJ.host; } catch (e0) { throw new Error('URL inválida: ' + sitioJ); }
+        var permJ = await scrapeUrlPermitida(job.user_id, sitioJ);
+        if (!permJ.ok) throw new Error(permJ.error || 'URL no permitida para tu cuenta');
+        await _scrapeJobUpdate(job.id, { progreso: 25, mensaje: 'Bajando las páginas del sitio…' });
+        var resAl = await _scrapeAlojamientoCompleto(baseJ, sitioJ, job.user_id, true);
+        var totAl = (resAl.complejos || []).reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+        var nomAl = (resAl.complejos && resAl.complejos[0] && resAl.complejos[0].nombre) || null;
+        if (!totAl && !nomAl) throw new Error('No se encontraron alojamientos en la página. Puede requerir JavaScript o cargá a mano.');
+        await _scrapeJobUpdate(job.id, { progreso: 70, mensaje: 'Guardando complejo y habitaciones…' });
+        var gAl = await _guardarComplejoYUnidades(job.user_id, resAl, sitioJ, (input.modo === 'reset' ? 'reset' : 'update'));
+        await _scrapeJobUpdate(job.id, {
+          estado: 'listo', progreso: 100,
+          mensaje: 'Importado: ' + (gAl.complejos || []).length + ' complejo(s), ' + (gAl.creados + gAl.actualizados) + ' unidad(es)',
+          resultado: { total: totAl, complejos: (gAl.complejos || []).length, creados: gAl.creados, actualizados: gAl.actualizados, errores: gAl.errores, estrategia: resAl.estrategia, complejo: nomAl },
+          error: null
+        });
+        console.log('[scrape-jobs runner] job', job.id, 'alojamiento OK (' + sitioJ + ')');
       } else {
         // ---- NUEVO: scrape profundo -> guarda el PREVIEW en resultado ----
         // (default; cubre tipo 'desarrollo_nuevo'). El usuario despues revisa y

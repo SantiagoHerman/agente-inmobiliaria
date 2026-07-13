@@ -15590,8 +15590,8 @@ async function _alojamientoIAcompleto(html, base, ownerId) {
       }
     } catch (eImg) {}
     var sys = 'Sos un extractor EXHAUSTIVO de ALOJAMIENTOS turisticos (hoteles, cabañas, complejos). Te paso el TEXTO de las paginas de UN alojamiento y una LISTA DE IMAGENES. ' +
-      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejo":{"nombre","descripcion","amenities","beneficios"},"unidades":[{"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion","imagenes"}]}. ' +
-      'complejo = el hotel/complejo EN GENERAL: nombre, descripcion general COMPLETA, amenities (TODOS los servicios generales, coma-separados), beneficios (ventajas/promos, coma-separado). ' +
+      'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor): {"complejo":{"nombre","descripcion","direccion","amenities","servicios","beneficios"},"unidades":[{"nombre","tipo","capacidad","precio","moneda","dormitorios","banos","servicios","descripcion","imagenes"}]}. ' +
+      'complejo = el hotel/complejo EN GENERAL: nombre, descripcion general COMPLETA, direccion/ubicacion, amenities (TODOS los servicios generales del complejo, coma-separados), servicios adicionales (coma-separado), beneficios (ventajas/promos, coma-separado). ' +
       'unidades = TODAS las habitaciones/cabañas/tipos de alojamiento que aparezcan. NO omitas ninguna. Copia la descripcion COMPLETA y TODOS los servicios de cada una. ' +
       'tipo: uno de Habitación|Suite|Cabaña|Domo|Departamento|Monoambiente|Loft|Bungalow|Casa|Glamping. capacidad = personas (numero). precio = tarifa por noche (solo numero) o "". moneda ARS o USD. servicios = coma-separados. ' +
       'imagenes = array de URLs de fotos de ESA unidad, copiadas TEXTUAL de la LISTA DE IMAGENES; si no podes asociar, []. ' +
@@ -15647,13 +15647,13 @@ async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
   // Complejo: buscar por nombre; si existe, mergear atributos (preservar images si ya hay); si no, insertar.
   try {
     var cEx = await supabase.from('hotel_complejos').select('id, atributos').eq('user_id', ownerId).eq('nombre', nombreComp).maybeSingle();
-    var atrComp = { descripcion: comp.descripcion || '', amenities: comp.amenities || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
+    var atrComp = { descripcion: comp.descripcion || '', direccion: comp.direccion || '', amenities: comp.amenities || '', servicios: comp.servicios || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
     if (cEx.data && cEx.data.id) {
       complejoId = cEx.data.id;
       var atrPrev = (cEx.data.atributos && typeof cEx.data.atributos === 'object') ? cEx.data.atributos : {};
       var merged = Object.assign({}, atrPrev, atrComp);
       if (Array.isArray(atrPrev.images) && atrPrev.images.length) merged.images = atrPrev.images; // preservar fotos manuales del complejo
-      ['descripcion', 'amenities', 'beneficios'].forEach(function (kk) { if (String(atrPrev[kk] || '').length > String(atrComp[kk] || '').length) merged[kk] = atrPrev[kk]; }); // no degradar: queda la version mas completa
+      ['descripcion', 'direccion', 'amenities', 'servicios', 'beneficios'].forEach(function (kk) { if (String(atrPrev[kk] || '').length > String(atrComp[kk] || '').length) merged[kk] = atrPrev[kk]; }); // no degradar: queda la version mas completa
       await supabase.from('hotel_complejos').update({ atributos: merged }).eq('id', complejoId).eq('user_id', ownerId);
     } else {
       var cIns = await supabase.from('hotel_complejos').insert({ user_id: ownerId, nombre: nombreComp, tipo: 'hotel_cabanas', atributos: atrComp }).select('id').maybeSingle();
@@ -15843,6 +15843,64 @@ app.post('/api/inventario/hotel/unidad/eliminar', async function (req, res) {
     var del = await supabase.from('hotel_unidades').delete().eq('id', id).eq('user_id', ownerId);
     if (del.error) return res.status(500).json({ error: del.error.message });
     try { await supabase.from('hotel_tarifa').delete().eq('unidad_id', id).eq('user_id', ownerId); } catch (eT) {}
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== COMPLEJO / HOTEL (plantilla general) — crear / editar / eliminar. Multi-complejo (cadena). Owner-scoped. =====
+// Toda la info general del complejo (subtipo, descripcion, direccion, amenities, servicios, beneficios, politicas,
+// fotos) va al jsonb hotel_complejos.atributos (sin migracion). Aislado al rubro hotel.
+app.post('/api/inventario/hotel/complejo/crear', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var nombre = (req.body && req.body.nombre) ? String(req.body.nombre).slice(0, 200) : 'Nuevo alojamiento';
+    var ins = await supabase.from('hotel_complejos').insert({ user_id: ownerId, nombre: nombre, tipo: 'hotel_cabanas', atributos: { subtipo: (req.body && req.body.subtipo) || 'hotel' } }).select('id').maybeSingle();
+    if (ins.error) return res.status(500).json({ error: ins.error.message });
+    return res.json({ ok: true, id: ins.data && ins.data.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/inventario/hotel/complejo/actualizar', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    var id = b.id ? String(b.id) : '';
+    if (!id) return res.status(400).json({ error: 'Falta id' });
+    var cur = await supabase.from('hotel_complejos').select('user_id, atributos').eq('id', id).maybeSingle();
+    if (cur.error) return res.status(500).json({ error: cur.error.message });
+    if (!cur.data) return res.status(404).json({ error: 'Complejo no encontrado' });
+    if (cur.data.user_id !== ownerId) return res.status(403).json({ error: 'El complejo no pertenece a tu cuenta' });
+    var fila = {};
+    if (b.nombre !== undefined) fila.nombre = String(b.nombre || 'Mi alojamiento').slice(0, 200);
+    var atr = Object.assign({}, (cur.data.atributos && typeof cur.data.atributos === 'object') ? cur.data.atributos : {});
+    // Solo se tocan los campos que llegan (merge). Lo demas (fotos manuales, etc.) se preserva.
+    ['subtipo', 'descripcion', 'direccion', 'amenities', 'servicios', 'beneficios', 'politicas'].forEach(function (k) { if (b[k] !== undefined) atr[k] = b[k]; });
+    if (Array.isArray(b.images)) atr.images = b.images.filter(function (im) { return im && im.url; }).map(function (im) { return { url: im.url, categoria: im.categoria || '' }; });
+    fila.atributos = atr;
+    var up = await supabase.from('hotel_complejos').update(fila).eq('id', id).eq('user_id', ownerId);
+    if (up.error) return res.status(500).json({ error: up.error.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/inventario/hotel/complejo/eliminar', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var b = req.body || {};
+    var id = b.id ? String(b.id) : '';
+    if (!id) return res.status(400).json({ error: 'Falta id' });
+    var cur = await supabase.from('hotel_complejos').select('user_id').eq('id', id).maybeSingle();
+    if (cur.error) return res.status(500).json({ error: cur.error.message });
+    if (!cur.data) return res.status(404).json({ error: 'Complejo no encontrado' });
+    if (cur.data.user_id !== ownerId) return res.status(403).json({ error: 'El complejo no pertenece a tu cuenta' });
+    // borrarUnidades=true elimina tambien sus habitaciones; si no, las desvincula (complejo_id -> null).
+    if (b.borrarUnidades === true) { try { await supabase.from('hotel_unidades').delete().eq('complejo_id', id).eq('user_id', ownerId); } catch (eU) {} }
+    else { try { await supabase.from('hotel_unidades').update({ complejo_id: null }).eq('complejo_id', id).eq('user_id', ownerId); } catch (eU) {} }
+    var del = await supabase.from('hotel_complejos').delete().eq('id', id).eq('user_id', ownerId);
+    if (del.error) return res.status(500).json({ error: del.error.message });
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

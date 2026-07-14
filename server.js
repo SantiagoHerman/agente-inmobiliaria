@@ -5942,6 +5942,31 @@ async function enviarAvisosTareas() {
   } catch (e) { console.error('enviarAvisosTareas:', e && e.message); }
 }
 
+// CRON: RECORDATORIO por lead (feature nueva, /conversaciones menu 3 puntos). A la HORA EXACTA
+// (fecha_hora <= ahora, aun pendiente) dispara push + WhatsApp al USUARIO que lo creo (enviarPushAsesor
+// ya cubre push + espejo WhatsApp) y la app muestra el modal via el poll de /api/recordatorios/pendientes.
+// CLAIM optimista (columna 'disparado') anti-doble-envio. Gateado defensivo: si la tabla no existe
+// (migracion no corrida) sale en silencio. 0 tokens IA (solo push + WhatsApp).
+async function enviarRecordatoriosLead() {
+  try {
+    const ahoraISO = new Date().toISOString();
+    const q = await supabase.from('recordatorios_lead').select('id, creado_por, lead_nombre, texto, fecha_hora, conversation_id')
+      .eq('estado', 'pendiente').eq('disparado', false).lte('fecha_hora', ahoraISO).order('fecha_hora', { ascending: true }).limit(50);
+    if (q.error) return; // tabla ausente / error -> no corre nada (silencioso)
+    const pend = q.data || [];
+    for (const r of pend) {
+      try {
+        // CLAIM: marcar disparado ANTES de enviar (evita doble envio si dos ticks se solapan).
+        const claim = await supabase.from('recordatorios_lead').update({ disparado: true, disparado_at: ahoraISO }).eq('id', r.id).eq('disparado', false).select('id');
+        if (!claim || !claim.data || claim.data.length === 0) continue;
+        const titulo = 'Recordatorio ' + (r.lead_nombre || 'lead');
+        // enviarPushAsesor(authUserId, title, texto, bodyLiteral, meta): title=titulo, body=texto. Ademas espeja a WhatsApp.
+        try { await enviarPushAsesor(r.creado_por, titulo, '', (r.texto || 'Tenes un recordatorio'), { tipo: 'recordatorio', conversation_id: r.conversation_id || null }); } catch (eP) {}
+      } catch (eR) { console.error('recordatorio lead:', eR && eR.message); }
+    }
+  } catch (e) { console.error('enviarRecordatoriosLead:', e && e.message); }
+}
+
 // CRON: recordatorio de cita al LEAD (WhatsApp) + aviso al asesor (push). NO gasta tokens (solo WhatsApp + push).
 // MEJORA #3: los OFFSETS son CONFIGURABLES por cuenta (business_settings.recordatorio_citas_horas, ej. '[24,1]').
 // DEFAULT [24,1] (24h + 1h antes). Idempotencia por-offset via citas.recordatorios_enviados (lista JSON de offsets
@@ -10879,6 +10904,10 @@ setTimeout(enviarRecordatoriosCitas, 70 * 1000);
 // Cero IA, cero tokens (WhatsApp + push, texto fijo). Defensivo: si la tabla no existe, no rompe.
 setInterval(enviarAvisosTareas, 30 * 60 * 1000);
 setTimeout(enviarAvisosTareas, 80 * 1000);
+// RECORDATORIOS por lead (feature nueva): precision de 1 MINUTO (una alarma a hora exacta, no 30 min).
+// Cero IA (push + WhatsApp). Defensivo: si la tabla recordatorios_lead no existe, sale en silencio.
+setInterval(enviarRecordatoriosLead, 60 * 1000);
+setTimeout(enviarRecordatoriosLead, 45 * 1000);
 // Backup automatico cada 30 minutos (foto completa de todos los datos por user)
 setInterval(hacerBackup, 30 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
@@ -19505,6 +19534,65 @@ app.get('/api/citas', async function(req, res) {
     return res.json({ ok: true, citas: citas, esDueno: !(ase && ase.data), esAdmin: esAdmin, miAsesorId: soloAsesorId, asesores: asesoresLista });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+// ============================================================================
+// RECORDATORIOS por lead (feature nueva). Se crean desde /conversaciones (menu 3 puntos al lado del ojo).
+// El cron enviarRecordatoriosLead los dispara a la hora exacta (push + WhatsApp al usuario). 0 IA.
+// ============================================================================
+app.post('/api/recordatorios', async function(req, res) {
+  try {
+    const userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    let ownerId = userId;
+    try { const ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', userId).maybeSingle(); if (ase && ase.data && ase.data.admin_id) ownerId = ase.data.admin_id; } catch (e) {}
+    const b = req.body || {};
+    if (!b.fecha_hora) return res.status(400).json({ error: 'Falta fecha_hora' });
+    const fh = new Date(b.fecha_hora);
+    if (isNaN(fh.getTime())) return res.status(400).json({ error: 'fecha_hora invalida' });
+    const texto = (b.texto ? String(b.texto).trim().slice(0, 500) : '');
+    if (!texto) return res.status(400).json({ error: 'Falta el texto a recordar' });
+    const fila = {
+      user_id: ownerId, creado_por: userId,
+      conversation_id: b.conversation_id || null, contact_id: b.contact_id || null,
+      lead_nombre: (b.lead_nombre ? String(b.lead_nombre).slice(0, 120) : null),
+      fecha_hora: fh.toISOString(), texto: texto, estado: 'pendiente', disparado: false
+    };
+    const r = await supabase.from('recordatorios_lead').insert(fila).select('id').single();
+    if (r.error) {
+      if (_invTablaFaltante(r.error)) return res.status(503).json({ error: 'La tabla recordatorios_lead no existe todavia. Corre migracion-recordatorios-lead.sql + NOTIFY pgrst.', tabla: 'recordatorios_lead' });
+      return res.status(500).json({ error: r.error.message });
+    }
+    return res.json({ ok: true, id: r.data.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Recordatorios del usuario que YA vencieron y siguen pendientes -> el front los muestra como alarma.
+app.get('/api/recordatorios/pendientes', async function(req, res) {
+  try {
+    const userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    const ahoraISO = new Date().toISOString();
+    const q = await supabase.from('recordatorios_lead')
+      .select('id, lead_nombre, texto, fecha_hora, conversation_id')
+      .eq('creado_por', userId).eq('estado', 'pendiente').lte('fecha_hora', ahoraISO)
+      .order('fecha_hora', { ascending: true }).limit(20);
+    if (q.error) { if (_invTablaFaltante(q.error)) return res.json({ ok: true, recordatorios: [] }); return res.status(500).json({ error: q.error.message }); }
+    return res.json({ ok: true, recordatorios: q.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Aceptar/cerrar un recordatorio -> estado 'visto' (no vuelve a sonar). Solo el creador.
+app.post('/api/recordatorios/aceptar', async function(req, res) {
+  try {
+    const userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+    const id = (req.body && req.body.id) ? String(req.body.id) : '';
+    if (!id) return res.status(400).json({ error: 'Falta id' });
+    const up = await supabase.from('recordatorios_lead').update({ estado: 'visto' }).eq('id', id).eq('creado_por', userId).select('id');
+    if (up.error) return res.status(500).json({ error: up.error.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/citas', async function(req, res) {
   try {
     var userId = await verificarUsuario(req);

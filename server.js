@@ -126,7 +126,9 @@ const _PREFIJOS_GATE_SUSCRIPCION = [
 // tope de mensajes (sin saldo extra) -> 429 ANTES de gastar. Antes el tope solo frenaba la auto-respuesta al lead;
 // estos endpoints seguían consumiendo IA por encima del tope (agujero del pricing). Prefijos ESPECÍFICOS a propósito:
 // NO se pone '/api/scrape/' entero porque incluiría /scrape/lista y /scrape/job (estado del job) que NO gastan IA y
-// cuyo bloqueo rompería la barra de progreso. Cortesía/ilimitado/flag-off => dentroDelTopeIA=true => nunca bloquea.
+// cuyo bloqueo rompería la barra de progreso. Flag-off / plan ilimitado / cortesía SIN override => dentroDelTopeIA=true
+// => nunca bloquea. OJO: una cortesía CON limits_override.ai_messages SÍ queda capeada (el override manda sobre la
+// cortesía, ver topeEfectivoIA) => esa sí puede recibir 429. Es intencional: el Maestro le puso un tope explícito.
 const _PREFIJOS_TOPE_IA = [
   '/api/clasificar-fotos',
   '/api/scrape/detalle',
@@ -16924,6 +16926,9 @@ async function revisarScrapingsDesarrollo() {
         if (!isNaN(last) && (ahora - last) < cada * 3600 * 1000) due = false;
       }
       if (!due) continue;
+      // P1 (CRON): freno de gasto IA por tope de plan (el gate HTTP no cubre los cron). Si la cuenta paso su
+      // tope -> saltear SIN tocar ultimo_scrape, asi reintenta cuando tenga cupo. Cortesia/ilimitado => pasa.
+      try { if (!(await dentroDelTopeIA(d.user_id))) { console.log('[cron auto-scrape desarrollo] dev', d.id, 'salteado: cuenta sin cupo IA'); continue; } } catch (eTope) {}
       try {
         console.log('[cron auto-scrape desarrollo] actualizando dev', d.id, 'de', url, '(cada', cada, 'hs)');
         var r = await actualizarDevelopment(d.id, d.user_id, url);
@@ -17127,6 +17132,17 @@ async function procesarScrapeJobs() {
     var jobs = q.data || [];
     if (!jobs.length) return;                  // nada pendiente
     var job = jobs[0];
+
+    // P1 (CRON): freno de gasto IA por tope. El ENCOLADO por HTTP ya esta gateado, pero un job encolado CON
+    // cupo puede ejecutarse DESPUES de que la cuenta supere el tope -> sin esto gastaba IA igual. Se marca
+    // 'error' con mensaje claro (NO se deja 'pendiente': el runner toma el mas viejo DE A UNO y un job sin
+    // cupo bloquearia la cola para siempre). Cortesia/ilimitado/flag-off => dentroDelTopeIA=true => corre.
+    try {
+      if (!(await dentroDelTopeIA(job.user_id))) {
+        await _scrapeJobUpdate(job.id, { estado: 'error', mensaje: 'Sin cupo de mensajes', error: 'Alcanzaste el tope de mensajes IA de tu plan. Ampliá el plan o esperá al próximo período y volvé a intentarlo.' });
+        return;
+      }
+    } catch (eTope) { /* fail-open: ante error de lectura no frenamos el job */ }
 
     // Marcar 'corriendo' (best-effort). Nota: no hay lock atomico; el guard
     // _scrapeJobsEnCurso + un unico proceso alcanzan para el volumen esperado.
@@ -20269,6 +20285,11 @@ async function revisarScrapingsAutomaticos() {
       // cliente (modo='ia'). Si usa IA, el costo se descuenta de SUS mensajes (como el scraper de inventario).
       if (_esHotelCfg) {
         var _iaHotel = (String(cfg.modo || '').indexOf('ia') >= 0);
+        // P1 (CRON): freno de gasto IA por tope de plan. El gate HTTP (_PREFIJOS_TOPE_IA) NO cubre los cron:
+        // sin esto, el auto-update seguia gastando IA (y cobrando 3 msgs) POR ENCIMA del tope, solo y sin que
+        // nadie mire. Si la corrida usa IA y la cuenta paso su tope -> saltear SIN marcar ultimo_scraping,
+        // asi reintenta la proxima hora cuando tenga cupo. Cortesia/ilimitado/flag-off => dentroDelTopeIA=true.
+        if (_iaHotel && !(await dentroDelTopeIA(cfg.user_id))) continue;
         await correrScrapingAlojamiento(cfg, _iaHotel);
       } else if (cfg.modo === 'directo') {
         await correrScrapingDeUsuario(cfg);

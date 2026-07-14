@@ -266,8 +266,13 @@ function _logNotif(authUserId, titulo, cuerpo, meta, res) {
 // Envia un push al/los dispositivo(s) del asesor (identificado por su auth_user_id).
 // meta (opcional): { tipo, conversation_id } para enriquecer el registro. Backward-compatible (los callers sin meta funcionan igual).
 async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral, meta) {
-  try {
-    if (!_fcmReady || !authUserId) return;
+  if (!authUserId) return;
+  // FIX: el push por FCM va en una funcion INTERNA. Sus early-returns (FCM off / usuario sin dispositivo) NO deben
+  // saltear el ESPEJO por WhatsApp de abajo. Antes el return de 'sin_dispositivo' salia de TODA la funcion y nunca
+  // se llegaba al espejo -> los usuarios SIN dispositivo push (ej. iPhone) no recibian NINGUNA notificacion, aunque
+  // el espejo por WhatsApp se hizo justamente para ellos. Ahora el espejo se intenta SIEMPRE.
+  const _enviarPushFCM = async () => {
+    if (!_fcmReady) return;
     const { data: toks } = await supabase.from('device_tokens').select('token').eq('user_id', authUserId);
     if (!toks || !toks.length) { _logNotif(authUserId, leadNombre, bodyLiteral || texto, meta, { total: 0, ok: 0, fail: 0, estado: 'sin_dispositivo' }); return; }
     const tokens = toks.map(function (t) { return t.token; }).filter(Boolean);
@@ -293,8 +298,10 @@ async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral, meta
       }
     }
     _logNotif(authUserId, leadNombre, _body, meta, { total: tokens.length, ok: _ok, fail: _fail, estado: _ok > 0 ? 'entregado' : 'error' });
-  } catch (e) { console.error('Error enviarPushAsesor:', e && e.message); }
-  // FASE 2 (gated OFF): ESPEJO del push por-usuario a WhatsApp. Best-effort, NUNCA rompe el push.
+  };
+  try { await _enviarPushFCM(); } catch (e) { console.error('Error enviarPushAsesor:', e && e.message); }
+  // FASE 2: ESPEJO del push por-usuario a WhatsApp. SIEMPRE se intenta (independiente del push): para los usuarios
+  // sin dispositivo push (iPhone) es la UNICA notificacion que reciben. Best-effort, NUNCA rompe nada (gates propios).
   try { await _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral); } catch (eDm) { console.error('Error _espejarPushAWhatsApp:', eDm && eDm.message); }
 }
 
@@ -8848,14 +8855,17 @@ function dentroHorarioOficinaEn(horario, tsMs) {
       const hasta = aMinutos(hastaStr, 18 * 60);
       return minutosAhora >= desde && minutosAhora <= hasta;
     };
-    // Franja explicita (turno cortado): EXIGE desde/hasta validos. Una franja sin horarios validos o degenerada
-    // (hasta <= desde) NO cuenta como abierta (no se asume el rango 09-18 que usa el formato legacy).
+    // Franja explicita (turno cortado): EXIGE desde/hasta validos. Una franja de LARGO CERO (desde === hasta) o con
+    // datos faltantes NO cuenta como abierta. SOPORTA CRUCE DE MEDIANOCHE: si hasta < desde (ej. 22:00->09:00, un
+    // turno de NOCHE de las 22 de hoy a las 9 de manana), abierto si ahora es >= desde O <= hasta. Antes rechazaba
+    // hasta <= desde -> el usuario IA de noche nunca quedaba "en horario".
     const enFranjaEstricta = function(f) {
       if (!f || typeof f !== 'object') return false;
       const desde = aMinutos(f.desde, null);
       const hasta = aMinutos(f.hasta, null);
-      if (desde == null || hasta == null || hasta <= desde) return false;
-      return minutosAhora >= desde && minutosAhora <= hasta;
+      if (desde == null || hasta == null || desde === hasta) return false; // dato faltante o largo cero => cerrado
+      if (hasta > desde) return minutosAhora >= desde && minutosAhora <= hasta; // mismo dia
+      return minutosAhora >= desde || minutosAhora <= hasta; // cruza medianoche (turno de noche)
     };
     // PARTE A (correccion 8) + C1 (horario cortado): si el dia tiene `franjas` (array), estar DENTRO de CUALQUIERA
     // de ellas (ej. manana 09-13 y tarde 16-20) => disponible. Soporta 1 o 2 (o mas) franjas por dia.

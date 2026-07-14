@@ -122,14 +122,37 @@ const _PREFIJOS_GATE_SUSCRIPCION = [
   // NOTA: /api/asesores/ NO se gatea: gestionar el equipo (crear/activar usuarios) es CONFIGURACION, no consumo de
   // IA; bloquearlo rompia el onboarding de una cuenta nueva y el setup del dueno impersonando un cliente sin pagar.
 ];
+// P1 (enforcement de plan): prefijos de features que GASTAN IA y NO son la respuesta al lead. Si la cuenta pasó su
+// tope de mensajes (sin saldo extra) -> 429 ANTES de gastar. Antes el tope solo frenaba la auto-respuesta al lead;
+// estos endpoints seguían consumiendo IA por encima del tope (agujero del pricing). Prefijos ESPECÍFICOS a propósito:
+// NO se pone '/api/scrape/' entero porque incluiría /scrape/lista y /scrape/job (estado del job) que NO gastan IA y
+// cuyo bloqueo rompería la barra de progreso. Cortesía/ilimitado/flag-off => dentroDelTopeIA=true => nunca bloquea.
+const _PREFIJOS_TOPE_IA = [
+  '/api/clasificar-fotos',
+  '/api/scrape/detalle',
+  '/api/scrape/universal',
+  '/api/scrape/v2',
+  '/api/scrape/alojamiento',   // /alojamiento, /alojamiento/profundo (cobra hasta 20), /alojamiento/job — todos IA (NO matchea /api/scrape/job)
+  '/api/scrape/desarrollo',    // /desarrollo, /desarrollo/actualizar, /desarrollo/job — IA
+  '/api/marketing/informe'
+  // NO se listan /api/probar-agente (tiene un camino de "agregar instrucción" con 0 tokens que no hay que bloquear)
+  // ni /api/agent/ (la respuesta al lead YA está gateada por dentroDelTopeIA en los paths WA/Meta).
+];
 app.use(async function(req, res, next) {
   try {
     const p = req.path || '';
-    const gateada = _PREFIJOS_GATE_SUSCRIPCION.some(function(pre){ return p === pre || p.indexOf(pre) === 0; });
-    if (!gateada) return next();
+    const payGate = _PREFIJOS_GATE_SUSCRIPCION.some(function(pre){ return p === pre || p.indexOf(pre) === 0; });
+    const topeGate = _PREFIJOS_TOPE_IA.some(function(pre){ return p === pre || p.indexOf(pre) === 0; });
+    if (!payGate && !topeGate) return next();
     const uid = await verificarUsuario(req);
     if (!uid) return next(); // sin sesion valida: que el handler haga su propia auth (no rompe internos/sin-token)
-    if (await debeBloquearAcceso(uid)) return res.status(403).json({ error: 'Suscripcion inactiva. Regulariza tu pago para continuar.' });
+    if (payGate && await debeBloquearAcceso(uid)) return res.status(403).json({ error: 'Suscripcion inactiva. Regulariza tu pago para continuar.' });
+    // P1: freno de gasto IA por tope de plan. Resolvemos el DUEÑO (asesor -> admin_id) porque el tope/plan es del tenant.
+    if (topeGate) {
+      let owner = uid;
+      try { const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle(); if (ase && ase.admin_id) owner = ase.admin_id; } catch (eOwn) {}
+      if (!(await dentroDelTopeIA(owner))) return res.status(429).json({ error: 'Alcanzaste el tope de mensajes IA de tu plan. Ampliá el plan o esperá al próximo período para usar esta función.', tope_alcanzado: true });
+    }
     return next();
   } catch (e) {
     // FAIL-OPEN (disponibilidad): ante cualquier error NO cortamos el servicio. B3: pero ahora LO LOGUEAMOS

@@ -140,7 +140,14 @@ const _PREFIJOS_TOPE_IA = [
 ];
 app.use(async function(req, res, next) {
   try {
-    const p = req.path || '';
+    // BYPASS DE MAYUSCULAS (fix 2026-07-14): Express rutea CASE-INSENSITIVE por defecto ('case sensitive routing'
+    // viene desactivado), asi que POST /API/WhatsApp/send o /API/CLASIFICAR-FOTOS LLEGAN AL MISMO HANDLER. Este gate
+    // comparaba con indexOf (case-SENSITIVE) -> no los veia y los dejaba pasar: bypass total del 403 de no-pago y del
+    // 429 de tope (estas rutas NO tienen chequeo propio adentro del handler, el gate es la UNICA barrera). Se compara
+    // en minusculas, que es exactamente el criterio con el que Express eligio el handler. Los prefijos ya son
+    // minusculas ASCII => bajar el path solo puede hacer que el gate vea MAS rutas (las que Express ya rutea ahi),
+    // nunca menos: no puede cortar a nadie que hoy pase.
+    const p = (req.path || '').toLowerCase();
     const payGate = _PREFIJOS_GATE_SUSCRIPCION.some(function(pre){ return p === pre || p.indexOf(pre) === 0; });
     const topeGate = _PREFIJOS_TOPE_IA.some(function(pre){ return p === pre || p.indexOf(pre) === 0; });
     if (!payGate && !topeGate) return next();

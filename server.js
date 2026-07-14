@@ -4120,7 +4120,33 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   let _iaAgendaOn = false;
   if (conversation_id && !modoPrueba) { try { _iaAgendaOn = await iaAgendaActivo(user_id, settings || undefined); } catch (eIaAg) { _iaAgendaOn = false; } }
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
-  const { data: properties } = await supabase.from('properties').select('id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images').eq('user_id', user_id).eq('activa', true);
+  // DIRECCION (Fase 1): helper compartido por los 3 rubros para componer la ubicacion buscable
+  // a partir de {direccion, entre_calles, ciudad}. Null-safe: si no hay nada devuelve '' y el
+  // prompt queda byte-identico. Sirve para propiedades (p), atributos de complejo hotel (a) y
+  // developments (d), que usan las MISMAS keys.
+  const _fmtDireccion = function (o) {
+    if (!o) return '';
+    var partes = [];
+    if (o.direccion && String(o.direccion).trim()) partes.push(String(o.direccion).trim());
+    if (o.entre_calles && String(o.entre_calles).trim()) partes.push('entre ' + String(o.entre_calles).trim());
+    if (o.ciudad && String(o.ciudad).trim()) partes.push(String(o.ciudad).trim());
+    return partes.join(', ');
+  };
+  // SELECT DEFENSIVO (patron perfil_comprador): pedimos las columnas de direccion; si la migracion
+  // aun no corrio (columnas ausentes) el select falla -> reintentamos SIN ellas para no perder el
+  // inventario. Asi el backend se puede deployar antes o despues de la migracion sin romper.
+  let properties = null;
+  {
+    const _colsProp = 'id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images';
+    try {
+      const _rp = await supabase.from('properties').select(_colsProp + ', direccion, entre_calles, ciudad, lat, lng').eq('user_id', user_id).eq('activa', true);
+      if (_rp.error) throw _rp.error;
+      properties = _rp.data;
+    } catch (eDirProp) {
+      const _rp2 = await supabase.from('properties').select(_colsProp).eq('user_id', user_id).eq('activa', true);
+      properties = _rp2.data;
+    }
+  }
 
   // MEMORIA DEL LEAD: traer datos ya conocidos del contacto (name/interest/budget/notes) para inyectarlos al prompt
   // y evitar re-preguntar o re-presentarse. No bloquea ni rompe si falla (campos opcionales).
@@ -4217,6 +4243,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     if (ops.length === 0 && p.operation) ops.push(p.operation + (p.price ? ': ' + p.price : ''));
     var enc = (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title||'');
     var carac = [p.zone, p.caracteristicas].filter(Boolean).join(', ');
+    var _dirProp = _fmtDireccion(p);
     // Resumen de fotos disponibles por categoria (ADITIVO, solo si la propiedad tiene images cargadas).
     // Asi la IA sabe que categorias puede mandar con la tool enviar_foto_propiedad.
     var fotosTxt = '';
@@ -4229,7 +4256,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         else fotosTxt = ' | fotos disponibles: si (sin categorizar)';
       }
     } catch (eImg) { fotosTxt = ''; }
-    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
   }).join(String.fromCharCode(10));
   }
 
@@ -4247,9 +4274,17 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     const _devOn = (_rubroCuenta === 'desarrolladora') ||
       (_rubroCuenta === 'inmobiliaria' && settings && settings.inventario_desarrollo_on === true);
     if (_devOn) {
-      const { data: _devs, error: _devErr } = await supabase.from('developments')
-        .select('id, nombre, tipo, zona, descripcion, link, estado_obra, avance_pct, fecha_entrega, dev_data')
-        .eq('user_id', user_id).eq('activo', true);
+      // SELECT DEFENSIVO: intentamos con las columnas de direccion (Fase 1); si la migracion no
+      // corrio, reintentamos sin ellas para no perder el inventario de desarrollos.
+      let _devs = null, _devErr = null;
+      {
+        const _colsDev = 'id, nombre, tipo, zona, descripcion, link, estado_obra, avance_pct, fecha_entrega, dev_data';
+        const _rd = await supabase.from('developments').select(_colsDev + ', direccion, entre_calles, ciudad, lat, lng').eq('user_id', user_id).eq('activo', true);
+        if (_rd.error) {
+          const _rd2 = await supabase.from('developments').select(_colsDev).eq('user_id', user_id).eq('activo', true);
+          _devs = _rd2.data; _devErr = _rd2.error;
+        } else { _devs = _rd.data; }
+      }
       // Si la tabla no existe todavia (migracion no corrida) NO rompemos: queda sin desarrollos.
       if (!_devErr && _devs && _devs.length > 0) {
         const _devIds = _devs.map(function(d){ return d.id; });
@@ -4310,8 +4345,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             });
             if (_els.length > 0) _etapasTxt = ' | etapas de precio: ' + _els.join(' ; ');
           } catch (eEt) { _etapasTxt = ''; }
+          const _dirDev = _fmtDireccion(d);
           const _cab = '* EMPRENDIMIENTO: ' + (d.nombre || 'Sin nombre') + (d.tipo ? ' (' + d.tipo + ')' : '') +
             (d.zona ? ' | zona: ' + d.zona : '') +
+            (_dirDev ? ' | direccion: ' + _dirDev : '') +
             (d.estado_obra ? ' | obra: ' + (_ESTADO_OBRA_TXT[d.estado_obra] || d.estado_obra) : '') +
             (d.avance_pct ? ' | avance: ' + d.avance_pct + '%' : '') +
             (d.fecha_entrega ? ' | entrega estimada: ' + d.fecha_entrega : '') +
@@ -4428,7 +4465,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const a = (c && c.atributos) || {}; const _pol = a.politicas || {};
         const _polTxt = [_pol.checkin ? 'check-in ' + _pol.checkin : '', _pol.checkout ? 'check-out ' + _pol.checkout : '', _pol.cancelacion ? 'cancelacion: ' + _pol.cancelacion : '', _pol.sena ? 'seña ' + _pol.sena : '', _pol.pagos ? 'pagos: ' + _pol.pagos : ''].filter(Boolean).join(' | ');
         return 'COMPLEJO: ' + (c.nombre || 'Alojamiento') + (a.subtipo ? ' (' + a.subtipo + ')' : '')
-          + (a.direccion ? _NL + '  Ubicacion: ' + a.direccion : '')
+          + (_fmtDireccion(a) ? _NL + '  Ubicacion: ' + _fmtDireccion(a) : '')
           + (a.descripcion ? _NL + '  ' + a.descripcion : '')
           + (a.amenities ? _NL + '  Amenities del complejo: ' + a.amenities : '')
           + (a.servicios ? _NL + '  Servicios: ' + a.servicios : '')
@@ -13328,8 +13365,12 @@ function parsearDetalleTokko(html, url) {
   if (amb) campos['Ambientes'] = amb;
   var ubic = raw['Ubicaci' + String.fromCharCode(243) + 'n'] || raw['Ubicacion'] || raw['Localidad'] || raw['Ciudad'];
   if (ubic) campos['Ciudad/ Localidad'] = ubic;
-  var dir = raw['Direcci' + String.fromCharCode(243) + 'n'] || raw['Direccion'] || raw['Barrio'] || raw['Zona'];
+  var dirCalle = raw['Direcci' + String.fromCharCode(243) + 'n'] || raw['Direccion'] || '';
+  var dir = dirCalle || raw['Barrio'] || raw['Zona'];
   if (dir) campos['Barrio/ Zona'] = dir;
+  // DIRECCION (Fase 1): guardamos la calle+numero real por separado (sin aplastarla en Barrio/Zona)
+  // para el campo direccion estructurado. Solo cuando hay direccion de calle de verdad.
+  if (dirCalle) campos['Direcci' + String.fromCharCode(243) + 'n'] = dirCalle;
   var plazas = raw['Plazas'] || raw['Capacidad'] || raw['Hu' + String.fromCharCode(233) + 'spedes'];
   if (plazas) campos['Plazas'] = plazas;
   // Estado/operacion: lo que entiende el normalizador (venta / alquiler anual / alquiler temporario)
@@ -13661,7 +13702,7 @@ function parsearDetalleEstructurado(html, url) {
     var addr = prop.address;
     if (addr && typeof addr === 'object') {
       if (addr.addressLocality) campos['Ciudad/ Localidad'] = addr.addressLocality;
-      if (addr.streetAddress) campos['Barrio/ Zona'] = addr.streetAddress;
+      if (addr.streetAddress) { campos['Barrio/ Zona'] = addr.streetAddress; campos['Direcci' + String.fromCharCode(243) + 'n'] = addr.streetAddress; }
       if (addr.addressRegion && !campos['Ciudad/ Localidad']) campos['Ciudad/ Localidad'] = addr.addressRegion;
     } else if (typeof addr === 'string') { campos['Barrio/ Zona'] = addr; }
   }
@@ -13971,7 +14012,8 @@ async function parsearDetalleIA(html, url, user_id) {
     if (limpio.length < 100) return null;
     var sys = 'Sos un extractor de fichas inmobiliarias. Te paso el TEXTO de la ficha de UNA propiedad. ' +
       'Devolve EXCLUSIVAMENTE un JSON objeto (sin markdown, sin texto alrededor) con: ' +
-      '{"titulo","descripcion","ref","operacion","tipo","precio","moneda","ubicacion","barrio","m2","ambientes","dormitorios","banos"}. ' +
+      '{"titulo","descripcion","ref","operacion","tipo","precio","moneda","ubicacion","barrio","direccion","entre_calles","m2","ambientes","dormitorios","banos"}. ' +
+      '"direccion" = calle y numero exactos (ej "Avenida 2 2050"); "entre_calles" = referencia entre que calles esta (ej "entre 20 y 21"); "ubicacion" = ciudad/localidad; "barrio" = barrio o zona. ' +
       'Si un dato no aparece, deja "". No inventes.';
     var r = await anthropic.messages.create({
       model: MODELO_INTERNO,
@@ -13993,6 +14035,8 @@ async function parsearDetalleIA(html, url, user_id) {
     if (o.m2) campos['Metros totales'] = String(o.m2);
     if (o.ubicacion) campos['Ciudad/ Localidad'] = o.ubicacion;
     if (o.barrio) campos['Barrio/ Zona'] = o.barrio;
+    if (o.direccion) campos['Direcci' + String.fromCharCode(243) + 'n'] = o.direccion;
+    if (o.entre_calles) campos['Entre calles'] = o.entre_calles;
     if (o.operacion) campos['Estado'] = /alquiler\s*tempora|temporari/i.test(o.operacion) ? 'Alquiler temporario' : (/alquiler|renta/i.test(o.operacion) ? 'Alquiler anual' : (/venta/i.test(o.operacion) ? 'Venta' : o.operacion));
     if (!o.titulo && !o.descripcion && Object.keys(campos).length === 0) return null;
     return { url: url, titulo: _limpiarHtmlScrape(o.titulo || ''), descripcion: _limpiarHtmlScrape(o.descripcion || ''), campos: campos, ia: true };
@@ -14142,6 +14186,9 @@ function _mapearPropWpJsonADetalle(p, urlOriginal, mediaMap) {
   if (ciudad) campos['Ciudad/ Localidad'] = ciudad;
   var area = _taxNombre(emb, 'property_area') || _metaVal(meta, 'fave_property_address');
   if (area) campos['Barrio/ Zona'] = area;
+  // DIRECCION (Fase 1): la calle+numero real de Houzez vive en fave_property_address.
+  var dirHz = _metaVal(meta, 'fave_property_address');
+  if (dirHz) campos['Direcci' + String.fromCharCode(243) + 'n'] = dirHz;
   var prov = _taxNombre(emb, 'property_state');
   if (prov) campos['Provincia'] = prov;
 
@@ -15298,6 +15345,9 @@ app.post('/api/scrape/universal', async function(req, res) {
         type: p.tipo || null,
         operation: p.operacion || null,
         zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null,
+        direccion: p.direccion || null,
+        entre_calles: p.entre_calles || null,
+        ciudad: p.ciudad || null,
         price: p.precio || null,
         description: p.descripcion || null,
         caracteristicas: p.caracteristicas || null,
@@ -16107,7 +16157,7 @@ app.post('/api/inventario/hotel/complejo/actualizar', async function (req, res) 
     if (b.nombre !== undefined) fila.nombre = String(b.nombre || 'Mi alojamiento').slice(0, 200);
     var atr = Object.assign({}, (cur.data.atributos && typeof cur.data.atributos === 'object') ? cur.data.atributos : {});
     // Solo se tocan los campos que llegan (merge). Lo demas (fotos manuales, etc.) se preserva.
-    ['subtipo', 'descripcion', 'direccion', 'amenities', 'servicios', 'beneficios', 'politicas'].forEach(function (k) { if (b[k] !== undefined) atr[k] = b[k]; });
+    ['subtipo', 'descripcion', 'direccion', 'entre_calles', 'ciudad', 'amenities', 'servicios', 'beneficios', 'politicas'].forEach(function (k) { if (b[k] !== undefined) atr[k] = b[k]; });
     if (Array.isArray(b.images)) atr.images = b.images.filter(function (im) { return im && im.url; }).map(function (im) { return { url: im.url, categoria: im.categoria || '' }; });
     fila.atributos = atr;
     var up = await supabase.from('hotel_complejos').update(fila).eq('id', id).eq('user_id', ownerId);
@@ -16761,11 +16811,18 @@ function _mapScrapeAGuardar(data, sourceUrl) {
   var _srcUrl = (sourceUrl != null && String(sourceUrl).trim()) ? String(sourceUrl).trim()
     : (emp.link != null && String(emp.link).trim() ? String(emp.link).trim() : '');
 
+  // DIRECCION (Fase 1): la calle exacta que scrapea la IA vive en ubicacion_detalle.direccion.
+  // La sacamos a campos de primer nivel (antes quedaba SOLO enterrada en dev_data.material) para
+  // que guardarDesarrolladora la persista en las columnas nuevas y la IA la lea.
+  var _ubDet = data.ubicacion_detalle || {};
   var development = {
     nombre: emp.nombre || '',
     // "tipo" del emprendimiento no lo infiere el scraper de forma fiable -> lo dejamos vacio (no pisa nada malo).
     tipo: '',
     zona: emp.ubicacion || '',
+    direccion: (_ubDet && _ubDet.direccion) ? String(_ubDet.direccion) : '',
+    entre_calles: (_ubDet && (_ubDet.entre_calles || _ubDet.entrecalles)) ? String(_ubDet.entre_calles || _ubDet.entrecalles) : '',
+    ciudad: (_ubDet && _ubDet.ciudad) ? String(_ubDet.ciudad) : (emp.ubicacion || ''),
     descripcion: emp.descripcion || '',
     link: emp.link || '',
     // source_url: URL scrapeada -> guardarDesarrolladora la persiste (v2). Sin esto, un emprendimiento
@@ -17448,6 +17505,9 @@ async function guardarDesarrolladora(user_id, b, opts) {
     nombre: _invStr(dev.nombre),
     tipo: _invStr(dev.tipo),
     zona: _invStr(dev.zona),
+    direccion: _invStr(dev.direccion),
+    entre_calles: _invStr(dev.entre_calles),
+    ciudad: _invStr(dev.ciudad),
     descripcion: _invStr(dev.descripcion),
     link: _invStr(dev.link),
     estado_obra: _invStr(dev.estado_obra),
@@ -17495,6 +17555,7 @@ async function guardarDesarrolladora(user_id, b, opts) {
     }
     var filaDevUpd = {
       nombre: filaDev.nombre, tipo: filaDev.tipo, zona: filaDev.zona,
+      direccion: filaDev.direccion, entre_calles: filaDev.entre_calles, ciudad: filaDev.ciudad,
       descripcion: filaDev.descripcion, link: filaDev.link, estado_obra: filaDev.estado_obra,
       avance_pct: filaDev.avance_pct, fecha_entrega: filaDev.fecha_entrega, dev_data: _devDataUpd
     };
@@ -19445,6 +19506,8 @@ async function procesarPropiedad(p) {
   var parking = pares['Parking'] || pares['Cochera'] || pares['Garage'] || null;
   var ciudad = (pares['Ciudad/ Localidad'] || pares['Ciudad'] || pares['Localidad'] || '').split(',')[0].trim() || null;
   var zona = pares['Barrio/ Zona'] || pares['Zona'] || pares['Barrio'] || null;
+  var direccion = pares['Direcci' + String.fromCharCode(243) + 'n'] || pares['Direccion'] || null;
+  var entreCalles = pares['Entre calles'] || pares['Entre Calles'] || null;
   var caract = [].concat(feats);
   if (banos) caract.push('Banos: ' + banos);
   if (parking && !/no|aplica/i.test(parking)) caract.push('Cochera: ' + parking);
@@ -19455,7 +19518,7 @@ async function procesarPropiedad(p) {
   return {
     numero: numero, titulo: titulo, tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
-    ciudad: ciudad, zona: zona, caracteristicas: caract.join(', '), descripcion: descripcion,
+    ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles, caracteristicas: caract.join(', '), descripcion: descripcion,
     link: link, foto: foto, fotos: fotos, postId: p.id
   };
 }
@@ -20126,6 +20189,7 @@ async function correrScrapingDeUsuario(cfg) {
         var fila = {
           user_id: cfg.user_id, numero: String(p.numero), title: p.titulo || 'Sin titulo',
           type: p.tipo || null, zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null,
+          direccion: p.direccion || null, entre_calles: p.entre_calles || null, ciudad: p.ciudad || null,
           price: p.precio || null, description: p.descripcion || null,
           caracteristicas: p.caracteristicas || null, link: p.link || null
         };
@@ -20219,6 +20283,7 @@ async function correrScrapingPendiente(cfg) {
         var nuevo = {
           numero: String(p.numero), title: p.titulo || 'Sin titulo', type: p.tipo || null,
           zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null, price: p.precio || null,
+          direccion: p.direccion || null, entre_calles: p.entre_calles || null, ciudad: p.ciudad || null,
           description: p.descripcion || null, caracteristicas: p.caracteristicas || null, link: p.link || null,
           images: _fotosPend.length ? _fotosPend.map(function(u){ return { url: u }; }) : null
         };
@@ -24115,5 +24180,26 @@ async function _migracionCalendarDefensiva() {
   } catch (e) {}
 }
 setTimeout(_migracionCalendarDefensiva, 8 * 1000);
+
+// MIGRACION DEFENSIVA en arranque: DIRECCION estructurada (Fase 1) para los 3 mundos. Agrega las
+// columnas nuevas a properties y developments (hotel usa jsonb, no migra) + refresca PostgREST.
+// Todas NULLABLE => aditivo, cero regresion. IF NOT EXISTS => idempotente (corre en cada boot sin
+// efecto si ya existen). Cada ALTER va por separado: si developments no existe en alguna base, la
+// de properties igual entra. No fatal si exec_sql no esta (loguea para correr a mano).
+async function _migracionDireccionDefensiva() {
+  const stmts = [
+    "ALTER TABLE properties ADD COLUMN IF NOT EXISTS direccion text, ADD COLUMN IF NOT EXISTS entre_calles text, ADD COLUMN IF NOT EXISTS ciudad text, ADD COLUMN IF NOT EXISTS lat numeric, ADD COLUMN IF NOT EXISTS lng numeric;",
+    "ALTER TABLE developments ADD COLUMN IF NOT EXISTS direccion text, ADD COLUMN IF NOT EXISTS entre_calles text, ADD COLUMN IF NOT EXISTS ciudad text, ADD COLUMN IF NOT EXISTS lat numeric, ADD COLUMN IF NOT EXISTS lng numeric;",
+    "NOTIFY pgrst, 'reload schema';"
+  ];
+  for (const sql of stmts) {
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql: sql });
+      if (error) console.log('[migracion direccion] fallo (' + error.message + '). Correr a mano: ' + sql);
+      else console.log('[migracion direccion] OK: ' + sql.slice(0, 55));
+    } catch (e) { console.log('[migracion direccion] no se pudo via RPC. Correr a mano en Supabase: ' + sql); }
+  }
+}
+setTimeout(_migracionDireccionDefensiva, 11 * 1000);
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

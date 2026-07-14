@@ -131,6 +131,7 @@ const _PREFIJOS_GATE_SUSCRIPCION = [
 // cortesía, ver topeEfectivoIA) => esa sí puede recibir 429. Es intencional: el Maestro le puso un tope explícito.
 const _PREFIJOS_TOPE_IA = [
   '/api/clasificar-fotos',
+  '/api/scrape/lista',         // SI gasta IA: su estrategia (5) es "extraccion con IA" -> listarUrlsIA (Sonnet) y cobra 3 msgs.
   '/api/scrape/detalle',
   '/api/scrape/universal',
   '/api/scrape/v2',

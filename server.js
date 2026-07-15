@@ -4726,10 +4726,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // asesor la toma. Al confirmarle al lead, NO nombres a ningun asesor: deci en generico que queda agendado y que un
   // asesor del equipo se lo confirma. NO agrega una llamada de IA extra: la tool viaja en el turno que el agente ya hace.
   if (_iaAgendaOn) {
+    var _tiposIAenum = tiposCitaPorRubro(rubro).map(function(t){ return t.value; }).filter(function(v){ return v !== 'otro'; });
+    var _tipoEjemploAg = _esHotel ? 'coordinar un check-in, una consulta o una llamada' : (normalizarRubro(rubro) === 'desarrolladora' ? 'una reunion, una visita a la obra o al showroom, o una llamada' : 'una visita, reunion o llamada');
     toolsAgente.push({
       name: 'agendar_cita',
-      description: 'Usala SOLO cuando el lead ya acordo un DIA y HORA concretos para una visita, reunion o llamada (ej: "el jueves a las 15hs", "manana a las 10 de la manana"). Deja la cita anotada en la agenda del equipo. Indica fecha_hora con el dia y hora acordados (lo mas explicito posible: incluye fecha y hora). NO la uses si el lead todavia no fijo un horario, ni para pedidos vagos ("algun dia", "mas adelante"). Al confirmarle al lead, NO nombres a ningun asesor ni persona (no digas "te atiende Walter"); deci de forma generica que queda agendado y que un asesor del equipo se lo confirma (ej: "listo, te lo dejo agendado y un asesor del equipo te confirma").',
-      input_schema: { type: 'object', properties: { fecha_hora: { type: 'string', description: 'Dia y hora acordados con el lead, lo mas explicito posible (ej: "2026-07-10 15:00", "jueves 10 de julio a las 15hs"). Preferentemente en formato ISO si podes.' }, tipo: { type: 'string', enum: ['visita','reunion','llamada','tasacion'], description: 'Tipo de cita. Opcional; por defecto "reunion".' }, departamento: { type: 'string', description: 'Nombre del area/departamento al que corresponde (ej: Ventas, Alquileres), si lo sabes. Opcional.' }, notas: { type: 'string', description: 'Nota breve para el asesor (ej: propiedad de interes, motivo). Opcional.' } }, required: ['fecha_hora'] }
+      description: 'Usala SOLO cuando el lead ya acordo un DIA y HORA concretos para ' + _tipoEjemploAg + ' (ej: "el jueves a las 15hs", "manana a las 10 de la manana"). Deja la cita anotada en la agenda del equipo. Indica fecha_hora con el dia y hora acordados (lo mas explicito posible: incluye fecha y hora). NO la uses si el lead todavia no fijo un horario, ni para pedidos vagos ("algun dia", "mas adelante"). Al confirmarle al lead, NO nombres a ningun asesor ni persona (no digas "te atiende Walter"); deci de forma generica que queda agendado y que un asesor del equipo se lo confirma (ej: "listo, te lo dejo agendado y un asesor del equipo te confirma").',
+      input_schema: { type: 'object', properties: { fecha_hora: { type: 'string', description: 'Dia y hora acordados con el lead, lo mas explicito posible (ej: "2026-07-10 15:00", "jueves 10 de julio a las 15hs"). Preferentemente en formato ISO si podes.' }, tipo: { type: 'string', enum: _tiposIAenum, description: 'Tipo de cita segun lo que corresponda al negocio. Opcional; por defecto "reunion".' }, departamento: { type: 'string', description: 'Nombre del area/departamento al que corresponde (ej: Ventas, Alquileres), si lo sabes. Opcional.' }, notas: { type: 'string', description: 'Nota breve para el asesor (ej: propiedad de interes, motivo). Opcional.' } }, required: ['fecha_hora'] }
     });
   }
 
@@ -11930,6 +11932,34 @@ function normalizarRubro(r) {
   if (v === 'hotel' || v === 'cabanas' || v === 'cabañas' || v === 'temporario' || v === 'hoteleria' || v === 'hotel_cabanas') return 'hotel_cabanas';
   return 'inmobiliaria';
 }
+
+// TIPOS DE CITA/EVENTO por rubro (fuente unica). El front muestra SOLO los del rubro; el backend
+// ACEPTA el superset de todos (para no romper datos viejos ni inmobiliaria). Aditivo.
+var _TIPOS_CITA = {
+  inmobiliaria: [
+    { value: 'visita', label: 'Visita' }, { value: 'tasacion', label: 'Tasacion' },
+    { value: 'reunion', label: 'Reunion' }, { value: 'llamada', label: 'Llamada' },
+    { value: 'alquiler', label: 'Alquiler' }, { value: 'alquiler_temporal', label: 'Alquiler temporal' },
+    { value: 'otro', label: 'Otro' }
+  ],
+  hotel_cabanas: [
+    { value: 'check_in', label: 'Check-in' }, { value: 'check_out', label: 'Check-out' },
+    { value: 'limpieza', label: 'Limpieza' }, { value: 'mantenimiento', label: 'Mantenimiento' },
+    { value: 'consulta', label: 'Consulta' }, { value: 'llamada', label: 'Llamada' },
+    { value: 'reunion', label: 'Reunion' }, { value: 'otro', label: 'Otro' }
+  ],
+  desarrolladora: [
+    { value: 'reunion_inversor', label: 'Reunion con inversor' }, { value: 'visita_obra', label: 'Visita a la obra' },
+    { value: 'visita_showroom', label: 'Visita al showroom' }, { value: 'hito_obra', label: 'Hito de obra' },
+    { value: 'entrega_unidad', label: 'Entrega de unidad' }, { value: 'seguimiento_reserva', label: 'Seguimiento de reserva' },
+    { value: 'llamada', label: 'Llamada' }, { value: 'reunion', label: 'Reunion' }, { value: 'otro', label: 'Otro' }
+  ]
+};
+function tiposCitaPorRubro(rubro) { return _TIPOS_CITA[normalizarRubro(rubro)] || _TIPOS_CITA.inmobiliaria; }
+// Superset de valores validos para el clamp del backend (incluye legacy 'venta' y 'alquiler').
+var _TIPOS_CITA_VALIDOS = (function () { var s = { venta: 1 }; Object.keys(_TIPOS_CITA).forEach(function (k) { _TIPOS_CITA[k].forEach(function (t) { s[t.value] = 1; }); }); return Object.keys(s); })();
+// Tipos que representan un RANGO (fecha_fin) por rubro -> el front les pide fecha/hora fin.
+var _TIPOS_CITA_RANGO = { inmobiliaria: ['alquiler_temporal'], hotel_cabanas: ['alquiler_temporal'], desarrolladora: ['hito_obra'] };
 
 // Plantillas de departamentos por rubro CANONICO (3). hotel_cabanas combina Hotel/Apart/Cabañas.
 // El lookup SIEMPRE pasa por normalizarRubro(), asi que las claves legacy se resuelven solas.
@@ -20228,8 +20258,7 @@ app.post('/api/citas', async function(req, res) {
     // Tipos AMPLIADOS: ademas de visita/llamada/reunion, ahora alquiler y alquiler_temporal
     // (eventos con rango: fecha_hora = check-in, fecha_fin = check-out). ADITIVO: si b.tipo
     // no entra en la lista, cae a 'visita' (comportamiento conservador de siempre).
-    var TIPOS_CITA = ['visita','venta','tasacion','llamada','reunion','alquiler','alquiler_temporal','otro'];
-    var tipoCita = (TIPOS_CITA.indexOf(b.tipo) >= 0) ? b.tipo : 'visita';
+    var tipoCita = (_TIPOS_CITA_VALIDOS.indexOf(b.tipo) >= 0) ? b.tipo : 'otro';
     var esAlquiler = (tipoCita === 'alquiler' || tipoCita === 'alquiler_temporal');
     var fila = { user_id: ownerId, fecha_hora: fh.toISOString(), tipo: tipoCita, titulo: (b.titulo ? String(b.titulo).slice(0,160) : 'Cita'), estado: 'agendada', notas: (b.notas ? String(b.notas).slice(0,500) : null), lead_nombre: (b.lead_nombre ? String(b.lead_nombre).slice(0,120) : null), lead_telefono: (b.lead_telefono ? String(b.lead_telefono).slice(0,40) : null), asesor_id: asesorCita, contact_id: b.contact_id || null, conversation_id: b.conversation_id || null, origen: 'manual' };
     // Campos nuevos de la AGENDA NATIVA. Se agregan SOLO si vienen (defensivo: si la
@@ -20306,8 +20335,7 @@ app.post('/api/citas/actualizar', async function(req, res) {
     // MEJORA #4: `lugar` editable (texto libre). Va con el bloque de campos nuevos; si la columna aun no
     // existe, el retry defensivo de abajo lo descarta (lugar no esta en la whitelist clasica) y no rompe.
     if (typeof b.lugar === 'string') upd.lugar = b.lugar.slice(0,300);
-    var TIPOS_UPD = ['visita','venta','tasacion','llamada','reunion','alquiler','alquiler_temporal','otro'];
-    if (b.tipo && TIPOS_UPD.indexOf(b.tipo) >= 0) upd.tipo = b.tipo;
+    if (b.tipo && _TIPOS_CITA_VALIDOS.indexOf(b.tipo) >= 0) upd.tipo = b.tipo;
     if (Object.keys(upd).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
     upd.actualizado_en = new Date().toISOString();
     var updq = supabase.from('citas').update(upd).eq('id', b.id).eq('user_id', ownerId);

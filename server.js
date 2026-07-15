@@ -4911,8 +4911,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
               const _conMin = (_disp.opciones || []).find(function(o){ return o.minLOS; });
               _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches) NO hay disponibilidad.' + (_conMin ? (' Varias tarifas piden un minimo de ' + _conMin.minLOS + ' noches para esas fechas.') : '') + ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.';
             } else {
-              const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.total) + ' total por ' + _disp.nights + ' noches (' + o.moneda + ' ' + _miles(o.porNoche) + '/noche)' + (o.desayuno ? ', desayuno incluido' : '') + ', ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : ''); });
-              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' personas). Precios FINALES con impuestos incluidos:' + String.fromCharCode(10) + _lineas.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele estas opciones. Cuando menciones varias, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados). No inventes nada fuera de esta lista.';
+              const _NLd = String.fromCharCode(10);
+              const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
+              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' personas). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
             }
           }
         }
@@ -16554,17 +16555,29 @@ async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos) {
     var opciones = skus.map(function (s) {
       var nombre = String(s.Title || s.SkuName || 'Habitación').replace(/\s+/g, ' ').trim();
       // OJO (verificado 2026-07-15 contra la web de Tequendama): Rate/PromotionalRate de PXSOL son
-      // POR NOCHE y con impuestos incluidos (ClientLoad=FINAL, Taxes=21), NO el total de la estadia.
-      // Prueba: PromotionalRate 196.000 x 5 noches = 980.000 = total web (809.917 sin IVA) + 21%.
+      // POR NOCHE y con impuestos INCLUIDOS (ClientLoad=FINAL, Taxes=21), NO el total de la estadia.
+      // La WEB, en cambio, cotiza POR NOCHE SIN IVA ("Impuestos: 21% no incluidos"). Devolvemos las 2:
+      // la de la WEB (default, lo que ve el huesped si entra a la pagina) y la FINAL con IVA.
       // NO usar RatePerDay para el total: su PromotionalRate NO trae aplicado el descuento.
-      var porNoche = Number(s.PromotionalRate || s.Rate || 0), avail = Number(s.Availability || 0);
-      if (!(porNoche > 0 && avail > 0)) {
+      var porNocheFinal = Number(s.PromotionalRate || s.Rate || 0), avail = Number(s.Availability || 0);
+      var ivaPct = 21;
+      try { var _rl0 = Array.isArray(s.RateList) ? s.RateList : []; for (var k = 0; k < _rl0.length; k++) { var _rpd = _rl0[k].RatePerDay; if (_rpd && _rpd[0] && _rpd[0].Taxes != null) { ivaPct = Number(_rpd[0].Taxes) || 21; break; } } } catch (eTx) {}
+      if (!(porNocheFinal > 0 && avail > 0)) {
         (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) {
           var a = Number(rt.Availability || 0), t = Number(rt.PromotionalRate || rt.Rate || 0);
-          if (a > 0 && t > 0 && (!(porNoche > 0) || t < porNoche)) { porNoche = t; avail = a; }
+          if (a > 0 && t > 0 && (!(porNocheFinal > 0) || t < porNocheFinal)) { porNocheFinal = t; avail = a; }
         });
       }
-      if (porNoche > 0 && avail > 0) return { nombre: nombre, total: Math.round(porNoche * nights), porNoche: Math.round(porNoche), disponibles: avail, desayuno: (s.Breakfast == 1 || s.Breakfast === true) };
+      if (porNocheFinal > 0 && avail > 0) {
+        var _totalFinal = porNocheFinal * nights;
+        var _div = 1 + (ivaPct / 100);
+        return {
+          nombre: nombre,
+          porNocheWeb: Math.round(porNocheFinal / _div), totalWeb: Math.round(_totalFinal / _div),
+          porNocheFinal: Math.round(porNocheFinal), totalFinal: Math.round(_totalFinal),
+          ivaPct: ivaPct, disponibles: avail, desayuno: (s.Breakfast == 1 || s.Breakfast === true)
+        };
+      }
       var minLos = 0;
       (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) { var m = Number(rt.MinLOS || 0); if (m > minLos) minLos = m; });
       return { nombre: nombre, sinDisponibilidad: true, minLOS: (minLos > nights) ? minLos : null };

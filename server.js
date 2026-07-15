@@ -1724,6 +1724,18 @@ async function iaUbicacionActivo(user_id, bs) {
   } catch (e) { return false; }
 }
 
+// DISPONIBILIDAD PXSOL (gated ia_disponibilidad): con ON la IA de un hotel puede consultar
+// disponibilidad+precio en vivo por fechas (API PXSOL). Fail-closed (mismo patrón).
+async function iaDisponibilidadActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_disponibilidad')) return bs.ia_disponibilidad === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_disponibilidad').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_disponibilidad === true);
+  } catch (e) { return false; }
+}
+
 // ===== MEJORA #3 (AGENDA): OFFSETS DE RECORDATORIO DE CITAS, CONFIGURABLES POR CUENTA =====
 // Devuelve un array de horas-antes (ej. [24, 1]) en las que se manda el recordatorio de una cita.
 // Fuente: business_settings.recordatorio_citas_horas (texto JSON, ej. '[24,1]'). DEFAULT [24,1] (24h + 1h
@@ -4137,6 +4149,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // Con flag OFF -> false => prompt y tools BYTE-IDENTICOS al actual. Reusa settings (0 queries extra).
   let _iaUbicacionOn = false;
   if (conversation_id && !modoPrueba) { try { _iaUbicacionOn = await iaUbicacionActivo(user_id, settings || undefined); } catch (eIaUb) { _iaUbicacionOn = false; } }
+  // DISPONIBILIDAD PXSOL (gated ia_disponibilidad): ¿ofrecer la tool consultar_disponibilidad? SOLO hotel + flag ON.
+  let _iaDisponibilidadOn = false;
+  if (conversation_id && !modoPrueba) { try { _iaDisponibilidadOn = await iaDisponibilidadActivo(user_id, settings || undefined); } catch (eIaDi) { _iaDisponibilidadOn = false; } }
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   // DIRECCION (Fase 1): helper compartido por los 3 rubros para componer la ubicacion buscable
   // a partir de {direccion, entre_calles, ciudad}. Null-safe: si no hay nada devuelve '' y el
@@ -4728,6 +4743,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // DISPONIBILIDAD PXSOL (gated ia_disponibilidad, solo hotel): consultar disponibilidad+precio REAL por fechas.
+  if (_iaDisponibilidadOn && _esHotel) {
+    var _hoyISO = new Date().toISOString().slice(0, 10);
+    toolsAgente.push({
+      name: 'consultar_disponibilidad',
+      description: 'Usala cuando el lead pide DISPONIBILIDAD o PRECIO para fechas concretas (ej: "tienen para el 10 al 13 de enero?", "cuanto sale una cabaña 3 noches en febrero para 2 personas?"). Consulta en vivo el motor de reservas y te devuelve las habitaciones con precio y si hay lugar. HOY es ' + _hoyISO + ': convertí las fechas del lead a formato AAAA-MM-DD; si el mes ya pasó este año, usá el año que viene. Si el lead no dio fecha de salida pero sí cantidad de noches, calculala. Si faltan datos (fechas o personas), preguntáselos con naturalidad ANTES de usar la tool, no inventes.',
+      input_schema: { type: 'object', properties: { check_in: { type: 'string', description: 'Fecha de entrada en formato AAAA-MM-DD (ej: 2026-01-10).' }, check_out: { type: 'string', description: 'Fecha de salida en formato AAAA-MM-DD (ej: 2026-01-13).' }, adultos: { type: 'integer', description: 'Cantidad de adultos/personas. Si no lo dijeron, asumí 2.' } }, required: ['check_in', 'check_out'] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -4802,6 +4827,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // el resultado en un 2do turno (mismo patron que foto/dueno). La tool solo existe con el flag
     // ON => esta rama nunca se entra con OFF (ACTUAL EXACTO). $0 recurrente: OSM gratis + math local.
     const _toolCerca = _iaUbicacionOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_propiedades_cerca'; }) : null;
+    const _toolDispo = (_iaDisponibilidadOn && _esHotel) ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_disponibilidad'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       let _resCercaTxt = '';
@@ -4861,6 +4887,54 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       } catch (eC2) { console.error('segundo turno buscar_propiedades_cerca:', eC2 && eC2.message); }
       reply = _textoCierreC || _textoPrevioC || 'Dejame chequear bien esa ubicacion y te confirmo.';
       if (!usaEmojis) { const _lC = quitarEmojis(reply); if (_lC) reply = _lC; }
+    } else if (_toolDispo) {
+      // DISPONIBILIDAD PXSOL: consulta en vivo por fechas + 2do turno para que la IA redacte.
+      const _textoPrevioD = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      const _miles = function(n){ return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
+      let _resDispoTxt = '';
+      try {
+        const _ci = (_toolDispo.input && _toolDispo.input.check_in) ? String(_toolDispo.input.check_in).trim() : '';
+        const _co = (_toolDispo.input && _toolDispo.input.check_out) ? String(_toolDispo.input.check_out).trim() : '';
+        const _ad = (_toolDispo.input && _toolDispo.input.adultos) ? _toolDispo.input.adultos : 2;
+        const _cfgPx = await _pxsolConfigDeCuenta(user_id);
+        if (!_cfgPx) {
+          _resDispoTxt = 'No pude conectar con el motor de reservas del hotel. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
+        } else {
+          const _disp = await _pxsolDisponibilidad(_cfgPx, _ci, _co, _ad);
+          if (!_disp.ok) {
+            _resDispoTxt = 'No se pudo consultar la disponibilidad (' + (_disp.error || 'error') + '). Confirma con el lead las fechas (entrada y salida) y cuantas personas, o decile que le confirmas a la brevedad. NO inventes precios.';
+          } else {
+            const _hay = (_disp.opciones || []).filter(function(o){ return !o.sinDisponibilidad; });
+            if (!_hay.length) {
+              const _conMin = (_disp.opciones || []).find(function(o){ return o.minLOS; });
+              _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches) NO hay disponibilidad.' + (_conMin ? (' Varias tarifas piden un minimo de ' + _conMin.minLOS + ' noches para esas fechas.') : '') + ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.';
+            } else {
+              const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.total) + ' total por ' + _disp.nights + ' noches (' + o.moneda + ' ' + _miles(o.porNoche) + '/noche)' + (o.desayuno ? ', desayuno incluido' : '') + ', ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : ''); });
+              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' personas). Precios FINALES con impuestos incluidos:' + String.fromCharCode(10) + _lineas.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele estas opciones. Cuando menciones varias, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados). No inventes nada fuera de esta lista.';
+            }
+          }
+        }
+      } catch (eDispo) { console.error('tool consultar_disponibilidad:', eDispo && eDispo.message); _resDispoTxt = 'No se pudo consultar la disponibilidad ahora. Decile al lead que le confirmas a la brevedad, sin inventar precios.'; }
+      let _textoCierreD = '';
+      try {
+        const _msgsD2 = mensajesParaIA.concat([
+          { role: 'assistant', content: completion.content },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolDispo.id, content: _resDispoTxt }] }
+        ]);
+        const _cd2 = await llamarIAConFailover({ model: MODELO_CLIENTE, max_tokens: 600, system: systemBlocks, tools: toolsAgente, messages: _msgsD2 }, 'generarRespuestaAgente:turno2-dispo');
+        const _bd2 = (_cd2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
+        if (_bd2 && _bd2.text) _textoCierreD = _bd2.text;
+        if (_cd2 && _cd2.usage && completion && completion.usage) {
+          completion.usage = {
+            input_tokens: (completion.usage.input_tokens || 0) + (_cd2.usage.input_tokens || 0),
+            output_tokens: (completion.usage.output_tokens || 0) + (_cd2.usage.output_tokens || 0),
+            cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (_cd2.usage.cache_read_input_tokens || 0),
+            cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (_cd2.usage.cache_creation_input_tokens || 0)
+          };
+        }
+      } catch (eD2) { console.error('segundo turno consultar_disponibilidad:', eD2 && eD2.message); }
+      reply = _textoCierreD || _textoPrevioD || 'Dejame chequear la disponibilidad y te confirmo.';
+      if (!usaEmojis) { const _lD = quitarEmojis(reply); if (_lD) reply = _lD; }
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
@@ -16398,6 +16472,92 @@ async function _pxsolResultUrl(homepageHtml, base) {
     if (!mSid) return null;
     return base + '/lp.html?search=OK&SearchID=' + mSid[1] + '&cur=ARS&lng=es&Pid=' + pid + '&checkin=' + iso(d1) + '&checkout=' + iso(d2);
   } catch (e) { console.error('[pxsol] insert:', e && e.message); return null; }
+}
+
+// ============================================================================
+// PXSOL — disponibilidad + precios REALES por fechas (para la tool de la IA).
+// Flujo: /search/insert (crea búsqueda por fechas) -> /query/list6 con Sku=1 (trae habitaciones
+// con precio TOTAL de la estadía —IVA + desayuno incluidos— y disponibilidad). GRATIS, sin token,
+// sin navegador. Verificado contra el JSON real de Tequendama.
+// ============================================================================
+
+// Extrae la config PXSOL del HTML del sitio: ProductID (hotelId) + pos (posición del hotel, la pide
+// list6) + api base. null si no es PXSOL o falta ProductID.
+function _pxsolConfig(homepageHtml) {
+  try {
+    if (!/pxsol/i.test(homepageHtml)) return null;
+    var mPid = homepageHtml.match(/product_id['"\s:=]+['"]?(\d{2,8})/i)
+      || homepageHtml.match(/ProductID[^>]*value=['"](\d{2,8})/i)
+      || homepageHtml.match(/Pid=(\d{2,8})/i);
+    if (!mPid) return null;
+    var mPos = homepageHtml.match(/[?&]pos=([^&"'\s]{1,40})/i)
+      || homepageHtml.match(/ApiKey\s*[:=]\s*['"]([^'"]{1,40})['"]/i);
+    var mApi = homepageHtml.match(/https?:\/\/[a-z0-9.-]*pxsol\.io/i);
+    return { productId: mPid[1], pos: mPos ? decodeURIComponent(mPos[1]) : '', api: mApi ? mApi[0] : 'https://api-1-eb-web.pxsol.io' };
+  } catch (e) { return null; }
+}
+
+// Consulta disponibilidad+precios para fechas concretas (YYYY-MM-DD). Devuelve
+// { ok, nights, moneda, opciones:[{nombre, total, porNoche, disponibles, desayuno} | {nombre, sinDisponibilidad, minLOS}] } | { ok:false, error }.
+async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos) {
+  try {
+    if (!cfg || !cfg.productId) return { ok: false, error: 'sin config pxsol' };
+    var d1 = new Date(String(checkinISO) + 'T12:00:00'), d2 = new Date(String(checkoutISO) + 'T12:00:00');
+    if (isNaN(d1.getTime()) || isNaN(d2.getTime())) return { ok: false, error: 'fechas invalidas' };
+    var nights = Math.round((d2.getTime() - d1.getTime()) / 86400000);
+    if (nights < 1) return { ok: false, error: 'el check-out debe ser posterior al check-in' };
+    var ddmm = function (dt) { return _padDos(dt.getDate()) + '/' + _padDos(dt.getMonth() + 1) + '/' + dt.getFullYear(); };
+    var ad = Math.max(1, Math.min(12, parseInt(adultos, 10) || 2));
+    var api = cfg.api || 'https://api-1-eb-web.pxsol.io';
+    var body = 'ProductID=' + cfg.productId + '&Start=' + ddmm(d1) + '&End=' + ddmm(d2) + '&Channel=2&RateType=auto&Currency=ARS&MaxRooms=1&Rooms=1&Adults=' + ad + '&Nights=' + nights + '&Lng=es';
+    var rIns = await fetchScrape(api + '/search/insert', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'RaicesCRM/1.0 (+https://raicescrm.com)' }, body: body });
+    if (!rIns.ok) return { ok: false, error: 'insert http ' + rIns.status };
+    var mSid = (await rIns.text()).match(/SearchID=(\d+)/);
+    if (!mSid) return { ok: false, error: 'sin SearchID' };
+    var url = api + '/query/list6?search=OK&pos=' + encodeURIComponent(cfg.pos || '') + '&lng=es&SearchID=' + mSid[1] + '&ProductID=' + cfg.productId + '&Sku=1&Currency=ARS&Email=NN&Tag=NN';
+    var rList = await fetchScrape(url, { headers: { 'User-Agent': 'RaicesCRM/1.0 (+https://raicescrm.com)' } });
+    if (!rList.ok) return { ok: false, error: 'list6 http ' + rList.status };
+    var data = await rList.json();
+    var pl = (data && Array.isArray(data.ProductList)) ? data.ProductList[0] : null;
+    var skus = (pl && Array.isArray(pl.SkuList)) ? pl.SkuList : [];
+    if (!skus.length) return { ok: false, error: 'sin habitaciones' };
+    var opciones = skus.map(function (s) {
+      var nombre = String(s.Title || s.SkuName || 'Habitación').replace(/\s+/g, ' ').trim();
+      var total = Number(s.PromotionalRate || s.Rate || 0), avail = Number(s.Availability || 0);
+      if (!(total > 0 && avail > 0)) {
+        (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) {
+          var a = Number(rt.Availability || 0), t = Number(rt.PromotionalRate || rt.Rate || 0);
+          if (a > 0 && t > 0 && (!(total > 0) || t < total)) { total = t; avail = a; }
+        });
+      }
+      if (total > 0 && avail > 0) return { nombre: nombre, total: Math.round(total), porNoche: Math.round(total / nights), disponibles: avail, desayuno: (s.Breakfast == 1 || s.Breakfast === true) };
+      var minLos = 0;
+      (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) { var m = Number(rt.MinLOS || 0); if (m > minLos) minLos = m; });
+      return { nombre: nombre, sinDisponibilidad: true, minLOS: (minLos > nights) ? minLos : null };
+    });
+    return { ok: true, nights: nights, moneda: 'ARS', opciones: opciones };
+  } catch (e) { console.error('[pxsol] disponibilidad:', e && e.message); return { ok: false, error: e && e.message }; }
+}
+
+// Resuelve la config PXSOL del hotel de una cuenta (cachea en hotel_complejos.atributos.pxsol para
+// no re-bajar el sitio en cada consulta). null si la cuenta no tiene un complejo con sitio PXSOL.
+async function _pxsolConfigDeCuenta(user_id) {
+  try {
+    var hc = await supabase.from('hotel_complejos').select('id, atributos').eq('user_id', user_id).limit(5);
+    var comps = (hc && hc.data) ? hc.data : [];
+    for (var i = 0; i < comps.length; i++) {
+      var a = (comps[i].atributos && typeof comps[i].atributos === 'object') ? comps[i].atributos : {};
+      if (a.pxsol && a.pxsol.productId) return a.pxsol;
+      var url = a.origen_url || a.origenUrl || '';
+      if (!url) continue;
+      if (!String(url).startsWith('http')) url = 'https://' + url;
+      var rh = await fetchScrape(url);
+      if (!rh.ok) continue;
+      var cfg = _pxsolConfig(await rh.text());
+      if (cfg) { try { await supabase.from('hotel_complejos').update({ atributos: Object.assign({}, a, { pxsol: cfg }) }).eq('id', comps[i].id); } catch (eU) {} return cfg; }
+    }
+    return null;
+  } catch (e) { return null; }
 }
 
 // Arma la lista de URLs a renderizar (PXSOL primero, luego rutas tipicas de habitaciones) y las

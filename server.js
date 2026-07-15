@@ -15086,6 +15086,15 @@ app.get('/api/scrape/lista', async function(req, res) {
       }
     } catch (e) { /* seguir a la IA */ }
 
+    // CONFIRMACION DE GASTO (ADITIVO): llegar aca significa que ninguna via GRATIS (1..4b) pudo
+    // leer el sitio y el unico camino que queda es la IA, que cuesta ~3 mensajes del plan. No lo
+    // gastamos sin permiso: avisamos y el frontend vuelve a llamar con ia_ok si el usuario acepta.
+    // NOTA: esta ruta es GET (no POST), asi que ia_ok llega por QUERY; igual aceptamos body por
+    // compatibilidad futura. Las estrategias 1..4b no pasan por aca -> no cambian en nada.
+    var _iaOk = (req.query && String(req.query.ia_ok) === 'true') || !!(req.body && req.body.ia_ok === true);
+    if (!_iaOk) {
+      return res.json({ ok: true, necesita_ia: true, costo_mensajes: 3, total: 0, urls: [] });
+    }
     // (5) Extraccion con IA (ultimo recurso; solo si 2-4b no extrajeron nada util).
     // Elegimos el HTML de listado MAS GRANDE (suele ser el que trae mas propiedades) para
     // darle a la IA el mejor material posible dentro del cap de chars.
@@ -20212,6 +20221,235 @@ async function traerListaPropiedades(sitio, limite) {
   if (limite) props = props.slice(0, limite);
   return props;
 }
+
+// ============================================================================
+// RESPALDO UNIVERSAL DEL CRON — SOLO INMOBILIARIA (ADITIVO)
+// ============================================================================
+// AGUJERO QUE TAPA: traerListaPropiedades() esta atada a /wp-json/wp/v2/properties.
+// Si el sitio del cliente NO es WordPress (o no expone ese post type) devuelve 0 y la
+// actualizacion automatica no hace NADA, en silencio. Eso NO se arregla tocando
+// traerListaPropiedades: romperia a los clientes WordPress que hoy andan (Anton).
+//
+// SOLUCION: un camino NUEVO que corre SOLO donde hoy no hace nada (cuando el camino
+// WordPress dio CERO). Para un sitio WordPress este codigo NUNCA se ejecuta.
+//
+// COSTO: reusa la MISMA cascada del import manual (POST->GET /api/scrape/lista) pero
+// SOLO las vias GRATIS (Tokko -> JSON-LD -> heuristica -> sitemap generico). La IA
+// (que descuenta mensajes del plan del cliente) es el ULTIMO recurso y solo si el dueno
+// la habilito a mano (scraping_config.ia_habilitada). Devuelve un array de URLs (strings).
+async function traerListaUniversalCron(sitio, user_id, permitirIA) {
+  var items = [];
+  var vistos = {};
+  function _sumar(arr) {
+    if (!Array.isArray(arr)) return;
+    for (var i = 0; i < arr.length; i++) {
+      var u = (arr[i] && typeof arr[i] === 'object') ? arr[i].url : arr[i];
+      if (!u || typeof u !== 'string') continue;
+      if (vistos[u]) continue;
+      vistos[u] = 1;
+      items.push(u);
+    }
+  }
+  try {
+    var base = String(sitio || '').trim().replace(/\/+$/, '');
+    if (!base) return [];
+    if (!base.startsWith('http')) base = 'https://' + base;
+    // Anti-SSRF + dominio propio del tenant: MISMO gate que usa el import manual.
+    var _permBase = await scrapeUrlPermitida(user_id, base);
+    if (!_permBase.ok) { console.log('[cron universal] origen no permitido:', _permBase.error); return []; }
+    // Material a analizar: home + rutas de listado tipicas (las mismas que /api/scrape/lista).
+    var rutasListado = ['/', '/propiedades', '/propiedades/', '/listado', '/buscar', '/emprendimientos', '/venta', '/alquiler'];
+    var homeHtml = '';
+    var htmlsListado = [];
+    for (var ri = 0; ri < rutasListado.length; ri++) {
+      try {
+        var rr = await fetchScrape(base + rutasListado[ri]);
+        if (rr && rr.ok) { var h = await rr.text(); if (ri === 0) homeHtml = h; if (h && h.length > 500) htmlsListado.push(h); }
+      } catch (eRuta) { /* seguir con la siguiente ruta */ }
+    }
+    if (htmlsListado.length === 0 && homeHtml) htmlsListado.push(homeHtml);
+
+    // (1) GRATIS — Tokko Broker
+    try {
+      if (esSitioTokko(homeHtml) || htmlsListado.some(esSitioTokko)) {
+        _sumar(await listarUrlsTokko(base, null));
+        if (items.length) { console.log('[cron universal] tokko:', items.length); return items; }
+      }
+    } catch (eTk) { /* seguir a la siguiente estrategia */ }
+
+    // (2) GRATIS — datos estructurados JSON-LD
+    try {
+      for (var hi = 0; hi < htmlsListado.length; hi++) _sumar(listarUrlsJsonLd(htmlsListado[hi], base));
+      if (items.length) { console.log('[cron universal] json-ld:', items.length); return items; }
+    } catch (eLd) { /* seguir */ }
+
+    // (3) GRATIS — heuristica HTML generica. Umbral >=3 igual que el import manual:
+    // con menos de 3 links es ruido (menu/destacados), no un listado -> se descarta.
+    try {
+      for (var hj = 0; hj < htmlsListado.length; hj++) _sumar(listarUrlsHeuristica(htmlsListado[hj], base));
+      if (items.length >= 3) { console.log('[cron universal] heuristica:', items.length); return items; }
+      items = []; vistos = {};
+    } catch (eHe) { items = []; vistos = {}; }
+
+    // (4) GRATIS — sitemap generico (cubre los sitios no-WP que igual publican sitemap.xml)
+    try {
+      _sumar(await descubrirUrlsSitemap(base, null));
+      if (items.length) { console.log('[cron universal] sitemap:', items.length); return items; }
+    } catch (eSm) { /* seguir */ }
+
+    // (5) IA (PAGA) — ultimo recurso y SOLO con permiso explicito del dueno.
+    if (permitirIA === true) {
+      try {
+        var htmlIA = homeHtml;
+        for (var hk = 0; hk < htmlsListado.length; hk++) { if ((htmlsListado[hk] || '').length > (htmlIA || '').length) htmlIA = htmlsListado[hk]; }
+        var iaItems = await listarUrlsIA(htmlIA, base, user_id);
+        if (iaItems.length) {
+          // COBRO: mismo patron exacto que /api/scrape/lista (3 mensajes por listar con IA).
+          try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 3); } catch (eCobLista) {}
+          _sumar(iaItems);
+          console.log('[cron universal] IA (cobrado 3 msgs):', items.length);
+          return items;
+        }
+      } catch (eIa) { /* nada mas que probar */ }
+    }
+  } catch (e) { console.error('[cron universal] traerListaUniversalCron:', e && e.message); }
+  return items;
+}
+
+// Campos "duros" de una ficha: si NO hay ninguno, el parseo determinista no saco nada util.
+// Mismo criterio que _wpJsonTieneDetalleUtil en /api/scrape/detalle (duplicado a proposito:
+// aquella vive dentro de la ruta y no se toca). Es el gate que decide si vale gastar IA.
+function _detalleTieneDatoDuroCron(campos) {
+  if (!campos) return false;
+  var duras = ['Precio', 'Ambientes', 'Habitaciones', 'Habitaciones / Cuartos', 'Ba' + String.fromCharCode(241) + 'os',
+    'Banos', 'Parking', 'Plazas', 'Metros cubiertos', 'Metros totales', 'Tipo de propiedad', 'Propiedad ID'];
+  for (var i = 0; i < duras.length; i++) { if (campos[duras[i]]) return true; }
+  return false;
+}
+
+// Procesa UNA ficha a partir de su URL y devuelve el MISMO shape que procesarPropiedad(),
+// para que el guardado de siempre (upsert por numero / pausa_manual / auto-pausa / fotos /
+// paso GEO) lo consuma sin cambiar una linea. Devuelve null si no se pudo leer.
+// Orden: helpers deterministas GRATIS -> (solo si no salio nada duro Y permitirIA) IA.
+async function procesarPropiedadURL(url, user_id, permitirIA) {
+  var u = String(url || '').trim();
+  if (!u) return null;
+  // Anti-SSRF + dominio propio del tenant ANTES de bajar nada.
+  try {
+    var _perm = await scrapeUrlPermitida(user_id, u);
+    if (!_perm.ok) return null;
+  } catch (ePerm) { return null; }
+  var html = '';
+  try {
+    var r = await fetchScrape(u, { headers: { 'User-Agent': 'Mozilla/5.0 RaicesCRM' } });
+    if (!r || !r.ok) return null;
+    html = await r.text();
+  } catch (eF) { return null; }
+  if (!html) return null;
+
+  var titulo = '', descripcion = '', pares = {}, precio = null;
+  var esTokko = false;
+  try { esTokko = esSitioTokko(html); } catch (eT) { esTokko = false; }
+
+  if (esTokko) {
+    // (1) GRATIS — Tokko tiene su propio parser, con las MISMAS claves de campos.
+    try {
+      var dt = parsearDetalleTokko(html, u);
+      if (dt) { titulo = dt.titulo || ''; descripcion = dt.descripcion || ''; pares = dt.campos || {}; }
+    } catch (eDt) {}
+  } else {
+    // (2) GRATIS — parser determinista de siempre (Houzez/WP y similares).
+    try { pares = extraerTablaDetalles(html) || {}; } catch (eTd) { pares = {}; }
+    try { precio = extraerPrecio2(html); } catch (eP) { precio = null; }
+    try {
+      var mT = html.match(/og:title["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:title/i);
+      if (mT && mT[1]) titulo = _limpiarHtmlScrape(mT[1]);
+      if (!titulo) { var mTt = html.match(/<title[^>]*>([\s\S]{0,200}?)<\/title>/i); if (mTt && mTt[1]) titulo = _limpiarHtmlScrape(mTt[1]); }
+      var mD = html.match(/og:description["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:description/i);
+      if (mD && mD[1]) descripcion = _limpiarHtmlScrape(mD[1]);
+    } catch (eOg) {}
+    // (3) GRATIS — datos estructurados (JSON-LD / microdata) si lo anterior no saco campos duros.
+    if (!_detalleTieneDatoDuroCron(pares)) {
+      try {
+        var detEst = parsearDetalleEstructurado(html, u);
+        if (detEst && detEst.campos && Object.keys(detEst.campos).length > 0) {
+          pares = Object.assign({}, pares, detEst.campos);
+          if (!titulo && detEst.titulo) titulo = detEst.titulo;
+          if (!descripcion && detEst.descripcion) descripcion = detEst.descripcion;
+        }
+      } catch (eEst) {}
+    }
+  }
+
+  // (4) IA (PAGA) — ULTIMO recurso: solo si lo determinista no saco NADA duro y hay permiso.
+  if (!_detalleTieneDatoDuroCron(pares) && !precio && permitirIA === true) {
+    try {
+      var detIa = await parsearDetalleIA(html, u, user_id);
+      if (detIa && (detIa.descripcion || (detIa.campos && Object.keys(detIa.campos).length > 0))) {
+        // COBRO: mismo patron que el resto. 1 mensaje por FICHA (parsearDetalleIA usa
+        // MODELO_INTERNO/Haiku y corre por propiedad; los 3 msgs del patron son el precio
+        // de listar con Sonnet, que es una sola llamada por corrida).
+        try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch (eCobFicha) {}
+        pares = Object.assign({}, pares, detIa.campos || {});
+        if (detIa.titulo) titulo = detIa.titulo;
+        if (detIa.descripcion) descripcion = detIa.descripcion;
+      }
+    } catch (eIaF) {}
+  }
+
+  // ===== MAPEO al shape de procesarPropiedad() (mismas claves, mismos fallbacks) =====
+  if (!precio && pares['Precio']) precio = pares['Precio'];
+  // numero: como no hay postId de WordPress, el ultimo fallback sale de la propia URL.
+  var _numUrl = (u.match(/id-?(\d{2,})/i) || [])[1] || (u.match(/(\d{4,})/) || [])[1] || null;
+  var numero = detectarNumeroProp(pares, titulo, _numUrl);
+  var operacion = detectarOperacion(pares['Estado'] || pares['Estado de la propiedad'], titulo + ' ' + String(descripcion || '').substring(0, 200));
+  var ambientes = pares['Ambientes'] || pares['Habitaciones / Cuartos'] || pares['Habitaciones'] || null;
+  var banos = pares['Banos'] || pares['Ba' + String.fromCharCode(241) + 'os'] || null;
+  var parking = pares['Parking'] || pares['Cochera'] || pares['Garage'] || null;
+  var ciudad = (pares['Ciudad/ Localidad'] || pares['Ciudad'] || pares['Localidad'] || '').split(',')[0].trim() || null;
+  var zona = pares['Barrio/ Zona'] || pares['Zona'] || pares['Barrio'] || null;
+  var direccion = pares['Direcci' + String.fromCharCode(243) + 'n'] || pares['Direccion'] || null;
+  var entreCalles = pares['Entre calles'] || pares['Entre Calles'] || null;
+  var caract = [];
+  if (banos) caract.push('Banos: ' + banos);
+  if (parking && !/no|aplica/i.test(parking)) caract.push('Cochera: ' + parking);
+  // FOTOS (0 IA): galeria generica del HTML -> fallback uploads/featured de WordPress -> og:image.
+  var ogImg = '';
+  try { var mOg = html.match(/og:image["'][^>]*content=["']([^"']*)/i) || html.match(/content=["']([^"']*)["'][^>]*og:image/i); if (mOg && mOg[1]) ogImg = mOg[1].trim(); } catch (eOi) {}
+  var fotos = [];
+  try { fotos = _extraerGaleriaHtml(html, u) || []; } catch (eG1) { fotos = []; }
+  if (fotos.length < 2) {
+    try {
+      var _baseFotos = u.replace(/^(https?:\/\/[^\/]+).*/, '$1');
+      var alt = await _armarGaleriaProp(_baseFotos, null, html, ogImg);
+      if (alt && alt.length > fotos.length) fotos = alt;
+    } catch (eG2) {}
+  }
+  if (!fotos.length && ogImg) fotos = [ogImg];
+  // PIN DEL MAPA: mismo lector que procesarPropiedad (sin meta wp-json -> solo desde el HTML).
+  var _pin = null;
+  try { _pin = _coordsHouzez(html, null); } catch (ePin) { _pin = null; }
+
+  return {
+    numero: numero, titulo: titulo || 'Sin titulo', tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
+    operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
+    ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles,
+    caracteristicas: caract.join(', '), descripcion: descripcion || '',
+    lat: _pin ? _pin.lat : null, lng: _pin ? _pin.lng : null,
+    link: u, foto: (fotos.length ? fotos[0] : null), fotos: fotos, postId: null
+  };
+}
+
+// Permiso de IA para la actualizacion automatica de UNA cuenta (inmobiliaria).
+// DEPLOY-SAFE: si la columna ia_habilitada todavia no existe (migracion no corrida),
+// cfg.ia_habilitada viene undefined -> false -> se comporta como hoy (IA apagada).
+// FRENO POR TOPE: mismo precedente que el cron de hotel. Si la cuenta paso su tope de
+// plan, NO se gasta IA (corre solo con las vias gratis) en vez de gastar por encima.
+async function _iaPermitidaCron(cfg) {
+  if (!cfg || cfg.ia_habilitada !== true) return false;
+  try { return await dentroDelTopeIA(cfg.user_id); } catch (e) { return false; } // ante duda, no gastar
+}
+
 // Endpoint: devuelve las propiedades procesadas (para que el frontend muestre y el humano apruebe)
 app.post('/api/scrape/v2', async function(req, res) {
   try {
@@ -20827,8 +21065,20 @@ app.post('/api/scraping-config', async function(req, res) {
       dias_semana: Array.isArray(b.dias_semana) ? b.dias_semana : [],
       modo: (b.modo === 'directo') ? 'directo' : 'pendiente'
     };
+    // SWITCH DE IA para la actualizacion automatica. Solo `true` explicito prende (opt-in);
+    // cualquier otra cosa (undefined incluido) apaga -> nunca se prende sola.
+    fila.ia_habilitada = (b.ia_habilitada === true);
     var up = await supabase.from('scraping_config').upsert(fila, { onConflict: 'user_id' }).select().maybeSingle();
-    if (up.error) return res.status(500).json({ error: up.error.message });
+    // DEPLOY-SAFE: si migracion-scraper-ia-cron.sql todavia NO corrio, la columna ia_habilitada
+    // no existe y PostgREST tira PGRST204 -> el guardado ENTERO fallaria (regresion). Reintentamos
+    // sin el campo nuevo: la config se guarda como siempre y la IA queda apagada (que es el default).
+    if (up.error) {
+      var _filaSinIA = Object.assign({}, fila);
+      delete _filaSinIA.ia_habilitada;
+      var up2 = await supabase.from('scraping_config').upsert(_filaSinIA, { onConflict: 'user_id' }).select().maybeSingle();
+      if (up2.error) return res.status(500).json({ error: up2.error.message });
+      return res.json({ ok: true, config: up2.data });
+    }
     return res.json({ ok: true, config: up.data });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -20842,7 +21092,16 @@ async function correrScrapingDeUsuario(cfg) {
     if (!sitio) return { ok: false, motivo: 'sin url' };
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
     var lista = await traerListaPropiedades(sitio, null);
-    if (!lista.length) return { ok: false, motivo: 'sin propiedades' };
+    // RESPALDO UNIVERSAL (ADITIVO): si el camino WordPress dio CERO, antes nos rendiamos aca y el
+    // cron no hacia NADA. Ahora probamos las vias universales GRATIS (y la IA solo con permiso).
+    // OJO: si el sitio ES WordPress, traerListaPropiedades trae datos -> este bloque NI SE EJECUTA.
+    var _urlsResp = null;
+    if (!lista.length) {
+      var _iaResp = await _iaPermitidaCron(cfg);
+      _urlsResp = await traerListaUniversalCron(sitio, cfg.user_id, _iaResp);
+      if (!_urlsResp.length) return { ok: false, motivo: 'sin propiedades' }; // igual que hoy
+      lista = _urlsResp; // el loop de abajo itera igual; solo cambia COMO se procesa cada item
+    }
     var creados = 0, actualizados = 0, errores = 0;
     var numerosVistos = {}; // numeros que SÍ figuran en el sitio en esta corrida
     // DEPLOY-SAFE: si la columna pausa_manual aun NO existe (migracion no corrida), caemos al comportamiento
@@ -20861,8 +21120,10 @@ async function correrScrapingDeUsuario(cfg) {
     }
     for (var i = 0; i < lista.length; i++) {
       try {
-        var p = await procesarPropiedad(lista[i]);
-        if (!p.numero) { errores++; continue; }
+        // Camino de siempre (WordPress) vs camino nuevo (URL suelta). Mismo shape de salida:
+        // todo lo de abajo (upsert por numero, pausa_manual, fotos, GEO) no se entera de nada.
+        var p = _urlsResp ? await procesarPropiedadURL(lista[i], cfg.user_id, _iaResp) : await procesarPropiedad(lista[i]);
+        if (!p || !p.numero) { errores++; continue; }
         numerosVistos[String(p.numero)] = 1;
         var fila = {
           user_id: cfg.user_id, numero: String(p.numero), title: p.titulo || 'Sin titulo',
@@ -20987,14 +21248,23 @@ async function correrScrapingPendiente(cfg) {
     if (!sitio) return { ok: false, motivo: 'sin url' };
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
     var lista = await traerListaPropiedades(sitio, null);
-    if (!lista.length) return { ok: false, motivo: 'sin propiedades' };
+    // RESPALDO UNIVERSAL (ADITIVO): mismo enganche que en correrScrapingDeUsuario. Si el sitio ES
+    // WordPress, traerListaPropiedades trae datos y este bloque NI SE EJECUTA.
+    var _urlsRespP = null;
+    if (!lista.length) {
+      var _iaRespP = await _iaPermitidaCron(cfg);
+      _urlsRespP = await traerListaUniversalCron(sitio, cfg.user_id, _iaRespP);
+      if (!_urlsRespP.length) return { ok: false, motivo: 'sin propiedades' }; // igual que hoy
+      lista = _urlsRespP;
+    }
     // limpiar pendientes anteriores de este usuario (se reemplazan por el scraping nuevo)
     await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id);
     var nuevas = 0, modificadas = 0;
     for (var i = 0; i < lista.length; i++) {
       try {
-        var p = await procesarPropiedad(lista[i]);
-        if (!p.numero) continue;
+        // Camino de siempre (WordPress) vs camino nuevo (URL suelta). Mismo shape de salida.
+        var p = _urlsRespP ? await procesarPropiedadURL(lista[i], cfg.user_id, _iaRespP) : await procesarPropiedad(lista[i]);
+        if (!p || !p.numero) continue;
         var _fotosPend = Array.isArray(p.fotos) ? p.fotos : [];
         var nuevo = {
           numero: String(p.numero), title: p.titulo || 'Sin titulo', type: p.tipo || null,

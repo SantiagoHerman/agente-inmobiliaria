@@ -17655,12 +17655,16 @@ async function procesarScrapeJobs() {
         var resAl = await _scrapeAlojamientoCompleto(baseJ, sitioJ, job.user_id, true);
         var totAl = (resAl.complejos || []).reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
         var nomAl = (resAl.complejos && resAl.complejos[0] && resAl.complejos[0].nombre) || null;
-        // AUTO-FALLBACK: si el scrape PLANO no trajo habitaciones (sitio JS tipo PXSOL), disparamos el
-        // render PROFUNDO (headless) automaticamente. Si el navegador no esta disponible o tampoco
-        // encuentra nada, recien ahi avisamos que se cargue a mano.
+        // PXSOL / sitios JS: las habitaciones se cargan por JavaScript. El scrape PLANO es INESTABLE e
+        // incompleto en PXSOL (a veces 0, a veces algunas), asi que si detectamos PXSOL usamos SIEMPRE el
+        // render PROFUNDO (headless): trae TODAS las unidades. Para sitios no-PXSOL, solo caemos al profundo
+        // cuando el plano no trajo nada. Si el profundo falla pero el plano trajo algo -> se guarda el plano
+        // (fallback, mas abajo). Solo se avisa "cargar a mano" si no hay NADA por ningun camino.
+        var _esPxsol = false;
+        try { var _rhp = await fetchScrape(sitioJ); if (_rhp && _rhp.ok) { var _hp = await _rhp.text(); _esPxsol = /pxsol/i.test(_hp); } } catch (ePx) {}
         var _hechoProfundo = false;
-        if (!totAl) {
-          await _scrapeJobUpdate(job.id, { progreso: 45, mensaje: 'La página carga por JavaScript: renderizando…' });
+        if (_esPxsol || !totAl) {
+          await _scrapeJobUpdate(job.id, { progreso: 45, mensaje: (_esPxsol ? 'Motor de reservas detectado: renderizando el sitio…' : 'La página carga por JavaScript: renderizando…') });
           var _prof = await _scrapeAlojamientoProfundo(baseJ, sitioJ, job.user_id, (input.modo === 'reset' ? 'reset' : 'update'), 5);
           if (_prof && _prof.ok && _prof.total > 0) {
             _hechoProfundo = true;

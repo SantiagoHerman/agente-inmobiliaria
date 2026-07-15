@@ -16318,10 +16318,15 @@ app.post('/api/scrape/alojamiento/job', async function (req, res) {
 // por el runner de jobs (_scrapeJobsEnCurso) y single-process para minimizar el pico de memoria.
 // ============================================================================
 var _headlessMods = undefined; // undefined=sin intentar, null=fallo, obj=ok
-function _cargarHeadless() {
+async function _cargarHeadless() {
   if (_headlessMods !== undefined) return _headlessMods;
   try {
-    _headlessMods = { pptr: require('puppeteer-core'), chromium: require('@sparticuz/chromium') };
+    // import() DINAMICO: @sparticuz/chromium es ESM ("type":"module"). require() de ESM tira
+    // ERR_REQUIRE_ESM en el Node de Railway (<22); import() funciona en cualquier version desde
+    // CommonJS. Cacheado en _headlessMods -> corre una sola vez.
+    var chMod = await import('@sparticuz/chromium');
+    var ppMod = await import('puppeteer-core');
+    _headlessMods = { pptr: (ppMod && ppMod.default) || ppMod, chromium: (chMod && chMod.default) || chMod };
   } catch (e) { console.error('[headless] no disponible:', e && e.message); _headlessMods = null; }
   return _headlessMods;
 }
@@ -16330,7 +16335,7 @@ function _cargarHeadless() {
 var _headlessEnCurso = false;
 // Renderiza una lista de URLs y devuelve los HTML resultantes. Cierra el navegador SIEMPRE.
 async function _renderHeadless(urls, opciones) {
-  var mod = _cargarHeadless();
+  var mod = await _cargarHeadless();
   if (!mod) return { via: null, htmls: [], error: 'headless no instalado' };
   if (_headlessEnCurso) return { via: 'headless', htmls: [], error: 'ya hay un render en curso' };
   _headlessEnCurso = true;
@@ -16341,7 +16346,7 @@ async function _renderHeadless(urls, opciones) {
     browser = await mod.pptr.launch({
       args: mod.chromium.args.concat(['--disable-gpu']),
       executablePath: execPath,
-      headless: mod.chromium.headless
+      headless: true
     });
     for (var i = 0; i < urls.length; i++) {
       var page = null;

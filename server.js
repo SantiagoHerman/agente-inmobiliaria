@@ -4909,7 +4909,20 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             const _hay = (_disp.opciones || []).filter(function(o){ return !o.sinDisponibilidad; });
             if (!_hay.length) {
               const _conMin = (_disp.opciones || []).find(function(o){ return o.minLOS; });
-              _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches) NO hay disponibilidad.' + (_conMin ? (' Varias tarifas piden un minimo de ' + _conMin.minLOS + ' noches para esas fechas.') : '') + ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.';
+              _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches) NO hay disponibilidad.' + (_conMin ? (' Varias tarifas piden un minimo de ' + _conMin.minLOS + ' noches para esas fechas.') : '');
+              // ADITIVO: mismas fechas alternativas que muestra la WEB del hotel cuando no hay lugar,
+              // asi la IA responde IGUAL que la web en vez de un "no" seco (incongruencia 2026-07-15).
+              try {
+                const _alts = await _pxsolAlternativas(_cfgPx, _disp.sid);
+                if (_alts.length) {
+                  const _NLa = String.fromCharCode(10);
+                  _resDispoTxt += _NLa + 'PERO la web del hotel ofrece estas fechas alternativas REALES (ofrecelas, cada una en su propia linea con un renglon en blanco entre cada una):' + _NLa +
+                    _alts.map(function(x){ return '- Del ' + x.llegada + ' al ' + x.salida + ' (' + x.noches + ' noches)' + (x.desde ? ' desde ' + x.desde + ' por noche (precio web, sin IVA)' : ''); }).join(_NLa) +
+                    _NLa + 'Si alguna le sirve al lead, consulta de nuevo la disponibilidad con esas fechas para darle el precio exacto de cada habitacion. No inventes precios fuera de esta lista.';
+                } else {
+                  _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.';
+                }
+              } catch (eAlt) { _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.'; }
             } else {
               const _NLd = String.fromCharCode(10);
               const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
@@ -16582,8 +16595,39 @@ async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos) {
       (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) { var m = Number(rt.MinLOS || 0); if (m > minLos) minLos = m; });
       return { nombre: nombre, sinDisponibilidad: true, minLOS: (minLos > nights) ? minLos : null };
     });
-    return { ok: true, nights: nights, moneda: 'ARS', opciones: opciones };
+    return { ok: true, nights: nights, moneda: 'ARS', opciones: opciones, sid: mSid[1] };
   } catch (e) { console.error('[pxsol] disponibilidad:', e && e.message); return { ok: false, error: e && e.message }; }
+}
+
+// FECHAS ALTERNATIVAS (ADITIVO, 0 IA): cuando NO hay disponibilidad, la WEB del hotel no deja al
+// huesped sin opciones — le muestra "Mejores opciones disponibles" (fechas cercanas que SI se venden).
+// Eso lo renderiza el module.php del sitio (mismo SearchID, sin token). Se lo damos a la IA para que
+// conteste IGUAL que la web en vez de un "no hay" seco. Si el sitio no expone module.php -> [] y todo
+// sigue como hoy.
+async function _pxsolAlternativas(cfg, sid) {
+  try {
+    if (!cfg || !cfg.base || !sid) return [];
+    var base = String(cfg.base).replace(/\/+$/, '');
+    var u = base + '/neo_modules/cart_hotel_v2/module.php?cart_version=7&pos=' + encodeURIComponent(cfg.pos || '') +
+      '&Sku=1&SearchID=' + sid + '&tag=NN&Pid=' + cfg.productId + '&cur=ARS&lng=es&Email=NN&search=OK';
+    var r = await fetchScrape(u, { headers: { 'User-Agent': 'RaicesCRM/1.0 (+https://raicescrm.com)' } });
+    if (!r.ok) return [];
+    var html = await r.text();
+    var out = [];
+    var bloques = html.split(/class="cart_opcion/i).slice(1, 9);
+    for (var i = 0; i < bloques.length; i++) {
+      var b = bloques[i];
+      var mIn = b.match(/Llegada:\s*<\/strong>\s*([^<]{4,40})/i) || b.match(/Entrada:\s*<\/strong>\s*([^<]{4,40})/i);
+      var mOut = b.match(/Salida:\s*<\/strong>\s*([^<]{4,40})/i);
+      var mNoc = b.match(/Noches:\s*<\/strong>\s*(\d{1,3})/i);
+      var mDesde = b.match(/Desde<\/small>\s*<b>\s*([A-Z]{2,4}\s*\$\s*[\d.,]+)/i) || b.match(/<b>\s*(ARS\s*\$\s*[\d.,]+)\s*<\/b>\s*<span>\s*\/\s*noche/i);
+      if (mIn && mOut && mNoc) {
+        out.push({ llegada: mIn[1].trim(), salida: mOut[1].trim(), noches: parseInt(mNoc[1], 10), desde: mDesde ? mDesde[1].replace(/\s+/g, ' ').trim() : null });
+      }
+      if (out.length >= 4) break;
+    }
+    return out;
+  } catch (e) { return []; }
 }
 
 // Resuelve la config PXSOL del hotel de una cuenta (cachea en hotel_complejos.atributos.pxsol para
@@ -16594,14 +16638,19 @@ async function _pxsolConfigDeCuenta(user_id) {
     var comps = (hc && hc.data) ? hc.data : [];
     for (var i = 0; i < comps.length; i++) {
       var a = (comps[i].atributos && typeof comps[i].atributos === 'object') ? comps[i].atributos : {};
-      if (a.pxsol && a.pxsol.productId) return a.pxsol;
+      // base = el sitio del hotel (para module.php de fechas alternativas). Se adjunta al vuelo,
+      // sin persistirlo, asi los pxsol ya cacheados tambien lo tienen.
+      var _baseSitio = a.origen_url || a.origenUrl || '';
+      if (_baseSitio && !String(_baseSitio).startsWith('http')) _baseSitio = 'https://' + _baseSitio;
+      _baseSitio = _baseSitio ? String(_baseSitio).replace(/^(https?:\/\/[^\/]+).*/, '$1') : '';
+      if (a.pxsol && a.pxsol.productId) return Object.assign({}, a.pxsol, _baseSitio ? { base: _baseSitio } : {});
       var url = a.origen_url || a.origenUrl || '';
       if (!url) continue;
       if (!String(url).startsWith('http')) url = 'https://' + url;
       var rh = await fetchScrape(url);
       if (!rh.ok) continue;
       var cfg = _pxsolConfig(await rh.text());
-      if (cfg) { try { await supabase.from('hotel_complejos').update({ atributos: Object.assign({}, a, { pxsol: cfg }) }).eq('id', comps[i].id); } catch (eU) {} return cfg; }
+      if (cfg) { try { await supabase.from('hotel_complejos').update({ atributos: Object.assign({}, a, { pxsol: cfg }) }).eq('id', comps[i].id); } catch (eU) {} return Object.assign({}, cfg, _baseSitio ? { base: _baseSitio } : {}); }
     }
     return null;
   } catch (e) { return null; }

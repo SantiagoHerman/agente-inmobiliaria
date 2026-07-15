@@ -12,10 +12,12 @@
   "type": "commonjs",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",
+    "@sparticuz/chromium": "149.0.0",
     "@supabase/supabase-js": "2.49.4",
     "express": "^5.2.1",
     "firebase-admin": "^13.10.0",
     "jose": "^6.2.3",
+    "puppeteer-core": "25.3.0",
     "twilio": "^6.0.0",
     "ws": "^8.21.0"
   }

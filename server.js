@@ -16312,10 +16312,130 @@ app.post('/api/scrape/alojamiento/job', async function (req, res) {
 });
 
 // ============================================================================
+// MOTOR HEADLESS (@sparticuz/chromium + puppeteer-core) — render de sitios JS (PXSOL, etc.)
+// LAZY: el require es dentro del helper; si el navegador no puede lanzarse (falta lib en el
+// server, etc.) NO rompe nada -> devuelve htmls:[] y el flujo cae a "cargar a mano". SERIALIZADO
+// por el runner de jobs (_scrapeJobsEnCurso) y single-process para minimizar el pico de memoria.
+// ============================================================================
+var _headlessMods = undefined; // undefined=sin intentar, null=fallo, obj=ok
+function _cargarHeadless() {
+  if (_headlessMods !== undefined) return _headlessMods;
+  try {
+    _headlessMods = { pptr: require('puppeteer-core'), chromium: require('@sparticuz/chromium') };
+  } catch (e) { console.error('[headless] no disponible:', e && e.message); _headlessMods = null; }
+  return _headlessMods;
+}
+
+// Candado global: NUNCA dos navegadores a la vez (protege la memoria del proceso que atiende los chats).
+var _headlessEnCurso = false;
+// Renderiza una lista de URLs y devuelve los HTML resultantes. Cierra el navegador SIEMPRE.
+async function _renderHeadless(urls, opciones) {
+  var mod = _cargarHeadless();
+  if (!mod) return { via: null, htmls: [], error: 'headless no instalado' };
+  if (_headlessEnCurso) return { via: 'headless', htmls: [], error: 'ya hay un render en curso' };
+  _headlessEnCurso = true;
+  var opts = opciones || {};
+  var browser = null, htmls = [];
+  try {
+    var execPath = await mod.chromium.executablePath();
+    browser = await mod.pptr.launch({
+      args: mod.chromium.args.concat(['--disable-gpu']),
+      executablePath: execPath,
+      headless: mod.chromium.headless
+    });
+    for (var i = 0; i < urls.length; i++) {
+      var page = null;
+      try {
+        page = await browser.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36');
+        await page.goto(urls[i], { waitUntil: 'networkidle2', timeout: opts.timeout || 30000 });
+        if (opts.waitMs) await new Promise(function (r) { setTimeout(r, opts.waitMs); });
+        var html = await page.content();
+        if (html && html.length > 800) htmls.push(html);
+      } catch (ep) { console.error('[headless] pagina', urls[i], ep && ep.message); }
+      finally { try { if (page) await page.close(); } catch (eC) {} }
+    }
+  } catch (e) { console.error('[headless] launch:', e && e.message); _headlessEnCurso = false; return { via: 'headless', htmls: htmls, error: e && e.message }; }
+  finally { try { if (browser) await browser.close(); } catch (eCl) {} _headlessEnCurso = false; }
+  return { via: 'headless', htmls: htmls, error: null };
+}
+
+// PXSOL: las habitaciones solo aparecen DESPUES de una busqueda con fechas. Hacemos el "insert"
+// server-side (sin navegador, sin token) para obtener un SearchID, y devolvemos la URL de la
+// pagina de RESULTADOS (lp.html) para renderizar. Ahi la propia pagina pide las habitaciones con
+// su token y quedan en el DOM. null si el sitio no es PXSOL o no se pudo armar la busqueda.
+function _padDos(n) { return (n < 10 ? '0' : '') + n; }
+async function _pxsolResultUrl(homepageHtml, base) {
+  try {
+    if (!/pxsol/i.test(homepageHtml)) return null;
+    var mPid = homepageHtml.match(/product_id['"\s:=]+['"]?(\d{2,8})/i)
+      || homepageHtml.match(/ProductID[^>]*value=['"](\d{2,8})/i)
+      || homepageHtml.match(/Pid=(\d{2,8})/i);
+    var pid = mPid ? mPid[1] : '';
+    if (!pid) return null;
+    var mApi = homepageHtml.match(/https?:\/\/[a-z0-9.-]*pxsol\.io/i);
+    var api = mApi ? mApi[0] : 'https://api-1-eb-web.pxsol.io';
+    var d1 = new Date(Date.now() + 30 * 86400000), d2 = new Date(Date.now() + 32 * 86400000);
+    var ddmmyyyy = function (dt) { return _padDos(dt.getDate()) + '/' + _padDos(dt.getMonth() + 1) + '/' + dt.getFullYear(); };
+    var iso = function (dt) { return dt.getFullYear() + '-' + _padDos(dt.getMonth() + 1) + '-' + _padDos(dt.getDate()); };
+    var body = 'ProductID=' + pid + '&Start=' + ddmmyyyy(d1) + '&End=' + ddmmyyyy(d2) + '&Channel=2&RateType=auto&Currency=ARS&MaxRooms=1&Rooms=1&Adults=2&Nights=2&Lng=es';
+    var r = await fetchScrape(api + '/search/insert', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': base, 'Referer': base + '/', 'User-Agent': 'Mozilla/5.0 (compatible; RaicesCRM/1.0)' }, body: body });
+    if (!r.ok) return null;
+    var txt = await r.text();
+    var mSid = txt.match(/SearchID=(\d+)/);
+    if (!mSid) return null;
+    return base + '/lp.html?search=OK&SearchID=' + mSid[1] + '&cur=ARS&lng=es&Pid=' + pid + '&checkin=' + iso(d1) + '&checkout=' + iso(d2);
+  } catch (e) { console.error('[pxsol] insert:', e && e.message); return null; }
+}
+
+// Arma la lista de URLs a renderizar (PXSOL primero, luego rutas tipicas de habitaciones) y las
+// renderiza. Usa RENDER_API_URL si esta seteada (servicio externo, cero infra local); si no,
+// el motor headless local. Devuelve { via, htmls, pxsol }.
+async function _renderProfundoAlojamiento(base, sitio) {
+  var homepageHtml = '';
+  try { var rh = await fetchScrape(sitio); if (rh && rh.ok) homepageHtml = await rh.text(); } catch (e) {}
+  var urls = [];
+  var pxUrl = await _pxsolResultUrl(homepageHtml, base);
+  if (pxUrl) urls.push(pxUrl);
+  ['/habitaciones.html', '/habitaciones', '/domos.html', '/domos', '/cabanas.html', '/cabanas', '/'].forEach(function (r) { urls.push(base + r); });
+  urls = urls.filter(function (u, i) { return urls.indexOf(u) === i; }).slice(0, 6);
+  var RENDER_API = process.env.RENDER_API_URL || '';
+  if (RENDER_API) {
+    var htmls = [];
+    for (var i = 0; i < urls.length && htmls.length < 5; i++) {
+      try { var rr = await fetch(RENDER_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: urls[i], gotoOptions: { waitUntil: 'networkidle2', timeout: 30000 } }) }); if (rr && rr.ok) { var h = await rr.text(); if (h && h.length > 800) htmls.push(h); } } catch (eR) {}
+    }
+    return { via: 'render-api', htmls: htmls, pxsol: !!pxUrl };
+  }
+  var res = await _renderHeadless(urls, { timeout: 30000, waitMs: 3500 });
+  return { via: res.via, htmls: res.htmls, pxsol: !!pxUrl, error: res.error };
+}
+
+// Render profundo + extraccion + guardado (compartido por el endpoint y el runner de jobs).
+async function _scrapeAlojamientoProfundo(base, sitio, ownerId, modo, costoMsgs) {
+  var rend = await _renderProfundoAlojamiento(base, sitio);
+  if (!rend.htmls.length) return { ok: false, via: rend.via, mensaje: rend.error ? ('No se pudo renderizar (' + rend.error + ').') : 'No se pudo renderizar el sitio.' };
+  var fotos = _extraerFotosAlojamiento(rend.htmls, base);
+  var data = await _alojamientoIAcompleto(rend.htmls.slice().reverse().join('\n\n\n'), base, ownerId);
+  try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, Math.min(20, costoMsgs || 5)); } catch (eCob) {}
+  var complejos = Array.isArray(data.complejos) ? data.complejos : [];
+  if (!complejos.length) complejos = [{ nombre: '', unidades: [] }];
+  var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
+  var _gi = 0;
+  for (var c = 0; c < complejos.length; c++) {
+    var cp = complejos[c]; var uds = Array.isArray(cp.unidades) ? cp.unidades : [];
+    for (var j = 0; j < uds.length; j++) { var _g = grupos[_gi++]; if (_g && _g.length) uds[j].imagenes = _g.slice(0, 40); else uds[j].imagenes = Array.isArray(uds[j].imagenes) ? uds[j].imagenes.slice(0, 40) : []; }
+    cp.images = (fotos.complejo.length ? fotos.complejo : (complejos.length === 1 ? fotos.todas.slice(0, 10) : [])).slice(0, 30);
+  }
+  var _totUn = complejos.reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
+  var g = await _guardarComplejoYUnidades(ownerId, { complejos: complejos }, sitio, modo);
+  return { ok: true, profundo: true, via: rend.via, pxsol: rend.pxsol, total: _totUn, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejos: (g.complejos || []).length, complejo: (complejos[0] && complejos[0].nombre) || null, fotosTotales: fotos.todas.length };
+}
+
+// ============================================================================
 // PASO 3 — SCRAPE PROFUNDO (headless). Renderiza el JS (PXSOL, etc.) para traer TODAS
-// las galerias. GATEADO + LAZY: el require de playwright es lazy adentro del handler;
-// si no esta instalado responde 503 SIN romper el boot ni afectar los otros rubros.
-// Opt-in del cliente (avisa gasto). Solo rubro hotel.
+// las galerias. LAZY: si el navegador no esta disponible responde SIN romper el boot ni
+// afectar los otros rubros. Opt-in del cliente (avisa gasto). Solo rubro hotel.
 // ============================================================================
 app.post('/api/scrape/alojamiento/profundo', async function (req, res) {
   try {
@@ -16328,56 +16448,10 @@ app.post('/api/scrape/alojamiento/profundo', async function (req, res) {
     var base; try { var u = new URL(sitio); base = u.protocol + '//' + u.host; } catch (e) { return res.status(400).json({ error: 'URL invalida' }); }
     var _perm = await scrapeUrlPermitida(ownerId, sitio);
     if (!_perm.ok) return res.status(400).json({ error: _perm.error });
-    var rutas = ['/habitaciones.html', '/habitaciones', '/domos.html', '/domos', '/cabanas.html', '/cabanas', '/'];
-    var rendered = [], via = null;
-    // OPCION SEGURA (NO toca la infra/build del backend -> cero riesgo para inmobiliaria/desarrolladora):
-    // servicio de render tercerizado via env RENDER_API_URL (ej. browserless: https://chrome.browserless.io/content?token=XXX).
-    // El backend solo hace un fetch; NO instala chromium.
-    var RENDER_API = process.env.RENDER_API_URL || '';
-    if (RENDER_API) {
-      via = 'render-api';
-      var vistas = 0;
-      for (var i = 0; i < rutas.length && vistas < 5; i++) {
-        try {
-          var rr = await fetch(RENDER_API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: base + rutas[i], gotoOptions: { waitUntil: 'networkidle2', timeout: 25000 } }) });
-          if (rr && rr.ok) { var h = await rr.text(); if (h && h.length > 800) { rendered.push(h); vistas++; } }
-        } catch (eR) {}
-      }
-    } else {
-      // FALLBACK opcional: playwright LOCAL, solo si alguien instalo chromium en el server (lazy require, no afecta el boot).
-      var chromium = null;
-      try { chromium = require('playwright').chromium; } catch (eReq) {
-        return res.status(503).json({ error: 'El scrape profundo no esta habilitado. Configura un servicio de render (env RENDER_API_URL, ej. browserless) en el servidor.', necesita: 'render' });
-      }
-      via = 'playwright-local';
-      var browser = null;
-      try {
-        browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
-        var ctx = await browser.newContext({ userAgent: 'Mozilla/5.0 RaicesCRM' });
-        var vistas2 = 0;
-        for (var j2 = 0; j2 < rutas.length && vistas2 < 5; j2++) {
-          try { var page = await ctx.newPage(); var pr = await page.goto(base + rutas[j2], { waitUntil: 'networkidle', timeout: 25000 }); if (pr && pr.ok()) { var ph = await page.content(); if (ph && ph.length > 800) { rendered.push(ph); vistas2++; } } await page.close(); } catch (ep) {}
-        }
-      } finally { try { if (browser) await browser.close(); } catch (eCl) {} }
-    }
-    if (!rendered.length) return res.json({ ok: false, via: via, mensaje: 'No se pudo renderizar el sitio.' });
-    // Extraccion completa sobre el HTML RENDERIZADO (mas fotos y contenido que el estatico).
-    var fotos = _extraerFotosAlojamiento(rendered, base);
-    var data = await _alojamientoIAcompleto(rendered.slice().reverse().join('\n\n\n'), base, ownerId);
-    // Cobro al cliente (opt-in): la cantidad de mensajes la puede mandar el front (costoMsgs), cap 20.
-    try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, Math.min(20, (req.body && parseInt(req.body.costoMsgs, 10)) || 5)); } catch (eCob) {}
-    var complejos = Array.isArray(data.complejos) ? data.complejos : [];
-    if (!complejos.length) complejos = [{ nombre: '', unidades: [] }];
-    var grupos = Object.keys(fotos.porRoom).map(function (k) { return fotos.porRoom[k]; });
-    var _gi = 0;
-    for (var c = 0; c < complejos.length; c++) {
-      var cp = complejos[c]; var uds = Array.isArray(cp.unidades) ? cp.unidades : [];
-      for (var j = 0; j < uds.length; j++) { var _g = grupos[_gi++]; if (_g && _g.length) uds[j].imagenes = _g.slice(0, 40); else uds[j].imagenes = Array.isArray(uds[j].imagenes) ? uds[j].imagenes.slice(0, 40) : []; }
-      cp.images = (fotos.complejo.length ? fotos.complejo : (complejos.length === 1 ? fotos.todas.slice(0, 10) : [])).slice(0, 30);
-    }
-    var _totUn = complejos.reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
-    var g = await _guardarComplejoYUnidades(ownerId, { complejos: complejos }, sitio, modo);
-    return res.json({ ok: true, profundo: true, via: via, total: _totUn, creados: g.creados, actualizados: g.actualizados, errores: g.errores, complejo: (complejos[0] && complejos[0].nombre) || null, fotosTotales: fotos.todas.length });
+    var costoMsgs = (req.body && parseInt(req.body.costoMsgs, 10)) || 5;
+    var r = await _scrapeAlojamientoProfundo(base, sitio, ownerId, modo, costoMsgs);
+    if (!r.ok && r.via === null) return res.status(503).json({ error: 'El render profundo no esta disponible en el servidor en este momento. Cargá las unidades a mano o reintentá más tarde.', necesita: 'render' });
+    return res.json(r);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -17576,16 +17650,37 @@ async function procesarScrapeJobs() {
         var resAl = await _scrapeAlojamientoCompleto(baseJ, sitioJ, job.user_id, true);
         var totAl = (resAl.complejos || []).reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
         var nomAl = (resAl.complejos && resAl.complejos[0] && resAl.complejos[0].nombre) || null;
-        if (!totAl && !nomAl) throw new Error('No se encontraron alojamientos en la página. Puede requerir JavaScript o cargá a mano.');
-        await _scrapeJobUpdate(job.id, { progreso: 70, mensaje: 'Guardando complejo y habitaciones…' });
-        var gAl = await _guardarComplejoYUnidades(job.user_id, resAl, sitioJ, (input.modo === 'reset' ? 'reset' : 'update'));
-        await _scrapeJobUpdate(job.id, {
-          estado: 'listo', progreso: 100,
-          mensaje: 'Importado: ' + (gAl.complejos || []).length + ' complejo(s), ' + (gAl.creados + gAl.actualizados) + ' unidad(es)',
-          resultado: { total: totAl, complejos: (gAl.complejos || []).length, creados: gAl.creados, actualizados: gAl.actualizados, errores: gAl.errores, estrategia: resAl.estrategia, complejo: nomAl },
-          error: null
-        });
-        console.log('[scrape-jobs runner] job', job.id, 'alojamiento OK (' + sitioJ + ')');
+        // AUTO-FALLBACK: si el scrape PLANO no trajo habitaciones (sitio JS tipo PXSOL), disparamos el
+        // render PROFUNDO (headless) automaticamente. Si el navegador no esta disponible o tampoco
+        // encuentra nada, recien ahi avisamos que se cargue a mano.
+        var _hechoProfundo = false;
+        if (!totAl) {
+          await _scrapeJobUpdate(job.id, { progreso: 45, mensaje: 'La página carga por JavaScript: renderizando…' });
+          var _prof = await _scrapeAlojamientoProfundo(baseJ, sitioJ, job.user_id, (input.modo === 'reset' ? 'reset' : 'update'), 5);
+          if (_prof && _prof.ok && _prof.total > 0) {
+            _hechoProfundo = true;
+            await _scrapeJobUpdate(job.id, {
+              estado: 'listo', progreso: 100,
+              mensaje: 'Importado (render profundo): ' + (_prof.complejos || 1) + ' complejo(s), ' + (_prof.creados + _prof.actualizados) + ' unidad(es)',
+              resultado: { total: _prof.total, complejos: _prof.complejos || 1, creados: _prof.creados, actualizados: _prof.actualizados, errores: _prof.errores, estrategia: 'profundo:' + (_prof.via || 'headless'), complejo: _prof.complejo, profundo: true },
+              error: null
+            });
+            console.log('[scrape-jobs runner] job', job.id, 'alojamiento OK por render PROFUNDO (' + sitioJ + ')');
+          } else if (!nomAl) {
+            throw new Error('No se encontraron alojamientos, ni siquiera renderizando la página' + (_prof && _prof.via === null ? ' (el render profundo no está disponible ahora)' : '') + '. Cargá las unidades a mano.');
+          }
+        }
+        if (!_hechoProfundo) {
+          await _scrapeJobUpdate(job.id, { progreso: 70, mensaje: 'Guardando complejo y habitaciones…' });
+          var gAl = await _guardarComplejoYUnidades(job.user_id, resAl, sitioJ, (input.modo === 'reset' ? 'reset' : 'update'));
+          await _scrapeJobUpdate(job.id, {
+            estado: 'listo', progreso: 100,
+            mensaje: 'Importado: ' + (gAl.complejos || []).length + ' complejo(s), ' + (gAl.creados + gAl.actualizados) + ' unidad(es)',
+            resultado: { total: totAl, complejos: (gAl.complejos || []).length, creados: gAl.creados, actualizados: gAl.actualizados, errores: gAl.errores, estrategia: resAl.estrategia, complejo: nomAl },
+            error: null
+          });
+          console.log('[scrape-jobs runner] job', job.id, 'alojamiento OK (' + sitioJ + ')');
+        }
       } else {
         // ---- NUEVO: scrape profundo -> guarda el PREVIEW en resultado ----
         // (default; cubre tipo 'desarrollo_nuevo'). El usuario despues revisa y

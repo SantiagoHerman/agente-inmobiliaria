@@ -1710,6 +1710,20 @@ async function iaAgendaActivo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== UBICACION OSM (Fase 2/3): flag ia_ubicacion por cuenta =====
+// Con ON: la IA recibe la tool buscar_propiedades_cerca + las referencias de zona en el prompt,
+// y el cron geocodificarPendientes procesa el inventario de esa cuenta. Con OFF (default) todo
+// queda EXACTO como hoy (fail-closed, mismo patron que iaAgendaActivo).
+async function iaUbicacionActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_ubicacion')) return bs.ia_ubicacion === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_ubicacion').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_ubicacion === true);
+  } catch (e) { return false; }
+}
+
 // ===== MEJORA #3 (AGENDA): OFFSETS DE RECORDATORIO DE CITAS, CONFIGURABLES POR CUENTA =====
 // Devuelve un array de horas-antes (ej. [24, 1]) en las que se manda el recordatorio de una cita.
 // Fuente: business_settings.recordatorio_citas_horas (texto JSON, ej. '[24,1]'). DEFAULT [24,1] (24h + 1h
@@ -4119,6 +4133,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // BYTE-IDENTICO al actual. Reusa el `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
   let _iaAgendaOn = false;
   if (conversation_id && !modoPrueba) { try { _iaAgendaOn = await iaAgendaActivo(user_id, settings || undefined); } catch (eIaAg) { _iaAgendaOn = false; } }
+  // UBICACION OSM (gated ia_ubicacion): ¿ofrecer la tool buscar_propiedades_cerca + referencias de zona?
+  // Con flag OFF -> false => prompt y tools BYTE-IDENTICOS al actual. Reusa settings (0 queries extra).
+  let _iaUbicacionOn = false;
+  if (conversation_id && !modoPrueba) { try { _iaUbicacionOn = await iaUbicacionActivo(user_id, settings || undefined); } catch (eIaUb) { _iaUbicacionOn = false; } }
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   // DIRECCION (Fase 1): helper compartido por los 3 rubros para componer la ubicacion buscable
   // a partir de {direccion, entre_calles, ciudad}. Null-safe: si no hay nada devuelve '' y el
@@ -4139,7 +4157,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   {
     const _colsProp = 'id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images';
     try {
-      const _rp = await supabase.from('properties').select(_colsProp + ', direccion, entre_calles, ciudad, lat, lng').eq('user_id', user_id).eq('activa', true);
+      const _rp = await supabase.from('properties').select(_colsProp + ', direccion, entre_calles, ciudad, lat, lng, referencias_zona').eq('user_id', user_id).eq('activa', true);
       if (_rp.error) throw _rp.error;
       properties = _rp.data;
     } catch (eDirProp) {
@@ -4256,7 +4274,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         else fotosTxt = ' | fotos disponibles: si (sin categorizar)';
       }
     } catch (eImg) { fotosTxt = ''; }
-    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + ((_iaUbicacionOn && p.referencias_zona) ? ' | cerca: ' + p.referencias_zona : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
   }).join(String.fromCharCode(10));
   }
 
@@ -4279,7 +4297,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       let _devs = null, _devErr = null;
       {
         const _colsDev = 'id, nombre, tipo, zona, descripcion, link, estado_obra, avance_pct, fecha_entrega, dev_data';
-        const _rd = await supabase.from('developments').select(_colsDev + ', direccion, entre_calles, ciudad, lat, lng').eq('user_id', user_id).eq('activo', true);
+        const _rd = await supabase.from('developments').select(_colsDev + ', direccion, entre_calles, ciudad, lat, lng, referencias_zona').eq('user_id', user_id).eq('activo', true);
         if (_rd.error) {
           const _rd2 = await supabase.from('developments').select(_colsDev).eq('user_id', user_id).eq('activo', true);
           _devs = _rd2.data; _devErr = _rd2.error;
@@ -4349,6 +4367,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           const _cab = '* EMPRENDIMIENTO: ' + (d.nombre || 'Sin nombre') + (d.tipo ? ' (' + d.tipo + ')' : '') +
             (d.zona ? ' | zona: ' + d.zona : '') +
             (_dirDev ? ' | direccion: ' + _dirDev : '') +
+            ((_iaUbicacionOn && d.referencias_zona) ? ' | cerca: ' + d.referencias_zona : '') +
             (d.estado_obra ? ' | obra: ' + (_ESTADO_OBRA_TXT[d.estado_obra] || d.estado_obra) : '') +
             (d.avance_pct ? ' | avance: ' + d.avance_pct + '%' : '') +
             (d.fecha_entrega ? ' | entrega estimada: ' + d.fecha_entrega : '') +
@@ -4466,6 +4485,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _polTxt = [_pol.checkin ? 'check-in ' + _pol.checkin : '', _pol.checkout ? 'check-out ' + _pol.checkout : '', _pol.cancelacion ? 'cancelacion: ' + _pol.cancelacion : '', _pol.sena ? 'seña ' + _pol.sena : '', _pol.pagos ? 'pagos: ' + _pol.pagos : ''].filter(Boolean).join(' | ');
         return 'COMPLEJO: ' + (c.nombre || 'Alojamiento') + (a.subtipo ? ' (' + a.subtipo + ')' : '')
           + (_fmtDireccion(a) ? _NL + '  Ubicacion: ' + _fmtDireccion(a) : '')
+          + ((_iaUbicacionOn && a.referencias_zona) ? _NL + '  Cerca: ' + a.referencias_zona : '')
           + (a.descripcion ? _NL + '  ' + a.descripcion : '')
           + (a.amenities ? _NL + '  Amenities del complejo: ' + a.amenities : '')
           + (a.servicios ? _NL + '  Servicios: ' + a.servicios : '')
@@ -4698,6 +4718,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // UBICACION OSM (gated ia_ubicacion): tool para ubicar una direccion/referencia del lead y
+  // encontrar lo mas cercano del inventario (geocoding OpenStreetMap + distancia local, $0).
+  if (_iaUbicacionOn) {
+    toolsAgente.push({
+      name: 'buscar_propiedades_cerca',
+      description: 'Usala cuando el lead nombra una DIRECCION, esquina, zona o punto de referencia y queres saber que opciones del inventario quedan cerca, o donde queda esa referencia respecto de lo que ofreces (ej: "busco algo por avenida 2 entre 20 y 21", "cerca de la terminal", "por el centro de Gesell"). Te devuelve las opciones del inventario ordenadas por distancia real. NO la uses si el lead solo nombra la ciudad (eso ya lo ves en el inventario).',
+      input_schema: { type: 'object', properties: { referencia: { type: 'string', description: 'La direccion o referencia tal como la dio el lead (ej: "Avenida 2 entre 20 y 21", "la terminal de omnibus").' }, ciudad: { type: 'string', description: 'Ciudad/localidad a la que pertenece la referencia, deducila del contexto o del inventario (ej: "Villa Gesell"). Muy importante para no confundir ciudades.' } }, required: ['referencia', 'ciudad'] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -4706,6 +4736,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // MEMORIA VIVA: resumen-de-avance de esta conversacion para que el agente RETOME donde quedo (no repregunte ni
   // retroceda). Va en bloque dinamico (no cacheado). Permite acortar el historial sin perder contexto -> baja tokens.
   if (memoriaViva) systemBlocks.push({ type: 'text', text: 'MEMORIA DE LA CONVERSACION (donde venis con este lead; segui DESDE ACA, no repreguntes lo ya hablado ni retrocedas): ' + memoriaViva });
+  // UBICACION OSM (gated): regla anti-invento de lugares. Solo se agrega con el flag ON (bloque
+  // dinamico, no cacheado) => con flag OFF el system es BYTE-IDENTICO al actual.
+  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada.' });
 
   // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
   // failover a Bedrock si esta gateado/encendido). Sin BEDROCK_ENABLED + creds, es identico a anthropic.messages.create.
@@ -4763,6 +4796,71 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         reply = _textoPrevioAg || 'Listo, te lo dejo agendado y un asesor del equipo te confirma. ¡Gracias!';
       }
       if (!usaEmojis) { const _lAg = quitarEmojis(reply); if (_lAg) reply = _lAg; }
+    } else {
+    // UBICACION OSM (gated ia_ubicacion): ¿la IA pidio buscar_propiedades_cerca? Geocodifica la
+    // referencia del lead (Nominatim con cache) + distancia local contra el inventario y devuelve
+    // el resultado en un 2do turno (mismo patron que foto/dueno). La tool solo existe con el flag
+    // ON => esta rama nunca se entra con OFF (ACTUAL EXACTO). $0 recurrente: OSM gratis + math local.
+    const _toolCerca = _iaUbicacionOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_propiedades_cerca'; }) : null;
+    if (_toolCerca) {
+      const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resCercaTxt = '';
+      try {
+        const _refIn = (_toolCerca.input && _toolCerca.input.referencia) ? String(_toolCerca.input.referencia).trim() : '';
+        const _ciuIn = (_toolCerca.input && _toolCerca.input.ciudad) ? String(_toolCerca.input.ciudad).trim() : '';
+        const _geoRefLead = _refIn ? await geocodificarTextoOSM(_refIn, _ciuIn) : null;
+        if (!_geoRefLead) {
+          _resCercaTxt = 'No pude ubicar en el mapa la referencia "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Decile al lead con naturalidad que no ubicas ese punto exacto y pedile una referencia mas conocida (esquina, avenida y altura, o un lugar conocido). NO inventes la ubicacion.';
+        } else {
+          // Candidatos con coordenadas segun el rubro de la cuenta.
+          let _cands = [];
+          const _rubroC = normalizarRubro(rubro);
+          if (_rubroC === 'hotel_cabanas') {
+            try {
+              const _hc = await supabase.from('hotel_complejos').select('nombre, atributos').eq('user_id', user_id);
+              (_hc.data || []).forEach(function(c){ const a = (c.atributos && typeof c.atributos === 'object') ? c.atributos : {}; if (a.lat != null && a.lng != null) _cands.push({ nombre: c.nombre || 'Complejo', lat: Number(a.lat), lng: Number(a.lng), extra: a.direccion || '' }); });
+            } catch (eHC) {}
+          } else if (_rubroC === 'desarrolladora') {
+            try {
+              const _dv = await supabase.from('developments').select('nombre, zona, direccion, lat, lng').eq('user_id', user_id).eq('activo', true);
+              (_dv.data || []).forEach(function(d){ if (d.lat != null && d.lng != null) _cands.push({ nombre: d.nombre || 'Emprendimiento', lat: Number(d.lat), lng: Number(d.lng), extra: d.direccion || d.zona || '' }); });
+            } catch (eDV) {}
+          } else {
+            (properties || []).forEach(function(p){ if (p.lat != null && p.lng != null) _cands.push({ nombre: (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title || ''), lat: Number(p.lat), lng: Number(p.lng), extra: p.direccion || p.zone || '' }); });
+          }
+          if (!_cands.length) {
+            _resCercaTxt = 'Referencia ubicada, pero el inventario todavia no tiene coordenadas cargadas para comparar distancias. Responde usando la zona/direccion que figura en el inventario, sin inventar distancias ni lugares.';
+          } else {
+            const _cercanas = _cands.map(function(c){ return { nombre: c.nombre, extra: c.extra, km: haversineKm(_geoRefLead.lat, _geoRefLead.lng, c.lat, c.lng) }; }).sort(function(a,b){ return a.km - b.km; }).slice(0, 5);
+            const _lineasC = _cercanas.map(function(c){ return '- ' + c.nombre + (c.extra ? ' (' + c.extra + ')' : '') + ': a ' + _fmtDistancia(c.km); });
+            _resCercaTxt = 'Referencia ubicada: "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Lo mas cercano del inventario (distancia en linea recta):' + String.fromCharCode(10) + _lineasC.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele lo que corresponda con naturalidad mencionando la distancia aproximada. Si nada queda razonablemente cerca, decilo con honestidad y ofrece la opcion menos lejana.';
+          }
+        }
+      } catch (eCerca) {
+        console.error('tool buscar_propiedades_cerca:', eCerca && eCerca.message);
+        _resCercaTxt = 'No se pudo consultar la ubicacion en este momento. Segui la conversacion con lo que sabes del inventario, sin inventar ubicaciones.';
+      }
+      // 2do turno con el tool_result (la IA redacta la respuesta final). Acumula usage para costeo exacto.
+      let _textoCierreC = '';
+      try {
+        const _msgsC2 = mensajesParaIA.concat([
+          { role: 'assistant', content: completion.content },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolCerca.id, content: _resCercaTxt }] }
+        ]);
+        const _cc2 = await llamarIAConFailover({ model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsC2 }, 'generarRespuestaAgente:turno2-cerca');
+        const _bc2 = (_cc2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
+        if (_bc2 && _bc2.text) _textoCierreC = _bc2.text;
+        if (_cc2 && _cc2.usage && completion && completion.usage) {
+          completion.usage = {
+            input_tokens: (completion.usage.input_tokens || 0) + (_cc2.usage.input_tokens || 0),
+            output_tokens: (completion.usage.output_tokens || 0) + (_cc2.usage.output_tokens || 0),
+            cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (_cc2.usage.cache_read_input_tokens || 0),
+            cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (_cc2.usage.cache_creation_input_tokens || 0)
+          };
+        }
+      } catch (eC2) { console.error('segundo turno buscar_propiedades_cerca:', eC2 && eC2.message); }
+      reply = _textoCierreC || _textoPrevioC || 'Dejame chequear bien esa ubicacion y te confirmo.';
+      if (!usaEmojis) { const _lC = quitarEmojis(reply); if (_lC) reply = _lC; }
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
@@ -4901,6 +4999,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       reply = _txt || 'Disculpa, ahora mismo no puedo mandarte la foto, pero seguimos por aca.';
     }
     } // cierra el else de _toolDueno (rama tool de foto / otras tools)
+    } // UBICACION OSM: cierra el else de _toolCerca (rama dueno/foto/otras tools)
     } // FEATURE #15: cierra el else de _toolAgendar (rama dueno/foto/otras tools)
     } // DERIVACION v3: cierra el else de _toolDerivar (rama tools existentes)
   } else {
@@ -13511,6 +13610,223 @@ function _fetchHttpsInseguro(url, opts) {
     } catch (e) { reject(e); }
   });
 }
+
+// ============================================================================
+// UBICACION OSM (Fase 2/3) — geocoding Nominatim + lugares cercanos Overpass
+// ----------------------------------------------------------------------------
+// Todo OpenStreetMap = GRATIS, $0 recurrente (regla de Diego). Reglas de uso del
+// servicio publico: max 1 req/seg con User-Agent identificable (fetchScrape ya lo
+// setea en GET; en POST lo pasamos explicito porque Object.assign pisa headers).
+// APRENDIZAJE de la prueba 2026-07-14 (ver PLAN-UBICACION-OSM.md): NO usar la
+// busqueda libre `q=` sola para direcciones (matchea otra ciudad, ej "Avenida 2
+// 2050, La Plata" caia en Mar del Plata); usar query ESTRUCTURADA street/city y,
+// para referencias con nombre ("la terminal"), busqueda libre VALIDANDO que el
+// resultado pertenezca a la ciudad pedida. Ante cualquier fallo: null/'' (no rompe).
+// ============================================================================
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  var R = 6371;
+  var dLat = (lat2 - lat1) * Math.PI / 180;
+  var dLon = (lon2 - lon1) * Math.PI / 180;
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function _fmtDistancia(km) {
+  if (km == null || isNaN(km)) return '';
+  if (km < 1) return Math.max(50, Math.round(km * 1000 / 50) * 50) + ' m';
+  return (Math.round(km * 10) / 10) + ' km';
+}
+
+// User-Agent para OSM: HONESTO, sin "Mozilla" (Overpass devuelve 406 a los UA de navegador;
+// verificado 2026-07-14). OJO: fetchScrape con opciones.headers PISA su default, asi que este
+// UA hay que pasarlo explicito en cada llamada OSM.
+var _OSM_UA = 'RaicesCRM/1.0 (+https://raicescrm.com)';
+
+// Serializa las requests a OSM (Nominatim exige max 1/seg; Overpass agradece lo mismo).
+var _osmUltimaReq = 0;
+async function _osmThrottle() {
+  var espera = 1100 - (Date.now() - _osmUltimaReq);
+  if (espera > 0) await new Promise(function (r) { setTimeout(r, espera); });
+  _osmUltimaReq = Date.now();
+}
+
+function _normGeoTexto(t) {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+
+// Geocodifica una DIRECCION con query estructurada (street+city+country). Si la calle no matchea,
+// cae al centro de la ciudad (precision 'ciudad'). Devuelve { lat, lng, display, precision } | null.
+async function geocodificarOSM(direccion, ciudad) {
+  try {
+    var dir = String(direccion || '').trim();
+    var ciu = String(ciudad || '').trim();
+    if (!dir && !ciu) return null;
+    await _osmThrottle();
+    var params = 'format=jsonv2&limit=1&addressdetails=1&country=Argentina';
+    if (dir) params += '&street=' + encodeURIComponent(dir);
+    if (ciu) params += '&city=' + encodeURIComponent(ciu);
+    var r = await fetchScrape('https://nominatim.openstreetmap.org/search?' + params, { headers: { 'User-Agent': _OSM_UA } });
+    if (!r.ok) return null;
+    var arr = await r.json();
+    if (!Array.isArray(arr) || !arr.length) {
+      if (dir && ciu) {
+        var soloCiudad = await geocodificarOSM('', ciu);
+        if (soloCiudad) soloCiudad.precision = 'ciudad';
+        return soloCiudad;
+      }
+      return null;
+    }
+    var lat = parseFloat(arr[0].lat), lng = parseFloat(arr[0].lon);
+    if (isNaN(lat) || isNaN(lng)) return null;
+    return { lat: lat, lng: lng, display: String(arr[0].display_name || ''), precision: dir ? 'direccion' : 'ciudad' };
+  } catch (e) { return null; }
+}
+
+// Geocodifica TEXTO LIBRE de un lead ("Avenida 2 entre 20 y 21", "la terminal") con cache en
+// geocode_cache (no re-pagamos ni re-pedimos lo mismo dos veces; el cache es compartido porque
+// unas coordenadas son un dato geografico publico, no PII). 1) estructurada; 2) libre country=ar
+// VALIDANDO la ciudad en el display (anti match en otra ciudad). null si no se ubico.
+async function geocodificarTextoOSM(referencia, ciudad) {
+  try {
+    var refN = String(referencia || '').trim();
+    if (!refN) return null;
+    var ciuN = String(ciudad || '').trim();
+    var clave = _normGeoTexto(refN + '|' + ciuN);
+    try {
+      var cq = await supabase.from('geocode_cache').select('lat, lng, encontrado').eq('q', clave).maybeSingle();
+      if (cq && cq.data) {
+        if (cq.data.encontrado && cq.data.lat != null) return { lat: Number(cq.data.lat), lng: Number(cq.data.lng), display: '', precision: 'cache' };
+        return null; // ya se busco y no existe: no volver a pegarle a Nominatim
+      }
+    } catch (eC) {} // tabla ausente (migracion sin correr) -> seguimos sin cache
+    var res = await geocodificarOSM(refN, ciuN);
+    if (!res || res.precision === 'ciudad') {
+      // Referencias con nombre (terminal, plaza, muelle) no son "street": busqueda libre + validacion de ciudad.
+      await _osmThrottle();
+      var q = refN + (ciuN ? ', ' + ciuN : '') + ', Argentina';
+      var r2 = await fetchScrape('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ar&q=' + encodeURIComponent(q), { headers: { 'User-Agent': _OSM_UA } });
+      if (r2.ok) {
+        var a2 = await r2.json();
+        if (Array.isArray(a2) && a2.length) {
+          var lat2 = parseFloat(a2[0].lat), lng2 = parseFloat(a2[0].lon);
+          var disp2 = String(a2[0].display_name || '');
+          var ciudadOk = !ciuN || _normGeoTexto(disp2).indexOf(_normGeoTexto(ciuN)) >= 0;
+          if (!isNaN(lat2) && !isNaN(lng2) && ciudadOk) res = { lat: lat2, lng: lng2, display: disp2, precision: 'libre' };
+        }
+      }
+    }
+    try { await supabase.from('geocode_cache').upsert({ q: clave, lat: res ? res.lat : null, lng: res ? res.lng : null, encontrado: !!res }); } catch (eU) {}
+    return res || null;
+  } catch (e) { return null; }
+}
+
+// "Que hay cerca" de un punto (Overpass): 1 lugar por tipo (el mas cercano), en texto castellano
+// listo para el prompt (ej "playa a 400 m; supermercado Dia a 200 m; farmacia a 300 m").
+// Se llama UNA vez por propiedad al geocodificar (cero costo por conversacion). '' si no hay data.
+async function referenciasZonaOSM(lat, lng) {
+  try {
+    if (lat == null || lng == null) return '';
+    await _osmThrottle();
+    var q = '[out:json][timeout:20];(' +
+      'node(around:800,' + lat + ',' + lng + ')[amenity~"supermarket|cafe|restaurant|pharmacy|bank|school|hospital|fuel"];' +
+      'node(around:800,' + lat + ',' + lng + ')[shop~"^(supermarket|bakery|convenience|greengrocer|butcher|kiosk)$"];' +
+      'node(around:1200,' + lat + ',' + lng + ')[highway=bus_stop];' +
+      'nwr(around:2500,' + lat + ',' + lng + ')[natural=beach];' +
+      ');out tags center 60;';
+    var r = await fetchScrape('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: { 'User-Agent': _OSM_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: 'data=' + encodeURIComponent(q)
+    });
+    if (!r.ok) return '';
+    var d = await r.json();
+    var els = Array.isArray(d.elements) ? d.elements : [];
+    if (!els.length) return '';
+    var TIPO_ES = { supermarket: 'supermercado', cafe: 'cafe', restaurant: 'restaurante', pharmacy: 'farmacia', bank: 'banco', school: 'escuela', hospital: 'hospital', fuel: 'estacion de servicio', bakery: 'panaderia', convenience: 'almacen', greengrocer: 'verduleria', butcher: 'carniceria', kiosk: 'kiosco', bus_stop: 'parada de colectivo', beach: 'playa' };
+    var mejorPorTipo = {};
+    els.forEach(function (e) {
+      var t = e.tags || {};
+      var la = (e.lat != null) ? e.lat : (e.center && e.center.lat);
+      var lo = (e.lon != null) ? e.lon : (e.center && e.center.lon);
+      if (la == null || lo == null) return;
+      var clase = (t.natural === 'beach') ? 'beach' : ((t.highway === 'bus_stop') ? 'bus_stop' : (t.shop || t.amenity));
+      var etiq = TIPO_ES[clase];
+      if (!etiq) return;
+      var km = haversineKm(Number(lat), Number(lng), Number(la), Number(lo));
+      if (!mejorPorTipo[etiq] || km < mejorPorTipo[etiq].km) mejorPorTipo[etiq] = { km: km, nombre: (t.name || '').trim() };
+    });
+    var tipos = Object.keys(mejorPorTipo).sort(function (a, b) { return mejorPorTipo[a].km - mejorPorTipo[b].km; }).slice(0, 8);
+    return tipos.map(function (k) { var v = mejorPorTipo[k]; return k + (v.nombre ? ' ' + v.nombre : '') + ' a ' + _fmtDistancia(v.km); }).join('; ');
+  } catch (e) { return ''; }
+}
+
+// CRON: geocodifica el inventario de las cuentas con ia_ubicacion ON (fail-closed: sin flag/columna
+// no hace NADA). Rellena lat/lng + referencias_zona + geo_ref. geo_ref = hash de direccion|ciudad:
+// si el dueno cambia la direccion, se re-geocodifica sola; si no, cada fila se procesa UNA vez.
+// Presupuesto por corrida (30 filas) para respetar el 1 req/seg de Nominatim sin bloquear el proceso.
+var _geocodEnCurso = false;
+async function geocodificarPendientes() {
+  if (_geocodEnCurso) return;
+  _geocodEnCurso = true;
+  try {
+    var fq = await supabase.from('business_settings').select('user_id').eq('ia_ubicacion', true);
+    if (fq.error || !fq.data || !fq.data.length) return;
+    var uids = fq.data.map(function (x) { return x.user_id; });
+    var presupuesto = 30;
+
+    var procesarTabla = async function (tabla, colActiva) {
+      if (presupuesto <= 0) return;
+      var q = await supabase.from(tabla).select('id, user_id, direccion, entre_calles, ciudad, lat, lng, geo_ref').in('user_id', uids).not('direccion', 'is', null).eq(colActiva, true).limit(400);
+      if (q.error || !q.data) return; // columnas ausentes (migracion sin correr) -> no romper
+      for (var i = 0; i < q.data.length && presupuesto > 0; i++) {
+        var f = q.data[i];
+        if (!f.direccion || !String(f.direccion).trim()) continue;
+        var refAct = _normGeoTexto(String(f.direccion) + '|' + String(f.ciudad || ''));
+        if (f.geo_ref === refAct) continue; // ya intentada esta direccion (con o sin exito): no repagar
+        presupuesto--;
+        var g = await geocodificarOSM(String(f.direccion), String(f.ciudad || ''));
+        var upd = { geo_ref: refAct };
+        if (g && g.precision !== 'ciudad') {
+          upd.lat = g.lat; upd.lng = g.lng;
+          var refs = await referenciasZonaOSM(g.lat, g.lng);
+          if (refs) upd.referencias_zona = refs;
+        }
+        try { await supabase.from(tabla).update(upd).eq('id', f.id); } catch (eU) {}
+      }
+    };
+    await procesarTabla('properties', 'activa');
+    await procesarTabla('developments', 'activo');
+
+    // HOTEL: la direccion vive en el jsonb hotel_complejos.atributos (keys direccion/ciudad/lat/lng/geo_ref/referencias_zona).
+    if (presupuesto > 0) {
+      var hq = await supabase.from('hotel_complejos').select('id, user_id, atributos').in('user_id', uids);
+      if (!hq.error && hq.data) {
+        for (var j = 0; j < hq.data.length && presupuesto > 0; j++) {
+          var c = hq.data[j];
+          var a = (c.atributos && typeof c.atributos === 'object') ? c.atributos : {};
+          if (!a.direccion || !String(a.direccion).trim()) continue;
+          var refH = _normGeoTexto(String(a.direccion) + '|' + String(a.ciudad || ''));
+          if (a.geo_ref === refH) continue;
+          presupuesto--;
+          var gH = await geocodificarOSM(String(a.direccion), String(a.ciudad || ''));
+          var aNew = Object.assign({}, a, { geo_ref: refH });
+          if (gH && gH.precision !== 'ciudad') {
+            aNew.lat = gH.lat; aNew.lng = gH.lng;
+            var refsH = await referenciasZonaOSM(gH.lat, gH.lng);
+            if (refsH) aNew.referencias_zona = refsH;
+          }
+          try { await supabase.from('hotel_complejos').update({ atributos: aNew }).eq('id', c.id); } catch (eUH) {}
+        }
+      }
+    }
+  } catch (e) { console.error('geocodificarPendientes:', e && e.message); }
+  finally { _geocodEnCurso = false; }
+}
+setInterval(geocodificarPendientes, 15 * 60 * 1000);
+setTimeout(geocodificarPendientes, 2 * 60 * 1000);
 
 // Limpia HTML para mandar a la IA: saca scripts/estilos/nav/header/footer y comprime espacios.
 // Devuelve texto + algo de estructura (mantiene href y precios). Cap configurable de chars.

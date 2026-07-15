@@ -35,6 +35,30 @@ sumar el input al alta en un segundo pase (no bloquea).
 
 ---
 
+## ESTADO — FASE 2 y 3 ✅ CONSTRUIDAS (2026-07-14, gateadas OFF)
+
+Todo construido en server.js, gateado por **`business_settings.ia_ubicacion`** (default false,
+fail-closed — con OFF el prompt/tools/crons quedan byte-idénticos):
+- Helpers module-level (junto a fetchScrape): `haversineKm`, `_fmtDistancia`, `_normGeoTexto`,
+  `geocodificarOSM` (estructurada street/city + fallback ciudad), `geocodificarTextoOSM`
+  (texto libre de leads con cache en `geocode_cache` + validación de ciudad), `referenciasZonaOSM`
+  (Overpass → texto castellano "playa a 400 m; supermercado X a 200 m").
+- Cron `geocodificarPendientes` (cada 15 min, 30 filas/corrida por rate-limit): rellena
+  lat/lng + referencias_zona + geo_ref en properties/developments/hotel_complejos de las
+  cuentas con flag ON. Re-geocodifica solo si cambia la dirección (geo_ref).
+- Tool IA `buscar_propiedades_cerca` (2º turno con tool_result, usage acumulado para costeo)
+  + regla anti-invento en el system + líneas "cerca:" en el inventario de los 3 rubros.
+- GOTCHA descubierto: Overpass devuelve **406 a User-Agents "Mozilla"** → usar UA honesto
+  `RaicesCRM/1.0 (+https://raicescrm.com)` (var _OSM_UA). fetchScrape con opciones.headers
+  PISA su default → pasar el UA explícito en cada llamada OSM.
+- Migración: `migracion-ubicacion-osm.sql` (flag + referencias_zona/geo_ref + geocode_cache con RLS).
+- Test aislado OK (scratchpad/test-osm.js): geocode VG nivel dirección, referencias ricas en
+  Av 3 550 VG (restaurante/café/banco a 50 m…), fallback ciudad correcto, validación anti-otra-ciudad OK.
+
+**ACTIVACIÓN por cuenta (decisión de Diego, tiene costo IA):** `UPDATE business_settings SET
+ia_ubicacion=true WHERE user_id='...'`. 🔴 Con ON: cada uso de la tool = 2º turno (~tokens de
+una respuesta extra) y las líneas "cerca:" agregan input tokens por mensaje. OSM en sí = $0.
+
 ## FASE 2 — GEOCODIFICACIÓN (dirección → lat/lng) con Nominatim (OSM)
 
 **Qué:** convertir la dirección de cada propiedad/emprendimiento/complejo en coordenadas
@@ -128,6 +152,32 @@ Si OSM viene completo en tus zonas → se construye Fase 2/3 tal cual, a costo c
 zona viene flojo, se decide ahí (self-host con más data, o ajustar el radio).
 
 ---
+
+## RESULTADO DE LA PRUEBA DE COBERTURA (2026-07-14) — leer antes de construir
+
+Probado Nominatim + Overpass sobre zonas reales de Anton:
+
+**Geocoding (Nominatim):**
+- Usar SIEMPRE la **query ESTRUCTURADA** (`street=` + `city=` + `country=Argentina`), NO la
+  libre (`q=`). La libre manda a otra ciudad con un match malo (ej "Avenida 2 2050, La Plata"
+  → cayó en Mar del Plata, importance 0.05). La estructurada devuelve "sin resultado" en vez de
+  un falso positivo.
+- La Plata numerada FUNCIONA bien escrita: `street="Calle 50 800" city="La Plata"` → ubicó el
+  número exacto en La Plata. Costa: `Villa Gesell`, `Mar de las Pampas` → OK a nivel calle/localidad.
+- **Validar** que la ciudad devuelta (`address.city/town`) coincida con la pedida; si no, bajar a
+  nivel zona/localidad. Umbral de confianza: descartar matches con `importance` muy bajo + ciudad distinta.
+
+**POIs (Overpass) — cobertura DISPAR por zona:**
+- Ciudad densa (La Plata microcentro): **80+ POIs** en 800m (kioscos, bancos, farmacias, cafés,
+  panaderías, restaurantes). Referencias ricas. 🟢
+- Costa (Villa Gesell): **~4 POIs** mapeados. OSM tiene pocos comercios en pueblos turísticos. 🟡
+- **Consecuencia:** en ciudad la IA nombra comercios reales de sobra; en la costa hay que apoyarse
+  en referencias GRANDES (playa/centro/peatonal, que sí están en OSM como geometría) + distancias,
+  no en comercios puntuales. La regla anti-invento sigue firme.
+- **Overpass requiere `User-Agent`** o devuelve 406.
+
+**Veredicto:** viable y gratis. Priorizar (1) geocoding + "buscar propiedades cerca" (anda en todos
+lados) y (2) referencias de comercios donde OSM tiene data, con fallback a landmarks en la costa.
 
 ## RESUMEN DE COSTOS
 

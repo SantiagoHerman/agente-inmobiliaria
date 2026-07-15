@@ -471,7 +471,7 @@ const OBJETIVO = {
   avanzar_reserva_hotel: 'Tu objetivo es tomar los datos de la reserva (fechas, cantidad de personas) y deriva a un asesor humano para confirmar y cobrar.'
 };
 const LARGO = {
-  corto: 'LARGO DE RESPUESTA (obligatorio, respeta esta config): responde MUY breve, como un mensaje de WhatsApp real: 1 a 3 frases cortas, sin parrafos largos ni listados. NO amontones varias opciones ni todo el inventario en un solo mensaje: ofrece la que mejor encaje o hace UNA pregunta para acotar, y ampliá de a poco segun lo que el lead responda. Sonás a persona, no a folleto.',
+  corto: 'LARGO DE RESPUESTA (obligatorio, respeta SIEMPRE esta config del cliente): escribí MUY breve, como una persona por WhatsApp: frases cortas, sin parrafos largos. NO amontones todo en un solo mensaje. En vez de tirar varias opciones juntas, PRIMERO pregunta que necesita (fechas, personas, presupuesto, zona) y ofrece la que mejor encaja. Si de verdad tenes que mencionar varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una y bien cortita: asi se mandan como mensajes separados (una burbuja por opcion), no como un bloque. Sonás a persona, no a un folleto.',
   normal: 'Responde con un largo equilibrado, ni muy corto ni muy extenso.',
   detallado: 'Podes dar respuestas mas completas y detalladas cuando ayude.'
 };
@@ -5287,10 +5287,17 @@ async function marcarLeido(instancia, key) {
   } catch (e) { /* no rompe nada */ }
 }
 
-// Parte un texto en 1-3 mensajes de forma ALEATORIA, cortando por frases completas
+// Parte un texto en varios mensajes (burbujas) para que se lea como una persona por WhatsApp.
+// PRIORIDAD 1: respetar los cortes DELIBERADOS de la IA -> si separó ideas/opciones con un renglón
+// en blanco (doble salto de línea), cada bloque va como un mensaje aparte (ej: una habitación por
+// burbuja). PRIORIDAD 2 (un solo bloque): partir por frases en 1-3 mensajes de forma natural.
 function partirMensaje(texto) {
   const t = String(texto || '').trim();
   if (!t) return [t];
+  // 1) Cortes deliberados (renglón en blanco) => cada bloque es un mensaje separado. Tope 6 para no
+  //    inundar. Esto es lo que hace que "cada habitación/opción en su línea" salga como burbujas.
+  const bloques = t.split(/\n\s*\n/).map(function(b){ return b.trim(); }).filter(Boolean);
+  if (bloques.length >= 2) return bloques.slice(0, 6);
   // separar en frases por punto, signo de exclamacion/pregunta, o salto de linea
   const frases = t.split(/(?<=[.!?\n])\s+/).map(function(f){ return f.trim(); }).filter(Boolean);
   if (frases.length <= 1) return [t];

@@ -471,7 +471,7 @@ const OBJETIVO = {
   avanzar_reserva_hotel: 'Tu objetivo es tomar los datos de la reserva (fechas, cantidad de personas) y deriva a un asesor humano para confirmar y cobrar.'
 };
 const LARGO = {
-  corto: 'Responde breve y simple, en pocas frases, como en un chat de WhatsApp real.',
+  corto: 'LARGO DE RESPUESTA (obligatorio, respeta esta config): responde MUY breve, como un mensaje de WhatsApp real: 1 a 3 frases cortas, sin parrafos largos ni listados. NO amontones varias opciones ni todo el inventario en un solo mensaje: ofrece la que mejor encaje o hace UNA pregunta para acotar, y ampliá de a poco segun lo que el lead responda. Sonás a persona, no a folleto.',
   normal: 'Responde con un largo equilibrado, ni muy corto ni muy extenso.',
   detallado: 'Podes dar respuestas mas completas y detalladas cuando ayude.'
 };

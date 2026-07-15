@@ -16553,14 +16553,18 @@ async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos) {
     if (!skus.length) return { ok: false, error: 'sin habitaciones' };
     var opciones = skus.map(function (s) {
       var nombre = String(s.Title || s.SkuName || 'Habitación').replace(/\s+/g, ' ').trim();
-      var total = Number(s.PromotionalRate || s.Rate || 0), avail = Number(s.Availability || 0);
-      if (!(total > 0 && avail > 0)) {
+      // OJO (verificado 2026-07-15 contra la web de Tequendama): Rate/PromotionalRate de PXSOL son
+      // POR NOCHE y con impuestos incluidos (ClientLoad=FINAL, Taxes=21), NO el total de la estadia.
+      // Prueba: PromotionalRate 196.000 x 5 noches = 980.000 = total web (809.917 sin IVA) + 21%.
+      // NO usar RatePerDay para el total: su PromotionalRate NO trae aplicado el descuento.
+      var porNoche = Number(s.PromotionalRate || s.Rate || 0), avail = Number(s.Availability || 0);
+      if (!(porNoche > 0 && avail > 0)) {
         (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) {
           var a = Number(rt.Availability || 0), t = Number(rt.PromotionalRate || rt.Rate || 0);
-          if (a > 0 && t > 0 && (!(total > 0) || t < total)) { total = t; avail = a; }
+          if (a > 0 && t > 0 && (!(porNoche > 0) || t < porNoche)) { porNoche = t; avail = a; }
         });
       }
-      if (total > 0 && avail > 0) return { nombre: nombre, total: Math.round(total), porNoche: Math.round(total / nights), disponibles: avail, desayuno: (s.Breakfast == 1 || s.Breakfast === true) };
+      if (porNoche > 0 && avail > 0) return { nombre: nombre, total: Math.round(porNoche * nights), porNoche: Math.round(porNoche), disponibles: avail, desayuno: (s.Breakfast == 1 || s.Breakfast === true) };
       var minLos = 0;
       (Array.isArray(s.RateList) ? s.RateList : []).forEach(function (rt) { var m = Number(rt.MinLOS || 0); if (m > minLos) minLos = m; });
       return { nombre: nombre, sinDisponibilidad: true, minLOS: (minLos > nights) ? minLos : null };

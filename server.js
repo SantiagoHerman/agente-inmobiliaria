@@ -21831,7 +21831,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var asesoresActivos = (ases.data || []).filter(function(a){ return a.activo === true; }).length;
     var sub = await supabase.from('subscriptions').select('*').eq('user_id', uid).maybeSingle();
     var S = sub.data || null;
-    var ultimoLogin = null; var altaFecha = null; try { var u = await supabase.auth.admin.getUserById(uid); if (u && u.data && u.data.user) { ultimoLogin = u.data.user.last_sign_in_at; altaFecha = u.data.user.created_at; } } catch(eL){}
+    var ultimoLogin = null; var altaFecha = null; var emailUsuario = null; try { var u = await supabase.auth.admin.getUserById(uid); if (u && u.data && u.data.user) { ultimoLogin = u.data.user.last_sign_in_at; altaFecha = u.data.user.created_at; emailUsuario = u.data.user.email || null; } } catch(eL){}
     var ultimoBackup = null; var backupsCount = 0; try { var bk = await supabase.from('backups').select('created_at', { count: 'exact' }).eq('user_id', uid).order('created_at', { ascending: false }).limit(1); ultimoBackup = (bk.data && bk.data[0]) ? bk.data[0].created_at : null; backupsCount = bk.count || 0; } catch(eB){}
     var nota = ''; try { var nt = await supabase.from('admin_notas').select('nota').eq('user_id', uid).maybeSingle(); nota = (nt && nt.data && nt.data.nota) ? nt.data.nota : ''; } catch(eN){}
     var wa = 'desconocido'; try { wa = (await instanciaConectada(nombreInstancia(uid))) ? 'conectado' : 'desconectado'; } catch(eWa){}
@@ -21844,7 +21844,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
     var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
     var extraMovs = []; try { var em = await supabase.from('mensajes_extra_mov').select('cantidad, origen, nota, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(12); extraMovs = (em && em.data) || []; } catch (eEM) {}
-    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, ui_moderno: B.ui_moderno === true, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, email: emailUsuario, ui_moderno: B.ui_moderno === true, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -22200,6 +22200,38 @@ app.post('/api/maestro/cliente/:id/nota', async function(req, res){
     var nota = (req.body && typeof req.body.nota === 'string') ? req.body.nota : '';
     await supabase.from('admin_notas').upsert({ user_id: req.params.id, nota: nota, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
     return res.json({ ok: true });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// CREDENCIALES DE ACCESO del cliente (SOLO Maestro). El mail se puede leer y cambiar; la clave NO se
+// puede mostrar (Auth la guarda hasheada) -> aca solo se SETEA una nueva. updateUserById aplica al
+// instante (efecto inmediato). Mandar email y/o password; al menos uno.
+app.post('/api/maestro/cliente/:id/credenciales', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'clientes'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var uid = req.params.id;
+    var b = req.body || {};
+    var nuevoEmail = (b.email ? String(b.email) : '').trim().toLowerCase();
+    var nuevaClave = (b.password ? String(b.password) : '').trim();
+    var patch = {};
+    if (nuevoEmail) {
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(nuevoEmail)) return res.status(400).json({ error: 'Email invalido' });
+      patch.email = nuevoEmail; patch.email_confirm = true;
+    }
+    if (nuevaClave) {
+      if (nuevaClave.length < 6) return res.status(400).json({ error: 'La clave debe tener al menos 6 caracteres' });
+      patch.password = nuevaClave;
+    }
+    if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nada para actualizar: manda un email nuevo y/o una clave nueva' });
+    var r = await supabase.auth.admin.updateUserById(uid, patch);
+    if (r.error) {
+      var m = String((r.error && r.error.message) || '');
+      if (/already|registered|exists|duplicate/i.test(m)) return res.status(400).json({ error: 'Ese email ya esta en uso por otra cuenta' });
+      return res.status(400).json({ error: m || 'No se pudo actualizar' });
+    }
+    try { await supabase.from('admin_audit').insert({ accion: 'editar_credenciales', target_user_id: uid, detalle: JSON.stringify({ cambio_email: !!nuevoEmail, cambio_clave: !!nuevaClave }) }); } catch(eA){}
+    return res.json({ ok: true, email: (r.data && r.data.user && r.data.user.email) || nuevoEmail || null });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

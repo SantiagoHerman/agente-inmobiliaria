@@ -20121,6 +20121,41 @@ async function _armarGaleriaProp(base, postId, html, featuredUrl) {
   return out;
 }
 // Procesa una propiedad de la API + su ficha. Devuelve objeto con todos los campos para revision.
+// PIN DEL MAPA (0 IA, 0 fetch extra): Houzez guarda la ubicacion como COORDENADAS (meta
+// fave_property_location = "lat,lng,zoom", o el mapa embebido en el HTML) aunque el campo de
+// direccion en TEXTO venga vacio -> es la solapa "Ubicacion" de la ficha. Reusa el HTML que ya
+// se baja para el precio. ADITIVO: si no hay pin devuelve null y todo queda igual que hoy.
+function _coordsHouzez(html, meta) {
+  function _ok(la, ln) {
+    la = Number(la); ln = Number(ln);
+    if (!isFinite(la) || !isFinite(ln)) return null;
+    if (la === 0 && ln === 0) return null;
+    if (la < -90 || la > 90 || ln < -180 || ln > 180) return null;
+    return { lat: la, lng: ln };
+  }
+  try {
+    var m = meta || {};
+    var v = m.fave_property_location || m.fave_property_map_address_location || null;
+    if (Array.isArray(v)) v = v[0];
+    if (v && typeof v === 'string' && v.indexOf(',') > 0) {
+      var pr = v.split(',');
+      var r0 = _ok(pr[0], pr[1]);
+      if (r0) return r0;
+    }
+    var h = html || '';
+    // Houzez (Anton): "property_lat":"-37.3235...","property_lng":"-57.0349..."
+    var m1 = h.match(/["']property_lat["']\s*:\s*["']?(-?\d+\.\d+)["']?\s*,\s*["']property_lng["']\s*:\s*["']?(-?\d+\.\d+)["']?/i);
+    if (m1) { var r1 = _ok(m1[1], m1[2]); if (r1) return r1; }
+    // Otros temas/plataformas: "lat":..,"lng":.. / "latitude":..,"longitude":.. / data-lat= data-lng=
+    var m2 = h.match(/["']lat(?:itude)?["']\s*:\s*["']?(-?\d+\.\d+)["']?\s*,\s*["']l(?:ng|on|ongitude)["']\s*:\s*["']?(-?\d+\.\d+)["']?/i);
+    if (m2) { var r2 = _ok(m2[1], m2[2]); if (r2) return r2; }
+    var m3 = h.match(/data-lat\s*=\s*["'](-?\d+\.\d+)["']/i);
+    var m4 = h.match(/data-lng\s*=\s*["'](-?\d+\.\d+)["']/i);
+    if (m3 && m4) { var r3 = _ok(m3[1], m4[1]); if (r3) return r3; }
+  } catch (e) {}
+  return null;
+}
+
 async function procesarPropiedad(p) {
   var emb = p._embedded || {};
   var terms = emb['wp:term'] || [];
@@ -20149,10 +20184,12 @@ async function procesarPropiedad(p) {
   // arriba para el precio, sin fetch extra) -> featured como minimo.
   var _base = (link || '').replace(/^(https?:\/\/[^\/]+).*/, '$1');
   var fotos = await _armarGaleriaProp(_base, p.id, (html || ''), foto);
+  var _pin = _coordsHouzez((html || ''), p.property_meta || p.meta);
   return {
     numero: numero, titulo: titulo, tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
     ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles, caracteristicas: caract.join(', '), descripcion: descripcion,
+    lat: _pin ? _pin.lat : null, lng: _pin ? _pin.lng : null,
     link: link, foto: foto, fotos: fotos, postId: p.id
   };
 }
@@ -20812,7 +20849,16 @@ async function correrScrapingDeUsuario(cfg) {
     // anterior (sin auto-pausa/despausa) para no romper la actualizacion de inventario. Al existir, se activa sola.
     var _tienePausa = true;
     try { var _pb = await supabase.from('properties').select('pausa_manual').limit(1); if (_pb.error) _tienePausa = false; } catch (e) { _tienePausa = false; }
-    var _selCols = _tienePausa ? 'id, images, pausa_manual' : 'id, images';
+    // ADITIVO: si la base tiene las columnas de geo, las leo para poder RELLENAR solo las vacias.
+    var _tieneGeo = true;
+    try { var _gb = await supabase.from('properties').select('lat, lng').limit(1); if (_gb.error) _tieneGeo = false; } catch (e) { _tieneGeo = false; }
+    var _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos';
+    var _pinsRun = [];
+    // Entero limpio de un valor de la tabla de detalles ("3", "3 ambientes"). null si no es un numero sano.
+    function _intProp(v) {
+      var n = parseInt(String(v == null ? '' : v).replace(/[^\d]/g, ''), 10);
+      return (isFinite(n) && n > 0 && n < 100) ? n : null;
+    }
     for (var i = 0; i < lista.length; i++) {
       try {
         var p = await procesarPropiedad(lista[i]);
@@ -20831,6 +20877,14 @@ async function correrScrapingDeUsuario(cfg) {
           // FIGURA en el sitio -> auto-DESPAUSA (activa=true) y actualiza info, SALVO que la hayas pausado a mano
           // (pausa_manual): en ese caso se respeta tu pausa (activa=false) pero igual se refresca la info.
           fila.activa = (_tienePausa && ex.data.pausa_manual) ? false : true;
+          // PIN DEL MAPA: solo RELLENA si la propiedad NO tiene coordenadas. Si ya tiene (geocodificadas
+          // o cargadas a mano) no se toca nada. Ahorra ademas la llamada a Nominatim.
+          if (_tieneGeo && p.lat != null && p.lng != null) _pinsRun.push({ numero: String(p.numero), lat: p.lat, lng: p.lng });
+          // Ambientes / banos: el scraper ya los lee pero no los guardaba. RELLENA solo si estan vacios,
+          // asi nunca pisa una carga manual ni una correccion del cliente.
+          var _rm = _intProp(p.ambientes), _bn = _intProp(p.banos);
+          if (_rm != null && ex.data.rooms == null) fila.rooms = _rm;
+          if (_bn != null && ex.data.banos == null) fila.banos = _bn;
           // Refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar
           // galerias buenas ni las fotos ya CLASIFICADAS (categoria) de las propiedades sanas.
           var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
@@ -20840,11 +20894,41 @@ async function correrScrapingDeUsuario(cfg) {
         } else {
           fila.activa = true;
           if (_fotos.length) fila.images = _fotos.map(function(u){ return { url: u }; });
+          if (_tieneGeo && p.lat != null && p.lng != null) _pinsRun.push({ numero: String(p.numero), lat: p.lat, lng: p.lng });
+          var _rmN = _intProp(p.ambientes), _bnN = _intProp(p.banos);
+          if (_rmN != null) fila.rooms = _rmN;
+          if (_bnN != null) fila.banos = _bnN;
           var ins = await supabase.from('properties').insert(fila);
           if (ins.error) errores++; else creados++;
         }
       } catch (e) { errores++; }
     }
+    // PASO GEO (ADITIVO, 0 IA, 0 fetch extra): carga el pin del mapa de la solapa "Ubicacion" en las
+    // propiedades que NO tienen coordenadas. Corre DESPUES del loop para ver todos los pines juntos:
+    // el tema (Houzez y similares) pone SU pin por defecto -el centro del mapa del sitio- en toda ficha
+    // sin ubicacion cargada, asi que un mismo par repetido en medio catalogo NO es una ubicacion real
+    // sino el default -> se descarta. Un pin real es propio de su ficha. Generico: no depende del sitio.
+    var geoCargadas = 0;
+    try {
+      if (_tieneGeo && _pinsRun.length) {
+        var _veces = {};
+        _pinsRun.forEach(function (x) { var k = x.lat + ',' + x.lng; _veces[k] = (_veces[k] || 0) + 1; });
+        var _distintos = Object.keys(_veces).length;
+        var _minRep = Math.max(5, Math.ceil(_pinsRun.length * 0.10));
+        // Si TODAS las fichas dan el mismo par, el sitio no carga pin por propiedad (es su default) -> no
+        // se guarda ninguno. Ante la duda NO llenar: sin pin, la direccion en texto se geocodifica igual;
+        // un pin equivocado en cambio haria que la IA mienta la ubicacion.
+        var _reales = (_distintos < 2) ? [] : _pinsRun.filter(function (x) { return _veces[x.lat + ',' + x.lng] < _minRep; });
+        for (var gi = 0; gi < _reales.length; gi++) {
+          var _pi = _reales[gi];
+          // .is('lat', null) => el propio Postgres garantiza que solo RELLENA lo vacio: nunca pisa una
+          // coordenada ya cargada (geocodificada o puesta a mano).
+          var _gu = await supabase.from('properties').update({ lat: _pi.lat, lng: _pi.lng })
+            .eq('user_id', cfg.user_id).eq('numero', _pi.numero).is('lat', null);
+          if (!_gu.error) geoCargadas++;
+        }
+      }
+    } catch (e) {}
     // AUTO-PAUSA de las que YA NO figuran en el sitio: activa=false (NO se borran, quedan en el inventario). Nunca
     // toca las pausadas a mano (pausa_manual). SALVAGUARDA anti-scrape-parcial: solo se auto-pausa si la corrida
     // cubrio la mayor parte del catalogo scrapeado (>=70%); si el sitio vino corto (caida), no se pausa nada.

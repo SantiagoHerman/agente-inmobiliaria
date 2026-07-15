@@ -20331,7 +20331,15 @@ function _detalleTieneDatoDuroCron(campos) {
 // para que el guardado de siempre (upsert por numero / pausa_manual / auto-pausa / fotos /
 // paso GEO) lo consuma sin cambiar una linea. Devuelve null si no se pudo leer.
 // Orden: helpers deterministas GRATIS -> (solo si no salio nada duro Y permitirIA) IA.
-async function procesarPropiedadURL(url, user_id, permitirIA) {
+//
+// ctrlIA (opcional, CANDADO B): objeto COMPARTIDO por toda la corrida del cron:
+//   { usados, max, saltadas_tope_corrida, saltadas_tope_plan }
+// - usados/max: contador de usos de IA de ficha en ESTA corrida (max 25). Al llegar al tope,
+//   el resto de las fichas siguen SOLO por el camino determinista (que igual actualiza).
+// - Ademas, ANTES de cada ficha con IA se re-chequea dentroDelTopeIA (query barata): cierra
+//   el agujero de chequear el tope del plan solo al inicio de una corrida larga.
+// Sin ctrlIA (llamada suelta) se comporta igual que antes.
+async function procesarPropiedadURL(url, user_id, permitirIA, ctrlIA) {
   var u = String(url || '').trim();
   if (!u) return null;
   // Anti-SSRF + dominio propio del tenant ANTES de bajar nada.
@@ -20383,7 +20391,23 @@ async function procesarPropiedadURL(url, user_id, permitirIA) {
 
   // (4) IA (PAGA) — ULTIMO recurso: solo si lo determinista no saco NADA duro y hay permiso.
   if (!_detalleTieneDatoDuroCron(pares) && !precio && permitirIA === true) {
-    try {
+    // CANDADO B (tope por corrida + re-chequeo del tope del plan) — solo cuando viene ctrlIA (cron).
+    var _puedeIA = true;
+    if (ctrlIA && typeof ctrlIA === 'object') {
+      if (ctrlIA.usados >= ctrlIA.max) {
+        // Tope de la CORRIDA alcanzado: esta ficha sigue solo determinista; queda para la proxima.
+        ctrlIA.saltadas_tope_corrida = (ctrlIA.saltadas_tope_corrida || 0) + 1;
+        _puedeIA = false;
+      } else {
+        // Re-chequeo del tope del PLAN antes de CADA ficha con IA (no solo al inicio de la corrida):
+        // una corrida larga puede agotar el cupo a mitad de camino. Query barata; ante duda, no gastar.
+        try { _puedeIA = await dentroDelTopeIA(user_id); } catch (eTope) { _puedeIA = false; }
+        if (!_puedeIA) ctrlIA.saltadas_tope_plan = (ctrlIA.saltadas_tope_plan || 0) + 1;
+      }
+    }
+    if (_puedeIA) try {
+      // El uso se cuenta al INVOCAR (los tokens se gastan aunque la IA no devuelva nada util).
+      if (ctrlIA && typeof ctrlIA === 'object') ctrlIA.usados = (ctrlIA.usados || 0) + 1;
       var detIa = await parsearDetalleIA(html, u, user_id);
       if (detIa && (detIa.descripcion || (detIa.campos && Object.keys(detIa.campos).length > 0))) {
         // COBRO: mismo patron que el resto. 1 mensaje por FICHA (parsearDetalleIA usa
@@ -20448,6 +20472,29 @@ async function procesarPropiedadURL(url, user_id, permitirIA) {
 async function _iaPermitidaCron(cfg) {
   if (!cfg || cfg.ia_habilitada !== true) return false;
   try { return await dentroDelTopeIA(cfg.user_id); } catch (e) { return false; } // ante duda, no gastar
+}
+
+// CANDADO A: mapa de links de propiedades que el tenant YA tiene cargadas (properties.link).
+// La IA de ficha del cron solo puede correr para URLs NUEVAS: una ficha cuyo link ya existe
+// se actualiza SOLO con el parser determinista (gratis). Asi la primera corrida es la cara
+// y las siguientes salen casi gratis. Ante error de DB devuelve {} -> NINGUN link "existe"
+// -> ojo: eso permitiria IA de mas, pero el CANDADO B (max 25/corrida) acota el dano.
+async function _linksExistentesTenant(user_id) {
+  var mapa = {};
+  try {
+    var q = await supabase.from('properties').select('link').eq('user_id', user_id);
+    var filas = (q && q.data) ? q.data : [];
+    for (var i = 0; i < filas.length; i++) {
+      var l = filas[i] && filas[i].link;
+      if (l) mapa[String(l).trim().replace(/\/+$/, '')] = 1;
+    }
+  } catch (e) {}
+  return mapa;
+}
+// Normaliza igual que el mapa (trim + sin barras finales) para que /ficha y /ficha/ matcheen.
+function _linkYaExiste(mapa, url) {
+  if (!mapa) return false;
+  return !!mapa[String(url || '').trim().replace(/\/+$/, '')];
 }
 
 // Endpoint: devuelve las propiedades procesadas (para que el frontend muestre y el humano apruebe)
@@ -21073,6 +21120,7 @@ app.post('/api/scraping-config', async function(req, res) {
     // no existe y PostgREST tira PGRST204 -> el guardado ENTERO fallaria (regresion). Reintentamos
     // sin el campo nuevo: la config se guarda como siempre y la IA queda apagada (que es el default).
     if (up.error) {
+      console.log('[scraping-config] upsert con ia_habilitada fallo (' + (up.error.code || '') + ' ' + (up.error.message || '') + ') -> reintento sin la columna (correr migracion-scraper-ia-cron.sql)');
       var _filaSinIA = Object.assign({}, fila);
       delete _filaSinIA.ia_habilitada;
       var up2 = await supabase.from('scraping_config').upsert(_filaSinIA, { onConflict: 'user_id' }).select().maybeSingle();
@@ -21095,12 +21143,18 @@ async function correrScrapingDeUsuario(cfg) {
     // RESPALDO UNIVERSAL (ADITIVO): si el camino WordPress dio CERO, antes nos rendiamos aca y el
     // cron no hacia NADA. Ahora probamos las vias universales GRATIS (y la IA solo con permiso).
     // OJO: si el sitio ES WordPress, traerListaPropiedades trae datos -> este bloque NI SE EJECUTA.
-    var _urlsResp = null;
+    var _urlsResp = null, _ctrlIA = null, _linksExist = null;
     if (!lista.length) {
       var _iaResp = await _iaPermitidaCron(cfg);
       _urlsResp = await traerListaUniversalCron(sitio, cfg.user_id, _iaResp);
       if (!_urlsResp.length) return { ok: false, motivo: 'sin propiedades' }; // igual que hoy
       lista = _urlsResp; // el loop de abajo itera igual; solo cambia COMO se procesa cada item
+      if (_iaResp) {
+        // CANDADO A: la IA de ficha solo para URLs NUEVAS (link no existente en properties).
+        _linksExist = await _linksExistentesTenant(cfg.user_id);
+        // CANDADO B: max 25 usos de IA de ficha por corrida (+ re-chequeo del tope del plan por ficha).
+        _ctrlIA = { usados: 0, max: 25, saltadas_tope_corrida: 0, saltadas_tope_plan: 0 };
+      }
     }
     var creados = 0, actualizados = 0, errores = 0;
     var numerosVistos = {}; // numeros que SÍ figuran en el sitio en esta corrida
@@ -21122,7 +21176,14 @@ async function correrScrapingDeUsuario(cfg) {
       try {
         // Camino de siempre (WordPress) vs camino nuevo (URL suelta). Mismo shape de salida:
         // todo lo de abajo (upsert por numero, pausa_manual, fotos, GEO) no se entera de nada.
-        var p = _urlsResp ? await procesarPropiedadURL(lista[i], cfg.user_id, _iaResp) : await procesarPropiedad(lista[i]);
+        // CANDADO A: si el link YA existe en properties, IA apagada para esa ficha (determinista solo).
+        var p;
+        if (_urlsResp) {
+          var _iaFicha = _iaResp && !_linkYaExiste(_linksExist, lista[i]);
+          p = await procesarPropiedadURL(lista[i], cfg.user_id, _iaFicha, _ctrlIA);
+        } else {
+          p = await procesarPropiedad(lista[i]);
+        }
         if (!p || !p.numero) { errores++; continue; }
         numerosVistos[String(p.numero)] = 1;
         var fila = {
@@ -21210,6 +21271,12 @@ async function correrScrapingDeUsuario(cfg) {
         }
       }
     } catch (e) {}
+    // CANDADO B: resumen de gasto IA de la corrida (solo camino universal con IA habilitada).
+    if (_ctrlIA) {
+      console.log('[cron universal] IA fichas user', cfg.user_id, '-> usadas:', _ctrlIA.usados + '/' + _ctrlIA.max,
+        '| saltadas por tope de corrida (quedan para la proxima):', _ctrlIA.saltadas_tope_corrida,
+        '| saltadas por tope del plan:', _ctrlIA.saltadas_tope_plan);
+    }
     return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
@@ -21250,12 +21317,18 @@ async function correrScrapingPendiente(cfg) {
     var lista = await traerListaPropiedades(sitio, null);
     // RESPALDO UNIVERSAL (ADITIVO): mismo enganche que en correrScrapingDeUsuario. Si el sitio ES
     // WordPress, traerListaPropiedades trae datos y este bloque NI SE EJECUTA.
-    var _urlsRespP = null;
+    var _urlsRespP = null, _ctrlIAP = null, _linksExistP = null;
     if (!lista.length) {
       var _iaRespP = await _iaPermitidaCron(cfg);
       _urlsRespP = await traerListaUniversalCron(sitio, cfg.user_id, _iaRespP);
       if (!_urlsRespP.length) return { ok: false, motivo: 'sin propiedades' }; // igual que hoy
       lista = _urlsRespP;
+      if (_iaRespP) {
+        // CANDADO A: la IA de ficha solo para URLs NUEVAS (link no existente en properties).
+        _linksExistP = await _linksExistentesTenant(cfg.user_id);
+        // CANDADO B: max 25 usos de IA de ficha por corrida (+ re-chequeo del tope del plan por ficha).
+        _ctrlIAP = { usados: 0, max: 25, saltadas_tope_corrida: 0, saltadas_tope_plan: 0 };
+      }
     }
     // limpiar pendientes anteriores de este usuario (se reemplazan por el scraping nuevo)
     await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id);
@@ -21263,7 +21336,14 @@ async function correrScrapingPendiente(cfg) {
     for (var i = 0; i < lista.length; i++) {
       try {
         // Camino de siempre (WordPress) vs camino nuevo (URL suelta). Mismo shape de salida.
-        var p = _urlsRespP ? await procesarPropiedadURL(lista[i], cfg.user_id, _iaRespP) : await procesarPropiedad(lista[i]);
+        // CANDADO A: si el link YA existe en properties, IA apagada para esa ficha (determinista solo).
+        var p;
+        if (_urlsRespP) {
+          var _iaFichaP = _iaRespP && !_linkYaExiste(_linksExistP, lista[i]);
+          p = await procesarPropiedadURL(lista[i], cfg.user_id, _iaFichaP, _ctrlIAP);
+        } else {
+          p = await procesarPropiedad(lista[i]);
+        }
         if (!p || !p.numero) continue;
         var _fotosPend = Array.isArray(p.fotos) ? p.fotos : [];
         var nuevo = {
@@ -21290,6 +21370,12 @@ async function correrScrapingPendiente(cfg) {
           nuevas++;
         }
       } catch (e) {}
+    }
+    // CANDADO B: resumen de gasto IA de la corrida (solo camino universal con IA habilitada).
+    if (_ctrlIAP) {
+      console.log('[cron universal] IA fichas (pendiente) user', cfg.user_id, '-> usadas:', _ctrlIAP.usados + '/' + _ctrlIAP.max,
+        '| saltadas por tope de corrida (quedan para la proxima):', _ctrlIAP.saltadas_tope_corrida,
+        '| saltadas por tope del plan:', _ctrlIAP.saltadas_tope_plan);
     }
     return { ok: true, nuevas: nuevas, modificadas: modificadas, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }

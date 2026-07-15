@@ -4751,7 +4751,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     toolsAgente.push({
       name: 'consultar_disponibilidad',
       description: 'Usala cuando el lead pide DISPONIBILIDAD o PRECIO para fechas concretas (ej: "tienen para el 10 al 13 de enero?", "cuanto sale una cabaña 3 noches en febrero para 2 personas?"). Consulta en vivo el motor de reservas y te devuelve las habitaciones con precio y si hay lugar. HOY es ' + _hoyISO + ': convertí las fechas del lead a formato AAAA-MM-DD; si el mes ya pasó este año, usá el año que viene. Si el lead no dio fecha de salida pero sí cantidad de noches, calculala. Si faltan datos (fechas o personas), preguntáselos con naturalidad ANTES de usar la tool, no inventes.',
-      input_schema: { type: 'object', properties: { check_in: { type: 'string', description: 'Fecha de entrada en formato AAAA-MM-DD (ej: 2026-01-10).' }, check_out: { type: 'string', description: 'Fecha de salida en formato AAAA-MM-DD (ej: 2026-01-13).' }, adultos: { type: 'integer', description: 'Cantidad de adultos/personas. Si no lo dijeron, asumí 2.' } }, required: ['check_in', 'check_out'] }
+      input_schema: { type: 'object', properties: { check_in: { type: 'string', description: 'Fecha de entrada en formato AAAA-MM-DD (ej: 2026-01-10).' }, check_out: { type: 'string', description: 'Fecha de salida en formato AAAA-MM-DD (ej: 2026-01-13).' }, adultos: { type: 'integer', description: 'Cantidad de adultos/personas. Si no lo dijeron, asumí 2.' }, ninos: { type: 'integer', description: 'Cantidad de niños/menores (sin contar bebés). Si no mencionaron niños, 0. IMPORTANTE: si el lead menciona hijos/nenes/menores, pasalos acá — cambian el precio y qué habitaciones aplican.' } }, required: ['check_in', 'check_out'] }
     });
   }
 
@@ -4898,11 +4898,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _ci = (_toolDispo.input && _toolDispo.input.check_in) ? String(_toolDispo.input.check_in).trim() : '';
         const _co = (_toolDispo.input && _toolDispo.input.check_out) ? String(_toolDispo.input.check_out).trim() : '';
         const _ad = (_toolDispo.input && _toolDispo.input.adultos) ? _toolDispo.input.adultos : 2;
+        const _ni = (_toolDispo.input && _toolDispo.input.ninos) ? _toolDispo.input.ninos : 0;
         const _cfgPx = await _pxsolConfigDeCuenta(user_id);
         if (!_cfgPx) {
           _resDispoTxt = 'No pude conectar con el motor de reservas del hotel. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
         } else {
-          const _disp = await _pxsolDisponibilidad(_cfgPx, _ci, _co, _ad);
+          const _disp = await _pxsolDisponibilidad(_cfgPx, _ci, _co, _ad, _ni);
           if (!_disp.ok) {
             _resDispoTxt = 'No se pudo consultar la disponibilidad (' + (_disp.error || 'error') + '). Confirma con el lead las fechas (entrada y salida) y cuantas personas, o decile que le confirmas a la brevedad. NO inventes precios.';
           } else {
@@ -4926,7 +4927,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             } else {
               const _NLd = String.fromCharCode(10);
               const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
-              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' personas). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
+              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' adultos' + (_ni > 0 ? ' y ' + _ni + ' niños' : '') + '). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
             }
           }
         }
@@ -16543,7 +16544,7 @@ function _pxsolConfig(homepageHtml) {
 
 // Consulta disponibilidad+precios para fechas concretas (YYYY-MM-DD). Devuelve
 // { ok, nights, moneda, opciones:[{nombre, total, porNoche, disponibles, desayuno} | {nombre, sinDisponibilidad, minLOS}] } | { ok:false, error }.
-async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos) {
+async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos, ninos) {
   try {
     if (!cfg || !cfg.productId) return { ok: false, error: 'sin config pxsol' };
     var d1 = new Date(String(checkinISO) + 'T12:00:00'), d2 = new Date(String(checkoutISO) + 'T12:00:00');
@@ -16552,8 +16553,12 @@ async function _pxsolDisponibilidad(cfg, checkinISO, checkoutISO, adultos) {
     if (nights < 1) return { ok: false, error: 'el check-out debe ser posterior al check-in' };
     var ddmm = function (dt) { return _padDos(dt.getDate()) + '/' + _padDos(dt.getMonth() + 1) + '/' + dt.getFullYear(); };
     var ad = Math.max(1, Math.min(12, parseInt(adultos, 10) || 2));
+    // NIÑOS (ADITIVO, verificado 2026-07-15 contra la API): PXSOL los recibe en GroupsForm
+    // "habitacion:adultos,niños,bebes" (es lo que manda el buscador de la web). Cambian precio y
+    // que habitaciones aplican. Sin niños, el body queda EXACTAMENTE como antes.
+    var ni = Math.max(0, Math.min(8, parseInt(ninos, 10) || 0));
     var api = cfg.api || 'https://api-1-eb-web.pxsol.io';
-    var body = 'ProductID=' + cfg.productId + '&Start=' + ddmm(d1) + '&End=' + ddmm(d2) + '&Channel=2&RateType=auto&Currency=ARS&MaxRooms=1&Rooms=1&Adults=' + ad + '&Nights=' + nights + '&Lng=es';
+    var body = 'ProductID=' + cfg.productId + '&Start=' + ddmm(d1) + '&End=' + ddmm(d2) + '&Channel=2&RateType=auto&Currency=ARS&MaxRooms=1&Rooms=1&Adults=' + ad + '&Nights=' + nights + '&Lng=es' + (ni > 0 ? '&GroupsForm=1:' + ad + ',' + ni + ',0' : '');
     var rIns = await fetchScrape(api + '/search/insert', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'RaicesCRM/1.0 (+https://raicescrm.com)' }, body: body });
     if (!rIns.ok) return { ok: false, error: 'insert http ' + rIns.status };
     var mSid = (await rIns.text()).match(/SearchID=(\d+)/);

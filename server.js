@@ -7490,7 +7490,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     if (!conversation_id || !texto) return res.status(400).json({ error: 'Faltan datos' });
 
     // 1) Buscar la conversacion para obtener el contacto (y el tenant dueño REAL).
-    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id, traductor_activo, idioma_lead').eq('id', conversation_id).maybeSingle();
+    const { data: conv } = await supabase.from('conversations').select('contact_id, user_id, traductor_activo, idioma_lead, channel').eq('id', conversation_id).maybeSingle();
     if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
     // SEGURIDAD (IDOR A2): verificar PERTENENCIA por tenant. Antes solo se comparaba el user_id del BODY contra el
     // token (identidad trivial: cualquiera podia mandar su propio user_id y operar conversaciones ajenas). Ahora el
@@ -7584,6 +7584,27 @@ app.post('/api/whatsapp/send', async (req, res) => {
 
     // 5) Enviar por WhatsApp
     const msgId = msgInsertado ? msgInsertado.id : null;
+
+    // ===== META (Messenger / Instagram) — responder MANUALMENTE un DM desde Conversaciones =====
+    // ADITIVO y AISLADO: solo entra si la conversation es de un canal Meta ('messenger'|'instagram').
+    // Las conversaciones de WhatsApp (channel null/'whatsapp') NO tocan este bloque y siguen por el camino
+    // Cloud/Evolution de abajo -> comportamiento BYTE-IDENTICO al actual. Reusa enviarMensajeMeta() (la MISMA
+    // Send API que usa la IA para auto-responder). El destinatario es contacto.phone (que en un canal Meta guarda
+    // el PSID de Messenger o el IGSID de Instagram). FAIL-CLOSED: sin credencial ACTIVA del tenant para ese canal,
+    // NO se envia nada (y NO se cae a Evolution con un PSID que fallaria en silencio): se devuelve 400 con el motivo.
+    // El mensaje ya quedo guardado arriba como 'human'; aca solo se actualiza su estado_envio (igual que el path Cloud).
+    if (conv.channel === 'messenger' || conv.channel === 'instagram') {
+      const _credMeta = await _credMetaSalientePorUsuario(conv.user_id, conv.channel);
+      const _etqCanal = (conv.channel === 'instagram') ? 'Instagram' : 'Messenger';
+      if (!_credMeta) {
+        if (msgId) { try { await supabase.from('messages').update({ estado_envio: 'fallido' }).eq('id', msgId); } catch (eUpM) {} }
+        return res.status(400).json({ sent: false, estado_envio: 'fallido', error: _etqCanal + ' no esta conectado o activo para esta cuenta.' });
+      }
+      const _okMeta = await enviarMensajeMeta(_credMeta.page_access_token, contacto.phone, textoEnviar, conv.channel, _credMeta.ig_user_id);
+      if (msgId) { try { await supabase.from('messages').update({ estado_envio: _okMeta ? 'enviado' : 'fallido' }).eq('id', msgId); } catch (eUpM) {} }
+      if (!_okMeta) return res.status(400).json({ sent: false, estado_envio: 'fallido', error: 'Meta rechazo el envio a ' + _etqCanal + ' (ventana de 24 h vencida o token no valido).' });
+      return res.json({ sent: true, estado_envio: 'enviado' });
+    }
 
     // ===== CLOUD API (gated cloud_api_v1, default OFF) — UNICO enganche de canalSalienteDe() =====
     // FAIL-CLOSED: canalSalienteDe() devuelve 'evolution' con el flag OFF, sin numero Cloud activo,
@@ -24414,21 +24435,30 @@ setTimeout(revisarSaludSistema, 75 * 1000);       // primer chequeo a los 75s de
 const META_GRAPH_VERSION = 'v21.0';
 const META_VERIFY_TOKEN_ENV = process.env.META_VERIFY_TOKEN || '';
 
-// --- ENVIO via Graph API (Send API). Best-effort: una falla nunca rompe el flujo. ---
-// POST https://graph.facebook.com/v21.0/me/messages?access_token=...
-// Sirve igual para Messenger e Instagram (misma Send API). Devuelve true/false.
-async function enviarMensajeMeta(pageAccessToken, recipientId, texto) {
+// --- ENVIO via Graph API (Send API). Best-effort: una falla nunca rompe el flujo. Devuelve true/false. ---
+// Messenger -> POST https://graph.facebook.com/v21.0/me/messages con el token de la Pagina.
+// Instagram (flujo "Instagram Login") -> POST https://graph.instagram.com/v21.0/<IG_ID>/messages con el token IG:
+//   ese token NO es valido contra graph.facebook.com (por eso IG necesita su propio host). Mismo criterio de host
+//   que _nombreRemitenteMeta, que ya lee de graph.instagram.com para IG. El body es identico salvo messaging_type,
+//   que es un campo del Messenger Platform (IG no lo usa). DEFAULT (canal ausente o 'messenger') = Facebook +
+//   messaging_type:'RESPONSE' -> BYTE-IDENTICO al comportamiento anterior. igBusinessId = el ig_user_id propio del
+//   tenant (segmento del path para IG); si no se pasa, se cae a 'me' (el token identifica igual a la cuenta).
+async function enviarMensajeMeta(pageAccessToken, recipientId, texto, canal, igBusinessId) {
   try {
     if (!pageAccessToken || !recipientId || !texto) return false;
-    const url = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/me/messages?access_token=' + encodeURIComponent(pageAccessToken);
+    let url, cuerpo;
+    if (canal === 'instagram') {
+      const seg = igBusinessId ? encodeURIComponent(String(igBusinessId)) : 'me';
+      url = 'https://graph.instagram.com/' + META_GRAPH_VERSION + '/' + seg + '/messages?access_token=' + encodeURIComponent(pageAccessToken);
+      cuerpo = { recipient: { id: String(recipientId) }, message: { text: String(texto) } };
+    } else {
+      url = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/me/messages?access_token=' + encodeURIComponent(pageAccessToken);
+      cuerpo = { recipient: { id: String(recipientId) }, messaging_type: 'RESPONSE', message: { text: String(texto) } };
+    }
     const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        recipient: { id: String(recipientId) },
-        messaging_type: 'RESPONSE',
-        message: { text: String(texto) }
-      })
+      body: JSON.stringify(cuerpo)
     });
     if (!resp.ok) {
       let _det = '';
@@ -24495,6 +24525,27 @@ async function _resolverCredMeta(canal, idCuenta) {
       .eq(columna, String(idCuenta))
       .maybeSingle();
     if (error || !data) return null;
+    return data;
+  } catch (e) { return null; }
+}
+
+// --- Resolver la credencial META de SALIDA por tenant + canal de la conversacion. ---
+// Se usa para RESPONDER MANUALMENTE (un humano en Conversaciones) un DM de Messenger/Instagram, reusando la MISMA
+// Send API que ya usa la IA (enviarMensajeMeta). El channel de la conversation es 'messenger'|'instagram'; en la
+// tabla messenger_credentials el canal es 'page' (Messenger) | 'instagram'. Devuelve la credencial ACTIVA del tenant
+// (page_access_token) o null si no hay / no esta activa -> FAIL-CLOSED (el caller NO cae a WhatsApp con un PSID).
+async function _credMetaSalientePorUsuario(userId, canalConv) {
+  try {
+    if (!userId) return null;
+    const dbCanal = (canalConv === 'instagram') ? 'instagram' : 'page'; // 'messenger' -> 'page'
+    const { data, error } = await supabase
+      .from('messenger_credentials')
+      .select('id, user_id, canal, page_access_token, ig_user_id, activo')
+      .eq('user_id', userId)
+      .eq('canal', dbCanal)
+      .eq('activo', true)
+      .maybeSingle();
+    if (error || !data || !data.page_access_token) return null;
     return data;
   } catch (e) { return null; }
 }
@@ -24588,7 +24639,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     // humanos). FAIL-OPEN: ante error no corta. 0 IA (solo lee/escribe DB). Mismo patron: avisar al lead + contar.
     try {
       if (!(await dentroDelTopeNocturno(tenantUserId))) {
-        try { await enviarMensajeMeta(creds.page_access_token, senderId, 'En este momento estamos fuera del horario de atencion. Un asesor te responde a la brevedad apenas se conecte. Gracias por escribirnos.'); } catch (eMn) {}
+        try { await enviarMensajeMeta(creds.page_access_token, senderId, 'En este momento estamos fuera del horario de atencion. Un asesor te responde a la brevedad apenas se conecte. Gracias por escribirnos.', canal, creds.ig_user_id); } catch (eMn) {}
         return;
       }
       try { await registrarMensajeNocturno(tenantUserId); } catch (eRn) {}
@@ -24598,7 +24649,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     const resultado = await generarRespuestaAgente(tenantUserId, conv.id, texto);
     if (resultado && resultado.reply) {
       const _txt = resultado.replyCliente || resultado.reply;
-      const _ok = await enviarMensajeMeta(creds.page_access_token, senderId, _txt);
+      const _ok = await enviarMensajeMeta(creds.page_access_token, senderId, _txt, canal, creds.ig_user_id);
       // Registrar uso (best-effort), igual que el webhook WA.
       try { await registrarUsoTokens(tenantUserId, resultado.usage); } catch (e) {}
       try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
@@ -24626,7 +24677,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     // FASE 0 — Degradacion elegante en el canal Meta (mismo criterio que WhatsApp).
     try {
       if (esErrorTransitorioIA(e) && conv && conv.id && creds && senderId) {
-        try { await enviarMensajeMeta(creds.page_access_token, senderId, MSG_DEMORA_IA); } catch (eEnv) {}
+        try { await enviarMensajeMeta(creds.page_access_token, senderId, MSG_DEMORA_IA, canal, creds.ig_user_id); } catch (eEnv) {}
         try { await supabase.from('messages').insert({ conversation_id: conv.id, user_id: tenantUserId, role: 'ai', content: MSG_DEMORA_IA, enviado_por: 'Agente IA' }); } catch (eIns) {}
         try { await derivarAHumano(conv.id, tenantUserId, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', resumen: false }); } catch (eDer) {}
         try { await avisarSiIaCaida(e); } catch (eAv) {}
@@ -25451,11 +25502,14 @@ setTimeout(_migracionDireccionDefensiva, 11 * 1000);
 const CLOUD_API_GRAPH_VERSION = 'v25.0';
 
 // Env vars NUEVAS, TODAS OPCIONALES (deploy-safe: si faltan, el boot no se entera):
-//   - META_WEBHOOK_VERIFY_TOKEN : para el handshake GET del webhook de Meta.
+//   - Token de verificacion del handshake GET del webhook. Acepta META_WEBHOOK_VERIFY_TOKEN
+//     (nombre propio) O, como fallback, el mismo META_VERIFY_TOKEN que YA usa el webhook de
+//     Messenger/Instagram (~24436). Asi un solo token secreto sirve para los tres webhooks
+//     (Messenger, Instagram y WhatsApp Cloud) y no hay que cargar dos variables con el mismo valor.
 //   - META_APP_ID / META_APP_SECRET : YA EXISTEN (declaradas ~24837, las usa el OAuth de
 //     Messenger). Se REUSAN aca (no se redeclaran). Si faltan, el camino MANUAL de la demo
 //     (pegar el token en el panel) igual anda; solo el Embedded Signup queda deshabilitado.
-const CLOUD_API_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN || '';
+const CLOUD_API_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN || process.env.META_VERIFY_TOKEN || '';
 
 // ===== GATE por cuenta: business_settings.cloud_api_v1 =====
 // FAIL-CLOSED: ante CUALQUIER error (columna inexistente, sin migracion, red) -> false
@@ -25739,7 +25793,7 @@ app.get('/api/webhook/cloud-api', function(req, res) {
     if (modo === 'subscribe' && CLOUD_API_VERIFY_TOKEN && token === CLOUD_API_VERIFY_TOKEN) {
       return res.status(200).send(String(challenge == null ? '' : challenge));
     }
-    if (!CLOUD_API_VERIFY_TOKEN) console.warn('[cloud-api] handshake rechazado: falta la env META_WEBHOOK_VERIFY_TOKEN.');
+    if (!CLOUD_API_VERIFY_TOKEN) console.warn('[cloud-api] handshake rechazado: falta la env META_WEBHOOK_VERIFY_TOKEN (o su fallback META_VERIFY_TOKEN).');
     return res.sendStatus(403);
   } catch (e) {
     console.error('[cloud-api] GET webhook error:', e && e.message);

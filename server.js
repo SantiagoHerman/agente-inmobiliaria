@@ -90,6 +90,7 @@ app.use((req, res, next) => {
     if (req.path === '/api/webhook/whatsapp') return next();
     if (req.path === '/api/webhook/mercadopago') return next();
     if (req.path === '/api/webhook/meta') return next(); // webhook Meta (Messenger/Instagram): Meta exige <2s y reintenta
+    if (req.path === '/api/webhook/cloud-api') return next(); // webhook WhatsApp Cloud API: idem (Meta exige <2s y reintenta)
     if (req.path === '/health') return next();
     const ip = (req.headers['x-forwarded-for'] || req.ip || 'sin-ip').split(',')[0].trim();
     const n = (_rlHits.get(ip) || 0) + 1;
@@ -7581,8 +7582,44 @@ app.post('/api/whatsapp/send', async (req, res) => {
       }
     }
 
-    // 5) Enviar por WhatsApp via Evolution
+    // 5) Enviar por WhatsApp
     const msgId = msgInsertado ? msgInsertado.id : null;
+
+    // ===== CLOUD API (gated cloud_api_v1, default OFF) — UNICO enganche de canalSalienteDe() =====
+    // FAIL-CLOSED: canalSalienteDe() devuelve 'evolution' con el flag OFF, sin numero Cloud activo,
+    // o ante CUALQUIER error/excepcion. Para TODOS los clientes de hoy (Anton, Tequendama, etc.) este
+    // bloque es un NO-EVENTO: se saltea entero y corre el enviarWhatsapp() de siempre, byte-identico.
+    // Solo una cuenta con el flag ON **y** un numero Cloud conectado y activo entra aca.
+    // POR QUE existe (unica desviacion del "no tocar el motor de envio"): sin esto, el paso 4 de la
+    // demo (responder al lead desde Conversaciones dentro de la ventana de 24h) es IMPOSIBLE en una
+    // cuenta Cloud, porque no hay instancia de Evolution que pueda entregar el mensaje.
+    // Para revertir: borrar este bloque (el camino Evolution de abajo queda intacto).
+    // B1c: la decision es POR CONVERSACION (no por cuenta). Una conv de Evolution sigue saliendo
+    // por Evolution aunque el flag Cloud este ON -> prender el flag NO desvia la bandeja historica.
+    let _canalSal = 'evolution';
+    try { _canalSal = await canalSalienteDe(conv.user_id, conversation_id); } catch (eCanal) { _canalSal = 'evolution'; }
+    if (_canalSal === 'cloud') {
+      const _rc = await enviarTextoCloud(conv.user_id, contacto.phone, textoEnviar);
+      // Registrar el estado del envio igual que hace enviarWhatsapp() (best-effort, defensivo).
+      // wa_message_id = el wamid de Meta -> deja que el webhook de statuses pinte las tildes ✓/✓✓.
+      if (msgId) {
+        try {
+          await supabase.from('messages')
+            .update(Object.assign({ estado_envio: _rc.ok ? 'enviado' : 'fallido' }, (_rc.ok && _rc.id) ? { wa_message_id: _rc.id } : {}))
+            .eq('id', msgId);
+        } catch (eUpC) {}
+      }
+      // D6 (2026-07-16): cuando Meta RECHAZA hay que devolver HTTP 400, no 200.
+      // Antes esto devolvia 200 con { sent:false, error }: el front (conversaciones/page.tsx
+      // ~2071) solo alerta `if (!resp.ok)`, asi que con 200 el error REAL de Meta se tiraba a la
+      // basura y el asesor veia su mensaje como si hubiera salido. Con 400, el manejo que el front
+      // YA tiene muestra el texto exacto de Meta ("Fuera de la ventana de 24 h: ..."). En camara,
+      // si algo falla, se ve lo que pasa de verdad. El shape de la respuesta OK no cambia.
+      if (!_rc.ok) return res.status(400).json({ sent: false, estado_envio: 'fallido', error: _rc.error });
+      return res.json({ sent: true, estado_envio: 'enviado' });
+    }
+
+    // ===== Evolution: camino de SIEMPRE, intacto =====
     const salio = await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgId);
 
     res.json({ sent: salio, estado_envio: salio ? 'enviado' : 'fallido' });
@@ -10807,6 +10844,18 @@ async function reintentarFallidos() {
         // conversacion -> user_id y contacto
         const { data: conv } = await supabase.from('conversations').select('id, user_id, contact_id').eq('id', msg.conversation_id).maybeSingle();
         if (!conv) continue;
+        // CLOUD API (ADITIVO): este cron reenvia SIEMPRE por Evolution. Un mensaje que salio por Cloud y Meta rechazo
+        // queda 'fallido' y SIN wa_message_id -> el guard de arriba no lo saltea -> se reenviaria por el numero VIEJO
+        // de Evolution. Pasa de verdad en la convivencia (cuenta con los dos canales, que es el caso de la demo).
+        // Las convs NACIDAS por Cloud se saltean. _canalOrigenDeConv es DEFENSIVA: columna ausente (migracion sin
+        // correr) o error -> null -> se reenvia por Evolution EXACTAMENTE como hoy. Con el flag OFF ninguna conv
+        // tiene canal_origen='cloud' -> este if nunca da true -> no-evento para Anton/Tequendama.
+        try {
+          if ((await _canalOrigenDeConv(msg.conversation_id)) === 'cloud') {
+            try { await supabase.from('messages').update({ estado_envio: 'indeterminado' }).eq('id', msg.id); } catch (eMkC) {}
+            continue;
+          }
+        } catch (eCanalR) { /* ante duda: seguir por Evolution, como siempre */ }
         const instancia = nombreInstancia(conv.user_id);
         // solo reenviar si la instancia esta conectada ahora
         const conectada = await instanciaConectada(instancia);
@@ -23595,8 +23644,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _mv = await supabase.from('business_settings').select('matching_v1').eq('user_id', user_id).maybeSingle();
       if (_mv && _mv.data) matching_v1 = _mv.data.matching_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1 });
-  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false }); }
+    // cloud_api_v1 (gate del modulo WhatsApp Cloud API oficial): query SEPARADA y defensiva.
+    // Ausente/error -> false (comportamiento actual: la card de Configuracion no se renderiza).
+    var cloud_api_v1 = false;
+    try {
+      var _cav = await supabase.from('business_settings').select('cloud_api_v1').eq('user_id', user_id).maybeSingle();
+      if (_cav && _cav.data) cloud_api_v1 = _cav.data.cloud_api_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1 });
+  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false }); }
 });
 
 // ============================================================================
@@ -25359,5 +25415,1121 @@ async function _migracionDireccionDefensiva() {
   }
 }
 setTimeout(_migracionDireccionDefensiva, 11 * 1000);
+
+// ============================================================================
+// ===== WHATSAPP CLOUD API (oficial de Meta) — MODULO NUEVO, 100% ADITIVO =====
+// ============================================================================
+// REGLA MADRE de este bloque: NO toca NADA del camino actual de WhatsApp
+// (Evolution / Baileys), que es lo que hoy usan Anton, Tequendama y todos.
+// Todo lo de aca abajo es codigo NUEVO en funciones NUEVAS, gateado por
+// business_settings.cloud_api_v1 (default FALSE => inerte). Para un cliente que
+// hoy anda con Evolution, este bloque es un NO-EVENTO: ninguna de estas
+// funciones se ejecuta jamas con el flag apagado.
+//
+// A PROPOSITO se DUPLICA logica en vez de refactorizar lo compartido:
+//   - CLOUD_API_GRAPH_VERSION ('v25.0') es SEPARADO de META_GRAPH_VERSION
+//     ('v21.0', linea ~24358). Tocar esa constante cambiaria el comportamiento
+//     de Messenger/Instagram => prohibido.
+//   - procesarMensajeCloud() es una funcion NUEVA y separada. NO se metieron
+//     ifs adentro del webhook de Evolution (/api/webhook/whatsapp, ~6412).
+// Se REUSAN solo helpers de lectura, agnosticos al canal y ya compartidos por
+// varios webhooks: obtenerOcrearConvDeCanal (M18, ya la usa el webhook de Meta),
+// _metaFirmaOk (validacion HMAC pura), generarRespuestaAgente, y los gates
+// (debeBloquearAcceso / dentroDelTopeIA). Reusarlos NO los modifica.
+//
+// MODELO TECH PROVIDER: cada cliente es dueño de SU WABA y SU numero y le paga
+// los mensajes DIRECTO a Meta. Raices solo orquesta => el token vive POR TENANT
+// en cloud_api_numbers.token. NUNCA hay un token hardcodeado (el de la consola
+// de Meta vence en 24h; se re-pega desde el panel, o llega por Embedded Signup).
+//
+// Requiere: migracion-cloud-api.sql (tablas cloud_api_numbers / cloud_api_templates
+// + business_settings.cloud_api_v1). TODO es deploy-safe: si la migracion todavia
+// NO se corrio, cada funcion devuelve null/false y NADA rompe (ni el boot).
+// ============================================================================
+
+// Version del Graph API para Cloud API. SEPARADA de META_GRAPH_VERSION a proposito (ver arriba).
+const CLOUD_API_GRAPH_VERSION = 'v25.0';
+
+// Env vars NUEVAS, TODAS OPCIONALES (deploy-safe: si faltan, el boot no se entera):
+//   - META_WEBHOOK_VERIFY_TOKEN : para el handshake GET del webhook de Meta.
+//   - META_APP_ID / META_APP_SECRET : YA EXISTEN (declaradas ~24837, las usa el OAuth de
+//     Messenger). Se REUSAN aca (no se redeclaran). Si faltan, el camino MANUAL de la demo
+//     (pegar el token en el panel) igual anda; solo el Embedded Signup queda deshabilitado.
+const CLOUD_API_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN || '';
+
+// ===== GATE por cuenta: business_settings.cloud_api_v1 =====
+// FAIL-CLOSED: ante CUALQUIER error (columna inexistente, sin migracion, red) -> false
+// => comportamiento ACTUAL EXACTO (Evolution). Mismo patron que iaUbicacionActivo /
+// iaDisponibilidadActivo (~1717/~1729). Reusa un bs ya cargado si trae la propiedad.
+async function cloudApiActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'cloud_api_v1')) return bs.cloud_api_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('cloud_api_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> flag OFF
+    return !!(data && data.cloud_api_v1 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como OFF
+}
+
+// ===== Config Cloud API ACTIVA de una cuenta =====
+// Devuelve la fila activa de cloud_api_numbers, o null. DEPLOY-SAFE: si la tabla todavia
+// no existe (migracion no corrida), el select devuelve error -> null, sin romper nada.
+async function _cloudApiConfigDeCuenta(user_id) {
+  try {
+    if (!user_id) return null;
+    const { data, error } = await supabase
+      .from('cloud_api_numbers')
+      .select('id, user_id, waba_id, phone_number_id, display_number, token, verificado, activo')
+      .eq('user_id', user_id).eq('activo', true)
+      .order('creado_at', { ascending: false })
+      .limit(1).maybeSingle();
+    if (error) return null; // tabla ausente / error -> null (el modulo queda inerte)
+    return data || null;
+  } catch (e) { return null; }
+}
+
+// ===== Resolver el DUEÑO (tenant) a partir del uid del token =====
+// Si quien pide es un ASESOR, la config Cloud API es la del DUEÑO (admin_id). El dueño no
+// tiene fila en asesores -> queda igual. MISMO patron que /api/ui-flags (~23567) y que el
+// resto de los gates (ver memoria "Fix asesor suscripcion dueño": todo gate resuelve el dueño).
+async function _cloudApiDueno(uid) {
+  try {
+    if (!uid) return null;
+    const { data } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (data && data.admin_id) return data.admin_id;
+  } catch (e) { /* sin fila -> es el dueño */ }
+  return uid;
+}
+
+// ===== B2 (SEGURIDAD): ¿el que llama es el DUEÑO de la cuenta (y no un asesor)? =====
+// POR QUE: los endpoints de /api/cloud-api/* configuran EL CANAL DE WHATSAPP DE TODA LA CUENTA.
+// Con solo "sesion valida", CUALQUIER asesor podia pegar SU numero + SU token y desviarse el
+// WhatsApp saliente del tenant entero (leyendo telefono y texto de cada lead), o borrarle el
+// token al dueño con el DELETE. Un asesor NO tiene por que tocar esto: es config del dueño.
+//
+// CRITERIO (el mismo de _equipoIdentidad ~12055 y _resolverOwnerId ~7973): el DUEÑO es el uid que
+// NO tiene fila en `asesores` con admin_id. Un asesor SIEMPRE tiene admin_id apuntando al dueño.
+//
+// FAIL-CLOSED a proposito (y esta es la diferencia con _cloudApiDueno, que es fail-open por
+// diseño): ante error de red/columna/tabla -> false -> 403. _cloudApiDueno ante un error devuelve
+// el mismo uid, lo que haria pasar a un ASESOR por dueño; por eso este chequeo NO se deriva de
+// comparar `_cloudApiDueno(uid) === uid`, sino que consulta y falla cerrado.
+async function _cloudApiEsDueno(uid) {
+  try {
+    if (!uid) return false;
+    const { data, error } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (error) return false;                 // ante duda -> NO es dueño (fail-closed)
+    if (data && data.admin_id) return false; // tiene admin_id -> es ASESOR
+    return true;                             // sin fila en asesores -> es el DUEÑO
+  } catch (e) { return false; }
+}
+
+// ===== Normalizar destinatario (solo digitos, como espera Meta) =====
+function _cloudApiNumero(n) { return String(n == null ? '' : n).replace(/[^0-9]/g, ''); }
+
+// ===== Traducir un error de Meta a algo que un humano entienda =====
+// Caso estrella: la VENTANA DE 24h. Si el lead no escribio en las ultimas 24h, Meta rechaza
+// el texto libre (codigo 131047 / 131026) y SOLO se puede mandar una PLANTILLA aprobada.
+function _cloudApiErrorLegible(j) {
+  try {
+    const err = j && j.error ? j.error : null;
+    if (!err) return 'Meta rechazo el envio (sin detalle).';
+    const code = err.code;
+    if (code === 131047) return 'Fuera de la ventana de 24 h: el contacto no escribio en las ultimas 24 h. Para reabrir la conversacion hay que mandarle una PLANTILLA aprobada.';
+    if (code === 131026) return 'Meta no puede entregar el mensaje: el numero no tiene WhatsApp o no acepta mensajes de este negocio.';
+    if (code === 190) return 'El token vencio o es invalido. Pegá un token nuevo en Configuracion -> WhatsApp API oficial.';
+    if (code === 132000 || code === 132001) return 'La plantilla no existe o no esta aprobada en ese idioma.';
+    if (code === 131030) return 'El numero destino no esta en la lista de destinatarios permitidos del numero de PRUEBA de Meta. Agregalo en la consola de Meta.';
+    return (err.message || 'Meta rechazo el envio.') + (code ? (' (codigo ' + code + ')') : '');
+  } catch (e) { return 'Meta rechazo el envio.'; }
+}
+
+// ===== ENVIAR PLANTILLA (Cloud API) =====
+// POST https://graph.facebook.com/v25.0/<phone_number_id>/messages con Bearer token DEL TENANT.
+// Una PLANTILLA aprobada es lo UNICO que se puede mandar FUERA de la ventana de 24h => es la
+// que abre la conversacion (paso 2 de la demo). parametros = array de strings para el BODY ({{1}}, {{2}}...).
+// Devuelve { ok, id } | { ok:false, error }.
+async function enviarPlantillaCloud(user_id, plantilla, idioma, destinatario, parametros) {
+  try {
+    const cfg = await _cloudApiConfigDeCuenta(user_id);
+    if (!cfg) return { ok: false, error: 'No hay un numero de WhatsApp API oficial conectado en esta cuenta.' };
+    if (!cfg.token) return { ok: false, error: 'La conexion no tiene token cargado.' };
+    if (!cfg.phone_number_id) return { ok: false, error: 'La conexion no tiene Phone Number ID.' };
+    const to = _cloudApiNumero(destinatario);
+    if (!to) return { ok: false, error: 'Destinatario invalido.' };
+    if (!plantilla) return { ok: false, error: 'Falta el nombre de la plantilla.' };
+
+    const cuerpo = {
+      messaging_product: 'whatsapp',
+      to: to,
+      type: 'template',
+      template: { name: String(plantilla), language: { code: String(idioma || 'es') } }
+    };
+    // Parametros del BODY: solo se mandan si hay (una plantilla sin variables NO lleva components).
+    const params = Array.isArray(parametros) ? parametros.filter(function(p){ return p != null && String(p) !== ''; }) : [];
+    if (params.length) {
+      cuerpo.template.components = [{
+        type: 'body',
+        parameters: params.map(function(p){ return { type: 'text', text: String(p) }; })
+      }];
+    }
+
+    const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(cfg.phone_number_id) + '/messages';
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + cfg.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(cuerpo)
+    });
+    const j = await r.json().catch(function(){ return null; });
+    if (!r.ok || !j || j.error) {
+      // El token NUNCA se loguea.
+      console.error('[cloud-api] enviarPlantillaCloud fallo:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 300));
+      return { ok: false, error: _cloudApiErrorLegible(j) };
+    }
+    const id = (j.messages && j.messages[0] && j.messages[0].id) || null;
+    return { ok: true, id: id };
+  } catch (e) {
+    console.error('[cloud-api] enviarPlantillaCloud error:', e && e.message);
+    return { ok: false, error: (e && e.message) || 'Error enviando la plantilla.' };
+  }
+}
+
+// ===== ENVIAR TEXTO LIBRE (Cloud API) =====
+// SOLO valido DENTRO de la ventana de 24h (o sea: el lead escribio hace menos de 24h). Si Meta
+// lo rechaza por ventana, se devuelve el error CLARO (ver _cloudApiErrorLegible / 131047).
+// Devuelve { ok, id } | { ok:false, error }.
+async function enviarTextoCloud(user_id, destinatario, texto) {
+  try {
+    const cfg = await _cloudApiConfigDeCuenta(user_id);
+    if (!cfg) return { ok: false, error: 'No hay un numero de WhatsApp API oficial conectado en esta cuenta.' };
+    if (!cfg.token) return { ok: false, error: 'La conexion no tiene token cargado.' };
+    if (!cfg.phone_number_id) return { ok: false, error: 'La conexion no tiene Phone Number ID.' };
+    const to = _cloudApiNumero(destinatario);
+    if (!to) return { ok: false, error: 'Destinatario invalido.' };
+    if (!texto || !String(texto).trim()) return { ok: false, error: 'Texto vacio.' };
+
+    const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(cfg.phone_number_id) + '/messages';
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + cfg.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: to,
+        type: 'text',
+        text: { preview_url: false, body: String(texto) }
+      })
+    });
+    const j = await r.json().catch(function(){ return null; });
+    if (!r.ok || !j || j.error) {
+      console.error('[cloud-api] enviarTextoCloud fallo:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 300));
+      return { ok: false, error: _cloudApiErrorLegible(j) };
+    }
+    const id = (j.messages && j.messages[0] && j.messages[0].id) || null;
+    return { ok: true, id: id };
+  } catch (e) {
+    console.error('[cloud-api] enviarTextoCloud error:', e && e.message);
+    return { ok: false, error: (e && e.message) || 'Error enviando el mensaje.' };
+  }
+}
+
+// ============================================================================
+// ===== CONVIVENCIA CON EVOLUTION: canalSalienteDe(user_id) ==================
+// ============================================================================
+// Decide por QUE canal deberia SALIR un mensaje de UNA CONVERSACION de este tenant:
+//   'cloud'     -> cloud_api_v1 ON **Y** numero Cloud activo **Y** la conversacion NACIO por Cloud.
+//   'evolution' -> en cualquier otro caso (incluye TODOS los clientes de hoy).
+// FAIL-CLOSED: ante cualquier error/duda -> 'evolution' (comportamiento actual).
+//
+// ===== B1c (2026-07-16): EL RUTEO ES POR CONVERSACION, NO POR CUENTA =====
+// FOOTGUN QUE ESTO ARREGLA: antes la decision era SOLO por cuenta (user_id). Prender el flag
+// desviaba de golpe TODO el WhatsApp saliente del tenant al numero Cloud nuevo => las respuestas
+// a los leads VIEJOS (que hablaron con el numero de Evolution y NUNCA le escribieron al numero
+// Cloud) salian por un numero que para ellos no existe y MORIAN: Meta las rechaza por la ventana
+// de 24h (131047) porque ese lead jamas escribio a ese numero. Y peor: /api/whatsapp/send ya
+// habia marcado la conv como 'listo_humano' + IA apagada ANTES de intentar el envio, asi que el
+// lead quedaba sin respuesta Y sin IA. Prender un flag no puede romper la bandeja historica.
+//
+// COMO SE DISTINGUE UNA CONV "NACIDA POR CLOUD": columna NUEVA conversations.canal_origen
+// (migracion-cloud-api.sql), que SOLO setea procesarMensajeCloud() al CREAR la conversacion.
+//   - canal_origen = 'cloud' -> nacio por Cloud API  -> puede salir por Cloud.
+//   - canal_origen = null    -> TODO lo demas (Evolution de siempre, y toda conv preexistente) -> Evolution.
+// POR QUE UNA COLUMNA NUEVA Y NO conversations.channel (que YA existe):
+//   1) channel es VISIBLE en la UI (CHANNEL_LABELS en conversaciones/pipeline) y agrupa los
+//      reportes por canal (~21073, ~23686): meter un valor nuevo ensucia pantallas y metricas.
+//   2) channel es parte del conflict target del dedupe de contactos (user_id,phone,channel,
+//      ~1587): un lead que escribio por Evolution y despues por Cloud se DUPLICARIA como contacto.
+//   3) Para el CRM esto ES WhatsApp (mismo inbox, misma UI) -> channel='whatsapp' es correcto.
+//      canal_origen responde otra pregunta (por que caño se contesta), y por eso va aparte.
+// Alternativa descartada: inferir el canal por el formato del wa_message_id ('wamid.' = Cloud).
+// Es una heuristica fragil (depende de un formato de Meta no contractual) y no responde por una
+// conv sin mensajes salientes todavia. Una columna explicita no miente.
+// ADITIVA Y FAIL-CLOSED: default null = Evolution de siempre. Si la migracion NO se corrio, el
+// select falla -> null -> 'evolution' -> comportamiento ACTUAL EXACTO.
+//
+// ESTADO: enganchada en UN SOLO punto, el envio MANUAL desde Conversaciones
+// (/api/whatsapp/send, ~7586), porque sin eso el paso 4 de la demo (responder al
+// lead dentro de la ventana de 24h) NO existe. Ahi el branch es fail-closed: con
+// el flag OFF ni siquiera se llama a Meta y se ejecuta el enviarWhatsapp() de
+// siempre, byte-identico.
+//
+// DONDE MAS SE ENGANCHARIA (deliberadamente NO hecho: Diego dijo "despues vemos como"):
+//   1) enviarWhatsapp() (~5464) — el motor que usa la IA para auto-responder al lead
+//      desde procesar(). Es el punto de mayor volumen y el mas riesgoso: cambia el
+//      camino de la IA de TODOS los clientes. Se engancharia envolviendo la llamada a
+//      Evolution con `if (await canalSalienteDe(user_id) === 'cloud') -> enviarTextoCloud`.
+//      OJO: enviarWhatsapp recibe `instancia`, no `user_id` -> hay que resolver el tenant
+//      antes (nombreInstancia(user_id) es la inversa) o cambiar la firma.
+//   2) /api/whatsapp/ubicacion (~7602) y /api/enviar-media — Cloud API tiene sus propios
+//      types (location / image) que NO estan implementados en este modulo.
+//   3) El motor de recontacto / Oportunidades — ahi ADEMAS cambia el modelo de costo:
+//      fuera de la ventana de 24h cada envio exige PLANTILLA y Meta la COBRA al cliente.
+//      🔴 Enganchar recontacto sin repensar el costo puede generar gasto real inesperado.
+// Lee conversations.canal_origen. DEFENSIVA: columna ausente (migracion sin correr) / error /
+// sin fila -> null -> el llamador rutea por Evolution (comportamiento actual).
+async function _canalOrigenDeConv(conversationId) {
+  try {
+    if (!conversationId) return null;
+    const { data, error } = await supabase.from('conversations').select('canal_origen').eq('id', conversationId).maybeSingle();
+    if (error || !data) return null; // columna ausente u otro error -> Evolution
+    return data.canal_origen || null;
+  } catch (e) { return null; }
+}
+
+// Marca una conversacion como NACIDA por Cloud API. Best-effort: si la columna todavia no existe,
+// el update falla en silencio y la conv queda como Evolution (conservador: nunca desvia de mas).
+async function _marcarConvOrigenCloud(conversationId) {
+  try {
+    if (!conversationId) return;
+    await supabase.from('conversations').update({ canal_origen: 'cloud' }).eq('id', conversationId);
+  } catch (e) { /* columna ausente -> no-op (la conv queda ruteando por Evolution) */ }
+}
+
+// conversationId es OBLIGATORIO: sin conversacion no hay forma de saber si nacio por Cloud, y
+// ante la duda se contesta por el canal de SIEMPRE (Evolution).
+async function canalSalienteDe(user_id, conversationId) {
+  try {
+    if (!user_id) return 'evolution';
+    if (!conversationId) return 'evolution'; // sin conversacion -> no se puede decidir -> fail-closed
+    if (!(await cloudApiActivo(user_id))) return 'evolution';
+    // La conv tiene que haber NACIDO por Cloud. Una conv de Evolution (canal_origen null) se
+    // sigue contestando por Evolution AUNQUE el flag Cloud este ON: el lead solo conoce ese numero.
+    if ((await _canalOrigenDeConv(conversationId)) !== 'cloud') return 'evolution';
+    const cfg = await _cloudApiConfigDeCuenta(user_id);
+    if (cfg && cfg.activo === true && cfg.phone_number_id && cfg.token) return 'cloud';
+    return 'evolution';
+  } catch (e) { return 'evolution'; } // ante cualquier fallo -> el camino de SIEMPRE
+}
+
+// ============================================================================
+// ===== WEBHOOK RECEPTOR (Cloud API) ========================================
+// ============================================================================
+// OJO EXPRESS 5 (gotcha conocido, tiro prod abajo el 2026-07-03): las rutas ':param?',
+// '*' y regex CRASHEAN el boot y `node --check` NO lo detecta. TODAS las rutas de este
+// modulo son PATHS LITERALES SIMPLES a proposito.
+
+// --- GET /api/webhook/cloud-api : handshake de verificacion de Meta. ---
+// Meta pega con ?hub.mode=subscribe&hub.verify_token=X&hub.challenge=Y y espera el challenge
+// crudo. Si META_WEBHOOK_VERIFY_TOKEN no esta seteado -> 403 (no validamos contra nada).
+app.get('/api/webhook/cloud-api', function(req, res) {
+  try {
+    const modo = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (modo === 'subscribe' && CLOUD_API_VERIFY_TOKEN && token === CLOUD_API_VERIFY_TOKEN) {
+      return res.status(200).send(String(challenge == null ? '' : challenge));
+    }
+    if (!CLOUD_API_VERIFY_TOKEN) console.warn('[cloud-api] handshake rechazado: falta la env META_WEBHOOK_VERIFY_TOKEN.');
+    return res.sendStatus(403);
+  } catch (e) {
+    console.error('[cloud-api] GET webhook error:', e && e.message);
+    return res.sendStatus(403);
+  }
+});
+
+// --- Validar la firma X-Hub-Signature-256 del webhook de Cloud API. ---
+// SEGURIDAD (antecedente real en este proyecto: "webhook de WA sin secreto", auditoria jun-26):
+// un webhook sin firma acepta payloads FALSIFICADOS de cualquiera que sepa la URL -> se pueden
+// inyectar mensajes/leads falsos en la bandeja de un cliente Y QUEMAR SU CUOTA DE IA PAGA.
+//
+// B3 (2026-07-16) — FAIL-CLOSED, sin excepciones. Antes esta funcion devolvia `true` cuando
+// META_APP_SECRET no estaba seteado ("tolerancia para la demo"): eso REINTRODUCIA exactamente el
+// agujero que la auditoria de junio ya habia registrado. Ahora:
+//   - sin META_APP_SECRET      -> false (se DESCARTA el payload; el modulo queda inerte)
+//   - con secret y firma mala  -> false
+//   - con secret y firma OK    -> true
+// Cada descarte se loguea con el MOTIVO exacto para poder diagnosticar (es la unica forma de
+// distinguir "falta la env" de "Meta firma con otro secret" mirando los logs de Railway).
+// CONSECUENCIA OPERATIVA (a proposito): para que ENTRE un solo mensaje por Cloud API hay que
+// setear META_APP_SECRET en Railway. Un modulo que no recibe es preferible a uno que acepta
+// mensajes de cualquiera. NO afecta a Evolution ni a Messenger (cada uno valida por su lado).
+let _cloudApiSecretWarned = false;
+function _cloudApiFirmaOk(req) {
+  try {
+    const secret = META_APP_SECRET || '';
+    if (!secret) {
+      if (!_cloudApiSecretWarned) {
+        console.error('[cloud-api] 🔴 META_APP_SECRET NO esta seteado: NO se puede validar la firma X-Hub-Signature-256, asi que se DESCARTAN TODOS los webhooks entrantes de Cloud API (fail-closed). Setea META_APP_SECRET en Railway para habilitar la recepcion.');
+        _cloudApiSecretWarned = true;
+      }
+      return false; // FAIL-CLOSED: sin secreto no hay forma de saber si el payload es de Meta.
+    }
+    if (!req.headers['x-hub-signature-256']) { console.warn('[cloud-api] payload sin header X-Hub-Signature-256 -> descartado.'); return false; }
+    if (!req.rawBody) { console.warn('[cloud-api] payload sin rawBody (no se pudo capturar el cuerpo crudo) -> no se puede validar la firma -> descartado.'); return false; }
+    return _metaFirmaOk(req.rawBody, req.headers['x-hub-signature-256'], secret);
+  } catch (e) { console.error('[cloud-api] error validando firma -> descartado:', e && e.message); return false; }
+}
+
+// --- Resolver el TENANT por el phone_number_id que manda Meta en el payload. ---
+// Sin match (o sin migracion) -> null -> el mensaje se IGNORA (inerte, no rompe).
+async function _resolverTenantCloud(phoneNumberId) {
+  try {
+    if (!phoneNumberId) return null;
+    const { data, error } = await supabase
+      .from('cloud_api_numbers')
+      .select('id, user_id, waba_id, phone_number_id, display_number, token, activo')
+      .eq('phone_number_id', String(phoneNumberId)).eq('activo', true)
+      .limit(1).maybeSingle();
+    if (error || !data) return null;
+    return data;
+  } catch (e) { return null; }
+}
+
+// ===== PROCESAR UN MENSAJE ENTRANTE DE CLOUD API =====
+// Funcion NUEVA y SEPARADA (no se toco el webhook de Evolution). Guarda el mensaje en las MISMAS
+// tablas que ya usa el CRM (contacts / conversations / messages) via obtenerOcrearConvDeCanal
+// (M18, el helper que YA comparten el webhook de WA y el de Meta) => el lead aparece en la bandeja
+// de Conversaciones EXACTAMENTE igual que hoy.
+// canal='whatsapp' a proposito: para el CRM esto ES WhatsApp (mismo inbox, misma UI, mismo shape).
+// Replica el shape del webhook de Evolution pero en version MINIMA: solo texto (sin media, sin
+// transcripcion, sin traduccion, sin debounce de rafagas). Los gates de gasto (pausa/papelera/
+// suscripcion/tope) se respetan igual que en los otros canales.
+async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil, waMessageId) {
+  let conv = null;
+  try {
+    if (!tenantUserId || !telefono || !texto) return;
+
+    // REGLA DE ORO (igual que el webhook de Evolution, ~6539): si quien escribe es un numero del
+    // EQUIPO (dueño/usuario), NO crear lead ni gastar IA. Cortar ANTES de tocar contacts.
+    try { if (await esNumeroDelEquipo(tenantUserId, telefono)) { console.log('[cloud-api] numero del equipo ignorado como lead:', telefono); return; } } catch (eEq) {}
+
+    // IDEMPOTENCIA: Meta REINTREGA el mismo webhook si no ve el 200 a tiempo. Sin este guard, el
+    // mismo mensaje del lead se procesa dos veces y la IA se presenta/responde dos veces (bug real
+    // que ya paso con Evolution). Mismo patron que ~6550: dedupe durable por wa_message_id.
+    // DEFENSIVO: si el select falla (columna ausente), NO cortamos (no perder mensajes por schema).
+    if (waMessageId) {
+      try {
+        const { data: _ya, error: _errIdem } = await supabase
+          .from('messages').select('id').eq('user_id', tenantUserId).eq('wa_message_id', waMessageId).limit(1).maybeSingle();
+        if (!_errIdem && _ya) { console.log('[cloud-api] entrega duplicada ignorada (wa_message_id ' + waMessageId + ')'); return; }
+      } catch (eIdem) {}
+    }
+
+    // Contacto + conversacion (helper M18 compartido, agnostico al canal).
+    const _ocrear = await obtenerOcrearConvDeCanal(tenantUserId, telefono, 'whatsapp', (nombrePerfil || telefono), 'id, ai_enabled, status, asesor_id');
+    const contacto = _ocrear.contacto;
+    if (!contacto) return;
+    conv = _ocrear.conv;
+    if (!conv) return;
+
+    // ===== B1c: marcar el ORIGEN solo si la conversacion la creamos NOSOTROS (nacio por Cloud) =====
+    // Si la conv YA existia (convExistente), es de Evolution (o preexistente): NO se toca -> se
+    // seguira contestando por Evolution. Esto es deliberado y conservador: un lead que venia
+    // hablando con el numero viejo tiene que seguir recibiendo respuestas por el numero viejo.
+    // Solo las conversaciones NUEVAS, creadas por este webhook, salen por Cloud.
+    if (!_ocrear.convExistente) { await _marcarConvOrigenCloud(conv.id); }
+
+    // ===== GATE TEMPRANO (mismas columnas y criterio que el webhook WA/Meta) =====
+    let _bsGate = null;
+    try {
+      const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado').eq('user_id', tenantUserId).maybeSingle();
+      _bsGate = _gq && _gq.data;
+    } catch (e) {}
+    const _enPapelera = !!(_bsGate && _bsGate.eliminado_at);
+    const _enPausaTotal = !!(_pausaGlobal === true) || !!(_bsGate && _bsGate.crm_pausado === true);
+
+    // Guardar SIEMPRE el mensaje entrante (aun en pausa/papelera: no se pierde nada).
+    // ===== B6 (PLATA): si el INSERT falla, CORTAR. No responder ni gastar IA. =====
+    // Antes el error del insert no se chequeaba (supabase-js NO tira excepcion: devuelve {error}),
+    // asi que un fallo (p.ej. PGRST204 por cache de schema viejo, gotcha conocido del proyecto)
+    // pasaba INADVERTIDO: el mensaje del lead NO quedaba en la conversacion pero la IA igual
+    // generaba y COBRABA la respuesta, contestando sobre un historial incompleto. Ahora cualquier
+    // fallo del insert corta la funcion: 0 tokens. El mensaje se pierde igual, pero Meta reintrega
+    // el webhook y el guard de idempotencia deja que el reintento lo grabe bien.
+    try {
+      const { error: _errIns } = await supabase.from('messages').insert(Object.assign(
+        { conversation_id: conv.id, user_id: tenantUserId, role: 'contact', content: texto },
+        waMessageId ? { wa_message_id: waMessageId } : {}
+      ));
+      if (_errIns) {
+        console.error('[cloud-api] 🔴 NO se pudo guardar el mensaje entrante -> se corta sin responder (0 tokens):', _errIns.message);
+        return;
+      }
+      await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    } catch (e) {
+      console.error('[cloud-api] 🔴 excepcion guardando el mensaje entrante -> se corta sin responder (0 tokens):', e && e.message);
+      return;
+    }
+
+    // Papelera o pausa TOTAL del Maestro: no responder (cero tokens). Ya quedo guardado arriba.
+    if (_enPapelera || _enPausaTotal) return;
+    // Pausa por-conversacion (ai_enabled) o pausa de IA por-cliente (agente_pausado): no responder.
+    if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) return;
+    // Gate de suscripcion (misma funcion que el resto de la app).
+    if (SUBSCRIPTIONS_ENABLED) { try { if (await debeBloquearAcceso(tenantUserId)) return; } catch (e) {} }
+    // Tope de mensajes IA del plan.
+    try { if (!(await dentroDelTopeIA(tenantUserId))) return; } catch (e) {}
+
+    // ===== B5 (PLATA): TOPE NOCTURNO tambien en Cloud API =====
+    // Copiado del canal Meta (~24568) y del webhook de Evolution (~7027): mismo gate, misma
+    // idempotencia, mismo aviso al lead. Solo aplica FUERA del horario de oficina del tenant.
+    // OJO — POR QUE IMPORTA: el default de _leerTopeNocturno es 100/noche AUNQUE el dueño no
+    // configure nada (decision de Diego 2026-06-27), asi que sin este bloque CUALQUIER cuenta
+    // Cloud con horario de oficina cargado perdia el freno de gasto nocturno EN SILENCIO. Los
+    // otros dos canales (Evolution y Messenger/IG) ya lo tenian; Cloud era el unico agujero.
+    // FAIL-OPEN ante error (igual que los otros canales): no cortar el servicio por un error de DB.
+    try {
+      if (!(await dentroDelTopeNocturno(tenantUserId))) {
+        try { await enviarTextoCloud(tenantUserId, telefono, 'En este momento estamos fuera del horario de atencion. Un asesor te responde a la brevedad apenas se conecte. Gracias por escribirnos.'); } catch (eMn) {}
+        return;
+      }
+      try { await registrarMensajeNocturno(tenantUserId); } catch (eRn) {}
+    } catch (eTn) { console.error('[cloud-api] tope nocturno:', eTn && eTn.message); }
+
+    // ===== B4 (PLATA): DEBOUNCE POR CONVERSACION — se REUSA el mecanismo de Evolution =====
+    // PROBLEMA: sin esto, un lead que manda 3 mensajes seguidos (o sea, como escribe todo el
+    // mundo) disparaba 3 generaciones = ~USD 0,09 en vez de ~USD 0,03 por rafaga, y la IA se
+    // presentaba 3 veces delante del cliente.
+    // SE REUSA TAL CUAL la maquinaria que Evolution ya tiene resuelta hace tiempo: el Map
+    // _debounceConv, el Set _genEnCurso y la constante DEBOUNCE_MS (declarados a nivel modulo,
+    // ~83-85). NO se toco NI UNA LINEA de la implementacion de Evolution (~7034-7479): esto es
+    // una copia del MISMO patron operando sobre las MISMAS estructuras compartidas, que es lo
+    // unico reusable sin refactorizar el webhook de Evolution (su `procesar` es un closure de
+    // ~440 lineas atado a variables locales de ese webhook; extraerlo seria tocarlo).
+    // Compartir el Map/Set entre canales es CORRECTO y ademas deseable. La clave es conv.id, que
+    // es unico, asi que un mensaje de Cloud NUNCA pisa el timer de una conv de Evolution distinta.
+    // El UNICO caso en que ambos canales tocan la MISMA entrada es un lead que le escribe a los
+    // DOS numeros del mismo tenant (el dedupe de contactos es por user_id+phone e IGNORA el canal,
+    // ~1579, asi que ambos webhooks caen en la misma conv). Ahi el ultimo mensaje reprograma el
+    // timer del anterior y se contesta UNA vez por el canal del ultimo mensaje, que es exactamente
+    // lo que uno quiere (una sola respuesta, al ultimo caño por el que hablo el lead) y nunca dos.
+    // Requiere ademas el flag ON: con cloud_api_v1 OFF esta funcion no corre y no hay interaccion
+    // posible con Evolution.
+    // El mensaje entrante YA quedo guardado arriba => generarRespuestaAgente() re-lee TODO el
+    // historial y contesta contemplando la rafaga entera. No se pierde ningun mensaje.
+    if (_debounceConv.has(conv.id)) { clearTimeout(_debounceConv.get(conv.id)); }
+    const _convId = conv.id;
+    const _procesarCloud = async function(){
+      // Si ya hay una generacion en curso para esta conv, REPROGRAMAR (no descartar): asi el/los
+      // mensaje(s) nuevo(s) se contestan cuando la generacion actual libere _genEnCurso.
+      if (_genEnCurso.has(_convId)) {
+        const _reintento = setTimeout(_procesarCloud, DEBOUNCE_MS);
+        _debounceConv.set(_convId, _reintento);
+        return;
+      }
+      _genEnCurso.add(_convId);
+      _debounceConv.delete(_convId);
+      try {
+        // RACE IA-vs-HUMANO (mismo re-check que Evolution ~7067): entre que entro el mensaje y
+        // vencio el debounce, un HUMANO pudo responder por /api/whatsapp/send y apagar la IA.
+        // Sin este re-check la IA le pisaria la respuesta al asesor delante del cliente.
+        const { data: _fresh } = await supabase.from('conversations').select('ai_enabled').eq('id', _convId).maybeSingle();
+        if (!_fresh || _fresh.ai_enabled !== true) {
+          console.log('[cloud-api] abortada generacion para conv ' + _convId + ' (un humano apago la IA durante el debounce)');
+          return; // 0 tokens
+        }
+        // Generar la respuesta (agnostico al canal) y enviarla por Cloud API.
+        // Va por texto libre: el lead ACABA de escribir => estamos DENTRO de la ventana de 24h.
+        const resultado = await generarRespuestaAgente(tenantUserId, _convId, texto);
+        if (resultado && resultado.reply) {
+          const _txt = resultado.replyCliente || resultado.reply;
+          const _env = await enviarTextoCloud(tenantUserId, telefono, _txt);
+          if (!_env.ok) console.error('[cloud-api] no se pudo enviar la respuesta:', _env.error);
+          try { await registrarUsoTokens(tenantUserId, resultado.usage); } catch (e) {}
+          try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
+          // NOTA: NO se re-inserta la fila role='ai' ni se actualiza last_message: generarRespuestaAgente()
+          // YA lo persiste internamente (igual que en el webhook de Meta, ~24560).
+        }
+      } catch (eGen) {
+        console.error('[cloud-api] generacion tras debounce:', eGen && eGen.message);
+      } finally {
+        // SIEMPRE liberar: la conv nunca queda trabada aunque la generacion explote.
+        _genEnCurso.delete(_convId);
+      }
+    };
+    const _timer = setTimeout(_procesarCloud, DEBOUNCE_MS);
+    _debounceConv.set(conv.id, _timer);
+  } catch (e) {
+    console.error('[cloud-api] procesarMensajeCloud error:', e && e.message);
+  }
+}
+
+// --- POST /api/webhook/cloud-api : mensajes entrantes + estados de envio. ---
+// Responde 200 RAPIDO SIEMPRE (Meta exige <2s y reintenta si no). Todo el procesamiento va en
+// segundo plano y es best-effort: una falla NUNCA debe cambiar el 200.
+// Payload: entry[].changes[].value con { metadata:{phone_number_id}, messages:[], statuses:[], contacts:[] }
+app.post('/api/webhook/cloud-api', function(req, res) {
+  // 200 inmediato, pase lo que pase.
+  res.sendStatus(200);
+  try {
+    // SEGURIDAD: firma ANTES de tocar base. Sin META_APP_SECRET -> warning + seguir (ver _cloudApiFirmaOk).
+    if (!_cloudApiFirmaOk(req)) { console.warn('[cloud-api] payload descartado: firma X-Hub-Signature-256 invalida.'); return; }
+    const body = req.body || {};
+    if (body.object !== 'whatsapp_business_account') return;
+    const entradas = Array.isArray(body.entry) ? body.entry : [];
+
+    // Procesar en segundo plano (no bloquea el 200 ya enviado).
+    (async function(){
+      for (let i = 0; i < entradas.length; i++) {
+        const entry = entradas[i] || {};
+        const cambios = Array.isArray(entry.changes) ? entry.changes : [];
+        for (let c = 0; c < cambios.length; c++) {
+          try {
+            const cambio = cambios[c] || {};
+            if (cambio.field && cambio.field !== 'messages') continue; // solo el campo 'messages'
+            const val = cambio.value || {};
+            const phoneNumberId = val.metadata && val.metadata.phone_number_id;
+            const tenant = await _resolverTenantCloud(phoneNumberId);
+            if (!tenant) continue; // numero no conectado a ningun tenant -> INERTE, se ignora
+            // Doble gate: aunque el numero este activo, si el flag de la cuenta esta OFF -> no procesar.
+            if (!(await cloudApiActivo(tenant.user_id))) continue;
+
+            // ===== D4 (backfill, gratis y sin llamar a nadie): entry.id ES el WABA ID =====
+            // En el payload de Cloud API, cada entry[] viene identificado por el WhatsApp Business
+            // Account que lo genera. Si la conexion quedo sin waba_id (Meta no lo devolvio al
+            // conectar), lo completamos con el primer webhook que entra -> las plantillas pasan a
+            // listarse solas, sin desconectar ni re-pegar nada. Best-effort: si falla, no importa.
+            if (!tenant.waba_id && entry.id) {
+              try {
+                await supabase.from('cloud_api_numbers').update({ waba_id: String(entry.id) }).eq('id', tenant.id);
+                tenant.waba_id = String(entry.id);
+                console.log('[cloud-api] waba_id completado desde el webhook para el tenant ' + tenant.user_id);
+              } catch (eWb) {}
+            }
+
+            // a) ESTADOS de mensajes SALIENTES (sent/delivered/read). Aditivo: solo sube estado_envio
+            //    cuando Meta confirma; sin match por wa_message_id es un no-op.
+            const estados = Array.isArray(val.statuses) ? val.statuses : [];
+            for (let s = 0; s < estados.length; s++) {
+              try {
+                const st = estados[s] || {};
+                if (!st.id) continue;
+                const _e = String(st.status || '');
+                if (_e === 'sent' || _e === 'delivered' || _e === 'read') {
+                  await supabase.from('messages').update({ estado_envio: 'enviado' }).eq('wa_message_id', st.id).neq('estado_envio', 'enviado');
+                  // Tildes ✓/✓✓/✓✓-azul (mismo mapeo que el ack de Evolution, ~6436). DEFENSIVO: si la
+                  // columna estado_entrega no existe, el update falla en silencio y queda el estado_envio.
+                  let _nivel = null, _inferiores = [];
+                  if (_e === 'read') { _nivel = 'leido'; _inferiores = ['enviado', 'entregado']; }
+                  else if (_e === 'delivered') { _nivel = 'entregado'; _inferiores = ['enviado']; }
+                  else { _nivel = 'enviado'; _inferiores = []; }
+                  try {
+                    let _q = supabase.from('messages').update({ estado_entrega: _nivel }).eq('wa_message_id', st.id);
+                    if (_inferiores.length) _q = _q.or('estado_entrega.is.null,estado_entrega.in.(' + _inferiores.join(',') + ')');
+                    else _q = _q.is('estado_entrega', null);
+                    await _q;
+                  } catch (eEnt) {}
+                }
+              } catch (eSt) {}
+            }
+
+            // b) MENSAJES ENTRANTES.
+            const mensajes = Array.isArray(val.messages) ? val.messages : [];
+            // contacts[] trae el nombre de perfil del que escribe (profile.name).
+            const perfiles = Array.isArray(val.contacts) ? val.contacts : [];
+            for (let m = 0; m < mensajes.length; m++) {
+              try {
+                const msg = mensajes[m] || {};
+                const de = msg.from; // wa_id del lead (solo digitos)
+                if (!de) continue;
+                // MINIMO VIABLE: solo texto. Media/ubicacion/audio de Cloud API NO estan implementados
+                // (Cloud API los entrega por /media con otro flujo). Se ignoran en vez de romper.
+                let texto = '';
+                if (msg.type === 'text' && msg.text && typeof msg.text.body === 'string') texto = msg.text.body;
+                else if (msg.type === 'button' && msg.button && msg.button.text) texto = String(msg.button.text);
+                else if (msg.type === 'interactive' && msg.interactive) {
+                  const _it = msg.interactive;
+                  texto = (_it.button_reply && _it.button_reply.title) || (_it.list_reply && _it.list_reply.title) || '';
+                }
+                if (!texto) { console.log('[cloud-api] tipo no soportado, ignorado:', msg.type); continue; }
+                let nombre = null;
+                try {
+                  const p = perfiles.find(function(x){ return x && x.wa_id === de; });
+                  if (p && p.profile && p.profile.name) nombre = String(p.profile.name);
+                } catch (eN) {}
+                await procesarMensajeCloud(tenant.user_id, String(de), texto, nombre, msg.id || null);
+              } catch (eMsg) { console.error('[cloud-api] mensaje:', eMsg && eMsg.message); }
+            }
+          } catch (eCambio) { console.error('[cloud-api] change:', eCambio && eCambio.message); }
+        }
+      }
+    })().catch(function(e){ console.error('[cloud-api] proc bg:', e && e.message); });
+  } catch (e) { console.error('[cloud-api] POST webhook error:', e && e.message); }
+});
+
+// ============================================================================
+// ===== ENDPOINTS DEL PANEL (/api/cloud-api/*) ==============================
+// ============================================================================
+// Auth: verificarUsuario (igual que el resto del archivo) + resolucion del DUEÑO
+// (_cloudApiDueno) para que un ASESOR opere sobre la config del dueño y no sobre
+// la suya. TODOS gateados por cloudApiActivo(dueño) => con el flag OFF el modulo
+// entero es inerte (404-equivalente: 403 "modulo no habilitado").
+// REGLA token: el token NUNCA se devuelve entero ni se loguea (solo ultimos 4).
+
+// ===== D5: ¿cuantas VARIABLES tiene el cuerpo de una plantilla? =====
+// Una plantilla con variables ("Hola {{1}}, te escribimos por {{2}}") NO se puede mandar sin
+// pasarle los valores: Meta la RECHAZA. Antes ese rechazo caia en _cloudApiErrorLegible como
+// "La plantilla no existe o no esta aprobada" (codigo 132000), que es una causa FALSA y manda a
+// buscar el problema al lugar equivocado (la plantilla existe y esta aprobada; lo que falta son
+// los parametros). Contando las variables ANTES de llamar a Meta se puede avisar la verdad.
+// Cuenta placeholders DISTINTOS: {{1}}/{{2}} (posicionales) o {{nombre}} (nombrados).
+function _cloudApiVarsDeCuerpo(cuerpo) {
+  try {
+    const s = String(cuerpo == null ? '' : cuerpo);
+    if (!s) return 0;
+    const encontrados = s.match(/\{\{\s*[^{}]+?\s*\}\}/g);
+    if (!encontrados) return 0;
+    const unicos = {};
+    for (let i = 0; i < encontrados.length; i++) {
+      const clave = encontrados[i].replace(/[{}\s]/g, '');
+      if (clave) unicos[clave] = true;
+    }
+    return Object.keys(unicos).length;
+  } catch (e) { return 0; } // ante la duda: 0 -> no se bloquea el envio (lo dira Meta)
+}
+
+// Enmascarar un token: solo los ultimos 4 (mismo criterio que /api/meta/credenciales, ~24677).
+function _cloudApiTokenMask(t) {
+  try {
+    const s = String(t == null ? '' : t);
+    if (!s) return null;
+    return '••••' + s.slice(-4);
+  } catch (e) { return null; }
+}
+
+// --- GET /api/cloud-api/estado -> { conectado, display_number, waba_id, activo } ---
+// B2: SOLO EL DUEÑO. Un asesor no tiene nada que hacer con la config del canal, y esta respuesta
+// expone el numero, el WABA y los ultimos 4 del token. Se devuelve un 403 con `solo_dueno:true`
+// para que la card muestre un cartel claro en vez de un error rojo generico.
+app.get('/api/cloud-api/estado', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede ver la configuracion de la WhatsApp API oficial.', solo_dueno: true });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.json({ ok: true, habilitado: false, conectado: false });
+    // Se lee la fila SIN filtrar por activo (el panel tiene que poder mostrar una conexion apagada).
+    let fila = null;
+    try {
+      const { data, error } = await supabase.from('cloud_api_numbers')
+        .select('id, waba_id, phone_number_id, display_number, token, verificado, activo, creado_at')
+        .eq('user_id', dueno).order('creado_at', { ascending: false }).limit(1).maybeSingle();
+      if (!error) fila = data || null;
+    } catch (e) { fila = null; } // tabla ausente -> como desconectado
+    if (!fila) return res.json({ ok: true, habilitado: true, conectado: false });
+    return res.json({
+      ok: true,
+      habilitado: true,
+      conectado: true,
+      display_number: fila.display_number || null,
+      waba_id: fila.waba_id || null,
+      phone_number_id: fila.phone_number_id || null,
+      verificado: fila.verificado === true,
+      activo: fila.activo === true,
+      token_mask: _cloudApiTokenMask(fila.token) // NUNCA el token entero
+    });
+  } catch (e) {
+    console.error('[cloud-api] GET estado:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// ===== D4: pedirle a Meta los datos del numero (y de paso el WABA al que pertenece) =====
+// Valida el par (phone_number_id, token) con un GET a /<phone_number_id> y aprovecha ESA MISMA
+// llamada (que el codigo ya hacia) para traer el WABA ID => el usuario no tiene que saberlo.
+// DEFENSIVO EN DOS PASOS, y esto es importante: si el campo `whatsapp_business_account` no
+// existiera o no estuviera permitido para ese token, Meta responde error 100 ("nonexisting field")
+// y REVENTARIA la conexion entera (rompiendo el camino de la demo). Por eso: primero se pide CON
+// el campo; si Meta rechaza, se reintenta con el set de campos ORIGINAL (display_phone_number,
+// verified_name) y se sigue sin WABA. Peor caso = exactamente el comportamiento anterior.
+// Devuelve { ok:true, display, wabaId } | { ok:false, errorJson }.
+async function _cloudApiDatosNumero(phone_number_id, token) {
+  const base = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(phone_number_id);
+  // Intento 1: con el WABA asociado.
+  try {
+    const r = await fetch(base + '?fields=display_phone_number,verified_name,whatsapp_business_account', { headers: { 'Authorization': 'Bearer ' + token } });
+    const j = await r.json().catch(function(){ return null; });
+    if (r.ok && j && !j.error) {
+      let wabaId = null;
+      try {
+        // Meta lo devuelve como objeto { id, name } (o, segun version, como string suelto).
+        if (j.whatsapp_business_account && j.whatsapp_business_account.id) wabaId = String(j.whatsapp_business_account.id);
+        else if (typeof j.whatsapp_business_account === 'string') wabaId = j.whatsapp_business_account;
+      } catch (eW) {}
+      return { ok: true, display: j.display_phone_number || null, wabaId: wabaId };
+    }
+    console.warn('[cloud-api] Meta no devolvio whatsapp_business_account (se reintenta sin ese campo):', JSON.stringify(j && j.error ? j.error : {}).slice(0, 200));
+  } catch (e) {
+    console.warn('[cloud-api] fallo el GET con whatsapp_business_account, se reintenta sin ese campo:', e && e.message);
+  }
+  // Intento 2 (fallback): set de campos ORIGINAL. Es el comportamiento previo, intacto.
+  try {
+    const r = await fetch(base + '?fields=display_phone_number,verified_name', { headers: { 'Authorization': 'Bearer ' + token } });
+    const j = await r.json().catch(function(){ return null; });
+    if (!r.ok || !j || j.error) {
+      console.error('[cloud-api] validacion contra Meta fallo:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 300));
+      return { ok: false, errorJson: j };
+    }
+    return { ok: true, display: j.display_phone_number || null, wabaId: null };
+  } catch (e) {
+    console.error('[cloud-api] validacion contra Meta error:', e && e.message);
+    return { ok: false, errorJson: null, red: true };
+  }
+}
+
+// --- POST /api/cloud-api/conectar -> body { waba_id?, phone_number_id, token, display_number? } ---
+// CAMINO DE LA DEMO: se pegan los datos a mano. Valida contra Meta con un GET simple a
+// /<phone_number_id> ANTES de guardar (si el token vencio, se entera aca y no en el envio).
+// B2: SOLO EL DUEÑO. D4: el WABA ID sale de Meta, no hace falta pegarlo.
+// B1a: conectar NO enciende el numero (ver abajo).
+app.post('/api/cloud-api/conectar', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // B2: un ASESOR no puede pegar SU numero/token y desviarse el WhatsApp de toda la cuenta.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede configurar la WhatsApp API oficial.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+
+    const b = req.body || {};
+    const waba_id = b.waba_id ? String(b.waba_id).trim() : '';
+    const phone_number_id = b.phone_number_id ? String(b.phone_number_id).trim() : '';
+    const token = b.token ? String(b.token).trim() : '';
+    if (!phone_number_id) return res.status(400).json({ error: 'Falta el Phone Number ID' });
+    if (!token) return res.status(400).json({ error: 'Falta el token de acceso' });
+
+    // Validar contra Meta + (D4) derivar el WABA ID de la MISMA llamada.
+    const _datos = await _cloudApiDatosNumero(phone_number_id, token);
+    if (!_datos.ok) {
+      if (_datos.red) return res.status(502).json({ error: 'No se pudo contactar a Meta para validar. Reintentá.' });
+      return res.status(400).json({ error: 'Meta rechazo estos datos: ' + _cloudApiErrorLegible(_datos.errorJson) });
+    }
+    // D4: precedencia -> lo que dijo META primero (es la fuente de verdad y no se puede tipear
+    // mal); lo que pego el usuario queda como fallback por si Meta no lo devolvio.
+    const _wabaFinal = _datos.wabaId || waba_id || null;
+
+    const fila = {
+      user_id: dueno,
+      waba_id: _wabaFinal,
+      phone_number_id: phone_number_id,
+      display_number: (b.display_number ? String(b.display_number).trim() : '') || _datos.display || null,
+      token: token,
+      verificado: true   // Meta acaba de confirmar el par numero+token
+    };
+    try {
+      const { data: existe } = await supabase.from('cloud_api_numbers').select('id, activo').eq('user_id', dueno).limit(1).maybeSingle();
+      if (existe) {
+        // ===== B1a (parte 2): re-conectar NO cambia el estado encendido/apagado =====
+        // Se PRESERVA el `activo` que ya tenia. Motivo: el token de la consola de Meta vence a las
+        // 24h, asi que re-pegar el token es la operacion MAS frecuente del panel; si aca forzaramos
+        // activo=false, cada refresco de token APAGARIA el numero en silencio (y en medio de la
+        // demo). Preservar respeta igual la invariante "conectar nunca ENCIENDE un numero apagado".
+        fila.activo = (existe.activo === true);
+        const { error } = await supabase.from('cloud_api_numbers').update(fila).eq('id', existe.id);
+        if (error) { console.error('[cloud-api] conectar update:', error.message); return res.status(500).json({ error: 'No se pudo guardar la conexion. ¿Corriste migracion-cloud-api.sql?' }); }
+      } else {
+        // ===== B1a (parte 1): CONECTAR != ENCENDER =====
+        // Antes esto guardaba activo:true, o sea que apenas se conectaba el numero TODO el
+        // WhatsApp saliente de la cuenta se iba por Cloud (ver el footgun descripto en
+        // canalSalienteDe). La propia migracion ya documentaba "conectar un numero NO lo
+        // enciende" pero el codigo lo encendia: la salvaguarda era letra muerta. Ahora un numero
+        // nuevo entra APAGADO y se enciende SOLO con el toggle explicito (POST /activar).
+        fila.activo = false;
+        const { error } = await supabase.from('cloud_api_numbers').insert(fila);
+        if (error) { console.error('[cloud-api] conectar insert:', error.message); return res.status(500).json({ error: 'No se pudo guardar la conexion. ¿Corriste migracion-cloud-api.sql?' }); }
+      }
+    } catch (e) {
+      console.error('[cloud-api] conectar save:', e && e.message);
+      return res.status(500).json({ error: 'No se pudo guardar la conexion.' });
+    }
+    return res.json({ ok: true, conectado: true, activo: fila.activo === true, display_number: fila.display_number, waba_id: fila.waba_id });
+  } catch (e) {
+    console.error('[cloud-api] POST conectar:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// --- POST /api/cloud-api/activar -> body { activo: boolean } ---
+// B1b: el interruptor EXPLICITO del numero. Es el unico lugar que puede ENCENDER Cloud.
+// Separar "conectar" de "encender" es lo que hace que el modulo sea probable sin riesgo: se
+// conecta y se verifica el numero con calma, y recien cuando esta todo bien se enciende.
+// Encender NO desvia las conversaciones viejas de Evolution (ver B1c en canalSalienteDe): solo
+// habilita que las conversaciones NACIDAS por Cloud salgan por Cloud.
+// OJO EXPRESS 5: path literal simple (sin ':param?', sin '*', sin regex) -> no revienta el boot.
+app.post('/api/cloud-api/activar', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // B2: prender/apagar el canal de WhatsApp de la cuenta es cosa del dueño.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede activar o desactivar la WhatsApp API oficial.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+
+    const b = req.body || {};
+    if (typeof b.activo !== 'boolean') return res.status(400).json({ error: 'Falta el campo activo (true/false).' });
+    const quiereActivar = b.activo === true;
+
+    let fila = null;
+    try {
+      const { data, error } = await supabase.from('cloud_api_numbers')
+        .select('id, phone_number_id, token, verificado, activo')
+        .eq('user_id', dueno).order('creado_at', { ascending: false }).limit(1).maybeSingle();
+      if (error) { console.error('[cloud-api] activar select:', error.message); return res.status(500).json({ error: 'No se pudo leer la conexion. ¿Corriste migracion-cloud-api.sql?' }); }
+      fila = data || null;
+    } catch (e) { return res.status(500).json({ error: 'No se pudo leer la conexion.' }); }
+    if (!fila) return res.status(400).json({ error: 'No hay un numero conectado para activar.' });
+    // No dejar encender algo que no puede enviar (si no, el primer mensaje muere sin explicacion).
+    if (quiereActivar && (!fila.phone_number_id || !fila.token)) {
+      return res.status(400).json({ error: 'La conexion no esta completa (falta Phone Number ID o token). Reconectá el numero antes de activarlo.' });
+    }
+    try {
+      const { error } = await supabase.from('cloud_api_numbers').update({ activo: quiereActivar }).eq('id', fila.id);
+      if (error) { console.error('[cloud-api] activar update:', error.message); return res.status(500).json({ error: 'No se pudo cambiar el estado.' }); }
+    } catch (e) { return res.status(500).json({ error: 'No se pudo cambiar el estado.' }); }
+    console.log('[cloud-api] numero ' + (quiereActivar ? 'ACTIVADO' : 'DESACTIVADO') + ' para el tenant ' + dueno);
+    return res.json({ ok: true, activo: quiereActivar });
+  } catch (e) {
+    console.error('[cloud-api] POST activar:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// --- DELETE /api/cloud-api/conectar -> desconecta (activo=false). ---
+// NO borra la fila: conserva los IDs para reconectar rapido. El token se limpia por higiene.
+app.delete('/api/cloud-api/conectar', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // B2: sin esto, CUALQUIER asesor podia borrarle el token al dueño y dejar el canal muerto.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede desconectar la WhatsApp API oficial.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    try {
+      const { error } = await supabase.from('cloud_api_numbers').update({ activo: false, verificado: false, token: null }).eq('user_id', dueno);
+      if (error) { console.error('[cloud-api] desconectar:', error.message); return res.status(500).json({ error: 'No se pudo desconectar.' }); }
+    } catch (e) { return res.status(500).json({ error: 'No se pudo desconectar.' }); }
+    return res.json({ ok: true, conectado: false });
+  } catch (e) {
+    console.error('[cloud-api] DELETE conectar:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// --- GET /api/cloud-api/plantillas -> lista desde Meta y cachea en cloud_api_templates. ---
+// Fuente de verdad = Meta (/<waba_id>/message_templates). El cache es best-effort: si falla el
+// upsert, igual se devuelve lo que dijo Meta (el panel no se rompe por el cache).
+app.get('/api/cloud-api/plantillas', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // B2: esta ruta usa el TOKEN DEL DUEÑO contra Meta y escribe el cache de plantillas. Solo dueño.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede ver las plantillas de la WhatsApp API oficial.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    const cfg = await _cloudApiConfigDeCuenta(dueno);
+    if (!cfg) return res.status(400).json({ error: 'No hay un numero conectado.' });
+    if (!cfg.waba_id) return res.status(400).json({ error: 'La conexion no tiene WABA ID cargado (hace falta para listar plantillas).' });
+
+    let lista = [];
+    try {
+      const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(cfg.waba_id) +
+        '/message_templates?fields=id,name,category,language,status,components&limit=100';
+      const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + cfg.token } });
+      const j = await r.json().catch(function(){ return null; });
+      if (!r.ok || !j || j.error) {
+        console.error('[cloud-api] plantillas fallo:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 300));
+        return res.status(400).json({ error: _cloudApiErrorLegible(j) });
+      }
+      lista = Array.isArray(j.data) ? j.data : [];
+    } catch (e) {
+      console.error('[cloud-api] plantillas error:', e && e.message);
+      return res.status(502).json({ error: 'No se pudo contactar a Meta.' });
+    }
+
+    // Aplanar: sacar el texto del componente BODY para poder previsualizar.
+    const salida = lista.map(function(t){
+      let cuerpo = '';
+      try {
+        const comps = Array.isArray(t.components) ? t.components : [];
+        const body = comps.find(function(c){ return c && String(c.type).toUpperCase() === 'BODY'; });
+        if (body && body.text) cuerpo = String(body.text);
+      } catch (e) {}
+      return {
+        nombre: t.name || '',
+        categoria: t.category || '',
+        idioma: t.language || '',
+        estado_aprobacion: t.status || '',
+        cuerpo: cuerpo,
+        meta_template_id: t.id ? String(t.id) : null
+      };
+    });
+
+    // Cache best-effort (upsert sobre el unique (user_id, nombre, idioma) de la migracion).
+    // OJO: se cachea ANTES de agregar `variables` porque esa columna NO existe en
+    // cloud_api_templates; mandarla haria fallar el upsert entero (PGRST204). `variables` es un
+    // dato DERIVADO del cuerpo, se recalcula gratis en cada respuesta y no necesita persistirse.
+    try {
+      if (salida.length) {
+        await supabase.from('cloud_api_templates').upsert(
+          salida.map(function(t){ return Object.assign({ user_id: dueno, actualizado_at: new Date().toISOString() }, t); }),
+          { onConflict: 'user_id,nombre,idioma' }
+        );
+      }
+    } catch (e) { /* cache best-effort: no rompe la respuesta */ }
+
+    // D5: exponer cuantas variables necesita cada plantilla, para que el front pueda avisar la
+    // causa REAL antes de que Meta la rechace con un codigo que dice otra cosa.
+    const salidaConVars = salida.map(function(t){ return Object.assign({}, t, { variables: _cloudApiVarsDeCuerpo(t.cuerpo) }); });
+    return res.json({ ok: true, plantillas: salidaConVars });
+  } catch (e) {
+    console.error('[cloud-api] GET plantillas:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// --- POST /api/cloud-api/enviar-prueba -> body { destinatario, plantilla, idioma, parametros? } ---
+// ESTE ES EL BOTON QUE SE FILMA (paso 2 de la demo).
+app.post('/api/cloud-api/enviar-prueba', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // B2: este boton manda un WhatsApp REAL con el numero y el token del dueño (y Meta se lo
+    // COBRA a el). Un asesor no puede dispararlo.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede enviar mensajes de prueba.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    const b = req.body || {};
+    if (!b.destinatario) return res.status(400).json({ error: 'Falta el destinatario' });
+    if (!b.plantilla) return res.status(400).json({ error: 'Falta la plantilla' });
+
+    // ===== D5: avisar la causa REAL antes de que Meta mienta =====
+    // Si la plantilla tiene variables y no se mandaron los valores, Meta responde 132000 y
+    // _cloudApiErrorLegible lo traduce a "La plantilla no existe o no esta aprobada": una causa
+    // FALSA que manda a revisar la consola de Meta cuando el problema es otro. Lo detectamos aca
+    // (gratis, contra el cache de plantillas) y devolvemos la verdad.
+    // DEFENSIVO: si no hay cache o falla la lectura, NO se bloquea el envio (que decida Meta).
+    try {
+      const _params = Array.isArray(b.parametros) ? b.parametros.filter(function(p){ return p != null && String(p) !== ''; }) : [];
+      const { data: _tpl } = await supabase.from('cloud_api_templates')
+        .select('cuerpo').eq('user_id', dueno).eq('nombre', String(b.plantilla)).eq('idioma', String(b.idioma || 'es'))
+        .limit(1).maybeSingle();
+      if (_tpl && _tpl.cuerpo) {
+        const _nVars = _cloudApiVarsDeCuerpo(_tpl.cuerpo);
+        if (_nVars > 0 && _params.length < _nVars) {
+          return res.status(400).json({
+            error: 'Esta plantilla necesita ' + _nVars + ' variable' + (_nVars === 1 ? '' : 's') + ' (' + String(_tpl.cuerpo).slice(0, 120) + '). Para la prueba, elegí una plantilla SIN variables.',
+            faltan_variables: _nVars
+          });
+        }
+      }
+    } catch (eVar) { /* sin cache -> seguir; el error de Meta llegara igual */ }
+
+    const r = await enviarPlantillaCloud(dueno, String(b.plantilla), String(b.idioma || 'es'), String(b.destinatario), b.parametros);
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    return res.json({ ok: true, id: r.id });
+  } catch (e) {
+    console.error('[cloud-api] POST enviar-prueba:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// --- GET /api/cloud-api/embedded-signup -> el front pregunta si el popup esta DISPONIBLE. ---
+// Sin META_APP_ID/META_APP_SECRET -> disponible:false y el boton del front avisa en vez de fallar.
+app.get('/api/cloud-api/embedded-signup', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    return res.json({ ok: true, disponible: !!(META_APP_ID && META_APP_SECRET), app_id: META_APP_ID || null });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
+// --- POST /api/cloud-api/embedded-signup -> body { code, phone_number_id?, waba_id? } ---
+// CAMINO DE PRODUCCION: el popup de Meta devuelve un `code`; aca se cambia por un token
+// (/v25.0/oauth/access_token con META_APP_ID + META_APP_SECRET) y se guarda POR TENANT.
+// ⚠️ NO VERIFICADO CONTRA META: sin las credenciales de la app cargadas no se pudo ejercitar
+// este camino ni una vez. La demo NO depende de esto (usa POST /api/cloud-api/conectar).
+app.post('/api/cloud-api/embedded-signup', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // B2: mismo criterio que /conectar (este endpoint guarda un token de tenant). Solo dueño.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede conectar la WhatsApp API oficial.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    if (!META_APP_ID || !META_APP_SECRET) return res.status(503).json({ error: 'Falta configurar credenciales de Meta (META_APP_ID / META_APP_SECRET) en el backend.' });
+    const b = req.body || {};
+    const code = b.code ? String(b.code) : '';
+    if (!code) return res.status(400).json({ error: 'Falta el code del popup de Meta' });
+
+    // code -> business access token.
+    let token = '';
+    try {
+      const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/oauth/access_token' +
+        '?client_id=' + encodeURIComponent(META_APP_ID) +
+        '&client_secret=' + encodeURIComponent(META_APP_SECRET) +
+        '&code=' + encodeURIComponent(code);
+      const r = await fetch(url);
+      const j = await r.json().catch(function(){ return null; });
+      if (!r.ok || !j || !j.access_token) {
+        console.error('[cloud-api] embedded-signup token:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 300));
+        return res.status(502).json({ error: 'Meta no devolvio un token de acceso. Reintentá.' });
+      }
+      token = String(j.access_token);
+    } catch (e) {
+      console.error('[cloud-api] embedded-signup error:', e && e.message);
+      return res.status(502).json({ error: 'No se pudo contactar a Meta.' });
+    }
+
+    // El popup devuelve waba_id + phone_number_id en su callback JS (el front los manda aca).
+    let waba_id = b.waba_id ? String(b.waba_id).trim() : '';
+    let phone_number_id = b.phone_number_id ? String(b.phone_number_id).trim() : '';
+    // Si el front no los mando, intentar resolverlos con el token recien obtenido (best-effort).
+    if (!waba_id || !phone_number_id) {
+      try {
+        const r = await fetch('https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/debug_token?input_token=' + encodeURIComponent(token) + '&access_token=' + encodeURIComponent(META_APP_ID + '|' + META_APP_SECRET));
+        const j = await r.json().catch(function(){ return null; });
+        const scopes = j && j.data && Array.isArray(j.data.granular_scopes) ? j.data.granular_scopes : [];
+        const wa = scopes.find(function(s){ return s && s.scope === 'whatsapp_business_messaging'; });
+        if (!waba_id && wa && Array.isArray(wa.target_ids) && wa.target_ids.length) waba_id = String(wa.target_ids[0]);
+      } catch (e) {}
+      if (waba_id && !phone_number_id) {
+        try {
+          const r = await fetch('https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(waba_id) + '/phone_numbers?access_token=' + encodeURIComponent(token));
+          const j = await r.json().catch(function(){ return null; });
+          if (j && Array.isArray(j.data) && j.data.length && j.data[0].id) phone_number_id = String(j.data[0].id);
+        } catch (e) {}
+      }
+    }
+    if (!phone_number_id) return res.status(400).json({ error: 'Meta no devolvio el Phone Number ID. Cargá los datos a mano.' });
+
+    // B1a: mismo criterio que /conectar -> dar de alta un numero NO lo enciende. Se enciende
+    // SOLO con el toggle explicito (POST /api/cloud-api/activar). Si la fila ya existia, se
+    // preserva su estado actual (re-hacer el signup no apaga un numero que ya venia andando).
+    const fila = { user_id: dueno, waba_id: waba_id || null, phone_number_id: phone_number_id, token: token, verificado: true };
+    try {
+      const { data: existe } = await supabase.from('cloud_api_numbers').select('id, display_number, activo').eq('user_id', dueno).limit(1).maybeSingle();
+      if (existe) { fila.activo = (existe.activo === true); await supabase.from('cloud_api_numbers').update(fila).eq('id', existe.id); }
+      else { fila.activo = false; await supabase.from('cloud_api_numbers').insert(fila); }
+    } catch (e) {
+      console.error('[cloud-api] embedded-signup save:', e && e.message);
+      return res.status(500).json({ error: 'No se pudo guardar la conexion.' });
+    }
+    return res.json({ ok: true, conectado: true, activo: fila.activo === true, waba_id: waba_id, phone_number_id: phone_number_id });
+  } catch (e) {
+    console.error('[cloud-api] POST embedded-signup:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+// ===== FIN MODULO WHATSAPP CLOUD API ========================================
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

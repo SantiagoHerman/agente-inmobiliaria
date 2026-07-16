@@ -23206,6 +23206,13 @@ app.post('/api/push/registrar-token', async function(req, res){
     var plataforma = (req.body && req.body.plataforma) ? String(req.body.plataforma).slice(0, 40) : 'web';
     if (!token) return res.status(400).json({ error: 'Falta token' });
 
+    // ANTI-CRUCE (exclusividad del dispositivo): un token FCM es del DISPOSITIVO, no del usuario, y NO cambia al
+    // cambiar de cuenta. Si el mismo teléfono se usó antes con OTRA cuenta, ese token seguía atado a la cuenta vieja
+    // y le llegaban sus push (fuga entre cuentas). Al registrar, se lo SACAMOS a cualquier otro user_id -> el push de
+    // cuentas anteriores deja de llegar a este dispositivo. Best-effort: si falla, el upsert de abajo igual reasigna
+    // cuando hay unique por token. Borra por token + user_id != uid (nunca toca el token del usuario actual).
+    try { await supabase.from('device_tokens').delete().eq('token', token).neq('user_id', uid); } catch (eDelOtros) {}
+
     // Intento 1: upsert con la columna REAL `platform` (device_tokens = id, user_id, token, platform, created_at).
     // onConflict por token (requiere unique en token; si no, cae a los intentos defensivos de abajo).
     var up = await supabase.from('device_tokens').upsert(

@@ -24830,35 +24830,60 @@ async function _metaCredExclusividad(user_id, canal, idCuenta) {
   try {
     if (!user_id || !idCuenta) return;
     const columna = (canal === 'instagram') ? 'ig_user_id' : 'page_id';
-    const { data, error } = await supabase
+    // El OAuth PROBO que user_id controla esta cuenta (se logueo en ella). Por lo tanto NINGUN otro tenant
+    // puede tener una credencial para esta misma cuenta: se BORRAN todas las filas ajenas para este id
+    // (activas O inactivas). Borrar -y no solo desactivar- es lo que cierra el problema de RAIZ:
+    //   - una fila ajena ACTIVA que quede rutearia los DMs del dueno al tenant equivocado (fuga IG: la firma
+    //     pasa con el secret global de Meta) -> hay que sacarla del ruteo;
+    //   - una fila ajena INACTIVA "squat" (plantada antes de que el dueno conecte, cuando el guard no tenia
+    //     nada que detectar) sobrevive al OAuth si solo se desactivara, y (a) bloquea que el dueno active su
+    //     canal (el guard de alta manual rechaza si existe CUALQUIER fila ajena) y (b) puede re-activarse ->
+    //     DoS/robo del canal del dueno. Borrandola, el dueno queda libre y nadie puede heredar la cuenta.
+    // Es seguro: una cuenta de IG/Pagina tiene UN solo dueno; si user_id acaba de probar control por login,
+    // toda fila de OTRO tenant para esa cuenta es ilegitima. Se loguea el estado (BACKUP) antes de borrar.
+    const { data: ajenas, error: eSel } = await supabase
       .from('messenger_credentials')
-      .update({ activo: false })
+      .select('id, user_id, activo, created_at')
       .eq(columna, String(idCuenta))
-      .neq('user_id', user_id)
-      .eq('activo', true)
-      .select('id, user_id');
-    if (!error && data && data.length) {
-      console.warn('[meta exclusividad] ' + columna + '=' + idCuenta + ' reclamada por user ' + user_id + ' -> DESACTIVADAS ' + data.length + ' credenciales de otros tenants: ' + data.map(function(r){ return r.user_id; }).join(', '));
-      // La cuenta estaba EN USO por otro tenant -> transferir el 'activo' al que acaba de PROBAR
-      // titularidad (OAuth). Asi, apenas el dueno real conecta su Instagram/Pagina, sus mensajes le
-      // llegan a EL (no queda el canal apagado, que era la "trampa": el viejo se apaga pero el nuevo
-      // seguia inactivo). Se enciende SOLO cuando se le saco a otro (cuenta que ya estaba activa); un
-      // connect fresco sin cruce sigue entrando apagado (principio "no auto-encender"). Desactivar
-      // ANTES de activar (arriba) respeta el indice unico parcial.
-      try {
-        const { error: eOn } = await supabase
-          .from('messenger_credentials')
-          .update({ activo: true })
-          .eq(columna, String(idCuenta))
-          .eq('user_id', user_id);
-        if (eOn) console.error('[meta exclusividad] no se pudo activar al dueno reclamante:', eOn.message);
-        else console.warn('[meta exclusividad] ' + columna + '=' + idCuenta + ' ACTIVADA para el dueno reclamante ' + user_id);
-      } catch (eOn2) { console.error('[meta exclusividad] activar dueno:', eOn2 && eOn2.message); }
+      .neq('user_id', user_id);
+    if (eSel) { console.error('[meta exclusividad] no se pudo leer ajenas (no bloquea):', eSel.message); return; }
+    if (ajenas && ajenas.length) {
+      console.warn('[meta exclusividad] BACKUP ' + columna + '=' + idCuenta + ' reclamada por ' + user_id +
+        ' -> BORRANDO ' + ajenas.length + ' credencial(es) de otros tenants: ' +
+        JSON.stringify(ajenas.map(function(r){ return { id: r.id, user: r.user_id, activo: r.activo, ts: r.created_at }; })));
+      const huboAjenaActiva = ajenas.some(function(r){ return r.activo === true; });
+      const { error: eDel } = await supabase
+        .from('messenger_credentials')
+        .delete()
+        .eq(columna, String(idCuenta))
+        .neq('user_id', user_id);
+      if (eDel) { console.error('[meta exclusividad] error borrando ajenas (no bloquea):', eDel.message); }
+      // Si la cuenta estaba EN USO por otro (habia una ACTIVA ajena) -> transferir el 'activo' al dueno que
+      // acaba de probar titularidad, para que sus mensajes le lleguen a EL de inmediato (no queda a oscuras).
+      // Un connect FRESCO sin cruce (no habia filas ajenas) mantiene "no auto-encender": la fila del dueno
+      // queda inactiva hasta que la active desde Integraciones.
+      if (huboAjenaActiva) {
+        try {
+          const { error: eOn } = await supabase
+            .from('messenger_credentials')
+            .update({ activo: true })
+            .eq(columna, String(idCuenta))
+            .eq('user_id', user_id);
+          if (eOn) console.error('[meta exclusividad] no se pudo activar al dueno reclamante:', eOn.message);
+          else console.warn('[meta exclusividad] ' + columna + '=' + idCuenta + ' ACTIVADA para el dueno reclamante ' + user_id);
+        } catch (eOn2) { console.error('[meta exclusividad] activar dueno:', eOn2 && eOn2.message); }
+      }
     }
   } catch (e) { console.error('[meta exclusividad] fallo (no bloquea):', e && e.message); }
 }
-// ¿Otro tenant ya tiene ACTIVA esta cuenta? (para rechazar la carga manual). Fail-closed: ante error de
-// consulta se responde true (mejor bloquear un alta manual que permitir un cruce).
+// ¿Otro tenant ya RECLAMO esta cuenta? (para rechazar la carga manual). Mira CUALQUIER fila ajena para ese
+// ig_user_id/page_id, ACTIVA o INACTIVA: si solo mirara las activas, un atacante podria, en la ventana en que
+// el dueno real esta INACTIVO (el estado por defecto tras cada OAuth, hasta que el cliente toca "Activar"),
+// guardar una credencial ACTIVA con el id ajeno, ganar el resolver (mas nueva activa) y capturar los DMs de IG
+// (la firma de IG pasa con el secret GLOBAL de Meta aunque el app_secret de la fila sea basura) -> fuga cross-tenant.
+// Con este check, apenas el dueno tiene UNA fila (post-OAuth) nadie mas puede reclamar la cuenta a mano. No bloquea
+// al propio dueno (.neq('user_id')) ni a una cuenta que nadie tiene (esa se reclama por OAuth -> _metaCredExclusividad
+// gobierna). Fail-closed: ante error de consulta se responde true (mejor bloquear un alta manual que permitir un cruce).
 async function _metaCredEnUsoPorOtro(user_id, canal, idCuenta) {
   try {
     if (!idCuenta) return false;
@@ -24868,7 +24893,6 @@ async function _metaCredEnUsoPorOtro(user_id, canal, idCuenta) {
       .select('id')
       .eq(columna, String(idCuenta))
       .neq('user_id', user_id)
-      .eq('activo', true)
       .limit(1);
     if (error) return true;
     return !!(data && data.length);
@@ -25019,6 +25043,10 @@ app.post('/api/meta/credenciales', async function(req, res) {
     if (existe) {
       if (!fila.page_access_token) delete fila.page_access_token; // conservar token previo
       if (fila.app_secret === null && !b.app_secret) delete fila.app_secret; // conservar app_secret previo
+      // NUNCA cambiar el id de cuenta al EDITAR una fila existente: el ig_user_id/page_id lo fija el OAuth
+      // (prueba de titularidad). Editar es solo para token/app_secret/verify_token/activo. Asi, aunque el
+      // body traiga un id ajeno (o el guard lo dejara pasar), la fila conserva SU cuenta y no se re-apunta.
+      delete fila.page_id; delete fila.ig_user_id;
       const { error } = await supabase.from('messenger_credentials').update(fila).eq('id', existe.id);
       if (error) return res.status(500).json({ error: error.message });
     } else {

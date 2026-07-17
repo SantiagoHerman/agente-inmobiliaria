@@ -24974,9 +24974,23 @@ function _metaOauthConfigurado() { return !!(META_APP_ID && META_APP_SECRET); }
 // es distinto al de Facebook: authorize en www.instagram.com/oauth/authorize, token en api.instagram.com/oauth/access_token,
 // long-lived en graph.instagram.com/access_token. La redirect URL (…/api/meta/ig/oauth/callback) ya esta cargada en Meta.
 // GATEADO por META_IG_APP_SECRET (el id tiene default). Sin el secret -> 503, el boton del front no arranca nada.
-const META_IG_APP_ID = process.env.META_IG_APP_ID || '1003865422423472';
-const META_IG_OAUTH_REDIRECT = process.env.META_IG_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta/ig/oauth/callback');
+const META_IG_APP_ID = (process.env.META_IG_APP_ID || '1003865422423472').trim();
+const META_IG_OAUTH_REDIRECT = (process.env.META_IG_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta/ig/oauth/callback')).trim();
 const META_IG_OAUTH_SCOPES = 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments';
+// Normalizar META_IG_APP_SECRET UNA vez (se consume via process.env en 5 lugares: canje OAuth, long-lived,
+// credencial y firma). MISMO gotcha que META_APP_SECRET (2026-07-16): basura invisible pegada en Railway
+// rompe el canje — e Instagram lo reporta con el mensaje ENGANIOSO "redirect_uri is identical..." en vez de
+// "secret invalido". El log al boot delata el caso sin revelar el secreto; el de la redirect permite comparar
+// caracter a caracter con la registrada en la app de Instagram (Business login settings).
+try {
+  const _igSecCrudo = process.env.META_IG_APP_SECRET || '';
+  if (_igSecCrudo) {
+    const _igSecLimpio = _igSecCrudo.trim();
+    if (_igSecLimpio !== _igSecCrudo) process.env.META_IG_APP_SECRET = _igSecLimpio;
+    console.log('[meta] META_IG_APP_SECRET cargado (len=' + _igSecLimpio.length + ', len_cruda=' + _igSecCrudo.length + (_igSecCrudo.length !== _igSecLimpio.length ? ' <- TENIA ESPACIOS/SALTOS INVISIBLES, corregido con trim' : '') + ')');
+  }
+  console.log('[meta] IG OAuth redirect_uri: "' + META_IG_OAUTH_REDIRECT + '"');
+} catch (e) {}
 function _igOauthConfigurado() { return !!(META_IG_APP_ID && process.env.META_IG_APP_SECRET); }
 
 // GET /api/meta/oauth/start — arranca el OAuth (redirige a Meta). Auth por JWT (?token= o Bearer).

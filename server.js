@@ -26320,6 +26320,24 @@ app.post('/api/cloud-api/conectar', async function(req, res) {
       console.error('[cloud-api] conectar save:', e && e.message);
       return res.status(500).json({ error: 'No se pudo guardar la conexion.' });
     }
+
+    // ===== SUSCRIBIR LA WABA A LA APP (POST /{waba_id}/subscribed_apps) =====
+    // SIN esto Meta NO entrega los mensajes ENTRANTES al webhook (gotcha real 2026-07-16: el
+    // envio andaba perfecto, pero los mensajes del lead JAMAS llegaban al servidor — ni un POST).
+    // El Embedded Signup lo hace solo; en la carga manual de la demo nadie lo hacia. Se corre en
+    // cada conectar/actualizacion de token (idempotente para Meta). Best-effort: si falla se
+    // loguea y la conexion igual queda (el saliente no depende de esto).
+    if (fila.waba_id) {
+      try {
+        const rSub = await fetch('https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(fila.waba_id) + '/subscribed_apps', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        const jSub = await rSub.json().catch(function(){ return null; });
+        console.log('[cloud-api] subscribed_apps waba=' + fila.waba_id + ' -> ' + JSON.stringify(jSub || {}).slice(0, 200));
+      } catch (eSub) { console.warn('[cloud-api] subscribed_apps fallo (no bloquea):', eSub && eSub.message); }
+    }
+
     return res.json({ ok: true, conectado: true, activo: fila.activo === true, display_number: fila.display_number, waba_id: fila.waba_id });
   } catch (e) {
     console.error('[cloud-api] POST conectar:', e && e.message);

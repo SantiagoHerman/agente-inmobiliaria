@@ -24948,8 +24948,15 @@ function _oauthCierreHtml(titulo, detalle, ok) {
 //
 // GATEADO por META_APP_ID + META_APP_SECRET. Si faltan -> 503 "no configurado": el boton
 // del front no arranca nada (cero comportamiento). NO toca el webhook ni el envio.
-const META_APP_ID = process.env.META_APP_ID || '';
-const META_APP_SECRET = process.env.META_APP_SECRET || '';
+const META_APP_ID = (process.env.META_APP_ID || '').trim();
+// .trim(): un espacio/salto de linea invisible pegado en Railway rompe el HMAC de la firma
+// X-Hub-Signature-256 (webhook cloud-api descartaba TODO con "firma invalida"). El log de abajo
+// delata ese caso sin revelar el secreto: si len_cruda != len, habia basura invisible.
+const META_APP_SECRET = (process.env.META_APP_SECRET || '').trim();
+try {
+  const _rawSec = process.env.META_APP_SECRET || '';
+  if (_rawSec) console.log('[meta] META_APP_SECRET cargado (len=' + META_APP_SECRET.length + ', len_cruda=' + _rawSec.length + (_rawSec.length !== META_APP_SECRET.length ? ' <- TENIA ESPACIOS/SALTOS INVISIBLES, corregido con trim' : '') + ')');
+} catch (e) {}
 const META_OAUTH_REDIRECT = process.env.META_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta/oauth/callback');
 // Scopes minimos para Messenger: leer las Paginas del usuario y mensajear desde ellas.
 const META_OAUTH_SCOPES = 'pages_show_list,pages_messaging,pages_manage_metadata,business_management';

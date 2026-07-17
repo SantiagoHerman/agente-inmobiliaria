@@ -24839,6 +24839,21 @@ async function _metaCredExclusividad(user_id, canal, idCuenta) {
       .select('id, user_id');
     if (!error && data && data.length) {
       console.warn('[meta exclusividad] ' + columna + '=' + idCuenta + ' reclamada por user ' + user_id + ' -> DESACTIVADAS ' + data.length + ' credenciales de otros tenants: ' + data.map(function(r){ return r.user_id; }).join(', '));
+      // La cuenta estaba EN USO por otro tenant -> transferir el 'activo' al que acaba de PROBAR
+      // titularidad (OAuth). Asi, apenas el dueno real conecta su Instagram/Pagina, sus mensajes le
+      // llegan a EL (no queda el canal apagado, que era la "trampa": el viejo se apaga pero el nuevo
+      // seguia inactivo). Se enciende SOLO cuando se le saco a otro (cuenta que ya estaba activa); un
+      // connect fresco sin cruce sigue entrando apagado (principio "no auto-encender"). Desactivar
+      // ANTES de activar (arriba) respeta el indice unico parcial.
+      try {
+        const { error: eOn } = await supabase
+          .from('messenger_credentials')
+          .update({ activo: true })
+          .eq(columna, String(idCuenta))
+          .eq('user_id', user_id);
+        if (eOn) console.error('[meta exclusividad] no se pudo activar al dueno reclamante:', eOn.message);
+        else console.warn('[meta exclusividad] ' + columna + '=' + idCuenta + ' ACTIVADA para el dueno reclamante ' + user_id);
+      } catch (eOn2) { console.error('[meta exclusividad] activar dueno:', eOn2 && eOn2.message); }
     }
   } catch (e) { console.error('[meta exclusividad] fallo (no bloquea):', e && e.message); }
 }
@@ -24898,30 +24913,56 @@ async function _sanearCredencialesMetaDuplicadas() {
     const pins = _leerMetaOwnerPins();
     for (const clave of Object.keys(grupos)) {
       const g = grupos[clave];
-      if (g.length < 2 && !pins[clave]) continue; // una sola fila y sin pin -> nada que sanear
-      // el mas nuevo (created_at desc) es el dueno canonico, salvo pin explicito.
-      g.sort(function (a, b) { return new Date(b.created_at || 0) - new Date(a.created_at || 0); });
-      const dueno = pins[clave] || g[0].user_id;
-      const filaDueno = g.find(function (r) { return r.user_id === dueno; }) || g[0];
-      const ajenasActivas = g.filter(function (r) { return r.activo === true && r.user_id !== dueno; });
-      const huboActiva = g.some(function (r) { return r.activo === true; });
-      // ya esta sano: nadie ajeno activo, y (el dueno ya esta activo O la cuenta estaba toda apagada)
-      if (!ajenasActivas.length && (filaDueno.activo === true || (!huboActiva && !pins[clave]))) continue;
-      console.warn('[meta sanear] BACKUP ' + clave + ' dueno=' + dueno + ': ' +
+      const activas = g.filter(function (r) { return r.activo === true; });
+      // Log de estado (SOLO lectura, sin tokens) para AUDITAR quien es el dueno activo de cada cuenta.
+      console.log('[meta sanear] estado ' + clave + ': ' +
+        JSON.stringify(g.map(function (r) { return { user: r.user_id, activo: r.activo, ts: r.created_at }; })));
+
+      // PIN de operador (env META_CRED_OWNER_PINS): override explicito de titularidad. SOLO vale si el
+      // usuario pinneado TIENE una fila en este grupo; si apunta a un user sin fila se IGNORA (evita que
+      // un pin mal configurado desactive al dueno legitimo o haga oscilar el estado cada corrida).
+      const pinUser = pins[clave];
+      const filaPin = pinUser ? g.find(function (r) { return r.user_id === pinUser; }) : null;
+      if (pinUser && !filaPin) console.warn('[meta sanear] ' + clave + ': PIN a ' + pinUser + ' IGNORADO (no tiene credencial en esta cuenta)');
+
+      if (filaPin) {
+        const ajenas = activas.filter(function (r) { return r.user_id !== pinUser; });
+        const activarPin = filaPin.activo !== true;
+        if (!ajenas.length && !activarPin) continue; // ya sano segun el pin
+        console.warn('[meta sanear] BACKUP ' + clave + ' pin_dueno=' + pinUser + ': ' +
+          JSON.stringify(g.map(function (r) { return { id: r.id, user: r.user_id, activo: r.activo, ts: r.created_at }; })));
+        // desactivar ANTES de activar (respeta el indice unico parcial si existe).
+        if (ajenas.length) {
+          const ids = ajenas.map(function (r) { return r.id; });
+          const { data: off, error: e1 } = await supabase.from('messenger_credentials').update({ activo: false }).in('id', ids).select('id, user_id');
+          if (e1) console.error('[meta sanear] ' + clave + ' error desactivando (pin):', e1.message);
+          else console.warn('[meta sanear] ' + clave + ': DESACTIVADAS ' + (off ? off.length : 0) + ' ajenas (pin) -> ' + JSON.stringify(off || []));
+        }
+        if (activarPin) {
+          const { error: e2 } = await supabase.from('messenger_credentials').update({ activo: true }).eq('id', filaPin.id);
+          if (e2) console.error('[meta sanear] ' + clave + ' error activando pin:', e2.message);
+          else console.warn('[meta sanear] ' + clave + ': ACTIVADA la del pin ' + pinUser + ' (id ' + filaPin.id + ')');
+        }
+        continue;
+      }
+
+      // SIN pin: la titularidad la fija EXCLUSIVAMENTE el OAuth (_metaCredExclusividad), que exige probar
+      // control de la cuenta logueandose en ella. El janitor NO transfiere titularidad ni enciende filas
+      // inactivas: si lo hiciera por "created_at mas nuevo", cualquier tenant podria guardar una credencial
+      // INACTIVA con el ig_user_id/page_id de otro y HEREDAR la cuenta al proximo saneo (el mismo cruce que
+      // este fix cierra). El janitor solo COLAPSA la carrera "2+ activas en la misma cuenta": deja activa la
+      // MAS NUEVA (misma politica "ultimo dueno probado gana" del resolver) y apaga las demas. 0 o 1 activa
+      // -> intacto (una fila inactiva ajena queda inerte: el resolver solo lee activas).
+      if (activas.length < 2) continue;
+      activas.sort(function (a, b) { return new Date(b.created_at || 0) - new Date(a.created_at || 0); });
+      const quedaActiva = activas[0];
+      const apagar = activas.slice(1);
+      console.warn('[meta sanear] BACKUP ' + clave + ' (colapso ' + activas.length + ' activas, queda ' + quedaActiva.user_id + '): ' +
         JSON.stringify(g.map(function (r) { return { id: r.id, user: r.user_id, activo: r.activo, ts: r.created_at }; })));
-      // 1) desactivar las ajenas activas (SIEMPRE antes de activar, por el indice unico parcial).
-      if (ajenasActivas.length) {
-        const ids = ajenasActivas.map(function (r) { return r.id; });
-        const { data: off, error: e1 } = await supabase.from('messenger_credentials').update({ activo: false }).in('id', ids).select('id, user_id');
-        if (e1) console.error('[meta sanear] ' + clave + ' error desactivando:', e1.message);
-        else console.warn('[meta sanear] ' + clave + ': DESACTIVADAS ' + (off ? off.length : 0) + ' ajenas -> ' + JSON.stringify(off || []));
-      }
-      // 2) si la cuenta estaba en uso (o hay pin), asegurar activa la del dueno canonico.
-      if ((huboActiva || pins[clave]) && filaDueno.activo !== true) {
-        const { error: e2 } = await supabase.from('messenger_credentials').update({ activo: true }).eq('id', filaDueno.id);
-        if (e2) console.error('[meta sanear] ' + clave + ' error activando dueno:', e2.message);
-        else console.warn('[meta sanear] ' + clave + ': ACTIVADA la del dueno ' + dueno + ' (id ' + filaDueno.id + ')');
-      }
+      const ids = apagar.map(function (r) { return r.id; });
+      const { data: off, error: e1 } = await supabase.from('messenger_credentials').update({ activo: false }).in('id', ids).select('id, user_id');
+      if (e1) console.error('[meta sanear] ' + clave + ' error colapsando activas:', e1.message);
+      else console.warn('[meta sanear] ' + clave + ': COLAPSADAS ' + (off ? off.length : 0) + ' activas viejas -> ' + JSON.stringify(off || []));
     }
     console.log('[meta sanear] saneamiento de credenciales Meta completado (' + Object.keys(grupos).length + ' cuentas revisadas)');
   } catch (e) { console.error('[meta sanear] fallo (no bloquea el boot):', e && e.message); }
@@ -24951,10 +24992,12 @@ app.post('/api/meta/credenciales', async function(req, res) {
     if (canal === 'page') { fila.page_id = String(b.page_id || '').trim(); fila.ig_user_id = null; }
     else                  { fila.ig_user_id = String(b.ig_user_id || '').trim(); fila.page_id = null; }
 
-    // EXCLUSIVIDAD (carga manual = sin prueba de titularidad): si OTRO tenant ya tiene esta cuenta
-    // ACTIVA, se rechaza. La via correcta para reclamarla es el boton "Conectar con Instagram/Facebook"
-    // (OAuth), que exige loguearse en esa cuenta y ahi si se la quita al tenant anterior.
-    if (fila.activo) {
+    // EXCLUSIVIDAD (carga manual = SIN prueba de titularidad): si OTRO tenant ya tiene esta cuenta ACTIVA,
+    // se rechaza SIEMPRE, este el alta activa o inactiva. Guardar (aunque sea inactiva) el id de una cuenta
+    // que otro cliente usa no tiene ningun caso legitimo, y ademas dejaba una fila ajena en la tabla que un
+    // saneo/error futuro podria promover (cruce). La via correcta para reclamar una cuenta propia es el boton
+    // "Conectar con Instagram/Facebook" (OAuth), que exige loguearse en esa cuenta y se la quita al anterior.
+    {
       const idCuenta = (canal === 'page') ? fila.page_id : fila.ig_user_id;
       if (await _metaCredEnUsoPorOtro(b.admin_id, canal, idCuenta)) {
         return res.status(409).json({ error: 'Esa cuenta ya esta conectada en OTRO cliente de Raices. Si es tuya, conectala con el boton "Conectar con ' + (canal === 'page' ? 'Facebook' : 'Instagram') + '" (inicio de sesion): eso la libera del cliente anterior.' });

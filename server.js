@@ -24507,7 +24507,10 @@ function _metaFirmaOk(rawBody, firmaHeader, appSecret) {
     // appSecret puede ser un string (Messenger) o un ARRAY de secrets candidatos (Instagram: el de la credencial +
     // el de la app de Instagram por env). Valido contra CADA uno y acepto si ALGUNO matchea. Sin ningun secret -> no
     // se procesa (app_secret es obligatorio; evita payloads falsificados). Retrocompatible con el uso previo (string).
-    const secrets = (Array.isArray(appSecret) ? appSecret : [appSecret]).filter(Boolean);
+    // .trim() en cada secret: un espacio/salto invisible pegado en el App Secret (env o el campo de la
+    // credencial) rompe el HMAC y el webhook descarta TODO con "firma invalida" (gotcha real que tiró el
+    // WhatsApp Cloud entrante el 2026-07-16). Trimear un secret limpio no cambia nada -> defensivo para los 3 canales.
+    const secrets = (Array.isArray(appSecret) ? appSecret : [appSecret]).filter(Boolean).map(function(s){ return String(s).trim(); }).filter(Boolean);
     if (!secrets.length) return false;
     const a = Buffer.from(firmaHeader);
     for (let i = 0; i < secrets.length; i++) {

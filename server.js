@@ -24796,6 +24796,52 @@ app.post('/api/webhook/meta', function(req, res) {
 // un booleano de si hay app_secret cargado.
 // ============================================================================
 
+// ===== EXCLUSIVIDAD DE CUENTA META (anti cruce entre inquilinos) =====
+// Una cuenta de Instagram (ig_user_id) o una Pagina de Facebook (page_id) pertenece a UN solo tenant.
+// INCIDENTE REAL 2026-07-17: @raicescrm quedo con credencial ACTIVA en DOS cuentas (una vieja en Anton
+// + la del tenant de prueba) -> un DM de IG lo proceso ANTON y su IA ("Nadia") le respondio al lead de
+// otro tenant. Cruce de inquilinos, inaceptable.
+// REGLA:
+//   - OAuth (el usuario PROBO ser dueno logueandose en esa cuenta) -> reclama la cuenta y DESACTIVA la
+//     credencial de cualquier otro tenant (_metaCredExclusividad). Ultimo dueno probado gana.
+//   - Carga MANUAL (sin prueba de titularidad) -> si OTRO tenant ya tiene esa cuenta activa, se RECHAZA
+//     con error claro (_metaCredEnUsoPorOtro). Nadie se roba un canal tipeando un id.
+// CANDADO FINAL: indice unico parcial en la DB (migracion-meta-exclusividad.sql): dos filas ACTIVAS no
+// pueden compartir ig_user_id ni page_id aunque todo este codigo fallara.
+async function _metaCredExclusividad(user_id, canal, idCuenta) {
+  try {
+    if (!user_id || !idCuenta) return;
+    const columna = (canal === 'instagram') ? 'ig_user_id' : 'page_id';
+    const { data, error } = await supabase
+      .from('messenger_credentials')
+      .update({ activo: false })
+      .eq(columna, String(idCuenta))
+      .neq('user_id', user_id)
+      .eq('activo', true)
+      .select('id, user_id');
+    if (!error && data && data.length) {
+      console.warn('[meta exclusividad] ' + columna + '=' + idCuenta + ' reclamada por user ' + user_id + ' -> DESACTIVADAS ' + data.length + ' credenciales de otros tenants: ' + data.map(function(r){ return r.user_id; }).join(', '));
+    }
+  } catch (e) { console.error('[meta exclusividad] fallo (no bloquea):', e && e.message); }
+}
+// ¿Otro tenant ya tiene ACTIVA esta cuenta? (para rechazar la carga manual). Fail-closed: ante error de
+// consulta se responde true (mejor bloquear un alta manual que permitir un cruce).
+async function _metaCredEnUsoPorOtro(user_id, canal, idCuenta) {
+  try {
+    if (!idCuenta) return false;
+    const columna = (canal === 'instagram') ? 'ig_user_id' : 'page_id';
+    const { data, error } = await supabase
+      .from('messenger_credentials')
+      .select('id')
+      .eq(columna, String(idCuenta))
+      .neq('user_id', user_id)
+      .eq('activo', true)
+      .limit(1);
+    if (error) return true;
+    return !!(data && data.length);
+  } catch (e) { return true; }
+}
+
 // --- POST /api/meta/credenciales : GUARDAR / ACTIVAR / DESACTIVAR una credencial. ---
 app.post('/api/meta/credenciales', async function(req, res) {
   try {
@@ -24819,6 +24865,16 @@ app.post('/api/meta/credenciales', async function(req, res) {
     const fila = { user_id: b.admin_id, canal, activo: (b.activo === false ? false : true) };
     if (canal === 'page') { fila.page_id = String(b.page_id || '').trim(); fila.ig_user_id = null; }
     else                  { fila.ig_user_id = String(b.ig_user_id || '').trim(); fila.page_id = null; }
+
+    // EXCLUSIVIDAD (carga manual = sin prueba de titularidad): si OTRO tenant ya tiene esta cuenta
+    // ACTIVA, se rechaza. La via correcta para reclamarla es el boton "Conectar con Instagram/Facebook"
+    // (OAuth), que exige loguearse en esa cuenta y ahi si se la quita al tenant anterior.
+    if (fila.activo) {
+      const idCuenta = (canal === 'page') ? fila.page_id : fila.ig_user_id;
+      if (await _metaCredEnUsoPorOtro(b.admin_id, canal, idCuenta)) {
+        return res.status(409).json({ error: 'Esa cuenta ya esta conectada en OTRO cliente de Raices. Si es tuya, conectala con el boton "Conectar con ' + (canal === 'page' ? 'Facebook' : 'Instagram') + '" (inicio de sesion): eso la libera del cliente anterior.' });
+      }
+    }
     fila.page_access_token = String(b.page_access_token || '').trim();
     fila.verify_token = b.verify_token ? String(b.verify_token).trim() : null;
     fila.app_secret = b.app_secret ? String(b.app_secret).trim() : null;
@@ -25087,6 +25143,9 @@ app.get('/api/meta/oauth/callback', async function(req, res) {
       }
     } catch (e) { console.error('meta oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
 
+    // EXCLUSIVIDAD: el OAuth probo titularidad de la Pagina -> se la quita a cualquier otro tenant.
+    await _metaCredExclusividad(uid, 'page', String(pagina.id));
+
     const aviso = (paginas.length > 1) ? (' Se conecto "' + (pagina.name || pagina.id) + '". Tenes ' + paginas.length + ' Paginas; si queres otra, reconectá.') : (' Pagina conectada: ' + (pagina.name || pagina.id) + '.');
     return res.status(200).send(_oauthCierreHtml('Messenger conectado', 'Activala desde Integraciones para empezar a responder.' + aviso, true));
   } catch (e) { console.error('GET /api/meta/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Messenger.', false)); }
@@ -25156,6 +25215,10 @@ app.get('/api/meta/ig/oauth/callback', async function(req, res) {
         if (error) { console.error('ig oauth save insert:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
       }
     } catch (e) { console.error('ig oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
+
+    // EXCLUSIVIDAD: el OAuth probo titularidad de la cuenta de IG (el usuario se logueo en ella) ->
+    // se la quita a cualquier otro tenant (incidente 2026-07-17: cruce con la credencial vieja de Anton).
+    await _metaCredExclusividad(uid, 'instagram', igUserId);
 
     // 4) SUSCRIBIR la cuenta de IG a los webhooks de mensajes. Sin esto Meta puede no enviar los DMs de esa cuenta.
     //    Best-effort (no rompe la conexion si falla). Log del resultado para diagnosticar.

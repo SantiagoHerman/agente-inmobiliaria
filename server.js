@@ -397,6 +397,11 @@ async function _refrescarAsesoresSinAcceso() {
 }
 setInterval(_refrescarAsesoresSinAcceso, 60 * 1000);
 setTimeout(function () { _refrescarAsesoresSinAcceso().catch(function () {}); }, 3000);
+// Auto-saneo de credenciales Meta cruzadas entre inquilinos (def. cerca de _metaCredExclusividad):
+// una vez al arrancar (a los 4s, tras conectar supabase) y cada 6h como red de seguridad. Cura el
+// estado que la exclusividad reactiva no toca (incidente 2026-07-17: @raicescrm activa en Anton).
+setTimeout(function () { try { _sanearCredencialesMetaDuplicadas().catch(function () {}); } catch (e) {} }, 4000);
+setInterval(function () { try { _sanearCredencialesMetaDuplicadas().catch(function () {}); } catch (e) {} }, 6 * 60 * 60 * 1000);
 // Banear / desbanear el LOGIN de un usuario en Supabase Auth (best-effort; el corte inmediato ya lo da el Set + verificarUsuario).
 async function _setBanUsuario(authUserId, banear) {
   if (!authUserId) return;
@@ -24528,14 +24533,27 @@ async function _resolverCredMeta(canal, idCuenta) {
   try {
     if (!idCuenta) return null;
     const columna = (canal === 'instagram') ? 'ig_user_id' : 'page_id';
+    // NO usar .maybeSingle(): con DOS filas ACTIVAS del mismo ig_user_id/page_id (cruce entre
+    // inquilinos), postgrest-js tira PGRST116 y devuelve null -> el DM se DESCARTA en silencio
+    // (se pierde el mensaje del dueno real) o, si solo una es activa, se rutea a ESE aunque sea
+    // el tenant equivocado (incidente 2026-07-17: Anton contesto un DM de @raicescrm). Traemos
+    // las activas ordenadas por created_at DESC y devolvemos SIEMPRE la del dueno MAS RECIENTE
+    // (misma politica "ultimo dueno probado gana" de la exclusividad por OAuth). Asi, aunque
+    // quedara una fila stale activa de otro tenant, gana el que conecto ultimo = el dueno real.
     const { data, error } = await supabase
       .from('messenger_credentials')
-      .select('id, user_id, canal, page_id, page_access_token, ig_user_id, app_secret, verify_token, activo')
+      .select('id, user_id, canal, page_id, page_access_token, ig_user_id, app_secret, verify_token, activo, created_at')
       .eq('activo', true)
       .eq(columna, String(idCuenta))
-      .maybeSingle();
-    if (error || !data) return null;
-    return data;
+      .order('created_at', { ascending: false })
+      .limit(2);
+    if (error || !data || !data.length) return null;
+    if (data.length > 1) {
+      console.warn('[meta resolver] AMBIGUEDAD ' + columna + '=' + idCuenta + ': ' + data.length +
+        ' credenciales ACTIVAS (' + data.map(function(r){ return r.user_id; }).join(', ') +
+        '). Uso la mas nueva (' + data[0].user_id + '). El saneo/candado deberia dejar 1 sola.');
+    }
+    return data[0];
   } catch (e) { return null; }
 }
 
@@ -24840,6 +24858,73 @@ async function _metaCredEnUsoPorOtro(user_id, canal, idCuenta) {
     if (error) return true;
     return !!(data && data.length);
   } catch (e) { return true; }
+}
+
+// ===== SANEAMIENTO AUTO-CURATIVO DE CREDENCIALES META (corre al boot + cada 6h) =====
+// Cura, en caliente y SIN correr SQL a mano, el estado que _metaCredExclusividad (reactivo, solo
+// dispara en un OAuth nuevo) NO toca: cuentas (ig_user_id/page_id) con credencial activa en un
+// tenant que NO es el dueno real. INCIDENTE 2026-07-17: @raicescrm quedo activa en Anton (vieja) y
+// el reconnect del dueno de prueba entro inactivo (el OAuth nunca enciende) -> el webhook resolvia
+// Anton. REGLA (misma politica "ultimo dueno probado gana" del OAuth): por cada cuenta, el DUENO
+// canonico es el de la credencial MAS NUEVA (created_at). Se desactiva cualquier fila activa de
+// OTRO tenant y, si la cuenta estaba en uso (habia alguna activa), se transfiere el 'activo' al
+// dueno. NUNCA enciende una cuenta que estaba toda apagada (respeta "no auto-encender"). Idempotente,
+// loguea BACKUP del estado previo antes de tocar, y desactiva ANTES de activar (por si hay indice unico).
+// PIN opcional por env META_CRED_OWNER_PINS (JSON {"ig:<id>":"<user_id>", "page:<id>":"<user_id>"}):
+// fuerza un dueno canonico si alguna vez hiciera falta pisar la heuristica de "el mas nuevo".
+function _leerMetaOwnerPins() {
+  try {
+    const raw = (process.env.META_CRED_OWNER_PINS || '').trim();
+    if (!raw) return {};
+    const o = JSON.parse(raw);
+    return (o && typeof o === 'object') ? o : {};
+  } catch (e) { console.error('[meta sanear] META_CRED_OWNER_PINS invalido (JSON):', e && e.message); return {}; }
+}
+async function _sanearCredencialesMetaDuplicadas() {
+  try {
+    const { data: filas, error } = await supabase
+      .from('messenger_credentials')
+      .select('id, user_id, canal, page_id, ig_user_id, activo, created_at');
+    if (error) { console.error('[meta sanear] no se pudo leer:', error.message); return; }
+    if (!filas || !filas.length) return;
+    // Agrupar por cuenta, con prefijo de canal para no mezclar ig con page.
+    const grupos = {};
+    for (const f of filas) {
+      const id = (f.canal === 'instagram') ? f.ig_user_id : f.page_id;
+      if (!id) continue;
+      const clave = (f.canal === 'instagram' ? 'ig:' : 'page:') + String(id);
+      (grupos[clave] = grupos[clave] || []).push(f);
+    }
+    const pins = _leerMetaOwnerPins();
+    for (const clave of Object.keys(grupos)) {
+      const g = grupos[clave];
+      if (g.length < 2 && !pins[clave]) continue; // una sola fila y sin pin -> nada que sanear
+      // el mas nuevo (created_at desc) es el dueno canonico, salvo pin explicito.
+      g.sort(function (a, b) { return new Date(b.created_at || 0) - new Date(a.created_at || 0); });
+      const dueno = pins[clave] || g[0].user_id;
+      const filaDueno = g.find(function (r) { return r.user_id === dueno; }) || g[0];
+      const ajenasActivas = g.filter(function (r) { return r.activo === true && r.user_id !== dueno; });
+      const huboActiva = g.some(function (r) { return r.activo === true; });
+      // ya esta sano: nadie ajeno activo, y (el dueno ya esta activo O la cuenta estaba toda apagada)
+      if (!ajenasActivas.length && (filaDueno.activo === true || (!huboActiva && !pins[clave]))) continue;
+      console.warn('[meta sanear] BACKUP ' + clave + ' dueno=' + dueno + ': ' +
+        JSON.stringify(g.map(function (r) { return { id: r.id, user: r.user_id, activo: r.activo, ts: r.created_at }; })));
+      // 1) desactivar las ajenas activas (SIEMPRE antes de activar, por el indice unico parcial).
+      if (ajenasActivas.length) {
+        const ids = ajenasActivas.map(function (r) { return r.id; });
+        const { data: off, error: e1 } = await supabase.from('messenger_credentials').update({ activo: false }).in('id', ids).select('id, user_id');
+        if (e1) console.error('[meta sanear] ' + clave + ' error desactivando:', e1.message);
+        else console.warn('[meta sanear] ' + clave + ': DESACTIVADAS ' + (off ? off.length : 0) + ' ajenas -> ' + JSON.stringify(off || []));
+      }
+      // 2) si la cuenta estaba en uso (o hay pin), asegurar activa la del dueno canonico.
+      if ((huboActiva || pins[clave]) && filaDueno.activo !== true) {
+        const { error: e2 } = await supabase.from('messenger_credentials').update({ activo: true }).eq('id', filaDueno.id);
+        if (e2) console.error('[meta sanear] ' + clave + ' error activando dueno:', e2.message);
+        else console.warn('[meta sanear] ' + clave + ': ACTIVADA la del dueno ' + dueno + ' (id ' + filaDueno.id + ')');
+      }
+    }
+    console.log('[meta sanear] saneamiento de credenciales Meta completado (' + Object.keys(grupos).length + ' cuentas revisadas)');
+  } catch (e) { console.error('[meta sanear] fallo (no bloquea el boot):', e && e.message); }
 }
 
 // --- POST /api/meta/credenciales : GUARDAR / ACTIVAR / DESACTIVAR una credencial. ---

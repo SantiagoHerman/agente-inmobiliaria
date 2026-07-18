@@ -402,6 +402,9 @@ setTimeout(function () { _refrescarAsesoresSinAcceso().catch(function () {}); },
 // estado que la exclusividad reactiva no toca (incidente 2026-07-17: @raicescrm activa en Anton).
 setTimeout(function () { try { _sanearCredencialesMetaDuplicadas().catch(function () {}); } catch (e) {} }, 4000);
 setInterval(function () { try { _sanearCredencialesMetaDuplicadas().catch(function () {}); } catch (e) {} }, 6 * 60 * 60 * 1000);
+// Correccion de DATOS one-time (idempotente) del incidente 2026-07-17: @raicescrm (ig del webhook 17841413610101571)
+// quedo registrada bajo el tenant de Anton -> sus DMs los contestaba "Nadia". Se reasigna al tenant de prueba (Franco).
+setTimeout(function () { try { _reasignarRaicescrmUnaVez().catch(function () {}); } catch (e) {} }, 5000);
 // Banear / desbanear el LOGIN de un usuario en Supabase Auth (best-effort; el corte inmediato ya lo da el Set + verificarUsuario).
 async function _setBanUsuario(authUserId, banear) {
   if (!authUserId) return;
@@ -24921,6 +24924,52 @@ function _leerMetaOwnerPins() {
     const o = JSON.parse(raw);
     return (o && typeof o === 'object') ? o : {};
   } catch (e) { console.error('[meta sanear] META_CRED_OWNER_PINS invalido (JSON):', e && e.message); return {}; }
+}
+// ===== CORRECCION DE DATOS ONE-TIME (idempotente): incidente 2026-07-17 =====
+// La cuenta de Instagram de @raicescrm (cuenta de PRUEBA/Raices, agente "Franco Bertoni") llega al webhook
+// con ig_user_id 17841413610101571 -el id de cuenta Business que Meta usa en el webhook-, pero esa credencial
+// quedo registrada bajo el tenant de ANTON (f771e75e) -> los DMs los contestaba "Nadia" (Anton). Cuando el test
+// conecto @raicescrm por Instagram Login, Meta devolvio OTRO id (27462544573385130, scoped del login) que el
+// webhook NUNCA entrega, por eso reconectar no arregla el ruteo. Aca se REASIGNA la fila del webhook (17841...)
+// al tenant de prueba y se desactiva la fila scoped vieja (27462...) del test para no dejar 2 activas del mismo
+// canal (romperia el envio saliente por maybeSingle). Idempotente: si ya esta en el test, es no-op. Backup logueado.
+async function _reasignarRaicescrmUnaVez() {
+  try {
+    const IG_RAICES = '17841413610101571';            // ig_user_id real de @raicescrm (el que usa el webhook)
+    const IG_SCOPED_VIEJO = '27462544573385130';       // id de Instagram-Login que el webhook no usa (fila inutil del test)
+    const TEST = '190b9a5c-9a3e-4053-80a2-21fb47cac10d'; // tenant de prueba/Raices (agente Franco Bertoni)
+    const { data: filas, error } = await supabase
+      .from('messenger_credentials')
+      .select('id, user_id, canal, ig_user_id, activo, created_at')
+      .eq('ig_user_id', IG_RAICES);
+    if (error) { console.error('[reasignar raices] no se pudo leer:', error.message); return; }
+    if (!filas || !filas.length) { console.log('[reasignar raices] no hay fila para ig ' + IG_RAICES + ' -> nada que hacer'); return; }
+    const ajenas = filas.filter(function (r) { return r.user_id !== TEST; });
+    if (!ajenas.length) { console.log('[reasignar raices] ig ' + IG_RAICES + ' ya esta en el test -> no-op'); return; }
+    console.warn('[reasignar raices] BACKUP filas ig ' + IG_RAICES + ': ' +
+      JSON.stringify(filas.map(function (r) { return { id: r.id, user: r.user_id, canal: r.canal, activo: r.activo }; })) + ' -> nuevo dueno ' + TEST);
+    // Reasignar la fila del webhook al test (la mas nueva si hubiera varias), activa.
+    ajenas.sort(function (a, b) { return new Date(b.created_at || 0) - new Date(a.created_at || 0); });
+    const mover = ajenas[0];
+    const { error: eUp } = await supabase.from('messenger_credentials').update({ user_id: TEST, activo: true }).eq('id', mover.id);
+    if (eUp) { console.error('[reasignar raices] error reasignando:', eUp.message); return; }
+    console.warn('[reasignar raices] ig ' + IG_RAICES + ' REASIGNADA de ' + mover.user_id + ' a ' + TEST + ' (activa)');
+    // Si habia mas de una fila ajena para esa ig, borrar el resto (evita duplicados ruteando).
+    if (ajenas.length > 1) {
+      const resto = ajenas.slice(1).map(function (r) { return r.id; });
+      const { error: eDel } = await supabase.from('messenger_credentials').delete().in('id', resto);
+      if (eDel) console.error('[reasignar raices] error borrando duplicadas:', eDel.message);
+      else console.warn('[reasignar raices] borradas ' + resto.length + ' filas duplicadas de ig ' + IG_RAICES);
+    }
+    // Desactivar la fila de IG scoped vieja del test (para no dejar 2 activas del mismo canal -> rompe envio saliente).
+    const { data: off, error: eOff } = await supabase
+      .from('messenger_credentials')
+      .update({ activo: false })
+      .eq('user_id', TEST).eq('canal', 'instagram').eq('ig_user_id', IG_SCOPED_VIEJO)
+      .select('id');
+    if (eOff) console.error('[reasignar raices] error desactivando fila scoped vieja:', eOff.message);
+    else if (off && off.length) console.warn('[reasignar raices] DESACTIVADA fila IG scoped vieja del test (ig ' + IG_SCOPED_VIEJO + ')');
+  } catch (e) { console.error('[reasignar raices] fallo (no bloquea el boot):', e && e.message); }
 }
 async function _sanearCredencialesMetaDuplicadas() {
   try {

@@ -25882,6 +25882,16 @@ async function _cloudApiEsDueno(uid) {
 
 // ===== Normalizar destinatario (solo digitos, como espera Meta) =====
 function _cloudApiNumero(n) { return String(n == null ? '' : n).replace(/[^0-9]/g, ''); }
+// AR (gotcha real): WhatsApp Cloud entrega el wa_id del ENTRANTE con el "9" (549 + area + numero = 13 digitos),
+// pero para ENVIAR hay que mandarlo SIN el 9 (54 + area + numero = 12 digitos) — igual que la consola de Meta, el
+// ejemplo curl y la allowlist del numero de PRUEBA. Si se manda con el 9, Meta rechaza con 131030 ("destino no
+// permitido") aunque sea el MISMO telefono (le pasa al numero de prueba, al revisor de Meta y a todo cliente AR).
+// Solo normaliza AR movil (prefijo 549 y 13 digitos); cualquier otro numero (AR fijo, ya sin 9, u otro pais) queda igual.
+function _cloudApiNumeroEnvio(n) {
+  const d = _cloudApiNumero(n);
+  if (d.length === 13 && d.slice(0, 3) === '549') return '54' + d.slice(3);
+  return d;
+}
 
 // ===== Traducir un error de Meta a algo que un humano entienda =====
 // Caso estrella: la VENTANA DE 24h. Si el lead no escribio en las ultimas 24h, Meta rechaza
@@ -25911,7 +25921,7 @@ async function enviarPlantillaCloud(user_id, plantilla, idioma, destinatario, pa
     if (!cfg) return { ok: false, error: 'No hay un numero de WhatsApp API oficial conectado en esta cuenta.' };
     if (!cfg.token) return { ok: false, error: 'La conexion no tiene token cargado.' };
     if (!cfg.phone_number_id) return { ok: false, error: 'La conexion no tiene Phone Number ID.' };
-    const to = _cloudApiNumero(destinatario);
+    const to = _cloudApiNumeroEnvio(destinatario);
     if (!to) return { ok: false, error: 'Destinatario invalido.' };
     if (!plantilla) return { ok: false, error: 'Falta el nombre de la plantilla.' };
 
@@ -25960,7 +25970,7 @@ async function enviarTextoCloud(user_id, destinatario, texto) {
     if (!cfg) return { ok: false, error: 'No hay un numero de WhatsApp API oficial conectado en esta cuenta.' };
     if (!cfg.token) return { ok: false, error: 'La conexion no tiene token cargado.' };
     if (!cfg.phone_number_id) return { ok: false, error: 'La conexion no tiene Phone Number ID.' };
-    const to = _cloudApiNumero(destinatario);
+    const to = _cloudApiNumeroEnvio(destinatario);
     if (!to) return { ok: false, error: 'Destinatario invalido.' };
     if (!texto || !String(texto).trim()) return { ok: false, error: 'Texto vacio.' };
 

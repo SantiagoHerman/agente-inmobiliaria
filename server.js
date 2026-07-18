@@ -22817,7 +22817,8 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
     var uid = (created && created.user) ? created.user.id : null;
     if (!uid) return res.status(400).json({ error: 'No se pudo crear el usuario (sin id)' });
     // 2) business_settings (rollback del auth user si falla)
-    var ins = await supabase.from('business_settings').insert({ user_id: uid, company_name: company, rubro: rubro, whatsapp_contacto: whatsapp });
+    // ui_moderno: true -> las cuentas NUEVAS arrancan SIEMPRE en el panel moderno (el viejo se retiro).
+    var ins = await supabase.from('business_settings').insert({ user_id: uid, company_name: company, rubro: rubro, whatsapp_contacto: whatsapp, ui_moderno: true });
     if (ins.error) {
       try { await supabase.auth.admin.deleteUser(uid); } catch(eD){}
       return res.status(400).json({ error: ins.error.message });
@@ -23688,11 +23689,13 @@ app.get('/api/ui-flags', async function(req, res){
       var _yo = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle();
       if (_yo && _yo.data && _yo.data.admin_id) user_id = _yo.data.admin_id;
     } catch (e) { /* sin fila -> es el dueño, user_id queda igual */ }
-    var ui_moderno = false, reparto_v2 = false, rubro = 'inmobiliaria';
+    // ui_moderno: el panel viejo se retiro -> default MODERNO (true) salvo que este EXPLICITAMENTE en false.
+    // (antes era `=== true` con default false; ahora `!== false` con default true).
+    var ui_moderno = true, reparto_v2 = false, rubro = 'inmobiliaria';
     try {
       var _bs = await supabase.from('business_settings').select('ui_moderno, reparto_v2, rubro').eq('user_id', user_id).maybeSingle();
-      if (_bs && _bs.data) { ui_moderno = _bs.data.ui_moderno === true; reparto_v2 = _bs.data.reparto_v2 === true; if (_bs.data.rubro) rubro = normalizarRubro(_bs.data.rubro); }
-    } catch (e) { /* columna ausente / error -> false (fail-open) */ }
+      if (_bs && _bs.data) { ui_moderno = _bs.data.ui_moderno !== false; reparto_v2 = _bs.data.reparto_v2 === true; if (_bs.data.rubro) rubro = normalizarRubro(_bs.data.rubro); }
+    } catch (e) { /* columna ausente / error -> moderno (fail-open a la vista nueva) */ }
     // reservas_v1 (gate maestro del vertical hotel): query SEPARADA y defensiva para que, si la columna faltara,
     // NO tire abajo los flags de arriba. Ausente/error -> false (comportamiento actual).
     var reservas_v1 = false;
@@ -23722,8 +23725,34 @@ app.get('/api/ui-flags', async function(req, res){
       if (_cav && _cav.data) cloud_api_v1 = _cav.data.cloud_api_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
     return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1 });
-  }catch(e){ return res.status(200).json({ ui_moderno: false, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false }); }
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false }); }
 });
+
+// ============================================================================
+// RETIRO DEL PANEL VIEJO: forzar ui_moderno=true en TODAS las cuentas existentes.
+// ----------------------------------------------------------------------------
+// Diego (2026-07-18): "el viejo panel que no se vea mas en ninguna cuenta". Esto pasa a
+// moderno a todas las cuentas que hoy esten en false/null. IDEMPOTENTE (las que ya estan
+// en true no se tocan; tras la 1a corrida no cambia nada). Corre en cada boot: si el dia
+// de manana alguien deja una cuenta en viejo, el proximo deploy la vuelve a moderno (que es
+// justo lo pedido). Antes de cambiar, LOGUEA el estado previo (regla: backup antes de tocar).
+// Nota: esto deja el toggle "apagar moderno" del Maestro como temporal (hasta el proximo boot).
+async function _forzarUiModernoTodos() {
+  try {
+    const { data, error } = await supabase.from('business_settings').select('user_id, ui_moderno');
+    if (error) { console.error('[ui_moderno todos] no se pudo leer:', error.message); return; }
+    const cambiar = (data || []).filter(function(r){ return r.ui_moderno !== true; });
+    if (!cambiar.length) { console.log('[ui_moderno todos] nada que cambiar (todas ya en moderno)'); return; }
+    console.log('[ui_moderno todos] BACKUP estado previo (' + cambiar.length + '): ' + JSON.stringify(cambiar));
+    let ok = 0;
+    for (const r of cambiar) {
+      try { const u = await supabase.from('business_settings').update({ ui_moderno: true }).eq('user_id', r.user_id); if (!u.error) ok++; }
+      catch (e) { console.error('[ui_moderno todos] update ' + r.user_id + ':', e && e.message); }
+    }
+    console.log('[ui_moderno todos] listo: ' + ok + '/' + cambiar.length + ' cuentas pasadas a moderno');
+  } catch (e) { console.error('_forzarUiModernoTodos:', e && e.message); }
+}
+setTimeout(_forzarUiModernoTodos, 12000);
 
 // ============================================================================
 // ===== ETAPA 3 — GET /api/reportes/metricas (tenant-scoped, auth) ============

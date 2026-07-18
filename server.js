@@ -8650,6 +8650,36 @@ app.get('/api/maestro/aviso', async function(req, res){
   }catch(e){ return res.json({ aviso: null }); }
 });
 
+// ===== BACKUPS (Maestro) — VER y DESCARGAR los respaldos de un cliente =====
+// Los backups los crea hacerBackup() cada 30min a la tabla 'backups' (snapshot de 8 tablas por cuenta). Estos
+// endpoints son READ-ONLY (no tocan datos): listar con fecha/resumen y descargar el JSON a la compu. Es la base de
+// la feature completa de backup (vincular Drive, seleccionar tablas, rotar ultimos N, restaurar) que sigue.
+app.get('/api/maestro/backups', async function(req, res){
+  try {
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.query.user_id ? String(req.query.user_id) : '';
+    if (!uid) return res.status(400).json({ error: 'Falta user_id' });
+    var r = await supabase.from('backups').select('id, created_at, resumen').eq('user_id', uid).order('created_at', { ascending: false }).limit(60);
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, backups: r.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.get('/api/maestro/backup/descargar', async function(req, res){
+  try {
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var id = req.query.id ? String(req.query.id) : '';
+    if (!id) return res.status(400).json({ error: 'Falta id' });
+    var r = await supabase.from('backups').select('user_id, created_at, resumen, contenido').eq('id', id).maybeSingle();
+    if (r.error || !r.data) return res.status(404).json({ error: 'Backup no encontrado' });
+    var d = r.data;
+    var nombre = 'backup-' + String(d.user_id || 'x').slice(0, 8) + '-' + String(d.created_at || '').slice(0, 19).replace(/[:T]/g, '-') + '.json';
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + nombre + '"');
+    return res.send(JSON.stringify({ user_id: d.user_id, created_at: d.created_at, resumen: d.resumen, contenido: d.contenido }, null, 2));
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // Cualquier usuario logueado (verificarUsuario -> 401 si no hay uid). Devuelve el
 // aviso activo MAS RECIENTE o null. No expone mas que mensaje/nivel/id. CERO tokens.
 app.get('/api/aviso-activo', async function(req, res){

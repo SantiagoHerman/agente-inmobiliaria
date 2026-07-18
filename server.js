@@ -25760,6 +25760,40 @@ app.post('/api/backup/drive', async function(req, res) {
   } catch (e) { console.error('POST /api/backup/drive:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error subiendo a Drive' }); }
 });
 
+// GET /api/backup/drive/lista — lista los backups del Drive del PROPIO cliente (JWT). Gateado igual que el POST.
+app.get('/api/backup/drive/lista', async function(req, res) {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Backup a Drive no disponible.' });
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    let ownerId = uid;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+    const cli = await _googleClientAutenticado(ownerId, 'drive');
+    if (!cli) return res.json({ ok: true, conectado: false, backups: [] });
+    const backups = await _listarBackupsDrive(ownerId);
+    return res.json({ ok: true, conectado: true, conservar: BACKUP_DRIVE_CONSERVAR, backups: backups });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// GET /api/backup/drive/descargar — baja un backup puntual del Drive del PROPIO cliente. ?id=fileId
+app.get('/api/backup/drive/descargar', async function(req, res) {
+  try {
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Backup a Drive no disponible.' });
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    let ownerId = uid;
+    const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (ase && ase.admin_id) ownerId = ase.admin_id;
+    const fileId = String(req.query.id || '');
+    if (!fileId) return res.status(400).json({ error: 'Falta id' });
+    const data = await _bajarBackupDrive(ownerId, fileId);
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename="raices-backup.json"');
+    return res.send(JSON.stringify(data));
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
 // ============================================================================
 // BACKUP GENERAL DEL SISTEMA -> UNA cuenta de Google Drive (la de raicescrm)
 // ----------------------------------------------------------------------------

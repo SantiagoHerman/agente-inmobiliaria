@@ -25564,9 +25564,10 @@ app.get('/api/google/oauth/callback', async function(req, res) {
     if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a Google.', false));
     const code = req.query.code ? String(req.query.code) : '';
     const stateRaw = String(req.query.state || '');
-    // El proposito viaja dentro del state ('google:drive' | 'google:calendar'). Validamos ambos.
-    let uid = _oauthStateLeer(stateRaw, 'google:drive'); let proposito = 'drive';
+    // El proposito viaja dentro del state ('google:drive' | 'google:calendar' | 'google:drive_sistema').
+    let uid = _oauthStateLeer(stateRaw, 'google:drive'); let proposito = 'drive'; let esSistema = false;
     if (!uid) { uid = _oauthStateLeer(stateRaw, 'google:calendar'); proposito = 'calendar'; }
+    if (!uid) { const su = _oauthStateLeer(stateRaw, 'google:drive_sistema'); if (su) { uid = su; proposito = 'drive'; esSistema = true; } }
     if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido vencio o no es valido. Reintentá desde Raices CRM.', false));
     const oauth = _googleOAuthClient();
     const { tokens } = await oauth.getToken(code);
@@ -25574,8 +25575,17 @@ app.get('/api/google/oauth/callback', async function(req, res) {
     if (!tokens.refresh_token) {
       // Sin refresh_token no podemos operar offline. Suele pasar si el usuario ya habia consentido antes
       // sin revocar; con prompt=consent no deberia, pero lo informamos por las dudas.
-      const { data: prev } = await supabase.from('google_oauth_tokens').select('refresh_token').eq('user_id', uid).eq('proposito', proposito).maybeSingle();
-      if (!prev || !prev.refresh_token) return res.status(400).send(_oauthCierreHtml('Falta permiso offline', 'Google no entrego un token de actualizacion. Revocá el acceso a la app en tu cuenta de Google y reintentá.', false));
+      if (esSistema) {
+        const prev = await _sysLeerToken();
+        if (!prev || !prev.refresh_token) return res.status(400).send(_oauthCierreHtml('Falta permiso offline', 'Google no entrego un token de actualizacion. Revocá el acceso a la app en la cuenta de Google del sistema y reintentá.', false));
+      } else {
+        const { data: prev } = await supabase.from('google_oauth_tokens').select('refresh_token').eq('user_id', uid).eq('proposito', proposito).maybeSingle();
+        if (!prev || !prev.refresh_token) return res.status(400).send(_oauthCierreHtml('Falta permiso offline', 'Google no entrego un token de actualizacion. Revocá el acceso a la app en tu cuenta de Google y reintentá.', false));
+      }
+    }
+    if (esSistema) {
+      await _sysGuardarToken(tokens);
+      return res.status(200).send(_oauthCierreHtml('Google Drive del sistema conectado', 'Listo. Ya podes hacer el backup general desde el Maestro.', true));
     }
     await _googleGuardarToken(uid, proposito, tokens);
     const titulo = (proposito === 'calendar') ? 'Google Calendar conectado' : 'Google Drive conectado';
@@ -25613,11 +25623,25 @@ app.get('/api/google/estado', async function(req, res) {
 //
 // Por ahora el disparo es MANUAL (endpoint). Queda DOCUMENTADO como engancharlo a un cron.
 
-// Arma el export de datos del cliente (mismas tablas que hacerBackup + opcional 'sistema').
-async function _armarExportCliente(userId, incluirSistema) {
-  const tablas = ['conversations','messages','contacts','recontactos','business_settings','properties','knowledge_base','whatsapp_instancias','citas'];
-  if (incluirSistema) { tablas.push('subscriptions'); tablas.push('ia_uso'); }
-  const contenido = { _meta: { user_id: userId, generado_en: new Date().toISOString(), incluye_sistema: !!incluirSistema } };
+// Tablas que se pueden respaldar. BASE = datos del cliente; SISTEMA = suscripcion/uso (opcional).
+// Se exponen para que el Maestro muestre la lista y el usuario elija que incluir.
+const BACKUP_TABLAS_BASE = ['conversations','messages','contacts','recontactos','business_settings','properties','knowledge_base','whatsapp_instancias','citas'];
+const BACKUP_TABLAS_SISTEMA = ['subscriptions','ia_uso'];
+
+// Arma el export de datos del cliente.
+//  - incluirSistema: agrega las tablas de sistema (subscriptions, ia_uso).
+//  - tablasSel: (opcional) array con las tablas elegidas; si viene, se respeta SOLO esa seleccion
+//    (intersectada con las permitidas, por seguridad). Si NO viene -> comportamiento historico (todas).
+async function _armarExportCliente(userId, incluirSistema, tablasSel) {
+  let tablas;
+  const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  if (Array.isArray(tablasSel) && tablasSel.length) {
+    tablas = tablasSel.filter(function(t){ return permitidas.indexOf(t) !== -1; });
+  } else {
+    tablas = BACKUP_TABLAS_BASE.slice();
+    if (incluirSistema) tablas = tablas.concat(BACKUP_TABLAS_SISTEMA);
+  }
+  const contenido = { _meta: { user_id: userId, generado_en: new Date().toISOString(), incluye_sistema: !!incluirSistema, tablas: tablas } };
   for (const t of tablas) {
     try { const { data } = await supabase.from(t).select('*').eq('user_id', userId); contenido[t] = data || []; }
     catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
@@ -25625,26 +25649,92 @@ async function _armarExportCliente(userId, incluirSistema) {
   return contenido;
 }
 
-// Sube un JSON a la carpeta "Raices CRM Backups" del Drive del tenant. Crea la carpeta si no existe.
-// Devuelve { ok, fileId, fileName } o lanza. Best-effort de carpeta: si no se puede crear, sube a raiz.
+// Estima cuanto "pesa" cada tabla de un tenant (filas + bytes aprox del JSON) para que el Maestro
+// muestre el espacio de cada seleccion. Best-effort: si una tabla falla, va en 0 y sigue.
+async function _pesoTablasCliente(userId) {
+  const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  const out = [];
+  for (const t of permitidas) {
+    let filas = 0, bytes = 0;
+    try {
+      const { data } = await supabase.from(t).select('*').eq('user_id', userId);
+      filas = (data || []).length;
+      bytes = data ? Buffer.byteLength(JSON.stringify(data)) : 0;
+    } catch (e) { filas = 0; bytes = 0; }
+    out.push({ tabla: t, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(t) !== -1 });
+  }
+  return out;
+}
+
+// Cuantos backups conservar en Drive por cuenta (rotacion). A medida que entra uno nuevo,
+// se borran los mas viejos que excedan este tope. Diego: "guardar los ultimos 3 siempre".
+const BACKUP_DRIVE_CONSERVAR = 3;
+
+// Busca (o crea) una carpeta contenedora en el Drive. Devuelve su id o null. `nombre` default = por-tenant.
+async function _carpetaBackupDrive(drive, nombre) {
+  const carpeta = nombre || 'Raices CRM Backups';
+  try {
+    const q = "mimeType='application/vnd.google-apps.folder' and name='" + carpeta.replace(/'/g, "\\'") + "' and trashed=false";
+    const lr = await drive.files.list({ q: q, fields: 'files(id,name)', spaces: 'drive' });
+    if (lr.data.files && lr.data.files.length) return lr.data.files[0].id;
+    const cr = await drive.files.create({ requestBody: { name: carpeta, mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+    return cr.data.id;
+  } catch (e) { console.error('drive carpeta:', e && e.message); return null; }
+}
+
+// Rotacion: deja solo los `conservar` backups mas nuevos en la carpeta; borra el resto. Best-effort.
+async function _rotarBackupsDrive(drive, folderId, conservar) {
+  try {
+    if (!folderId) return;
+    const q = "'" + folderId + "' in parents and name contains 'raices-backup-' and trashed=false";
+    const lr = await drive.files.list({ q: q, fields: 'files(id,name,createdTime)', orderBy: 'createdTime desc', spaces: 'drive', pageSize: 100 });
+    const files = (lr.data.files || []);
+    const sobran = files.slice(conservar); // los mas viejos
+    for (const f of sobran) {
+      try { await drive.files.delete({ fileId: f.id }); console.log('[backup-drive] rotacion: borrado ' + f.name); }
+      catch (e) { console.error('[backup-drive] rotacion delete:', e && e.message); }
+    }
+  } catch (e) { console.error('_rotarBackupsDrive:', e && e.message); }
+}
+
+// Sube un JSON a la carpeta "Raices CRM Backups" del Drive del tenant. Crea la carpeta si no existe
+// y ROTA (deja los ultimos BACKUP_DRIVE_CONSERVAR). Devuelve { ok, fileId, fileName } o lanza.
 async function _subirBackupADrive(userId, contenido) {
   const oauth = await _googleClientAutenticado(userId, 'drive');
   if (!oauth) throw new Error('Drive no conectado para esta cuenta');
   const drive = _googleapis.drive({ version: 'v3', auth: oauth });
-  // Buscar/crear carpeta contenedora.
-  let folderId = null;
-  try {
-    const q = "mimeType='application/vnd.google-apps.folder' and name='Raices CRM Backups' and trashed=false";
-    const lr = await drive.files.list({ q: q, fields: 'files(id,name)', spaces: 'drive' });
-    if (lr.data.files && lr.data.files.length) folderId = lr.data.files[0].id;
-    else { const cr = await drive.files.create({ requestBody: { name: 'Raices CRM Backups', mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' }); folderId = cr.data.id; }
-  } catch (e) { console.error('drive carpeta:', e && e.message); folderId = null; }
+  const folderId = await _carpetaBackupDrive(drive);
   const fileName = 'raices-backup-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
   const Readable = require('stream').Readable;
   const body = Readable.from([JSON.stringify(contenido)]);
   const meta = { name: fileName }; if (folderId) meta.parents = [folderId];
   const up = await drive.files.create({ requestBody: meta, media: { mimeType: 'application/json', body: body }, fields: 'id,name' });
+  // Rotacion DESPUES de subir el nuevo (asi nunca quedamos con menos de los que corresponde).
+  await _rotarBackupsDrive(drive, folderId, BACKUP_DRIVE_CONSERVAR);
   return { ok: true, fileId: up.data.id, fileName: up.data.name };
+}
+
+// Lista los backups guardados en el Drive del tenant (nombre, id, fecha, tamanio). Best-effort: [] si falla.
+async function _listarBackupsDrive(userId) {
+  const oauth = await _googleClientAutenticado(userId, 'drive');
+  if (!oauth) return [];
+  const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+  const folderId = await _carpetaBackupDrive(drive);
+  if (!folderId) return [];
+  try {
+    const q = "'" + folderId + "' in parents and name contains 'raices-backup-' and trashed=false";
+    const lr = await drive.files.list({ q: q, fields: 'files(id,name,createdTime,size)', orderBy: 'createdTime desc', spaces: 'drive', pageSize: 100 });
+    return (lr.data.files || []).map(function(f){ return { id: f.id, nombre: f.name, fecha: f.createdTime, bytes: f.size ? Number(f.size) : null }; });
+  } catch (e) { console.error('_listarBackupsDrive:', e && e.message); return []; }
+}
+
+// Descarga el contenido JSON de un backup puntual del Drive del tenant. Devuelve el objeto parseado o lanza.
+async function _bajarBackupDrive(userId, fileId) {
+  const oauth = await _googleClientAutenticado(userId, 'drive');
+  if (!oauth) throw new Error('Drive no conectado para esta cuenta');
+  const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+  const r = await drive.files.get({ fileId: fileId, alt: 'media' }, { responseType: 'json' });
+  return r.data;
 }
 
 // POST /api/backup/drive — dispara MANUALMENTE un backup a Drive para la cuenta del JWT.
@@ -25669,6 +25759,238 @@ app.post('/api/backup/drive', async function(req, res) {
     return res.json({ ok: true, file: r.fileName, fileId: r.fileId });
   } catch (e) { console.error('POST /api/backup/drive:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error subiendo a Drive' }); }
 });
+
+// ============================================================================
+// BACKUP GENERAL DEL SISTEMA -> UNA cuenta de Google Drive (la de raicescrm)
+// ----------------------------------------------------------------------------
+// Diego: "el backup general de todo lo quiero en una cuenta propia y aparte cada
+// usuario podra hacer un backup personal en su cuenta de drive". Esto es lo GENERAL:
+// una sola cuenta de Google, un export de TODOS los tenants, con rotacion (ultimos 3),
+// listado con fechas/tamanio, restaurar y descarga. Se maneja desde el Maestro.
+//
+// El token de esa cuenta vive en la tabla `system_backup_tokens` (SIN FK, una fila por
+// proposito). Migracion DEFENSIVA en arranque; si exec_sql no existe, se loguea y la
+// feature queda inerte (no rompe nada).
+
+// Migracion defensiva de la tabla del token del sistema.
+async function _migracionSystemBackupTokens() {
+  try {
+    if (!_googleConfigurado()) return;
+    const sql = "CREATE TABLE IF NOT EXISTS system_backup_tokens (proposito text PRIMARY KEY, refresh_token text, access_token text, token_expiry timestamptz, scope text, updated_at timestamptz DEFAULT now()); NOTIFY pgrst, 'reload schema';";
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql: sql });
+      if (error) console.log('[migracion system_backup_tokens] RPC exec_sql fallo (' + error.message + '). Corré a mano: ' + sql);
+      else console.log('[migracion system_backup_tokens] OK + NOTIFY pgrst');
+    } catch (e) { console.log('[migracion system_backup_tokens] sin exec_sql; corré a mano: ' + sql); }
+  } catch (e) { console.error('_migracionSystemBackupTokens:', e && e.message); }
+}
+if (_googleConfigurado()) setTimeout(_migracionSystemBackupTokens, 8000);
+
+// Guarda/actualiza el token de la cuenta de Drive del sistema (proposito='drive').
+async function _sysGuardarToken(tokens) {
+  const fila = {
+    proposito: 'drive',
+    refresh_token: tokens.refresh_token || null,
+    access_token: tokens.access_token || null,
+    token_expiry: tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null,
+    scope: tokens.scope || null,
+    updated_at: new Date().toISOString()
+  };
+  const prev = await _sysLeerToken();
+  if (prev) {
+    if (!fila.refresh_token && prev.refresh_token) delete fila.refresh_token; // Google solo lo manda 1a vez
+    const { error } = await supabase.from('system_backup_tokens').update(fila).eq('proposito', 'drive');
+    if (error) throw new Error(error.message);
+  } else {
+    const { error } = await supabase.from('system_backup_tokens').insert(fila);
+    if (error) throw new Error(error.message);
+  }
+}
+async function _sysLeerToken() {
+  try { const { data } = await supabase.from('system_backup_tokens').select('*').eq('proposito', 'drive').maybeSingle(); return data || null; }
+  catch (e) { return null; }
+}
+// OAuth2 client autenticado con el refresh_token del sistema, o null si no esta vinculado.
+async function _sysDriveOAuth() {
+  const oauth = _googleOAuthClient();
+  if (!oauth) return null;
+  const t = await _sysLeerToken();
+  if (!t || !t.refresh_token) return null;
+  oauth.setCredentials({ refresh_token: t.refresh_token });
+  return oauth;
+}
+
+// Export de TODOS los tenants: vuelca las tablas elegidas SIN filtrar por user_id.
+// Best-effort por tabla. Nombre de carpeta distinto al de los backups por-tenant.
+async function _armarExportSistema(tablasSel) {
+  const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  let tablas = (Array.isArray(tablasSel) && tablasSel.length) ? tablasSel.filter(function(t){ return permitidas.indexOf(t) !== -1; }) : permitidas.slice();
+  const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), tablas: tablas } };
+  for (const t of tablas) {
+    try { const { data } = await supabase.from(t).select('*'); contenido[t] = data || []; }
+    catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
+  }
+  return contenido;
+}
+const BACKUP_SISTEMA_CARPETA = 'Raices CRM Backups (Sistema)';
+
+// Sube el export del sistema a la cuenta propia + rota (ultimos 3). Devuelve {ok,fileId,fileName}.
+async function _subirBackupSistema(contenido) {
+  const oauth = await _sysDriveOAuth();
+  if (!oauth) throw new Error('La cuenta de Drive del sistema no esta vinculada');
+  const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+  const folderId = await _carpetaBackupDrive(drive, BACKUP_SISTEMA_CARPETA);
+  const fileName = 'raices-backup-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+  const Readable = require('stream').Readable;
+  const body = Readable.from([JSON.stringify(contenido)]);
+  const meta = { name: fileName }; if (folderId) meta.parents = [folderId];
+  const up = await drive.files.create({ requestBody: meta, media: { mimeType: 'application/json', body: body }, fields: 'id,name' });
+  await _rotarBackupsDrive(drive, folderId, BACKUP_DRIVE_CONSERVAR);
+  return { ok: true, fileId: up.data.id, fileName: up.data.name };
+}
+async function _listarBackupsSistema() {
+  const oauth = await _sysDriveOAuth();
+  if (!oauth) return [];
+  const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+  const folderId = await _carpetaBackupDrive(drive, BACKUP_SISTEMA_CARPETA);
+  if (!folderId) return [];
+  try {
+    const q = "'" + folderId + "' in parents and name contains 'raices-backup-' and trashed=false";
+    const lr = await drive.files.list({ q: q, fields: 'files(id,name,createdTime,size)', orderBy: 'createdTime desc', spaces: 'drive', pageSize: 100 });
+    return (lr.data.files || []).map(function(f){ return { id: f.id, nombre: f.name, fecha: f.createdTime, bytes: f.size ? Number(f.size) : null }; });
+  } catch (e) { console.error('_listarBackupsSistema:', e && e.message); return []; }
+}
+async function _bajarBackupSistema(fileId) {
+  const oauth = await _sysDriveOAuth();
+  if (!oauth) throw new Error('La cuenta de Drive del sistema no esta vinculada');
+  const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+  const r = await drive.files.get({ fileId: fileId, alt: 'media' }, { responseType: 'json' });
+  return r.data;
+}
+
+// RESTAURAR (levantar) un backup: upsert por id de las tablas elegidas. PELIGROSO (pisa datos),
+// por eso: (1) SOLO super-admin, (2) toma un snapshot "pre-restore" del estado actual ANTES de tocar
+// nada (regla de Diego: backup antes de cambiar), (3) upsert por id (no borra lo que no esta en el backup).
+async function _restaurarBackupSistema(contenido, tablasSel) {
+  if (!contenido || typeof contenido !== 'object') throw new Error('Backup invalido');
+  const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  let tablas = Object.keys(contenido).filter(function(k){ return k !== '_meta' && permitidas.indexOf(k) !== -1; });
+  if (Array.isArray(tablasSel) && tablasSel.length) tablas = tablas.filter(function(t){ return tablasSel.indexOf(t) !== -1; });
+  // (2) snapshot de seguridad del estado ACTUAL antes de restaurar.
+  let snapshot = null;
+  try { const cur = await _armarExportSistema(tablas); const r = await _subirBackupSistema(Object.assign({ _meta: { tipo: 'pre-restore', generado_en: new Date().toISOString(), tablas: tablas } }, (function(){ const o = {}; tablas.forEach(function(t){ o[t] = cur[t] || []; }); return o; })())); snapshot = r.fileName; }
+  catch (e) { console.error('[restore] no se pudo tomar snapshot previo:', e && e.message); throw new Error('No se pudo tomar el respaldo previo de seguridad; restauracion abortada.'); }
+  const resultado = { snapshot_previo: snapshot, tablas: {} };
+  for (const t of tablas) {
+    const filas = Array.isArray(contenido[t]) ? contenido[t] : [];
+    if (!filas.length) { resultado.tablas[t] = { filas: 0 }; continue; }
+    try {
+      // upsert en lotes de 500 por id.
+      let ok = 0;
+      for (let i = 0; i < filas.length; i += 500) {
+        const lote = filas.slice(i, i + 500);
+        const { error } = await supabase.from(t).upsert(lote, { onConflict: 'id' });
+        if (error) { resultado.tablas[t] = { error: error.message, filas: ok }; break; }
+        ok += lote.length;
+      }
+      if (!resultado.tablas[t]) resultado.tablas[t] = { filas: ok };
+    } catch (e) { resultado.tablas[t] = { error: (e && e.message) || 'fallo' }; }
+  }
+  return resultado;
+}
+
+// ---- Endpoints Maestro para el backup del sistema (todos gateados por maestroAuth) ----
+
+// Estado: vinculado o no, cantidad de backups y ultima fecha, + lista de tablas con su peso (todos los tenants).
+app.get('/api/maestro/backup/sistema/estado', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    const configurado = _googleConfigurado() && !!_googleapis;
+    const t = await _sysLeerToken();
+    const vinculado = !!(t && t.refresh_token);
+    let backups = [];
+    if (vinculado) { try { backups = await _listarBackupsSistema(); } catch (e) {} }
+    // Peso por tabla a nivel SISTEMA (sin filtrar user_id).
+    const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+    const pesos = [];
+    for (const tb of permitidas) {
+      let filas = 0, bytes = 0;
+      try { const { data } = await supabase.from(tb).select('*'); filas = (data || []).length; bytes = data ? Buffer.byteLength(JSON.stringify(data)) : 0; } catch (e) {}
+      pesos.push({ tabla: tb, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(tb) !== -1 });
+    }
+    return res.json({ ok: true, configurado: configurado, vinculado: vinculado, conservar: BACKUP_DRIVE_CONSERVAR, backups: backups, pesos: pesos, auto: _backupSistemaAutoActivo() });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Arranca el OAuth para vincular la cuenta de Drive del sistema. Devuelve la URL (el front la abre).
+app.get('/api/maestro/backup/sistema/vincular', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (!_googleConfigurado()) return res.status(503).json({ error: 'Google no configurado (faltan credenciales).' });
+    if (!_googleapis) return res.status(503).json({ error: 'Falta instalar googleapis.' });
+    const oauth = _googleOAuthClient();
+    const url = oauth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: [GOOGLE_SCOPE_DRIVE], state: _oauthStateFirmar('SYSTEM', 'google:drive_sistema') });
+    return res.json({ ok: true, url: url });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Hace un backup del sistema AHORA. body: { tablas?: string[] }.
+app.post('/api/maestro/backup/sistema/ahora', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Backup a Drive no disponible.' });
+    const oauth = await _sysDriveOAuth();
+    if (!oauth) return res.status(409).json({ error: 'Vinculá la cuenta de Drive del sistema primero.' });
+    const tablas = (req.body && Array.isArray(req.body.tablas)) ? req.body.tablas : null;
+    const contenido = await _armarExportSistema(tablas);
+    const r = await _subirBackupSistema(contenido);
+    return res.json({ ok: true, file: r.fileName, fileId: r.fileId });
+  } catch (e) { console.error('POST sistema/ahora:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// Descarga un backup del sistema (para "guardarlo en la computadora"). ?id=fileId
+app.get('/api/maestro/backup/sistema/descargar', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    const fileId = String(req.query.id || '');
+    if (!fileId) return res.status(400).json({ error: 'Falta id' });
+    const data = await _bajarBackupSistema(fileId);
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename="raices-backup-sistema.json"');
+    return res.send(JSON.stringify(data));
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// Restaura (levanta) un backup. SOLO super-admin. body: { id: fileId, tablas?: string[], confirmar: true }
+app.post('/api/maestro/backup/sistema/restaurar', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (req._maestroTipo !== 'admin') return res.status(403).json({ error: 'Solo el super-admin puede restaurar.' });
+    if (!req.body || req.body.confirmar !== true) return res.status(400).json({ error: 'Falta confirmacion explicita (confirmar:true).' });
+    const fileId = String(req.body.id || '');
+    if (!fileId) return res.status(400).json({ error: 'Falta id del backup.' });
+    const contenido = await _bajarBackupSistema(fileId);
+    const tablas = Array.isArray(req.body.tablas) ? req.body.tablas : null;
+    const r = await _restaurarBackupSistema(contenido, tablas);
+    return res.json({ ok: true, resultado: r });
+  } catch (e) { console.error('POST sistema/restaurar:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// AUTO-BACKUP del sistema (actualizacion automatica). Gateado por env BACKUP_SISTEMA_AUTO=on.
+// Si esta prendido y hay cuenta vinculada, sube un backup del sistema cada 24h. CERO IA.
+function _backupSistemaAutoActivo() { return String(process.env.BACKUP_SISTEMA_AUTO || '').toLowerCase() === 'on'; }
+async function _cronBackupSistema() {
+  try {
+    if (!_backupSistemaAutoActivo()) return;
+    if (!_googleConfigurado() || !_googleapis) return;
+    const oauth = await _sysDriveOAuth();
+    if (!oauth) return;
+    const contenido = await _armarExportSistema(null);
+    const r = await _subirBackupSistema(contenido);
+    console.log('[backup-sistema] auto subido: ' + r.fileName);
+  } catch (e) { console.error('_cronBackupSistema:', e && e.message); }
+}
+if (_backupSistemaAutoActivo()) { setInterval(_cronBackupSistema, 24 * 60 * 60 * 1000); setTimeout(_cronBackupSistema, 10 * 60 * 1000); }
 
 // CRON OPCIONAL (DOCUMENTADO, NO ARRANCADO): para subir a Drive periodicamente a las cuentas
 // premium+ que tengan Drive conectado, descomentar el setInterval de abajo. Por default queda

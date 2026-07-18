@@ -24747,6 +24747,9 @@ app.post('/api/webhook/meta', function(req, res) {
     (async function(){
       for (let i = 0; i < entradas.length; i++) {
         const entry = entradas[i] || {};
+        // DIAGNOSTICO: loguea el id de cuenta ENTRANTE real (entry.id = page_id en Messenger / ig_user_id en
+        // Instagram). Cruzar con "[meta sanear] estado" del boot dice a QUE tenant se rutea ese DM. Sin token.
+        try { console.log('[meta webhook] inbound object=' + objeto + ' entry.id=' + (entry && entry.id)); } catch (e) {}
         try {
           if (canal === 'messenger') {
             // Messenger: entry[].messaging[] con { sender:{id}, recipient:{id=page_id}, message:{text} }

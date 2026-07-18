@@ -25910,10 +25910,37 @@ async function _sysDriveOAuth() {
 
 // Export de TODOS los tenants: vuelca las tablas elegidas SIN filtrar por user_id.
 // Best-effort por tabla. Nombre de carpeta distinto al de los backups por-tenant.
+// Enumera TODAS las tablas de la base via el OpenAPI de PostgREST (asi el backup general es "todo es
+// todo", no una lista fija). Devuelve array de nombres o null si no se pudo (=> fallback a la lista curada).
+let _cacheTablasSistema = null;
+async function _listarTablasSistema() {
+  try {
+    const base = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+    const key = process.env.SUPABASE_SERVICE_KEY || '';
+    if (!base || !key) return null;
+    const r = await fetch(base + '/rest/v1/', { headers: { apikey: key, Authorization: 'Bearer ' + key, Accept: 'application/openapi+json' } });
+    if (!r.ok) return null;
+    const spec = await r.json();
+    const paths = (spec && spec.paths) ? Object.keys(spec.paths) : [];
+    const tablas = paths
+      .map(function(p){ return p.replace(/^\//, ''); })
+      .filter(function(t){ return t && t.indexOf('rpc/') !== 0 && t.indexOf('/') === -1; });
+    return tablas.length ? tablas : null;
+  } catch (e) { console.error('_listarTablasSistema:', e && e.message); return null; }
+}
+// Lista efectiva de tablas para el backup del sistema: TODA la base (enumerada) o, si falla, la lista curada.
+async function _tablasBackupSistema() {
+  if (_cacheTablasSistema && _cacheTablasSistema.length) return _cacheTablasSistema;
+  const todas = await _listarTablasSistema();
+  _cacheTablasSistema = (todas && todas.length) ? todas : BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  return _cacheTablasSistema;
+}
+
+// Export del sistema. SIN seleccion -> TODA la base (todas las tablas). Con seleccion -> solo esas.
 async function _armarExportSistema(tablasSel) {
-  const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
-  let tablas = (Array.isArray(tablasSel) && tablasSel.length) ? tablasSel.filter(function(t){ return permitidas.indexOf(t) !== -1; }) : permitidas.slice();
-  const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), tablas: tablas } };
+  const todas = await _tablasBackupSistema();
+  let tablas = (Array.isArray(tablasSel) && tablasSel.length) ? tablasSel.filter(function(t){ return todas.indexOf(t) !== -1; }) : todas.slice();
+  const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), total_tablas: tablas.length, tablas: tablas } };
   for (const t of tablas) {
     try { const { data } = await supabase.from(t).select('*'); contenido[t] = data || []; }
     catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
@@ -25961,8 +25988,8 @@ async function _bajarBackupSistema(fileId) {
 // nada (regla de Diego: backup antes de cambiar), (3) upsert por id (no borra lo que no esta en el backup).
 async function _restaurarBackupSistema(contenido, tablasSel) {
   if (!contenido || typeof contenido !== 'object') throw new Error('Backup invalido');
-  const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
-  let tablas = Object.keys(contenido).filter(function(k){ return k !== '_meta' && permitidas.indexOf(k) !== -1; });
+  // Restaura TODAS las tablas que traiga el backup (menos _meta). "Todo es todo".
+  let tablas = Object.keys(contenido).filter(function(k){ return k !== '_meta' && Array.isArray(contenido[k]); });
   if (Array.isArray(tablasSel) && tablasSel.length) tablas = tablas.filter(function(t){ return tablasSel.indexOf(t) !== -1; });
   // (2) snapshot de seguridad del estado ACTUAL antes de restaurar.
   let snapshot = null;
@@ -25998,8 +26025,8 @@ app.get('/api/maestro/backup/sistema/estado', async function(req, res) {
     const vinculado = !!(t && t.refresh_token);
     let backups = [];
     if (vinculado) { try { backups = await _listarBackupsSistema(); } catch (e) {} }
-    // Peso por tabla a nivel SISTEMA (sin filtrar user_id).
-    const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+    // Peso por tabla a nivel SISTEMA (sin filtrar user_id). "Todo es todo": TODAS las tablas de la base.
+    const permitidas = await _tablasBackupSistema();
     const pesos = [];
     for (const tb of permitidas) {
       let filas = 0, bytes = 0;

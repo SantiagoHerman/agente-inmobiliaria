@@ -23755,6 +23755,29 @@ async function _forzarUiModernoTodos() {
 setTimeout(_forzarUiModernoTodos, 12000);
 
 // ============================================================================
+// CANDADO por cuenta (business_settings.congelada). Cuenta congelada = NO recibe
+// features nuevas en rollouts a los 3 mundos (Calendar, Backup Drive, y futuras).
+// Diego (2026-07-18): "Raices Meta Test queda con candado, no se toca". La cuenta de
+// prueba pasa a ser Raices Inmobiliaria. Migracion DEFENSIVA: crea la columna si falta
+// y marca congelada=true SOLO a Raices Meta Test (idempotente, con log del estado previo).
+async function _migracionCandadoCuentas() {
+  try {
+    const sql = "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS congelada boolean DEFAULT false; NOTIFY pgrst, 'reload schema';";
+    try { const { error } = await supabase.rpc('exec_sql', { sql: sql }); if (error) console.log('[candado] exec_sql fallo (' + error.message + '). Corré a mano: ' + sql); else console.log('[candado] columna congelada OK'); }
+    catch (e) { console.log('[candado] sin exec_sql; corré a mano: ' + sql); }
+    // Marcar SOLO Raices Meta Test (por company_name). Log del estado previo (regla: backup antes de tocar).
+    try {
+      const { data: prev } = await supabase.from('business_settings').select('user_id, company_name, congelada').ilike('company_name', 'Raices Meta Test');
+      const objetivo = (prev || []).filter(function(r){ return r.congelada !== true; });
+      if (!objetivo.length) { console.log('[candado] Raices Meta Test ya congelada (o no existe)'); return; }
+      console.log('[candado] BACKUP previo: ' + JSON.stringify(prev));
+      for (const r of objetivo) { try { await supabase.from('business_settings').update({ congelada: true }).eq('user_id', r.user_id); console.log('[candado] congelada=true -> ' + r.company_name + ' (' + r.user_id + ')'); } catch (e2) { console.error('[candado] update:', e2 && e2.message); } }
+    } catch (e) { console.error('[candado] marcar Raices Meta Test:', e && e.message); }
+  } catch (e) { console.error('_migracionCandadoCuentas:', e && e.message); }
+}
+setTimeout(_migracionCandadoCuentas, 14000);
+
+// ============================================================================
 // ===== ETAPA 3 — GET /api/reportes/metricas (tenant-scoped, auth) ============
 // ============================================================================
 // UN endpoint que sirve TODAS las tarjetas de Reportes con la SERVICE KEY del
@@ -25636,7 +25659,9 @@ app.get('/api/google/estado', async function(req, res) {
       (data || []).forEach(function(f){ if (f.refresh_token) { if (f.proposito === 'drive') drive = true; if (f.proposito === 'calendar') calendar = true; } });
     } catch (e) {}
     let backupDrivePlan = false; try { backupDrivePlan = await planPermite(ownerId, 'backup_drive'); } catch (e) {}
-    return res.json({ ok: true, configurado: _googleConfigurado() && !!_googleapis, drive_conectado: drive, calendar_conectado: calendar, backup_drive_plan: backupDrivePlan });
+    // congelada: cuenta con "candado" (ej. Raices Meta Test) -> NO recibe features nuevas (Calendar/Backup ocultos).
+    let congelada = false; try { const { data: bsC } = await supabase.from('business_settings').select('congelada').eq('user_id', ownerId).maybeSingle(); congelada = !!(bsC && bsC.congelada === true); } catch (e) {}
+    return res.json({ ok: true, configurado: _googleConfigurado() && !!_googleapis, drive_conectado: drive, calendar_conectado: calendar, backup_drive_plan: backupDrivePlan, congelada: congelada });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

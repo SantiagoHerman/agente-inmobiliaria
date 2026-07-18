@@ -1725,12 +1725,14 @@ async function iaAgendaActivo(user_id, bs) {
 // queda EXACTO como hoy (fail-closed, mismo patron que iaAgendaActivo).
 async function iaUbicacionActivo(user_id, bs) {
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_ubicacion')) return bs.ia_ubicacion === true;
-    if (!user_id) return false;
+    // 2026-07-18 (pedido de Diego): ubicacion PRENDIDA para TODOS por default. Antes era fail-closed OFF;
+    // ahora es ON salvo que la cuenta este explicitamente en false (asi se puede apagar puntualmente).
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_ubicacion')) return bs.ia_ubicacion !== false;
+    if (!user_id) return true;
     const { data, error } = await supabase.from('business_settings').select('ia_ubicacion').eq('user_id', user_id).maybeSingle();
-    if (error) return false;
-    return !!(data && data.ia_ubicacion === true);
-  } catch (e) { return false; }
+    if (error) return true;                       // ante error de lectura, mantener ON (default nuevo)
+    return !(data && data.ia_ubicacion === false); // ON salvo false explicito
+  } catch (e) { return true; }
 }
 
 // DISPONIBILIDAD PXSOL (gated ia_disponibilidad): con ON la IA de un hotel puede consultar
@@ -13976,7 +13978,9 @@ async function geocodificarPendientes() {
   if (_geocodEnCurso) return;
   _geocodEnCurso = true;
   try {
-    var fq = await supabase.from('business_settings').select('user_id').eq('ia_ubicacion', true);
+    // 2026-07-18: ubicacion ON por default para TODOS -> geocodificar cuentas con ia_ubicacion true O null
+    // (sin setear), excluyendo solo las explicitamente en false. Presupuesto 30/corrida respeta OSM 1req/s.
+    var fq = await supabase.from('business_settings').select('user_id').or('ia_ubicacion.is.null,ia_ubicacion.eq.true');
     if (fq.error || !fq.data || !fq.data.length) return;
     var uids = fq.data.map(function (x) { return x.user_id; });
     var presupuesto = 30;

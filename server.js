@@ -26170,7 +26170,7 @@ async function _listarMediaBucket(prefix, acc, cap) {
 }
 
 // Espejo incremental a Drive. Corre en 2° plano (no await en el endpoint). Actualiza _mediaEspejo.
-async function _espejarMediaADrive() {
+async function _espejarMediaADrive(onProgress) {
   if (_mediaEspejo.corriendo) return;
   _mediaEspejo = { corriendo: true, copiados: 0, saltados: 0, errores: 0, total: 0, iniciado: new Date().toISOString(), terminado: null, error: null };
   try {
@@ -26192,21 +26192,84 @@ async function _espejarMediaADrive() {
     const archivos = await _listarMediaBucket('', [], 200000);
     _mediaEspejo.total = archivos.length;
     const Readable = require('stream').Readable;
+    let hechos = 0;
     for (const a of archivos) {
       const nombreDrive = a.path.replace(/\//g, '__');   // aplano la ruta en el nombre
-      if (yaEn.has(nombreDrive)) { _mediaEspejo.saltados++; continue; }
-      try {
-        const { data: blob, error } = await supabase.storage.from(MEDIA_BUCKET).download(a.path);
-        if (error || !blob) { _mediaEspejo.errores++; continue; }
-        const buf = Buffer.from(await blob.arrayBuffer());
-        const meta = { name: nombreDrive }; if (folderId) meta.parents = [folderId];
-        await drive.files.create({ requestBody: meta, media: { body: Readable.from([buf]) }, fields: 'id' });
-        _mediaEspejo.copiados++;
-      } catch (e) { _mediaEspejo.errores++; }
+      if (yaEn.has(nombreDrive)) { _mediaEspejo.saltados++; }
+      else {
+        try {
+          const { data: blob, error } = await supabase.storage.from(MEDIA_BUCKET).download(a.path);
+          if (error || !blob) { _mediaEspejo.errores++; }
+          else {
+            const buf = Buffer.from(await blob.arrayBuffer());
+            const meta = { name: nombreDrive }; if (folderId) meta.parents = [folderId];
+            await drive.files.create({ requestBody: meta, media: { body: Readable.from([buf]) }, fields: 'id' });
+            _mediaEspejo.copiados++;
+          }
+        } catch (e) { _mediaEspejo.errores++; }
+      }
+      hechos++;
+      if (typeof onProgress === 'function') { try { onProgress(hechos, archivos.length); } catch (e) {} }
     }
     console.log('[media espejo] copiados=' + _mediaEspejo.copiados + ' saltados=' + _mediaEspejo.saltados + ' errores=' + _mediaEspejo.errores);
   } catch (e) { console.error('_espejarMediaADrive:', e && e.message); _mediaEspejo.error = (e && e.message) || 'error'; }
   finally { _mediaEspejo.corriendo = false; _mediaEspejo.terminado = new Date().toISOString(); }
+}
+
+// ============================================================================
+// BACKUP COMPLETO CON PROGRESO (0-100%): orquesta datos -> capas extra -> subida a Drive -> multimedia.
+// Corre en 2° plano; el frontend lee _backupProgreso para pintar la barra. Lo usan el boton "Hacer backup
+// ahora" y el automatico diario -> asi la MULTIMEDIA SIEMPRE entra dentro del backup.
+let _backupProgreso = { corriendo: false, pct: 0, fase: '', detalle: '', ok: false, error: null, iniciado: null, terminado: null, file: null };
+async function _ejecutarBackupCompleto(tablasSel) {
+  if (_backupProgreso.corriendo) return;
+  _backupProgreso = { corriendo: true, pct: 0, fase: 'Preparando', detalle: '', ok: false, error: null, iniciado: new Date().toISOString(), terminado: null, file: null };
+  try {
+    if (!_googleConfigurado() || !_googleapis) throw new Error('Google no configurado');
+    if (!(await _sysDriveOAuth())) throw new Error('Drive del sistema no vinculado');
+    const todas = await _tablasBackupSistema();
+    const esCompleto = !(Array.isArray(tablasSel) && tablasSel.length);
+    const tablas = esCompleto ? todas.slice() : tablasSel.filter(function(t){ return todas.indexOf(t) !== -1; });
+    const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), completo: esCompleto, total_tablas: tablas.length, tablas: tablas } };
+    // 1) DATOS (0-55%)
+    _backupProgreso.fase = 'Respaldando datos';
+    for (let i = 0; i < tablas.length; i++) {
+      const t = tablas[i];
+      _backupProgreso.detalle = 'tabla ' + (i + 1) + ' de ' + tablas.length + ' · ' + t;
+      _backupProgreso.pct = Math.round((i / Math.max(1, tablas.length)) * 55);
+      try { const { data } = await supabase.from(t).select('*'); contenido[t] = data || []; }
+      catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
+    }
+    // 2) CAPAS EXTRA (55-63%) — solo backup completo
+    if (esCompleto) {
+      _backupProgreso.fase = 'Logins, estructura, secretos, WhatsApp, DNS'; _backupProgreso.detalle = ''; _backupProgreso.pct = 57;
+      contenido._auth_users = await _exportAuthUsers();
+      contenido._schema = await _exportSchema();
+      contenido._env = _exportEnv();
+      contenido._referencias = _exportReferencias();
+      contenido._whatsapp_evolution = await _exportEvolutionInstances();
+      contenido._dns = await _exportDNS();
+      contenido._meta.incluye = ['datos', 'logins', 'estructura', 'secretos', 'referencias', 'whatsapp', 'dns'];
+      _backupProgreso.pct = 63;
+    }
+    // 3) SUBIR JSON A DRIVE (63-70%)
+    _backupProgreso.fase = 'Subiendo a Drive'; _backupProgreso.detalle = ''; _backupProgreso.pct = 66;
+    const r = await _subirBackupSistema(contenido);
+    _backupProgreso.file = r.fileName; _backupProgreso.pct = 70;
+    // 4) MULTIMEDIA (70-100%) — solo backup completo
+    if (esCompleto) {
+      _backupProgreso.fase = 'Respaldando multimedia'; _backupProgreso.detalle = '';
+      await _espejarMediaADrive(function(hechos, total){
+        _backupProgreso.pct = 70 + Math.round((hechos / Math.max(1, total)) * 30);
+        _backupProgreso.detalle = 'archivo ' + hechos + ' de ' + total;
+      });
+    }
+    _backupProgreso.pct = 100; _backupProgreso.fase = 'Listo'; _backupProgreso.detalle = ''; _backupProgreso.ok = true;
+  } catch (e) {
+    console.error('_ejecutarBackupCompleto:', e && e.message); _backupProgreso.error = (e && e.message) || 'error';
+  } finally {
+    _backupProgreso.corriendo = false; _backupProgreso.terminado = new Date().toISOString();
+  }
 }
 
 // ---- Endpoints Maestro para el backup del sistema (todos gateados por maestroAuth) ----
@@ -26298,11 +26361,20 @@ app.post('/api/maestro/backup/sistema/ahora', async function(req, res) {
     if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Backup a Drive no disponible.' });
     const oauth = await _sysDriveOAuth();
     if (!oauth) return res.status(409).json({ error: 'Vinculá la cuenta de Drive del sistema primero.' });
+    if (_backupProgreso.corriendo) return res.json({ ok: true, ya_corriendo: true, progreso: _backupProgreso });
     const tablas = (req.body && Array.isArray(req.body.tablas)) ? req.body.tablas : null;
-    const contenido = await _armarExportSistema(tablas);
-    const r = await _subirBackupSistema(contenido);
-    return res.json({ ok: true, file: r.fileName, fileId: r.fileId });
+    // Corre en 2° plano con progreso (datos -> capas -> Drive -> multimedia). El front lo sigue con /progreso.
+    _ejecutarBackupCompleto(tablas).catch(function(e){ console.error('backup completo bg:', e && e.message); });
+    return res.json({ ok: true, started: true });
   } catch (e) { console.error('POST sistema/ahora:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// Progreso del backup en curso (0-100% + fase + detalle). El front lo consulta para pintar la barra.
+app.get('/api/maestro/backup/sistema/progreso', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    return res.json({ ok: true, progreso: _backupProgreso });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
 
 // Descarga un backup del sistema (para "guardarlo en la computadora"). ?id=fileId
@@ -26353,9 +26425,9 @@ async function _cronBackupSistema() {
       }
     } catch (e) {}
     if (!debe) return;
-    const contenido = await _armarExportSistema(null);
-    const r = await _subirBackupSistema(contenido);
-    console.log('[backup-sistema] auto subido: ' + r.fileName);
+    // Backup COMPLETO (datos + capas + Drive + multimedia) con progreso. Auto = todo incluido.
+    await _ejecutarBackupCompleto(null);
+    console.log('[backup-sistema] auto: ' + (_backupProgreso.ok ? 'ok ' + _backupProgreso.file : 'error ' + _backupProgreso.error));
   } catch (e) { console.error('_cronBackupSistema:', e && e.message); }
 }
 // Tick horario, SIEMPRE agendado (barato: si auto=off, _cronBackupSistema sale enseguida). La primera pasada

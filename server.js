@@ -26016,9 +26016,42 @@ function _exportReferencias() {
   };
 }
 
+// #7 WHATSAPP: inventario de las instancias de Evolution (para saber QUE reconectar ante un desastre).
+// Via API se ve nombre/estado/numero; la SESION (auth) vive dentro de Evolution y se restaura copiando su
+// volumen/DB (parte del servidor propio) o re-escaneando el QR. Esto documenta el mapa cliente<->instancia.
+async function _exportEvolutionInstances() {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return { _error: 'Evolution no configurado' };
+    const r = await fetch(EVOLUTION_URL + '/instance/fetchInstances', { headers: { 'apikey': EVOLUTION_KEY } });
+    if (!r.ok) return { _error: 'fetchInstances HTTP ' + r.status };
+    const data = await r.json();
+    const arr = Array.isArray(data) ? data : (data && data.instances ? data.instances : []);
+    const instancias = arr.map(function(x){ const i = (x && x.instance) ? x.instance : x; return { nombre: i.instanceName || i.name || null, estado: i.connectionStatus || i.state || i.status || null, numero: i.owner || i.number || i.ownerJid || null }; });
+    let mapa = [];
+    try { const { data: bs } = await supabase.from('business_settings').select('user_id, company_name'); mapa = (bs || []).map(function(b){ return { cliente: b.company_name, user_id: b.user_id, instancia_esperada: nombreInstancia(b.user_id) }; }); } catch (e) {}
+    return { instancias: instancias, mapa_clientes: mapa, nota: 'La sesion (auth) de cada WhatsApp vive DENTRO de Evolution; para restaurar sin re-escanear QR hay que copiar el volumen/DB de Evolution (servidor propio). Esto documenta que reconectar y de quien es cada instancia.' };
+  } catch (e) { return { _error: (e && e.message) || 'error' }; }
+}
+// #9 DNS: snapshot de los registros DNS del dominio (para recrearlos en cualquier proveedor si hay que migrar).
+async function _exportDNS() {
+  try {
+    const dns = require('dns').promises;
+    const dominios = ['raicescrm.com', 'www.raicescrm.com'];
+    const tipos = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
+    const registros = {};
+    for (const d of dominios) {
+      registros[d] = {};
+      for (const t of tipos) {
+        try { registros[d][t] = await dns.resolve(d, t); } catch (e) { registros[d][t] = null; }
+      }
+    }
+    return { registros: registros, nota: 'Registros DNS publicos actuales; para reconstruir el dominio, recrear estos registros en el proveedor (Don Web u otro) apuntando a los nuevos servidores.' };
+  } catch (e) { return { _error: (e && e.message) || 'error' }; }
+}
+
 // Export del sistema. SIN seleccion -> "TODO ES TODO": todas las tablas + logins + estructura + secretos +
-// referencias de codigo/config (todo menos la multimedia, que va por separado por su tamaño). Con seleccion
-// (backup manual acotado) -> solo esas tablas, sin las capas extra.
+// referencias de codigo/config + inventario WhatsApp + DNS (todo menos la multimedia, que va por separado por
+// su tamaño). Con seleccion (backup manual acotado) -> solo esas tablas, sin las capas extra.
 async function _armarExportSistema(tablasSel) {
   const todas = await _tablasBackupSistema();
   const esCompleto = !(Array.isArray(tablasSel) && tablasSel.length);
@@ -26029,11 +26062,13 @@ async function _armarExportSistema(tablasSel) {
     catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
   }
   if (esCompleto) {
-    contenido._auth_users = await _exportAuthUsers();   // #2 logins
-    contenido._schema = await _exportSchema();           // #3 estructura
-    contenido._env = _exportEnv();                       // #6 secretos
-    contenido._referencias = _exportReferencias();       // #5 codigo + #8 config externa
-    contenido._meta.incluye = ['datos', 'logins', 'estructura', 'secretos', 'referencias'];
+    contenido._auth_users = await _exportAuthUsers();         // #2 logins
+    contenido._schema = await _exportSchema();                 // #3 estructura
+    contenido._env = _exportEnv();                             // #6 secretos
+    contenido._referencias = _exportReferencias();             // #5 codigo + #8 config externa
+    contenido._whatsapp_evolution = await _exportEvolutionInstances(); // #7 inventario WhatsApp
+    contenido._dns = await _exportDNS();                       // #9 registros DNS
+    contenido._meta.incluye = ['datos', 'logins', 'estructura', 'secretos', 'referencias', 'whatsapp', 'dns'];
   }
   return contenido;
 }

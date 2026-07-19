@@ -26104,6 +26104,76 @@ async function _restaurarBackupSistema(contenido, tablasSel) {
   return resultado;
 }
 
+// ============================================================================
+// #4 MULTIMEDIA: espejo del bucket de Storage 'media' (audios/fotos/videos de WhatsApp + soporte + equipo)
+// al Drive del sistema. La base guarda solo el LINK; los archivos reales viven en Supabase Storage. Esto los
+// copia a Drive (carpeta "Raices CRM Media"), INCREMENTAL (salta lo ya copiado). Pesado -> corre en 2° plano.
+const MEDIA_BUCKET = 'media';
+const BACKUP_MEDIA_CARPETA = 'Raices CRM Media';
+let _mediaEspejo = { corriendo: false, copiados: 0, saltados: 0, errores: 0, total: 0, iniciado: null, terminado: null, error: null };
+
+// Lista recursiva del bucket. Devuelve [{path, size}]. `cap` = tope de archivos (seguridad anti-cuelgue).
+async function _listarMediaBucket(prefix, acc, cap) {
+  acc = acc || []; prefix = prefix || '';
+  let offset = 0;
+  for (;;) {
+    if (acc.length >= cap) break;
+    let data, error;
+    try { const r = await supabase.storage.from(MEDIA_BUCKET).list(prefix, { limit: 100, offset: offset, sortBy: { column: 'name', order: 'asc' } }); data = r.data; error = r.error; }
+    catch (e) { break; }
+    if (error || !data || !data.length) break;
+    for (const it of data) {
+      const full = prefix ? (prefix + '/' + it.name) : it.name;
+      if (it.id) acc.push({ path: full, size: (it.metadata && it.metadata.size) || 0 });   // archivo (folders no tienen id)
+      else await _listarMediaBucket(full, acc, cap);                                        // carpeta -> recursion
+      if (acc.length >= cap) break;
+    }
+    if (data.length < 100) break;
+    offset += 100;
+  }
+  return acc;
+}
+
+// Espejo incremental a Drive. Corre en 2° plano (no await en el endpoint). Actualiza _mediaEspejo.
+async function _espejarMediaADrive() {
+  if (_mediaEspejo.corriendo) return;
+  _mediaEspejo = { corriendo: true, copiados: 0, saltados: 0, errores: 0, total: 0, iniciado: new Date().toISOString(), terminado: null, error: null };
+  try {
+    if (!_googleConfigurado() || !_googleapis) { _mediaEspejo.error = 'Google no configurado'; return; }
+    const oauth = await _sysDriveOAuth();
+    if (!oauth) { _mediaEspejo.error = 'Drive del sistema no vinculado'; return; }
+    const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+    const folderId = await _carpetaBackupDrive(drive, BACKUP_MEDIA_CARPETA);
+    // Nombres ya presentes en Drive (para saltar lo copiado).
+    const yaEn = new Set();
+    try {
+      let pageToken = null;
+      do {
+        const lr = await drive.files.list({ q: "'" + folderId + "' in parents and trashed=false", fields: 'nextPageToken, files(name)', pageSize: 1000, pageToken: pageToken || undefined });
+        (lr.data.files || []).forEach(function(f){ yaEn.add(f.name); });
+        pageToken = lr.data.nextPageToken;
+      } while (pageToken);
+    } catch (e) {}
+    const archivos = await _listarMediaBucket('', [], 200000);
+    _mediaEspejo.total = archivos.length;
+    const Readable = require('stream').Readable;
+    for (const a of archivos) {
+      const nombreDrive = a.path.replace(/\//g, '__');   // aplano la ruta en el nombre
+      if (yaEn.has(nombreDrive)) { _mediaEspejo.saltados++; continue; }
+      try {
+        const { data: blob, error } = await supabase.storage.from(MEDIA_BUCKET).download(a.path);
+        if (error || !blob) { _mediaEspejo.errores++; continue; }
+        const buf = Buffer.from(await blob.arrayBuffer());
+        const meta = { name: nombreDrive }; if (folderId) meta.parents = [folderId];
+        await drive.files.create({ requestBody: meta, media: { body: Readable.from([buf]) }, fields: 'id' });
+        _mediaEspejo.copiados++;
+      } catch (e) { _mediaEspejo.errores++; }
+    }
+    console.log('[media espejo] copiados=' + _mediaEspejo.copiados + ' saltados=' + _mediaEspejo.saltados + ' errores=' + _mediaEspejo.errores);
+  } catch (e) { console.error('_espejarMediaADrive:', e && e.message); _mediaEspejo.error = (e && e.message) || 'error'; }
+  finally { _mediaEspejo.corriendo = false; _mediaEspejo.terminado = new Date().toISOString(); }
+}
+
 // ---- Endpoints Maestro para el backup del sistema (todos gateados por maestroAuth) ----
 
 // Estado: vinculado o no, cantidad de backups y ultima fecha, + lista de tablas con su peso (todos los tenants).
@@ -26148,6 +26218,27 @@ app.post('/api/maestro/backup/sistema/config', async function(req, res) {
     const guardada = await _sysConfigGuardar(req.body || {});
     return res.json({ ok: true, config: guardada });
   } catch (e) { console.error('POST sistema/config:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// #4 MULTIMEDIA — mide el bucket 'media' (cantidad + tamaño) y devuelve el estado del espejo. Cap 20000 archivos.
+app.get('/api/maestro/backup/media/estado', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    const archivos = await _listarMediaBucket('', [], 20000);
+    const bytes = archivos.reduce(function(a, f){ return a + (Number(f.size) || 0); }, 0);
+    return res.json({ ok: true, total: archivos.length, bytes: bytes, capado: archivos.length >= 20000, espejo: _mediaEspejo });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// #4 MULTIMEDIA — arranca el espejo del bucket a Drive (en 2° plano). Devuelve enseguida; el progreso se ve en /media/estado.
+app.post('/api/maestro/backup/media/espejar', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Google no configurado.' });
+    if (_mediaEspejo.corriendo) return res.json({ ok: true, ya_corriendo: true, espejo: _mediaEspejo });
+    _espejarMediaADrive().catch(function(e){ console.error('espejar media bg:', e && e.message); }); // background
+    return res.json({ ok: true, started: true });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
 
 // Arranca el OAuth para vincular la cuenta de Drive del sistema. Devuelve la URL (el front la abre).

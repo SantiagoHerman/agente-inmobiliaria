@@ -25959,14 +25959,81 @@ async function _tablasBackupSistema() {
   return _cacheTablasSistema;
 }
 
-// Export del sistema. SIN seleccion -> TODA la base (todas las tablas). Con seleccion -> solo esas.
+// #2 LOGINS: exporta los usuarios de Supabase Auth (para recrear las cuentas). listUsers paginado.
+// NO trae contraseñas (Supabase no las expone); trae id/email/telefono/metadata/rol -> alcanza para recrear.
+async function _exportAuthUsers() {
+  try {
+    const out = []; let page = 1;
+    for (;;) {
+      const { data, error } = await supabase.auth.admin.listUsers({ page: page, perPage: 1000 });
+      if (error) { console.error('_exportAuthUsers:', error.message); break; }
+      const users = (data && data.users) || [];
+      users.forEach(function(u){ out.push({ id: u.id, email: u.email, phone: u.phone, created_at: u.created_at, last_sign_in_at: u.last_sign_in_at, user_metadata: u.user_metadata, app_metadata: u.app_metadata, role: u.role }); });
+      if (users.length < 1000) break;
+      page++; if (page > 50) break; // tope de seguridad
+    }
+    return out;
+  } catch (e) { console.error('_exportAuthUsers:', e && e.message); return { _error: (e && e.message) || 'no disponible' }; }
+}
+// #3 ESTRUCTURA: snapshot del esquema (columnas + tipos por tabla) via el OpenAPI de PostgREST.
+async function _exportSchema() {
+  try {
+    const base = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+    const key = process.env.SUPABASE_SERVICE_KEY || '';
+    if (!base || !key) return null;
+    const r = await fetch(base + '/rest/v1/', { headers: { apikey: key, Authorization: 'Bearer ' + key, Accept: 'application/openapi+json' } });
+    if (!r.ok) return null;
+    const spec = await r.json();
+    return { definitions: (spec && spec.definitions) || null };
+  } catch (e) { console.error('_exportSchema:', e && e.message); return null; }
+}
+// #6 SECRETOS/ENV: snapshot de las variables de entorno del backend (para reconstruir en otro server).
+// SENSIBLE: incluye claves reales. El backup vive en el Drive PRIVADO del dueño; el restore es super-admin.
+function _exportEnv() {
+  try {
+    const env = {}; const skip = ['PATH','HOME','PWD','SHELL','TERM','HOSTNAME','TMPDIR','LANG','LS_COLORS','_','OLDPWD','SHLVL'];
+    Object.keys(process.env).forEach(function(k){ if (skip.indexOf(k) === -1) env[k] = process.env[k]; });
+    return env;
+  } catch (e) { return { _error: 'no disponible' }; }
+}
+// #5 CODIGO + #8 CONFIG EXTERNA: referencias para reconstruir (el codigo esta en GitHub; la config de
+// proveedores se rehace de su lado, los tokens por-cuenta ya estan en las tablas).
+function _exportReferencias() {
+  return {
+    codigo: {
+      backend: 'GitHub: SantiagoHerman/agente-inmobiliaria (deploy Railway)',
+      frontend: 'GitHub: SantiagoHerman/raices-crm (deploy Vercel)',
+      nota: 'Codigo versionado en GitHub; para reconstruir: clonar ambos repos + desplegar + cargar el _env.'
+    },
+    config_externa: {
+      meta_app_id: process.env.META_APP_ID || '',
+      google_client_id: process.env.GOOGLE_CLIENT_ID || '',
+      supabase_url: process.env.SUPABASE_URL || '',
+      backend_url: process.env.BACKEND_PUBLIC_URL || '',
+      evolution_url: process.env.EVOLUTION_URL || '',
+      nota: 'Meta app + Google OAuth + MercadoPago se configuran del lado del proveedor; los tokens por-cuenta estan en messenger_credentials / google_oauth_tokens (ya incluidas arriba).'
+    }
+  };
+}
+
+// Export del sistema. SIN seleccion -> "TODO ES TODO": todas las tablas + logins + estructura + secretos +
+// referencias de codigo/config (todo menos la multimedia, que va por separado por su tamaño). Con seleccion
+// (backup manual acotado) -> solo esas tablas, sin las capas extra.
 async function _armarExportSistema(tablasSel) {
   const todas = await _tablasBackupSistema();
-  let tablas = (Array.isArray(tablasSel) && tablasSel.length) ? tablasSel.filter(function(t){ return todas.indexOf(t) !== -1; }) : todas.slice();
-  const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), total_tablas: tablas.length, tablas: tablas } };
+  const esCompleto = !(Array.isArray(tablasSel) && tablasSel.length);
+  let tablas = esCompleto ? todas.slice() : tablasSel.filter(function(t){ return todas.indexOf(t) !== -1; });
+  const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), completo: esCompleto, total_tablas: tablas.length, tablas: tablas } };
   for (const t of tablas) {
     try { const { data } = await supabase.from(t).select('*'); contenido[t] = data || []; }
     catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
+  }
+  if (esCompleto) {
+    contenido._auth_users = await _exportAuthUsers();   // #2 logins
+    contenido._schema = await _exportSchema();           // #3 estructura
+    contenido._env = _exportEnv();                       // #6 secretos
+    contenido._referencias = _exportReferencias();       // #5 codigo + #8 config externa
+    contenido._meta.incluye = ['datos', 'logins', 'estructura', 'secretos', 'referencias'];
   }
   return contenido;
 }

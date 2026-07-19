@@ -11098,7 +11098,11 @@ setInterval(revisarInactividad, 60 * 60 * 1000);
 // activo; en la TRANSICION conectado->desconectado crea una notif del Maestro (dedupe 2h) + push. Estado en memoria:
 // tras un reinicio del backend no dispara falsos (primera lectura solo siembra el estado). 0 IA.
 // ============================================================================
-var _waEstadoPrev = {}; // user_id -> bool (ultima conexion conocida)
+var _waEstadoPrev = {};       // user_id -> bool (ultima conexion conocida)
+var _waVistoConectado = {};   // user_id -> true si ALGUNA vez lo vimos conectado (para no alarmar cuentas sin vincular)
+var _waDesconCount = {};      // user_id -> lecturas seguidas en 'desconectado' (debounce anti falso-positivo)
+var _waYaAvisado = {};        // user_id -> true si ya avisamos esta caida (se limpia al reconectar)
+var WA_UMBRAL_DESCON = 3;     // avisar recien tras 3 lecturas seguidas desconectado (~15 min: el cron corre cada 5)
 async function revisarWhatsappDesconexiones() {
   try {
     var bs = await supabase.from('business_settings').select('user_id, company_name, crm_pausado, eliminado_at');
@@ -11107,23 +11111,27 @@ async function revisarWhatsappDesconexiones() {
       var c = cuentas[i];
       var conn = null;
       try { conn = await instanciaConectada(nombreInstancia(c.user_id)); } catch (eC) { conn = null; }
-      if (conn === null || typeof conn === 'undefined') continue; // indeterminado -> no tocar el estado
-      var prev = _waEstadoPrev[c.user_id];
+      if (conn === null || typeof conn === 'undefined') continue; // indeterminado (blip/timeout) -> NO tocar el estado
       _waEstadoPrev[c.user_id] = conn;
-      if (prev === true && conn === false) {
-        // AUTO-PAUSA anti-baneo: al desconectarse, PAUSAR recontacto + oportunidades de la cuenta (queda apagado hasta
-        // que el dueno lo reactive a mano). Evita que, al reconectar, retome envios masivos contra un numero recien
-        // restringido y lo re-restrinja. Best-effort (no rompe el aviso si falla el update).
-        try { await supabase.from('business_settings').update({ recontacto_pausado: true, oportunidades_v1: false }).eq('user_id', c.user_id); } catch (ePa) {}
-        try {
-          var desde = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
-          var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'whatsapp_desconectado').eq('ref_user_id', c.user_id).gte('created_at', desde).limit(1);
-          if (ya && ya.data && ya.data.length) continue; // dedupe: ya avisamos en las ultimas 2h
-        } catch (eD) {}
-        crearNotifMaestro('whatsapp_desconectado', 'WhatsApp desconectado: ' + (c.company_name || 'cliente'),
-          'El WhatsApp de ' + (c.company_name || 'un cliente') + ' se desconecto (o fue restringido por WhatsApp). Pause AUTOMATICAMENTE su recontacto y oportunidades para no empeorar la restriccion. No puede iniciar mensajes hasta reconectar. Cuando vuelva a estar OK, reactivalos a mano y arranca con goteo bajo.',
-          { ref_user_id: c.user_id, severidad: 'critico' }).catch(function () {});
-      }
+      if (conn === true) { _waVistoConectado[c.user_id] = true; _waDesconCount[c.user_id] = 0; _waYaAvisado[c.user_id] = false; continue; }
+      // conn === false:
+      if (!_waVistoConectado[c.user_id]) continue;   // nunca estuvo conectado (cuenta sin vincular) -> jamas alarmar
+      _waDesconCount[c.user_id] = (_waDesconCount[c.user_id] || 0) + 1;
+      // DEBOUNCE: solo cuando la desconexion es SOSTENIDA (cruza el umbral) y no avisamos aun. Un parpadeo
+      // transitorio (1-2 lecturas) NO dispara -> se acabaron los falsos "fue restringido".
+      if (_waDesconCount[c.user_id] < WA_UMBRAL_DESCON || _waYaAvisado[c.user_id]) continue;
+      _waYaAvisado[c.user_id] = true;
+      // AUTO-PAUSA anti-baneo: al confirmar desconexion sostenida, PAUSAR recontacto + oportunidades (queda apagado
+      // hasta que el dueno lo reactive a mano). Best-effort. Solo tras el umbral -> no se pausa por un blip.
+      try { await supabase.from('business_settings').update({ recontacto_pausado: true, oportunidades_v1: false }).eq('user_id', c.user_id); } catch (ePa) {}
+      try {
+        var desde = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+        var ya = await supabase.from('maestro_notificaciones').select('id').eq('tipo', 'whatsapp_desconectado').eq('ref_user_id', c.user_id).gte('created_at', desde).limit(1);
+        if (ya && ya.data && ya.data.length) continue; // dedupe: ya avisamos en las ultimas 2h
+      } catch (eD) {}
+      crearNotifMaestro('whatsapp_desconectado', 'WhatsApp desconectado: ' + (c.company_name || 'cliente'),
+        'El WhatsApp de ' + (c.company_name || 'un cliente') + ' quedo desconectado hace un rato (unos 15 min). Por las dudas pause su recontacto y sus oportunidades para no golpear un numero caido. Revisa que siga vinculado (escanea el QR si hace falta) y reactivalos cuando vuelva a estar OK.',
+        { ref_user_id: c.user_id, severidad: 'critico' }).catch(function () {});
     }
   } catch (e) { console.error('revisarWhatsappDesconexiones:', e && e.message); }
 }

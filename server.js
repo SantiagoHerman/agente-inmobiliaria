@@ -26194,19 +26194,22 @@ app.get('/api/maestro/backup/sistema/estado', async function(req, res) {
     // estimar bytes promedio -> evita traer TODA la base en cada apertura del panel (antes tardaba muchisimo).
     // bytes es ESTIMADO (aprox); el tamaño REAL de cada backup se ve en la lista de abajo.
     const permitidas = await _tablasBackupSistema();
-    const pesos = [];
-    for (const tb of permitidas) {
+    // Conteo ESTIMADO (usa estadisticas de Postgres, instantaneo) en vez de 'exact' (escanea la tabla, lento
+    // en las grandes). + muestra de 200 filas para estimar bytes. Todo en PARALELO -> el panel abre rapido.
+    const pesos = await Promise.all(permitidas.map(async function(tb){
       let filas = 0, bytes = 0;
       try {
-        const { count } = await supabase.from(tb).select('*', { count: 'exact', head: true });
+        const { count } = await supabase.from(tb).select('*', { count: 'estimated', head: true });
         filas = count || 0;
-        if (filas > 0) {
-          const { data: muestra } = await supabase.from(tb).select('*').limit(200);
-          if (muestra && muestra.length) { const prom = Buffer.byteLength(JSON.stringify(muestra)) / muestra.length; bytes = Math.round(prom * filas); }
+        const { data: muestra } = await supabase.from(tb).select('*').limit(200);
+        if (muestra && muestra.length) {
+          const prom = Buffer.byteLength(JSON.stringify(muestra)) / muestra.length;
+          bytes = Math.round(prom * (filas || muestra.length));
+          if (!filas) filas = muestra.length; // si el estimado da 0 pero hay filas, uso lo que vi
         }
       } catch (e) {}
-      pesos.push({ tabla: tb, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(tb) !== -1 });
-    }
+      return { tabla: tb, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(tb) !== -1 };
+    }));
     return res.json({ ok: true, configurado: configurado, vinculado: vinculado, conservar: BACKUP_DRIVE_CONSERVAR, backups: backups, pesos: pesos, cuenta: cuenta, config: config, auto: !!config.auto });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

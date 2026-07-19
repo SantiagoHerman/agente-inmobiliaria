@@ -25642,7 +25642,7 @@ app.get('/api/google/oauth/callback', async function(req, res) {
     await _googleGuardarToken(uid, proposito, tokens);
     const titulo = (proposito === 'calendar') ? 'Google Calendar conectado' : 'Google Drive conectado';
     return res.status(200).send(_oauthCierreHtml(titulo, 'Listo. Ya podes usarlo desde Raices CRM.', true));
-  } catch (e) { console.error('GET /api/google/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Google.', false)); }
+  } catch (e) { console.error('GET /api/google/oauth/callback:', e && e.message, e && e.stack); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar Google. Detalle: ' + ((e && e.message) || 'desconocido'), false)); }
 });
 
 // GET /api/google/estado — el front consulta que tiene conectado (drive/calendar) y si la feature esta disponible.
@@ -25874,38 +25874,22 @@ async function _migracionSystemBackupTokens() {
 }
 if (_googleConfigurado()) setTimeout(_migracionSystemBackupTokens, 8000);
 
-// Guarda/actualiza el token de la cuenta de Drive del sistema (proposito='drive').
+// El token de la cuenta de Drive del sistema se guarda en la MISMA tabla que los per-tenant
+// (google_oauth_tokens), bajo un uid FIJO del sistema + proposito 'drive_sistema'. Asi NO depende de
+// crear una tabla nueva `system_backup_tokens` (la migracion por exec_sql puede no estar disponible en
+// la base -> era la causa del "ocurrio un problema al conectar"). El uid por default es la cuenta Raices
+// (real, FK-safe); se puede override con la env SYSTEM_BACKUP_UID.
+const SYSTEM_BACKUP_UID = process.env.SYSTEM_BACKUP_UID || '190b9a5c-9a3e-4053-80a2-21fb47cac10d';
 async function _sysGuardarToken(tokens) {
-  const fila = {
-    proposito: 'drive',
-    refresh_token: tokens.refresh_token || null,
-    access_token: tokens.access_token || null,
-    token_expiry: tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null,
-    scope: tokens.scope || null,
-    updated_at: new Date().toISOString()
-  };
-  const prev = await _sysLeerToken();
-  if (prev) {
-    if (!fila.refresh_token && prev.refresh_token) delete fila.refresh_token; // Google solo lo manda 1a vez
-    const { error } = await supabase.from('system_backup_tokens').update(fila).eq('proposito', 'drive');
-    if (error) throw new Error(error.message);
-  } else {
-    const { error } = await supabase.from('system_backup_tokens').insert(fila);
-    if (error) throw new Error(error.message);
-  }
+  return _googleGuardarToken(SYSTEM_BACKUP_UID, 'drive_sistema', tokens);
 }
 async function _sysLeerToken() {
-  try { const { data } = await supabase.from('system_backup_tokens').select('*').eq('proposito', 'drive').maybeSingle(); return data || null; }
+  try { const { data } = await supabase.from('google_oauth_tokens').select('*').eq('user_id', SYSTEM_BACKUP_UID).eq('proposito', 'drive_sistema').maybeSingle(); return data || null; }
   catch (e) { return null; }
 }
 // OAuth2 client autenticado con el refresh_token del sistema, o null si no esta vinculado.
 async function _sysDriveOAuth() {
-  const oauth = _googleOAuthClient();
-  if (!oauth) return null;
-  const t = await _sysLeerToken();
-  if (!t || !t.refresh_token) return null;
-  oauth.setCredentials({ refresh_token: t.refresh_token });
-  return oauth;
+  return _googleClientAutenticado(SYSTEM_BACKUP_UID, 'drive_sistema');
 }
 
 // Export de TODOS los tenants: vuelca las tablas elegidas SIN filtrar por user_id.

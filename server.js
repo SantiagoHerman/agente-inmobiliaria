@@ -25892,6 +25892,45 @@ async function _sysDriveOAuth() {
   return _googleClientAutenticado(SYSTEM_BACKUP_UID, 'drive_sistema');
 }
 
+// Config de automatizacion del backup del sistema (auto on/off + frecuencia en horas). Se guarda como
+// JSON en google_oauth_tokens (uid sistema, proposito 'backup_config', campo scope) -> SIN tabla nueva,
+// editable desde el panel del Maestro.
+const BACKUP_CFG_DEFAULT = { auto: false, frecuencia_horas: 24 };
+async function _sysConfigLeer() {
+  try {
+    const { data } = await supabase.from('google_oauth_tokens').select('scope').eq('user_id', SYSTEM_BACKUP_UID).eq('proposito', 'backup_config').maybeSingle();
+    if (data && data.scope) { try { return Object.assign({}, BACKUP_CFG_DEFAULT, JSON.parse(data.scope)); } catch (e) {} }
+  } catch (e) {}
+  // Compat: si nunca se guardo config pero la env BACKUP_SISTEMA_AUTO=on, respetamos ese arranque.
+  return Object.assign({}, BACKUP_CFG_DEFAULT, { auto: String(process.env.BACKUP_SISTEMA_AUTO || '').toLowerCase() === 'on' });
+}
+async function _sysConfigGuardar(cfg) {
+  const limpio = { auto: !!(cfg && cfg.auto), frecuencia_horas: Math.max(1, Math.min(168, Number(cfg && cfg.frecuencia_horas) || 24)) };
+  const { data: prev } = await supabase.from('google_oauth_tokens').select('id').eq('user_id', SYSTEM_BACKUP_UID).eq('proposito', 'backup_config').maybeSingle();
+  if (prev) { const { error } = await supabase.from('google_oauth_tokens').update({ scope: JSON.stringify(limpio), updated_at: new Date().toISOString() }).eq('id', prev.id); if (error) throw new Error(error.message); }
+  else { const { error } = await supabase.from('google_oauth_tokens').insert({ user_id: SYSTEM_BACKUP_UID, proposito: 'backup_config', scope: JSON.stringify(limpio), updated_at: new Date().toISOString() }); if (error) throw new Error(error.message); }
+  return limpio;
+}
+
+// Info de la cuenta de Drive del sistema: email + cuota (total/usado/libre). Best-effort: null si falla.
+// about.get(storageQuota,user) funciona con el scope drive.file. limit=null => cuenta Workspace (ilimitado).
+async function _sysDriveInfo() {
+  try {
+    const oauth = await _sysDriveOAuth();
+    if (!oauth) return null;
+    const drive = _googleapis.drive({ version: 'v3', auth: oauth });
+    const r = await drive.about.get({ fields: 'user(displayName,emailAddress),storageQuota(limit,usage,usageInDrive)' });
+    const u = (r.data && r.data.user) || {};
+    const q = (r.data && r.data.storageQuota) || {};
+    return {
+      email: u.emailAddress || '', nombre: u.displayName || '',
+      limit: q.limit ? Number(q.limit) : null,
+      usage: q.usage ? Number(q.usage) : 0,
+      usageInDrive: q.usageInDrive ? Number(q.usageInDrive) : 0
+    };
+  } catch (e) { console.error('_sysDriveInfo:', e && e.message); return null; }
+}
+
 // Export de TODOS los tenants: vuelca las tablas elegidas SIN filtrar por user_id.
 // Best-effort por tabla. Nombre de carpeta distinto al de los backups por-tenant.
 // Enumera TODAS las tablas de la base via el OpenAPI de PostgREST (asi el backup general es "todo es
@@ -26008,7 +26047,12 @@ app.get('/api/maestro/backup/sistema/estado', async function(req, res) {
     const t = await _sysLeerToken();
     const vinculado = !!(t && t.refresh_token);
     let backups = [];
-    if (vinculado) { try { backups = await _listarBackupsSistema(); } catch (e) {} }
+    let cuenta = null;
+    if (vinculado) {
+      try { backups = await _listarBackupsSistema(); } catch (e) {}
+      try { cuenta = await _sysDriveInfo(); } catch (e) {}
+    }
+    const config = await _sysConfigLeer();
     // Peso por tabla a nivel SISTEMA (sin filtrar user_id). "Todo es todo": TODAS las tablas de la base.
     const permitidas = await _tablasBackupSistema();
     const pesos = [];
@@ -26017,8 +26061,17 @@ app.get('/api/maestro/backup/sistema/estado', async function(req, res) {
       try { const { data } = await supabase.from(tb).select('*'); filas = (data || []).length; bytes = data ? Buffer.byteLength(JSON.stringify(data)) : 0; } catch (e) {}
       pesos.push({ tabla: tb, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(tb) !== -1 });
     }
-    return res.json({ ok: true, configurado: configurado, vinculado: vinculado, conservar: BACKUP_DRIVE_CONSERVAR, backups: backups, pesos: pesos, auto: _backupSistemaAutoActivo() });
+    return res.json({ ok: true, configurado: configurado, vinculado: vinculado, conservar: BACKUP_DRIVE_CONSERVAR, backups: backups, pesos: pesos, cuenta: cuenta, config: config, auto: !!config.auto });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Guarda la config de automatizacion (auto on/off + frecuencia). body: { auto: bool, frecuencia_horas: number }
+app.post('/api/maestro/backup/sistema/config', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    const guardada = await _sysConfigGuardar(req.body || {});
+    return res.json({ ok: true, config: guardada });
+  } catch (e) { console.error('POST sistema/config:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
 
 // Arranca el OAuth para vincular la cuenta de Drive del sistema. Devuelve la URL (el front la abre).
@@ -26075,21 +26128,34 @@ app.post('/api/maestro/backup/sistema/restaurar', async function(req, res) {
   } catch (e) { console.error('POST sistema/restaurar:', e && e.message); return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
 
-// AUTO-BACKUP del sistema (actualizacion automatica). Gateado por env BACKUP_SISTEMA_AUTO=on.
-// Si esta prendido y hay cuenta vinculada, sube un backup del sistema cada 24h. CERO IA.
-function _backupSistemaAutoActivo() { return String(process.env.BACKUP_SISTEMA_AUTO || '').toLowerCase() === 'on'; }
+// AUTO-BACKUP del sistema (actualizacion automatica). Se maneja desde el panel del Maestro (config
+// auto + frecuencia_horas, guardada en la DB). Corre un tick cada 1h que se AUTOGATEA: si auto=off sale
+// al toque; si auto=on, backupea solo cuando el ultimo backup es mas viejo que la frecuencia. CERO IA.
 async function _cronBackupSistema() {
   try {
-    if (!_backupSistemaAutoActivo()) return;
     if (!_googleConfigurado() || !_googleapis) return;
+    const cfg = await _sysConfigLeer();
+    if (!cfg.auto) return;
     const oauth = await _sysDriveOAuth();
     if (!oauth) return;
+    // ¿Ya toca? Miramos el backup mas nuevo; si es mas viejo que la frecuencia (o no hay) -> corremos.
+    let debe = true;
+    try {
+      const bks = await _listarBackupsSistema();
+      if (bks && bks.length && bks[0].fecha) {
+        const edadH = (Date.now() - new Date(bks[0].fecha).getTime()) / 3600000;
+        if (edadH < (Number(cfg.frecuencia_horas) || 24)) debe = false;
+      }
+    } catch (e) {}
+    if (!debe) return;
     const contenido = await _armarExportSistema(null);
     const r = await _subirBackupSistema(contenido);
     console.log('[backup-sistema] auto subido: ' + r.fileName);
   } catch (e) { console.error('_cronBackupSistema:', e && e.message); }
 }
-if (_backupSistemaAutoActivo()) { setInterval(_cronBackupSistema, 24 * 60 * 60 * 1000); setTimeout(_cronBackupSistema, 10 * 60 * 1000); }
+// Tick horario, SIEMPRE agendado (barato: si auto=off, _cronBackupSistema sale enseguida). La primera pasada
+// a los 5 min del arranque.
+if (_googleConfigurado()) { setInterval(_cronBackupSistema, 60 * 60 * 1000); setTimeout(_cronBackupSistema, 5 * 60 * 1000); }
 
 // CRON OPCIONAL (DOCUMENTADO, NO ARRANCADO): para subir a Drive periodicamente a las cuentas
 // premium+ que tengan Drive conectado, descomentar el setInterval de abajo. Por default queda

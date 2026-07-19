@@ -26053,12 +26053,21 @@ app.get('/api/maestro/backup/sistema/estado', async function(req, res) {
       try { cuenta = await _sysDriveInfo(); } catch (e) {}
     }
     const config = await _sysConfigLeer();
-    // Peso por tabla a nivel SISTEMA (sin filtrar user_id). "Todo es todo": TODAS las tablas de la base.
+    // Peso por tabla a nivel SISTEMA. RAPIDO: conteo exacto (head, no trae filas) + muestra de 200 filas para
+    // estimar bytes promedio -> evita traer TODA la base en cada apertura del panel (antes tardaba muchisimo).
+    // bytes es ESTIMADO (aprox); el tamaño REAL de cada backup se ve en la lista de abajo.
     const permitidas = await _tablasBackupSistema();
     const pesos = [];
     for (const tb of permitidas) {
       let filas = 0, bytes = 0;
-      try { const { data } = await supabase.from(tb).select('*'); filas = (data || []).length; bytes = data ? Buffer.byteLength(JSON.stringify(data)) : 0; } catch (e) {}
+      try {
+        const { count } = await supabase.from(tb).select('*', { count: 'exact', head: true });
+        filas = count || 0;
+        if (filas > 0) {
+          const { data: muestra } = await supabase.from(tb).select('*').limit(200);
+          if (muestra && muestra.length) { const prom = Buffer.byteLength(JSON.stringify(muestra)) / muestra.length; bytes = Math.round(prom * filas); }
+        }
+      } catch (e) {}
       pesos.push({ tabla: tb, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(tb) !== -1 });
     }
     return res.json({ ok: true, configurado: configurado, vinculado: vinculado, conservar: BACKUP_DRIVE_CONSERVAR, backups: backups, pesos: pesos, cuenta: cuenta, config: config, auto: !!config.auto });

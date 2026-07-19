@@ -26398,6 +26398,40 @@ app.get('/api/maestro/backup/sistema/descargar', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
 
+// BACKUP A LA COMPUTADORA: arma y descarga un ZIP con TODO (JSON completo + todos los archivos de multimedia)
+// para guardar en el disco. Streaming (no carga todo en memoria de golpe). El front elige la carpeta.
+let _archiver = null;
+try { _archiver = require('archiver'); console.log('[ZIP] archiver disponible'); }
+catch (e) { _archiver = null; console.log('[ZIP] archiver NO instalado -> descarga a la compu OFF (npm i archiver)'); }
+app.get('/api/maestro/backup/sistema/descargar-zip', async function(req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (!_archiver) return res.status(503).json({ error: 'Falta la libreria archiver.' });
+    if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Google no configurado.' });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="raices-backup-completo-' + new Date().toISOString().slice(0, 10) + '.zip"');
+    var zip = _archiver('zip', { zlib: { level: 6 } });
+    zip.on('error', function(err){ console.error('[ZIP] error:', err && err.message); try { res.end(); } catch (e) {} });
+    zip.pipe(res);
+    // 1) JSON completo (datos + logins + estructura + secretos + refs + whatsapp + dns)
+    var contenido = await _armarExportSistema(null);
+    zip.append(JSON.stringify(contenido, null, 2), { name: 'backup-datos.json' });
+    // 2) Multimedia: cada archivo del bucket 'media' dentro de media/
+    try {
+      var archivos = await _listarMediaBucket('', [], 200000);
+      for (var i = 0; i < archivos.length; i++) {
+        try {
+          var dl = await supabase.storage.from(MEDIA_BUCKET).download(archivos[i].path);
+          if (dl && dl.data) { var buf = Buffer.from(await dl.data.arrayBuffer()); zip.append(buf, { name: 'media/' + archivos[i].path }); }
+        } catch (eF) {}
+      }
+    } catch (eM) { console.error('[ZIP] media:', eM && eM.message); }
+    // 3) README
+    zip.append('Backup COMPLETO de Raices CRM.\n\nContenido:\n- backup-datos.json: TODAS las tablas + logins + estructura + secretos + referencias de codigo + inventario de WhatsApp + registros DNS.\n- media/: audios, fotos y videos.\n\nGenerado: ' + new Date().toISOString() + '\n\nOJO: contiene claves reales. Guardalo en un lugar seguro y privado.\n', { name: 'LEEME.txt' });
+    await zip.finalize();
+  } catch (e) { console.error('GET descargar-zip:', e && e.message); try { if (!res.headersSent) res.status(500).json({ error: (e && e.message) || 'Error' }); else res.end(); } catch (e2) {} }
+});
+
 // Restaura (levanta) un backup. SOLO super-admin. body: { id: fileId, tablas?: string[], confirmar: true }
 app.post('/api/maestro/backup/sistema/restaurar', async function(req, res) {
   try {

@@ -21814,39 +21814,27 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
       if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
     }
     var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
-    // B1: TRIAL de 4 dias con tarjeta upfront. Solo para una cuenta NUEVA con un plan FIJO (no upgrade, no personal).
-    // Personal cobra al toque (sin trial) para no chocar con el cap de 100 mensajes del trial.
+    // SUSCRIPCION DIRECTA (decision Diego 2026-07-20): SIN periodo de prueba. Se cobra el primer mes al autorizar la
+    // tarjeta y el cliente arranca con el cupo COMPLETO del plan. No hay cobro diferido ni cap de 100. El primer mes
+    // sirve para ajustar/dar asistencia con el cliente ya adentro. startDateISO = null -> MP cobra al autorizar.
     var subPrev = await getSubscription(user_id);
     var yaActivo = !!(subPrev && (subPrev.status === 'active' || subPrev.status === 'past_due' || subPrev.cortesia === true));
     var startDateISO = null;
-    if (nivel !== 'personal' && !yaActivo) {
-      var d4 = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000);
-      startDateISO = d4.toISOString();
-    }
     var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, startDateISO, montoOverride);
     // Guardar el plan ELEGIDO en la fila para que se apliquen sus limites al activarse (el webhook NO incluye
-    // 'plan' en su upsert -> se preserva). Asi un Enterprise queda con 20.000 y no cae al default. Si el tenant
-    // NO esta active/cortesia, lo dejamos en 'trial' y marcamos trial_con_tarjeta=true: durante esos 4 dias la IA
-    // SI atiende (capeada a 100; ver dentroDelTopeIA/debeBloquearAcceso). Tras el 1er pago real el webhook lo pasa
-    // a 'active' (cupo del plan). Si YA esta active (upgrade), NO tocamos status ni el flag (no cortar el acceso).
+    // 'plan' en su upsert -> se preserva). Asi un Enterprise queda con su cupo y no cae al default. Si el tenant
+    // NO esta active/cortesia, lo dejamos en 'trial' (estado PENDIENTE, sin trial_con_tarjeta): debeBloquearAcceso
+    // lo corta hasta que el webhook confirme el pago y lo pase a 'active' (cupo COMPLETO del plan). SIN periodo de
+    // prueba: no hay cap de 100 ni atencion gratis previa. Si YA esta active (upgrade), NO tocamos su status.
     try {
       var filaPlan = { user_id: user_id, plan: nivel };
       if (nivel === 'personal') {
         // Cupo a medida via limits_override (preserva otros overrides del Maestro).
         filaPlan.limits_override = Object.assign({}, (subPrev && subPrev.limits_override) || {}, { ai_messages: cantPersonal });
-        // CRITICO: Personal NO tiene trial, pero NO debe servir gratis antes de pagar. status='trial' (sin trial_con_tarjeta)
-        // -> debeBloquearAcceso lo corta hasta que el webhook lo pase a 'active' al confirmarse el pago. Si ya estaba activo
-        // (upgrade raro via checkout), NO tocamos su status para no cortarle el acceso.
-        if (!yaActivo) filaPlan.status = 'trial';
-      } else if (!yaActivo) { filaPlan.status = 'trial'; filaPlan.trial_con_tarjeta = true; }
-      // DEFENSIVO: la columna trial_con_tarjeta puede no existir aun (migracion pendiente). Si el upsert falla por
-      // eso, reintentamos sin ese campo: el cliente queda en 'trial' (bloqueado hasta el pago, como antes) en vez
-      // de romper el checkout. Una vez corrida la migracion, el trial atiende capeado a 100 normalmente.
-      var upT = await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
-      if (upT && upT.error && !yaActivo && nivel !== 'personal') {
-        var filaSinFlag = { user_id: user_id, plan: nivel, status: 'trial' };
-        await supabase.from('subscriptions').upsert(filaSinFlag, { onConflict: 'user_id' });
       }
+      // PENDIENTE hasta el pago: status='trial' (sin trial_con_tarjeta) => bloqueado hasta que el webhook lo active.
+      if (!yaActivo) filaPlan.status = 'trial';
+      await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
     } catch (eP) { console.error('checkout guardar plan:', eP && eP.message); }
     return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }

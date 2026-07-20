@@ -10274,15 +10274,20 @@ async function revisarRespaldoTimeout() {
         const { data: _d } = await supabase.from('conversations').select('respaldo_derivado').eq('id', conv.id).maybeSingle();
         if (_d && _d.respaldo_derivado === true) { _respaldoDerivado.add(conv.id); continue; }
       } catch (eD) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
-      // ULTIMO mensaje de la conversacion: tiene que ser del LEAD (role='contact') y tener > umbral minutos.
+      // ULTIMO mensaje REAL de la conversacion (solo lead / IA / humano): tiene que ser del LEAD (role='contact') y
+      // tener > umbral minutos. REGLA DE DIEGO (2026-07-20): el disparador es "el lead escribio y pasaron X minutos
+      // SIN SER ATENDIDO". Un mensaje de SISTEMA ('sistema': pases de asesor, avisos internos, cartelitos) NO es
+      // atencion -> se IGNORA. Antes se miraba el ultimo mensaje SEA CUAL SEA, asi que un 'sistema' posterior al
+      // mensaje del lead salteaba el respaldo y el lead quedaba colgado igual (justo lo que este plan B evita).
       const { data: ult } = await supabase
         .from('messages')
         .select('role, created_at')
         .eq('conversation_id', conv.id)
+        .in('role', ['contact', 'ai', 'human'])
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
-      if (!ult || ult.role !== 'contact' || !ult.created_at) continue; // ya hubo respuesta (ai/human/sistema) o sin datos
+      if (!ult || ult.role !== 'contact' || !ult.created_at) continue; // ya lo atendio la IA o un humano, o sin datos
       const transcurrido = ahoraMs - new Date(ult.created_at).getTime();
       if (transcurrido < UMBRAL_MS) continue; // todavia no cumplio el umbral: la IA aun puede responder
       // -> La IA NO respondio en el umbral. DERIVAR a un humano de forma equitativa REUSANDO derivarAHumano.

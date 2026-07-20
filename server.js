@@ -766,8 +766,8 @@ function precioRecargaARS(cantMsgs) {
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)
 const PLAN_LIMITS = {
   trial:      { ai_messages: 100,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  basico:     { ai_messages: 500,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
-  pro:        { ai_messages: 1800,  asesores: 10,       contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
+  basico:     { ai_messages: 500,   asesores: 3,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: false },
+  pro:        { ai_messages: 1800,  asesores: 6,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: false },
   premium:    { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
   enterprise: { ai_messages: 8000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
   // 'personal' (a medida): el CUPO real lo fija limits_override.ai_messages = la cantidad elegida (>=15.000) al contratar.

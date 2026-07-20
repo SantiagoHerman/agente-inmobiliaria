@@ -386,12 +386,29 @@ async function _getSupaJwks() {
 // si el uid esta en el Set -> el frontend recibe 401 y cierra la sesion sola. Ademas se banea/desbanea el LOGIN en
 // Supabase Auth (defensa extra para el ingreso externo; best-effort). El DUEÑO nunca esta en asesores -> nunca se corta.
 // ============================================================================
-var _asesoresSinAcceso = new Set(); // auth_user_id de asesores con activo=false (acceso apagado)
+var _asesoresSinAcceso = new Set(); // auth_user_id SIN acceso: asesores apagados + cuentas eliminadas (dueño y asesores)
 async function _refrescarAsesoresSinAcceso() {
   try {
-    const { data } = await supabase.from('asesores').select('auth_user_id').eq('activo', false).not('auth_user_id', 'is', null);
     const s = new Set();
-    (data || []).forEach(function (r) { if (r && r.auth_user_id) s.add(r.auth_user_id); });
+    // 1) Asesores con acceso apagado (activo=false).
+    const { data: asDes } = await supabase.from('asesores').select('auth_user_id').eq('activo', false).not('auth_user_id', 'is', null);
+    (asDes || []).forEach(function (r) { if (r && r.auth_user_id) s.add(r.auth_user_id); });
+    // 2) CUENTAS ELIMINADAS EN PAPELERA (business_settings.eliminado_at != null): el DUEÑO + TODOS sus asesores quedan
+    //    SIN acceso (sesion cortada -> verificarUsuario 401). Es RESTORABLE: al restaurar (eliminado_at=null) vuelven.
+    //    El dueño NO esta en 'asesores', por eso su uid se agrega aparte. (Diego 2026-07-20: eliminar cuenta = desloguear.)
+    const { data: cuentasElim } = await supabase.from('business_settings').select('user_id').not('eliminado_at', 'is', null);
+    const ownersElim = (cuentasElim || []).map(function (r) { return r && r.user_id; }).filter(Boolean);
+    ownersElim.forEach(function (uid) { s.add(uid); });
+    if (ownersElim.length) {
+      const { data: asElim } = await supabase.from('asesores').select('auth_user_id').in('admin_id', ownersElim).not('auth_user_id', 'is', null);
+      (asElim || []).forEach(function (r) { if (r && r.auth_user_id) s.add(r.auth_user_id); });
+    }
+    // 3) CUENTAS BORRADAS DEFINITIVO (permanente, no restorable): sus filas ya no existen, se toman del audit para que la
+    //    revocacion del dueño SOBREVIVA a este refresco y a reinicios (hasta que su JWT expire; despues es inofensivo).
+    try {
+      const { data: defs } = await supabase.from('admin_audit').select('target_user_id').eq('accion', 'borrar_definitivo').not('target_user_id', 'is', null);
+      (defs || []).forEach(function (r) { if (r && r.target_user_id) s.add(r.target_user_id); });
+    } catch (eDef) { /* si admin_audit falla, seguimos con el resto del set */ }
     _asesoresSinAcceso = s;
   } catch (e) { /* defensivo: si falla, dejar el set como esta (no cambiar el estado de acceso por un error puntual) */ }
 }
@@ -22512,6 +22529,17 @@ app.post('/api/maestro/cliente/eliminar', async function(req, res){
     if (!(await _verificar2fa('eliminar', codigo))) return res.status(403).json({ ok: false, error: 'codigo' });
     var up = await supabase.from('business_settings').update({ eliminado_at: new Date().toISOString() }).eq('user_id', uid);
     if (up.error) return res.status(500).json({ ok: false, error: up.error.message });
+    // CORTAR YA las sesiones activas de la cuenta (dueño + asesores): al Set en memoria (verificarUsuario -> 401 en su
+    // proximo request) + ban del login en Auth. El refresco periodico (eliminado_at) lo sostiene cross-instancia y tras
+    // reinicio; al restaurar se revierte. Antes: borrar la cuenta NO deslogueaba al que ya estaba adentro (Diego 2026-07-20).
+    try {
+      _asesoresSinAcceso.add(uid); await _setBanUsuario(uid, true);
+      var _asDel = await supabase.from('asesores').select('auth_user_id').eq('admin_id', uid).not('auth_user_id', 'is', null);
+      for (var _ad = 0; _ad < ((_asDel && _asDel.data) || []).length; _ad++) {
+        var _aid = _asDel.data[_ad] && _asDel.data[_ad].auth_user_id;
+        if (_aid) { _asesoresSinAcceso.add(_aid); await _setBanUsuario(_aid, true); }
+      }
+    } catch (eCut) { console.error('eliminar cortar sesiones:', eCut && eCut.message); }
     try { await supabase.from('admin_audit').insert({ accion: 'eliminar_cliente_papelera', target_user_id: uid, detalle: '{}' }); } catch(eA){}
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -22528,6 +22556,19 @@ app.post('/api/maestro/cliente/restaurar', async function(req, res){
     if (codigo) { if (!(await _verificar2fa('eliminar', codigo))) return res.status(403).json({ ok: false, error: 'codigo' }); }
     var up = await supabase.from('business_settings').update({ eliminado_at: null }).eq('user_id', uid);
     if (up.error) return res.status(500).json({ ok: false, error: up.error.message });
+    // Revertir el corte de sesiones: el dueño recupera acceso; cada asesor vuelve SALVO que este apagado individualmente
+    // (activo=false), en cuyo caso sigue revocado. Best-effort; el refresco periodico deja el set consistente igual.
+    try {
+      _asesoresSinAcceso.delete(uid); await _setBanUsuario(uid, false);
+      var _asRes = await supabase.from('asesores').select('auth_user_id, activo').eq('admin_id', uid).not('auth_user_id', 'is', null);
+      for (var _ar = 0; _ar < ((_asRes && _asRes.data) || []).length; _ar++) {
+        var _r = _asRes.data[_ar];
+        if (_r && _r.auth_user_id) {
+          if (_r.activo === false) { _asesoresSinAcceso.add(_r.auth_user_id); }
+          else { _asesoresSinAcceso.delete(_r.auth_user_id); await _setBanUsuario(_r.auth_user_id, false); }
+        }
+      }
+    } catch (eRes) { console.error('restaurar sesiones:', eRes && eRes.message); }
     try { await supabase.from('admin_audit').insert({ accion: 'restaurar_cliente', target_user_id: uid, detalle: '{}' }); } catch(eA){}
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -22557,7 +22598,20 @@ app.post('/api/maestro/cliente/borrar-definitivo', async function(req, res){
     // 2) Borrar en cascada (best-effort; el backup ya esta a salvo).
     for (var di = 0; di < tablasUser.length; di++) { try { await supabase.from(tablasUser[di]).delete().eq('user_id', uid); } catch(eD){} }
     try { await supabase.from('asesores').delete().eq('admin_id', uid); } catch(eDA){}
-    // 3) Borrar el usuario de Auth (ultimo paso).
+    // 3) Cortar sesiones activas + borrar de Auth. El dueño: al Set (sostenido por el audit borrar_definitivo en el
+    //    refresco) + ban + deleteUser. Los ASESORES: sus filas ya se borraron arriba, pero sus cuentas de Auth seguian
+    //    vivas con sesion valida -> las baneamos, deslogueamos (Set) y borramos tambien. contenido.asesores trae sus auth_user_id.
+    try {
+      _asesoresSinAcceso.add(uid); await _setBanUsuario(uid, true);
+      for (var _ci = 0; _ci < ((contenido && contenido.asesores) || []).length; _ci++) {
+        var _ca = contenido.asesores[_ci];
+        if (_ca && _ca.auth_user_id) {
+          _asesoresSinAcceso.add(_ca.auth_user_id);
+          await _setBanUsuario(_ca.auth_user_id, true);
+          try { await supabase.auth.admin.deleteUser(_ca.auth_user_id); } catch(eDUa){}
+        }
+      }
+    } catch (eCutD) { console.error('borrar-definitivo cortar sesiones:', eCutD && eCutD.message); }
     try { await supabase.auth.admin.deleteUser(uid); } catch(eAu){ console.error('deleteUser borrar-definitivo:', eAu && eAu.message); }
     try { await supabase.from('admin_audit').insert({ accion: 'borrar_definitivo', target_user_id: uid, detalle: JSON.stringify({ resumen: resumen }) }); } catch(eA){}
     return res.json({ ok: true });

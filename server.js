@@ -1417,7 +1417,11 @@ async function _limpiarPlanesMpViejosUnaVez() {
       var subs = (p.summarized && Number(p.summarized.subscribed)) || 0;
       if (subs > 0) continue; // jamas tocar una con suscriptores (por las dudas)
       try { await mpFetch('/preapproval_plan/' + p.id, 'PUT', { status: 'cancelled' }); cancelados++; }
-      catch (eC) { console.error('limpiar plan MP ' + p.id + ':', eC && eC.message); }
+      catch (eC) {
+        // Algunos entornos de MP esperan 'inactive' en vez de 'cancelled' para desactivar una plantilla.
+        try { await mpFetch('/preapproval_plan/' + p.id, 'PUT', { status: 'inactive' }); cancelados++; }
+        catch (eC2) { console.error('limpiar plan MP ' + p.id + ':', (eC && eC.message), '|', (eC2 && eC2.message)); }
+      }
     }
     if (cancelados) console.log('[mp] plantillas viejas canceladas: ' + cancelados);
   } catch (e) { console.error('_limpiarPlanesMpViejosUnaVez:', e && e.message); }

@@ -8868,6 +8868,10 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
 // ============ MULTI-CLIENTE: conectar WhatsApp propio de cada inmobiliaria ============
 // La URL publica del backend (para configurar el webhook de cada instancia automaticamente)
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || 'https://agente-inmobiliaria-production-7e1c.up.railway.app';
+// URL PUBLICA DEL FRONTEND (la app que ve el cliente). Se usa para el back_url de MercadoPago (a donde vuelve el
+// USUARIO tras pagar) y cualquier link de retorno al front. NO reusar BACKEND_PUBLIC_URL (eso es el backend en Railway).
+// Default = www.raicescrm.com para que el retorno nunca caiga en raices-crm.vercel.app (Diego 2026-07-20).
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.raicescrm.com';
 
 // Nombre de instancia unico y estable por usuario
 function nombreInstancia(user_id) {
@@ -21803,7 +21807,7 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
       planId = PLANES_MP[nivel] || null;
       if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
     }
-    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var backUrl = FRONTEND_URL + '/suscripcion/listo';
     // SUSCRIPCION DIRECTA (decision Diego 2026-07-20): SIN periodo de prueba. Se cobra el primer mes al autorizar la
     // tarjeta y el cliente arranca con el cupo COMPLETO del plan. No hay cobro diferido ni cap de 100. El primer mes
     // sirve para ajustar/dar asistencia con el cliente ya adentro. startDateISO = null -> MP cobra al autorizar.
@@ -21860,7 +21864,7 @@ app.post('/api/suscripcion/aceptar-plan', async function(req, res) {
       catch (eC) { console.error('aceptar-plan cancelar trial MP:', eC && eC.message); }
     }
     // 2) Crear un preapproval nuevo SIN start_date (cobra al autorizar -> YA).
-    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var backUrl = FRONTEND_URL + '/suscripcion/listo';
     var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, null);
     // M12: GUARDAR el mp_preapproval_id NUEVO (reemplaza al del trial que acabamos de cancelar) + marcar trial_reauth_at.
     // ANTES no se guardaba: si el cliente nunca autorizaba el preapproval nuevo, la fila quedaba en 'trial' +
@@ -22124,7 +22128,7 @@ app.post('/api/recarga/checkout', async function(req, res) {
     if (!tieneMPactivo && !esCortesia) return res.status(409).json({ error: 'Necesitas un plan activo para comprar mensajes', usar_checkout: true });
     var monto = precioRecargaARS(cant);
     if (typeof monto === 'undefined' || monto === null || monto <= 0) return res.status(400).json({ error: 'Cantidad invalida' });
-    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var backUrl = FRONTEND_URL + '/suscripcion/listo';
     var extRef = 'recarga|' + user_id + '|' + cant;
     var pref = await mpCrearPreferencia('Recarga ' + cant + ' mensajes IA - Raices CRM', monto, extRef, backUrl, { tipo: 'recarga', user_id: user_id, cantidad_mensajes: cant });
     return res.json({ ok: true, init_point: pref && (pref.init_point || pref.sandbox_init_point), id: pref && pref.id });
@@ -22140,7 +22144,7 @@ app.post('/api/maestro/mp-crear-plan-enterprise', async function(req, res){
     var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado' });
     if (PLANES_MP.enterprise) return res.json({ ok: true, yaConfigurado: true, id: PLANES_MP.enterprise, aviso: 'Ya hay un plan Enterprise configurado (env MP_PLAN_ENTERPRISE). Para recrearlo, borra esa variable primero.' });
-    var backUrl = (process.env.BACKEND_PUBLIC_URL || 'https://raices-crm.vercel.app') + '/suscripcion/listo';
+    var backUrl = FRONTEND_URL + '/suscripcion/listo';
     var plan = await mpCrearPlan('Raices CRM - Plan Enterprise', 500000, backUrl);
     return res.json({ ok: true, id: plan && plan.id, aviso: 'Plan Enterprise creado en MP. Copia este id a la variable MP_PLAN_ENTERPRISE en Railway y redeploya para activarlo.' });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }

@@ -1360,26 +1360,20 @@ async function mpCrearSuscripcion(planId, payerEmail, externalRef, backUrl, nive
   if (typeof monto === 'undefined' || monto === null) {
     throw new Error('Plan sin precio configurado: ' + nivel);
   }
-  // El GET del plan es SOLO para el "reason" (texto). NO para el precio. Si falla, seguimos con un reason por defecto.
-  // Personal no tiene plan en MP (preapproval directo con monto a medida) -> planId vacio -> se saltea el GET.
-  var plan = null;
-  if (planId) {
-    try { plan = await mpFetch('/preapproval_plan/' + planId, 'GET', null); }
-    catch (e) { console.error('mpCrearSuscripcion GET plan (no critico, se usa precio hardcode):', e && e.message); }
-  }
+  // NOMBRE que ve el cliente en MercadoPago: sale del CODIGO (ya NO usamos plantillas preapproval_plan de MP). El cobro
+  // es un preapproval DIRECTO con transaction_amount = precio del codigo (atado al dolar). planId se ignora.
+  var _nivelNombre = { basico: 'Basico', pro: 'Pro', premium: 'Premium', enterprise: 'Enterprise', personal: 'Personal' };
+  var reasonPlan = 'Raices CRM - Plan ' + (_nivelNombre[nivel] || 'Suscripcion');
   var autoRecurring = {
     frequency: 1,
     frequency_type: 'months',
     transaction_amount: monto,
     currency_id: 'ARS'
   };
-  // B1 (TRIAL con tarjeta): si llega startDateISO, lo ponemos en auto_recurring.start_date para diferir el PRIMER
-  // cobro (ej. ahora + 4 dias). El cliente carga la tarjeta YA (autoriza), pero MP no cobra hasta esa fecha -> es el
-  // periodo de prueba. NO usamos free_trial: en el preapproval DIRECTO (sin plan) MP lo rechaza con 500. Defensivo:
-  // solo lo agregamos si vino un valor; sin start_date el comportamiento es el de siempre (cobra al autorizar).
+  // Sin trial: cobra al autorizar. (startDateISO se conserva por compat; hoy el checkout siempre lo manda null.)
   if (startDateISO) autoRecurring.start_date = startDateISO;
   var body = {
-    reason: (plan && plan.reason) ? plan.reason : 'Suscripcion Raices CRM',
+    reason: reasonPlan,
     external_reference: externalRef,
     payer_email: payerEmail,
     back_url: backUrl,
@@ -1404,6 +1398,31 @@ async function mpConsultarSuscripcion(preapprovalId) {
 async function mpConsultarPago(paymentId) {
   return await mpFetch('/v1/payments/' + paymentId, 'GET', null);
 }
+
+// LIMPIEZA one-time (idempotente): cancela las PLANTILLAS de suscripcion viejas de MP (preapproval_plan con reason que
+// arranca con "Raices CRM") que ya NO se usan (el cobro es un preapproval DIRECTO con el monto del codigo). Deja las
+// plantillas AJENAS (ej. "Plan Redes Basico") intactas. Cancelar = sacar de "activos"; idempotente (tras el 1er boot
+// no quedan activas -> no hace nada). NUNCA cancela nada con suscriptores (esas plantillas nunca tuvieron, usamos directo).
+async function _limpiarPlanesMpViejosUnaVez() {
+  try {
+    if (!MP_TOKEN) return;
+    var r = await mpFetch('/preapproval_plan/search?status=active&limit=100', 'GET', null);
+    var results = (r && (r.results || r.elements)) || [];
+    var cancelados = 0;
+    for (var i = 0; i < results.length; i++) {
+      var p = results[i];
+      if (!p || !p.id) continue;
+      var reason = String(p.reason || '').toLowerCase();
+      if (reason.indexOf('raices crm') !== 0) continue; // SOLO nuestras plantillas (no "Plan Redes", ni ajenas)
+      var subs = (p.summarized && Number(p.summarized.subscribed)) || 0;
+      if (subs > 0) continue; // jamas tocar una con suscriptores (por las dudas)
+      try { await mpFetch('/preapproval_plan/' + p.id, 'PUT', { status: 'cancelled' }); cancelados++; }
+      catch (eC) { console.error('limpiar plan MP ' + p.id + ':', eC && eC.message); }
+    }
+    if (cancelados) console.log('[mp] plantillas viejas canceladas: ' + cancelados);
+  } catch (e) { console.error('_limpiarPlanesMpViejosUnaVez:', e && e.message); }
+}
+setTimeout(function () { try { _limpiarPlanesMpViejosUnaVez().catch(function () {}); } catch (e) {} }, 30 * 1000);
 
 // URL publica del webhook (este mismo backend). MP manda aca las notificaciones del pago unico de la recarga.
 const MP_WEBHOOK_URL = process.env.MP_WEBHOOK_URL || 'https://agente-inmobiliaria-production-7e1c.up.railway.app/api/webhook/mercadopago';
@@ -21820,9 +21839,9 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
       montoOverride = precioPersonalARS(cantPersonal);
       if (!montoOverride) return res.status(400).json({ error: 'Cantidad invalida' });
     } else {
-      // Los planes fijos son GLOBALES (del SaaS), no per-tenant.
-      planId = PLANES_MP[nivel] || null;
-      if (!planId) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
+      // Ya NO usamos plantillas de MP: preapproval DIRECTO con el monto del codigo (atado al dolar). Validamos que el
+      // nivel sea un plan fijo con precio configurado (BASE_PESOS). planId queda null (mpCrearSuscripcion lo ignora).
+      if (typeof BASE_PESOS[nivel] === 'undefined' || BASE_PESOS[nivel] === null) return res.status(503).json({ error: 'Ese plan todavia no esta disponible' });
     }
     var backUrl = FRONTEND_URL + '/suscripcion/listo';
     // SUSCRIPCION DIRECTA (decision Diego 2026-07-20): SIN periodo de prueba. Se cobra el primer mes al autorizar la
@@ -22156,14 +22175,12 @@ app.post('/api/recarga/checkout', async function(req, res) {
 // (mensual, 4 dias de prueba, ARS, credito+debito) via mpCrearPlan. Devuelve el id para cargarlo en la env
 // MP_PLAN_ENTERPRISE de Railway (mismo patron que los 3 planes base). Si ya esta seteado, no crea otro.
 app.post('/api/maestro/mp-crear-plan-enterprise', async function(req, res){
+  // DEPRECADO (2026-07-20): ya NO usamos plantillas de MP (preapproval_plan). El cobro es un preapproval DIRECTO con el
+  // monto del codigo. Este endpoint creaba plantillas "Raices CRM - Plan Enterprise" (origen de las plantillas viejas /
+  // del duplicado). Se deja como no-op para no volver a ensuciar la cuenta de MP.
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
-    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
-    if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado' });
-    if (PLANES_MP.enterprise) return res.json({ ok: true, yaConfigurado: true, id: PLANES_MP.enterprise, aviso: 'Ya hay un plan Enterprise configurado (env MP_PLAN_ENTERPRISE). Para recrearlo, borra esa variable primero.' });
-    var backUrl = FRONTEND_URL + '/suscripcion/listo';
-    var plan = await mpCrearPlan('Raices CRM - Plan Enterprise', 500000, backUrl);
-    return res.json({ ok: true, id: plan && plan.id, aviso: 'Plan Enterprise creado en MP. Copia este id a la variable MP_PLAN_ENTERPRISE en Railway y redeploya para activarlo.' });
+    return res.status(410).json({ ok: false, error: 'Deshabilitado: ya no se usan plantillas de plan en MercadoPago (el cobro es directo, con el monto del codigo atado al dolar).' });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

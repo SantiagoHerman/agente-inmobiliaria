@@ -26405,7 +26405,11 @@ try { _archiver = require('archiver'); console.log('[ZIP] archiver disponible');
 catch (e) { _archiver = null; console.log('[ZIP] archiver NO instalado -> descarga a la compu OFF (npm i archiver)'); }
 app.get('/api/maestro/backup/sistema/descargar-zip', async function(req, res) {
   try {
-    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    // Auth: maestroAuth (desde el panel) O una clave propia BACKUP_LOCAL_KEY (para el script local programado en
+    // la compu de Diego). La clave va por header 'x-backup-key' (no en la URL, para no loguearla).
+    var claveLocal = process.env.BACKUP_LOCAL_KEY || '';
+    var okKey = claveLocal && (req.headers['x-backup-key'] === claveLocal);
+    if (!okKey && !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     if (!_archiver) return res.status(503).json({ error: 'Falta la libreria archiver.' });
     if (!_googleConfigurado() || !_googleapis) return res.status(503).json({ error: 'Google no configurado.' });
     res.setHeader('Content-Type', 'application/zip');

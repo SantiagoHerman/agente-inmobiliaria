@@ -21777,8 +21777,10 @@ app.get('/api/suscripcion', async function(req, res) {
     } else {
       plan_label = (sub && sub.plan && PLAN_LIMITS[sub.plan]) ? sub.plan : null; // estado intermedio (trial/etc): no forzar "basico"
     }
-    // puede_cancelar: solo si hay un preapproval real cobrable.
-    var puede_cancelar = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
+    // puede_cancelar: hay un preapproval (tarjeta cargada) y NO esta ya cancelada. Incluye la PRUEBA con tarjeta
+    // -> el cliente puede darse de baja durante el trial para no llegar al primer cobro (antes exigia active/past_due
+    // y en prueba daba false: no aparecia el boton de cancelar).
+    var puede_cancelar = !!(sub && sub.mp_preapproval_id && sub.status !== 'cancelled');
     return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
       // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.
       precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync(),

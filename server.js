@@ -774,25 +774,15 @@ const PLAN_LIMITS = {
   // Aca ai_messages: 15000 es solo el piso/fallback si por algun motivo no hubiera override.
   personal:   { ai_messages: 15000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
 };
-// TOPES VIEJOS (grandfathering). Los clientes creados ANTES de PLANES_NUEVOS_DESDE conservan estos topes de mensajes
-// (no se les recorta a mitad de camino); los clientes NUEVOS arrancan con los topes nuevos de arriba (mas bajos, para
-// blindar el margen ~70% aun a uso pleno). Solo difiere ai_messages; las features son las mismas que en PLAN_LIMITS.
-const PLAN_LIMITS_LEGACY = { trial: 200, basico: 1000, pro: 4000, premium: 12000, enterprise: 20000 };
-// Fecha de corte del nuevo esquema de planes (margen maximo). Configurable por env; default = el dia del cambio.
-const PLANES_NUEVOS_DESDE = process.env.PLANES_NUEVOS_DESDE || '2026-06-19T00:00:00.000Z';
+// SIN grandfathering de topes (Diego 2026-07-20): se ELIMINO. TODOS los clientes (viejos y nuevos) usan los topes
+// actuales de PLAN_LIMITS. Ya no hay PLAN_LIMITS_LEGACY ni fecha de corte: nadie conserva topes "viejos" mas altos.
+// (El override del Maestro por cliente sigue mandando aparte, ver topeEfectivoIA.)
 // Plan por defecto cuando la funcion esta apagada o el tenant no tiene fila: acceso total.
 const PLAN_DEFECTO = 'premium';
 
-// Tope de mensajes EFECTIVO de un plan, segun si el cliente es viejo (grandfathered -> tope legacy) o nuevo (tope nuevo).
-// Usa sub.created_at (ya disponible, sin costo extra). Sin fecha confiable o creado antes del corte -> legacy (no recortar).
+// Tope de mensajes EFECTIVO de un plan = el de PLAN_LIMITS (mismo para todos; el override del Maestro se aplica aparte).
 function topeMensajesPlan(plan, sub) {
-  var nuevo = (PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO]).ai_messages;
-  var legacy = PLAN_LIMITS_LEGACY[plan];
-  if (legacy == null) return nuevo;
-  var corte = new Date(PLANES_NUEVOS_DESDE).getTime();
-  var ca = (sub && sub.created_at) ? new Date(sub.created_at).getTime() : null;
-  if (ca == null || ca < corte) return legacy; // grandfathered
-  return nuevo;
+  return (PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO]).ai_messages;
 }
 
 // Lee la suscripcion del tenant. Si la tabla no existe o no hay fila, devuelve null (no rompe).

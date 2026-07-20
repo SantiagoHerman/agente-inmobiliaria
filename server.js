@@ -4206,6 +4206,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     if (o.ciudad && String(o.ciudad).trim()) partes.push(String(o.ciudad).trim());
     return partes.join(', ');
   };
+  // DIRECCION EXACTA vs APROXIMADA (pedido de Diego): una direccion es EXACTA si trae un numero de
+  // altura (al menos un digito en `direccion`); si no (solo entre_calles/zona/ciudad) es APROXIMADA.
+  // Regla: exacta -> podemos armar link de Google Maps; aproximada -> solo texto, sin link (el pin
+  // caeria mal). El "entre 20 y 21" vive en entre_calles, no en direccion, asi que no falsea esto.
+  // Nota: calles que son numeros ("Avenida 3") sin altura tambien dan true; como el link se arma con
+  // la DIRECCION TEXTUAL (?q=direccion, NO lat/lng), Google geocodifica la calle y nunca cae un pin falso.
+  const _dirEsExacta = function (o) {
+    if (!o || !o.direccion) return false;
+    return /\d/.test(String(o.direccion).trim());
+  };
   // SELECT DEFENSIVO (patron perfil_comprador): pedimos las columnas de direccion; si la migracion
   // aun no corrio (columnas ausentes) el select falla -> reintentamos SIN ellas para no perder el
   // inventario. Asi el backend se puede deployar antes o despues de la migracion sin romper.
@@ -4330,7 +4340,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         else fotosTxt = ' | fotos disponibles: si (sin categorizar)';
       }
     } catch (eImg) { fotosTxt = ''; }
-    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + ((_iaUbicacionOn && p.referencias_zona) ? ' | cerca: ' + p.referencias_zona : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
+    // UBICACION DE PROPIEDAD (gated ia_ubicacion): exacta (con altura) -> link de Google Maps armado con la
+    // direccion TEXTUAL (?q=direccion, NO lat/lng, asi el pin default del tema/Miami nunca entra al link);
+    // aproximada (sin altura) -> sin link (solo el texto de direccion que ya va arriba).
+    var _linkMaps = (_iaUbicacionOn && _dirEsExacta(p)) ? (' | ubicacion Maps: https://www.google.com/maps?q=' + encodeURIComponent(_dirProp)) : '';
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + _linkMaps + ((_iaUbicacionOn && p.referencias_zona) ? ' | cerca: ' + p.referencias_zona : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
   }).join(String.fromCharCode(10));
   }
 
@@ -4420,9 +4434,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             if (_els.length > 0) _etapasTxt = ' | etapas de precio: ' + _els.join(' ; ');
           } catch (eEt) { _etapasTxt = ''; }
           const _dirDev = _fmtDireccion(d);
+          // UBICACION DEL EMPRENDIMIENTO (gated ia_ubicacion): exacta -> link Maps por direccion textual; aproximada -> sin link.
+          const _linkMapsDev = (_iaUbicacionOn && _dirEsExacta(d)) ? (' | ubicacion Maps: https://www.google.com/maps?q=' + encodeURIComponent(_dirDev)) : '';
           const _cab = '* EMPRENDIMIENTO: ' + (d.nombre || 'Sin nombre') + (d.tipo ? ' (' + d.tipo + ')' : '') +
             (d.zona ? ' | zona: ' + d.zona : '') +
-            (_dirDev ? ' | direccion: ' + _dirDev : '') +
+            (_dirDev ? ' | direccion: ' + _dirDev : '') + _linkMapsDev +
             ((_iaUbicacionOn && d.referencias_zona) ? ' | cerca: ' + d.referencias_zona : '') +
             (d.estado_obra ? ' | obra: ' + (_ESTADO_OBRA_TXT[d.estado_obra] || d.estado_obra) : '') +
             (d.avance_pct ? ' | avance: ' + d.avance_pct + '%' : '') +
@@ -4540,7 +4556,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const a = (c && c.atributos) || {}; const _pol = a.politicas || {};
         const _polTxt = [_pol.checkin ? 'check-in ' + _pol.checkin : '', _pol.checkout ? 'check-out ' + _pol.checkout : '', _pol.cancelacion ? 'cancelacion: ' + _pol.cancelacion : '', _pol.sena ? 'seña ' + _pol.sena : '', _pol.pagos ? 'pagos: ' + _pol.pagos : ''].filter(Boolean).join(' | ');
         return 'COMPLEJO: ' + (c.nombre || 'Alojamiento') + (a.subtipo ? ' (' + a.subtipo + ')' : '')
-          + (_fmtDireccion(a) ? _NL + '  Ubicacion: ' + _fmtDireccion(a) : '')
+          + (_fmtDireccion(a) ? _NL + '  Ubicacion: ' + _fmtDireccion(a) + ((_iaUbicacionOn && _dirEsExacta(a)) ? ' | Maps: https://www.google.com/maps?q=' + encodeURIComponent(_fmtDireccion(a)) : '') : '')
           + ((_iaUbicacionOn && a.referencias_zona) ? _NL + '  Cerca: ' + a.referencias_zona : '')
           + (a.descripcion ? _NL + '  ' + a.descripcion : '')
           + (a.amenities ? _NL + '  Amenities del complejo: ' + a.amenities : '')
@@ -4784,6 +4800,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       description: 'Usala cuando el lead nombra una DIRECCION, esquina, zona o punto de referencia y queres saber que opciones del inventario quedan cerca, o donde queda esa referencia respecto de lo que ofreces (ej: "busco algo por avenida 2 entre 20 y 21", "cerca de la terminal", "por el centro de Gesell"). Te devuelve las opciones del inventario ordenadas por distancia real. NO la uses si el lead solo nombra la ciudad (eso ya lo ves en el inventario).',
       input_schema: { type: 'object', properties: { referencia: { type: 'string', description: 'La direccion o referencia tal como la dio el lead (ej: "Avenida 2 entre 20 y 21", "la terminal de omnibus").' }, ciudad: { type: 'string', description: 'Ciudad/localidad a la que pertenece la referencia, deducila del contexto o del inventario (ej: "Villa Gesell"). Muy importante para no confundir ciudades.' } }, required: ['referencia', 'ciudad'] }
     });
+    // UBICACION OSM (gated ia_ubicacion): tool para ubicar CUALQUIER referencia del lead (no hace falta que sea
+    // del inventario) y devolver calle/direccion + coordenadas + link de Google Maps. Reusa geocodificarTextoOSM.
+    toolsAgente.push({
+      name: 'ubicar_lugar',
+      description: 'Usala cuando el lead pregunta DONDE queda una direccion, esquina, barrio o punto de referencia, o te pide la ubicacion / como llegar a un lugar (ej: "donde queda la terminal de Gesell?", "por donde esta Avenida 3 y Paseo 104?", "pasame la ubicacion del centro"). Geocodifica CUALQUIER referencia (no hace falta que sea del inventario) y te devuelve la calle/direccion aproximada, las coordenadas y un link de Google Maps para compartir con el lead. Si lo que queres es ver QUE opciones del inventario quedan cerca de un punto, usa buscar_propiedades_cerca en su lugar.',
+      input_schema: { type: 'object', properties: { referencia: { type: 'string', description: 'El lugar o referencia tal como lo dijo el lead (ej: "la terminal de omnibus", "Avenida 3 y Paseo 104", "Plaza San Martin").' }, ciudad: { type: 'string', description: 'Ciudad/localidad de la referencia, deducila del contexto o del inventario (ej: "Villa Gesell"). Muy importante para no confundir ciudades.' } }, required: ['referencia', 'ciudad'] }
+    });
   }
 
   // DISPONIBILIDAD PXSOL (gated ia_disponibilidad, solo hotel): consultar disponibilidad+precio REAL por fechas.
@@ -4806,7 +4829,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (memoriaViva) systemBlocks.push({ type: 'text', text: 'MEMORIA DE LA CONVERSACION (donde venis con este lead; segui DESDE ACA, no repreguntes lo ya hablado ni retrocedas): ' + memoriaViva });
   // UBICACION OSM (gated): regla anti-invento de lugares. Solo se agrega con el flag ON (bloque
   // dinamico, no cacheado) => con flag OFF el system es BYTE-IDENTICO al actual.
-  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada.' });
+  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada.' });
 
   // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
   // failover a Bedrock si esta gateado/encendido). Sin BEDROCK_ENABLED + creds, es identico a anthropic.messages.create.
@@ -4871,6 +4894,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // ON => esta rama nunca se entra con OFF (ACTUAL EXACTO). $0 recurrente: OSM gratis + math local.
     const _toolCerca = _iaUbicacionOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_propiedades_cerca'; }) : null;
     const _toolDispo = (_iaDisponibilidadOn && _esHotel) ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_disponibilidad'; }) : null;
+    // UBICACION OSM (gated ia_ubicacion): ¿la IA pidio ubicar_lugar? (geocodifica una referencia libre del lead)
+    const _toolUbicar = _iaUbicacionOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ubicar_lugar'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       let _resCercaTxt = '';
@@ -4930,6 +4955,53 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       } catch (eC2) { console.error('segundo turno buscar_propiedades_cerca:', eC2 && eC2.message); }
       reply = _textoCierreC || _textoPrevioC || 'Dejame chequear bien esa ubicacion y te confirmo.';
       if (!usaEmojis) { const _lC = quitarEmojis(reply); if (_lC) reply = _lC; }
+    } else if (_toolUbicar) {
+      // UBICACION OSM (gated): geocodifica la referencia libre que nombro el lead (Nominatim con cache) y
+      // devuelve calle/direccion + coordenadas + link de Google Maps en un 2do turno (mismo patron que foto/cerca).
+      // La tool solo existe con el flag ON => esta rama nunca se entra con OFF (ACTUAL EXACTO). $0 recurrente: OSM gratis.
+      const _textoPrevioU = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resUbicTxt = '';
+      try {
+        const _refU = (_toolUbicar.input && _toolUbicar.input.referencia) ? String(_toolUbicar.input.referencia).trim() : '';
+        const _ciuU = (_toolUbicar.input && _toolUbicar.input.ciudad) ? String(_toolUbicar.input.ciudad).trim() : '';
+        const _geoU = _refU ? await geocodificarTextoOSM(_refU, _ciuU) : null;
+        if (!_geoU) {
+          // Anti-invento: si OSM no lo ubica, la IA NO debe inventar una direccion ni coordenadas.
+          _resUbicTxt = 'No pude ubicar en el mapa "' + _refU + '"' + (_ciuU ? ' (' + _ciuU + ')' : '') + '. Decile al lead con naturalidad que no ubicas ese punto exacto y pedile una referencia mas precisa (calle y altura, una esquina, o un lugar conocido). NO inventes la direccion ni las coordenadas.';
+        } else {
+          const _mapsU = 'https://www.google.com/maps?q=' + _geoU.lat + ',' + _geoU.lng;
+          const _dirU = (_geoU.display && String(_geoU.display).trim()) ? String(_geoU.display).trim() : '';
+          _resUbicTxt = 'Ubicacion encontrada para "' + _refU + '"' + (_ciuU ? ' (' + _ciuU + ')' : '') + '.' +
+            (_dirU ? (' Direccion aproximada segun el mapa: ' + _dirU + '.') : '') +
+            ' Coordenadas: ' + _geoU.lat + ', ' + _geoU.lng + '.' +
+            ' Link de Google Maps para pasarle al lead: ' + _mapsU + '.' +
+            ' Compartile la calle/direccion' + (_dirU ? '' : ' (si la sabes)') + ' y el link de Google Maps. IMPORTANTE: esto te da SOLO la ubicacion del punto que nombro el lead, NO una lista de comercios; no nombres negocios ni lugares puntuales que no figuren en el inventario ni en este resultado.';
+        }
+      } catch (eUbic) {
+        console.error('tool ubicar_lugar:', eUbic && eUbic.message);
+        _resUbicTxt = 'No se pudo consultar la ubicacion en este momento. Segui la conversacion sin inventar direcciones ni coordenadas.';
+      }
+      // 2do turno con el tool_result (la IA redacta la respuesta final). Acumula usage para costeo exacto.
+      let _textoCierreU = '';
+      try {
+        const _msgsU2 = mensajesParaIA.concat([
+          { role: 'assistant', content: completion.content },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolUbicar.id, content: _resUbicTxt }] }
+        ]);
+        const _cu2 = await llamarIAConFailover({ model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsU2 }, 'generarRespuestaAgente:turno2-ubicar');
+        const _bu2 = (_cu2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
+        if (_bu2 && _bu2.text) _textoCierreU = _bu2.text;
+        if (_cu2 && _cu2.usage && completion && completion.usage) {
+          completion.usage = {
+            input_tokens: (completion.usage.input_tokens || 0) + (_cu2.usage.input_tokens || 0),
+            output_tokens: (completion.usage.output_tokens || 0) + (_cu2.usage.output_tokens || 0),
+            cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (_cu2.usage.cache_read_input_tokens || 0),
+            cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (_cu2.usage.cache_creation_input_tokens || 0)
+          };
+        }
+      } catch (eU2) { console.error('segundo turno ubicar_lugar:', eU2 && eU2.message); }
+      reply = _textoCierreU || _textoPrevioU || 'Dejame chequear esa ubicacion y te paso la direccion.';
+      if (!usaEmojis) { const _lU = quitarEmojis(reply); if (_lU) reply = _lU; }
     } else if (_toolDispo) {
       // DISPONIBILIDAD PXSOL: consulta en vivo por fechas + 2do turno para que la IA redacte.
       const _textoPrevioD = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();

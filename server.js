@@ -1777,6 +1777,59 @@ async function iaDisponibilidadActivo(user_id, bs) {
   } catch (e) { return false; }
 }
 
+// ===== 5 FUENTES EXTERNAS PARA LA IA (dolar / clima / feriados / georef / distancia) =====
+// Cada tool nueva se gatea por SU flag propio en business_settings. FAIL-CLOSED, mismo patron EXACTO
+// que iaAgendaActivo / iaDisponibilidadActivo / marketingIaActivo: si el flag no esta (columna ausente
+// porque no se corrio la migracion / select error / null / false) -> OFF. Asi el codigo queda INERTE
+// (la tool NO se ofrece, prompt+flujo BYTE-IDENTICOS al actual) hasta correr migracion-5-fuentes-flags.sql.
+// Reusa un `bs` ya cargado (generarRespuestaAgente trae settings con select('*')) => 0 queries extra una
+// vez corrida la migracion. Ante cualquier error -> OFF (nunca romper). Ninguna usa API key.
+async function iaDolarLeadActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_dolar_lead')) return bs.ia_dolar_lead === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_dolar_lead').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> feature OFF
+    return !!(data && data.ia_dolar_lead === true);
+  } catch (e) { return false; }
+}
+async function iaClimaActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_clima')) return bs.ia_clima === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_clima').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_clima === true);
+  } catch (e) { return false; }
+}
+async function iaFeriadosActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_feriados')) return bs.ia_feriados === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_feriados').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_feriados === true);
+  } catch (e) { return false; }
+}
+async function iaGeorefActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_georef')) return bs.ia_georef === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_georef').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_georef === true);
+  } catch (e) { return false; }
+}
+async function iaOsrmActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_osrm')) return bs.ia_osrm === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_osrm').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_osrm === true);
+  } catch (e) { return false; }
+}
+
 // ===== MEJORA #3 (AGENDA): OFFSETS DE RECORDATORIO DE CITAS, CONFIGURABLES POR CUENTA =====
 // Devuelve un array de horas-antes (ej. [24, 1]) en las que se manda el recordatorio de una cita.
 // Fuente: business_settings.recordatorio_citas_horas (texto JSON, ej. '[24,1]'). DEFAULT [24,1] (24h + 1h
@@ -4193,6 +4246,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // DISPONIBILIDAD PXSOL (gated ia_disponibilidad): ¿ofrecer la tool consultar_disponibilidad? SOLO hotel + flag ON.
   let _iaDisponibilidadOn = false;
   if (conversation_id && !modoPrueba) { try { _iaDisponibilidadOn = await iaDisponibilidadActivo(user_id, settings || undefined); } catch (eIaDi) { _iaDisponibilidadOn = false; } }
+  // 5 FUENTES EXTERNAS (gated c/u por su flag): dolar / clima / feriados / georef / distancia. FAIL-CLOSED:
+  // con la columna ausente el helper devuelve false -> la tool NO se ofrece y el prompt+flujo son BYTE-IDENTICOS
+  // al actual (codigo INERTE hasta correr migracion-5-fuentes-flags.sql). SOLO en conv REAL (no modoPrueba).
+  // Reusa el `settings` ya cargado (select('*')) => 0 queries extra una vez corrida la migracion.
+  let _iaDolarOn = false, _iaClimaOn = false, _iaFeriadosOn = false, _iaGeorefOn = false, _iaOsrmOn = false;
+  if (conversation_id && !modoPrueba) {
+    try { _iaDolarOn = await iaDolarLeadActivo(user_id, settings || undefined); } catch (eF1) { _iaDolarOn = false; }
+    try { _iaClimaOn = await iaClimaActivo(user_id, settings || undefined); } catch (eF2) { _iaClimaOn = false; }
+    try { _iaFeriadosOn = await iaFeriadosActivo(user_id, settings || undefined); } catch (eF3) { _iaFeriadosOn = false; }
+    try { _iaGeorefOn = await iaGeorefActivo(user_id, settings || undefined); } catch (eF4) { _iaGeorefOn = false; }
+    try { _iaOsrmOn = await iaOsrmActivo(user_id, settings || undefined); } catch (eF5) { _iaOsrmOn = false; }
+  }
   const { data: knowledge } = await supabase.from('knowledge_base').select('category, question, answer').eq('user_id', user_id);
   // DIRECCION (Fase 1): helper compartido por los 3 rubros para componer la ubicacion buscable
   // a partir de {direccion, entre_calles, ciudad}. Null-safe: si no hay nada devuelve '' y el
@@ -4819,6 +4884,51 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // FUENTE #1 (gated ia_dolar_lead, 3 mundos): cotizacion del dolar + conversion USD<->ARS (dolarapi.com, $0, sin API key).
+  if (_iaDolarOn) {
+    toolsAgente.push({
+      name: 'cotizacion_dolar',
+      description: 'Usala cuando el lead pregunta a cuanto esta el dolar, o pide convertir un monto entre dolares (USD) y pesos (ARS) (ej: "a cuanto esta el blue?", "cuanto es USD 50.000 en pesos?", "el oficial hoy"). Te devuelve la cotizacion (compra/venta) y la fecha de actualizacion. Es un valor de REFERENCIA de mercado: aclaraselo al lead. Nunca inventes un numero si la tool no lo trae.',
+      input_schema: { type: 'object', properties: { tipo: { type: 'string', enum: ['oficial', 'blue', 'bolsa', 'contadoconliqui', 'tarjeta', 'cripto'], description: 'Tipo de dolar. Default "blue". Usa "oficial" si preguntan el oficial, "tarjeta" para el turista/ahorro, etc.' }, monto_usd: { type: 'number', description: 'Opcional: monto en dolares (USD) a convertir a pesos (se multiplica por el valor de VENTA). Solo si el lead pide una conversion.' } }, required: [] }
+    });
+  }
+
+  // FUENTE #2 (gated ia_clima, LOS 3 MUNDOS): pronostico por lat/lon o por id_propiedad (Open-Meteo, $0, sin API key).
+  if (_iaClimaOn) {
+    toolsAgente.push({
+      name: 'pronostico_clima',
+      description: 'Usala cuando el lead pregunta por el clima o el pronostico de una zona/propiedad para los proximos dias (ej: "como viene el clima el finde?", "va a llover en Gesell la semana que viene?"). Pasa lat y lon del lugar, o id_propiedad para usar la ubicacion de una propiedad del inventario. Devuelve maxima, minima, probabilidad de lluvia y estado del cielo por dia. Solo hay pronostico hasta 16 dias; mas lejos NO hay dato y no debes inventarlo.',
+      input_schema: { type: 'object', properties: { lat: { type: 'number', description: 'Latitud del lugar.' }, lon: { type: 'number', description: 'Longitud del lugar.' }, id_propiedad: { type: 'string', description: 'Alternativa a lat/lon: numero o id de una propiedad/emprendimiento/complejo del inventario, para usar SU ubicacion.' }, fecha_desde: { type: 'string', description: 'Opcional: fecha de inicio en formato AAAA-MM-DD. Si no la pasas, arranca hoy.' }, dias: { type: 'integer', description: 'Cantidad de dias de pronostico. Default 3, maximo 16.' } }, required: [] }
+    });
+  }
+
+  // FUENTE #3 (gated ia_feriados, 3 mundos): feriados NACIONALES de Argentina + findes largos (Nager.Date, $0, sin API key).
+  if (_iaFeriadosOn) {
+    toolsAgente.push({
+      name: 'feriados_ar',
+      description: 'Usala cuando el lead pregunta por feriados o fines de semana largos en Argentina (ej: "cuando cae el proximo feriado?", "hay finde largo en octubre?", "el 25 es feriado?"). Devuelve feriados NACIONALES unicamente (NO incluye feriados turisticos por decreto ni provinciales; aclaraselo al lead si viene al caso). Elegi el modo segun lo que pregunten.',
+      input_schema: { type: 'object', properties: { modo: { type: 'string', enum: ['proximos', 'finde_largo', 'es_feriado', 'del_anio'], description: 'proximos = los siguientes feriados; finde_largo = fines de semana largos del anio; es_feriado = si una fecha puntual es feriado (pasa "fecha"); del_anio = todos los del anio. Default "proximos".' }, anio: { type: 'integer', description: 'Anio a consultar. Default: el actual.' }, fecha: { type: 'string', description: 'Fecha AAAA-MM-DD, requerida para el modo es_feriado.' } }, required: [] }
+    });
+  }
+
+  // FUENTE #4 (gated ia_georef, 3 mundos): normaliza una direccion argentina (provincia/partido/localidad + coords) (Georef, $0, sin API key).
+  if (_iaGeorefOn) {
+    toolsAgente.push({
+      name: 'normalizar_direccion_ar',
+      description: 'Usala para normalizar/validar una direccion argentina que dio el lead y saber a que provincia, departamento (partido) y localidad pertenece, con su nomenclatura oficial (fuente: Georef del Estado). Ej: "vivo en San Martin 1234, La Plata". Si la direccion no matchea, pedile al lead que aclare la localidad y la provincia; NUNCA inventes el partido ni la localidad.',
+      input_schema: { type: 'object', properties: { direccion: { type: 'string', description: 'Direccion tal como la dio el lead (calle y altura, ej "San Martin 1234").' }, provincia: { type: 'string', description: 'Opcional: provincia, para desambiguar.' }, localidad: { type: 'string', description: 'Opcional: localidad, para desambiguar.' } }, required: ['direccion'] }
+    });
+  }
+
+  // FUENTE #5 (gated ia_osrm, 3 mundos): distancia y tiempo EN AUTO entre dos puntos (OSRM, $0, sin API key).
+  if (_iaOsrmOn) {
+    toolsAgente.push({
+      name: 'distancia_viaje',
+      description: 'Usala cuando el lead pregunta cuanto tarda o que distancia hay EN AUTO entre dos puntos (ej: "a cuanto esta la propiedad de la playa?", "cuanto tardo de la terminal hasta ahi?"). Pasa origen y destino por coordenadas, o usa id_propiedad como uno de los extremos y destino_texto (una referencia) para el otro. Devuelve distancia y tiempo estimado por ruta. Si no se puede calcular la ruta, se da la distancia en linea recta aclarandolo; NUNCA prometas un tiempo que la tool no devolvio.',
+      input_schema: { type: 'object', properties: { origen_lat: { type: 'number' }, origen_lon: { type: 'number' }, destino_lat: { type: 'number' }, destino_lon: { type: 'number' }, id_propiedad: { type: 'string', description: 'Numero o id de una propiedad del inventario, para usar SU ubicacion como uno de los extremos.' }, destino_texto: { type: 'string', description: 'Referencia libre del otro extremo (ej "la terminal de Gesell"); se geocodifica.' }, ciudad: { type: 'string', description: 'Ciudad de destino_texto, para no confundir localidades.' } }, required: [] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -4829,6 +4939,17 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (memoriaViva) systemBlocks.push({ type: 'text', text: 'MEMORIA DE LA CONVERSACION (donde venis con este lead; segui DESDE ACA, no repreguntes lo ya hablado ni retrocedas): ' + memoriaViva });
   // UBICACION OSM (gated): regla anti-invento de lugares. Solo se agrega con el flag ON (bloque
   // dinamico, no cacheado) => con flag OFF el system es BYTE-IDENTICO al actual.
+  // 5 FUENTES EXTERNAS (gated c/u): regla anti-invento. Bloque dinamico (no cacheado). Solo se agrega si HAY al menos
+  // una fuente ON => con todas OFF el system es BYTE-IDENTICO al actual. Enumera SOLO las tools activas.
+  if (_iaDolarOn || _iaClimaOn || _iaFeriadosOn || _iaGeorefOn || _iaOsrmOn) {
+    var _fp = [];
+    if (_iaDolarOn) _fp.push('para la cotizacion del dolar o convertir USD<->ARS usa cotizacion_dolar');
+    if (_iaClimaOn) _fp.push('para el clima o pronostico usa pronostico_clima');
+    if (_iaFeriadosOn) _fp.push('para feriados nacionales o findes largos usa feriados_ar');
+    if (_iaGeorefOn) _fp.push('para normalizar/validar una direccion argentina (provincia/partido/localidad) usa normalizar_direccion_ar');
+    if (_iaOsrmOn) _fp.push('para distancia o tiempo en auto entre dos puntos usa distancia_viaje');
+    systemBlocks.push({ type: 'text', text: 'DATOS EN VIVO (fuentes externas): ' + _fp.join('; ') + '. REGLA DURA: estos datos NO los sabes de memoria — pedilos SIEMPRE con la tool correspondiente y NUNCA inventes una cotizacion, un pronostico del clima, un feriado, una direccion normalizada ni una distancia/tiempo de viaje. Los valores son de REFERENCIA. Si la tool no trae el dato (no se pudo consultar), decile al lead con naturalidad que no lo pudiste confirmar en el momento en vez de inventar.' });
+  }
   if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada.' });
 
   // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
@@ -4844,6 +4965,32 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // mediaAEnviar: fotos que el webhook debera mandar DESPUES del texto. Vacio si la IA no pidio foto.
   let mediaAEnviar = [];
   let reply;
+  // 5 FUENTES EXTERNAS: helper del 2do turno (mismo patron EXACTO que los bloques cerca/ubicar/dispo de arriba):
+  // manda el tool_result, deja que la IA redacte la respuesta final y ACUMULA usage para costeo exacto. Devuelve el
+  // texto (con emojis ya saneados). Se usa una vez por cada branch de fuente para no duplicar el boilerplate.
+  async function _cerrarTurnoFuente(_toolUse, _resultTexto, _etiqueta, _textoPrevio, _fallback) {
+    let _cierre = '';
+    try {
+      const _msgs2 = mensajesParaIA.concat([
+        { role: 'assistant', content: completion.content },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: _toolUse.id, content: _resultTexto }] }
+      ]);
+      const _c2 = await llamarIAConFailover({ model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgs2 }, 'generarRespuestaAgente:turno2-' + _etiqueta);
+      const _b2 = (_c2.content || []).find(function(b){ return b && b.type === 'text' && b.text; });
+      if (_b2 && _b2.text) _cierre = _b2.text;
+      if (_c2 && _c2.usage && completion && completion.usage) {
+        completion.usage = {
+          input_tokens: (completion.usage.input_tokens || 0) + (_c2.usage.input_tokens || 0),
+          output_tokens: (completion.usage.output_tokens || 0) + (_c2.usage.output_tokens || 0),
+          cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (_c2.usage.cache_read_input_tokens || 0),
+          cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (_c2.usage.cache_creation_input_tokens || 0)
+        };
+      }
+    } catch (e2) { console.error('segundo turno ' + _etiqueta + ':', e2 && e2.message); }
+    let _r = _cierre || _textoPrevio || _fallback;
+    if (!usaEmojis) { const _l = quitarEmojis(_r); if (_l) _r = _l; }
+    return _r;
+  }
   // DERIVACION v3 (gated): flags de salida para que el WEBHOOK dispare la rotacion. Con flag OFF quedan false (la tool
   // no existe) -> el return es identico al actual. 0 tokens: NO hacemos 2do turno de cortesia; reusamos el texto que
   // el agente ya escribio junto a la tool (o un fallback fijo) como reply.
@@ -4896,6 +5043,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     const _toolDispo = (_iaDisponibilidadOn && _esHotel) ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_disponibilidad'; }) : null;
     // UBICACION OSM (gated ia_ubicacion): ¿la IA pidio ubicar_lugar? (geocodifica una referencia libre del lead)
     const _toolUbicar = _iaUbicacionOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ubicar_lugar'; }) : null;
+    // 5 FUENTES EXTERNAS (gated c/u): ¿la IA pidio alguna? Cada una solo se detecta si su flag esta ON => con OFF
+    // la rama nunca se entra (ACTUAL EXACTO). El branch de cada una hace un 2do turno con el tool_result.
+    const _toolDolar = _iaDolarOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'cotizacion_dolar'; }) : null;
+    const _toolClima = _iaClimaOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'pronostico_clima'; }) : null;
+    const _toolFeriados = _iaFeriadosOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'feriados_ar'; }) : null;
+    const _toolGeoref = _iaGeorefOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'normalizar_direccion_ar'; }) : null;
+    const _toolOsrm = _iaOsrmOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'distancia_viaje'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       let _resCercaTxt = '';
@@ -5065,6 +5219,163 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       } catch (eD2) { console.error('segundo turno consultar_disponibilidad:', eD2 && eD2.message); }
       reply = _textoCierreD || _textoPrevioD || 'Dejame chequear la disponibilidad y te confirmo.';
       if (!usaEmojis) { const _lD = quitarEmojis(reply); if (_lD) reply = _lD; }
+    } else if (_toolDolar) {
+      // FUENTE #1 dolar (gated ia_dolar_lead): cotizacion + conversion USD<->ARS. Ante fallo -> texto de fallback (no inventa).
+      const _textoPrevioDl = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resDolarTxt = '';
+      try {
+        const _tipoDl = (_toolDolar.input && _toolDolar.input.tipo) ? String(_toolDolar.input.tipo).trim().toLowerCase() : 'blue';
+        const _montoDl = (_toolDolar.input && _toolDolar.input.monto_usd != null) ? Number(_toolDolar.input.monto_usd) : null;
+        const _d = await _fuenteDolar(_tipoDl);
+        if (!_d) {
+          _resDolarTxt = 'No se pudo obtener la cotizacion del dolar en este momento. Decile al lead con naturalidad que no la pudiste confirmar ahora y que la chequee en un rato. NO inventes un valor.';
+        } else {
+          const _fmtM = function(n){ return (n == null) ? '?' : String(Math.round(Number(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
+          _resDolarTxt = 'Cotizacion del dolar ' + (_d.nombre || _d.tipo) + ' (valor de REFERENCIA de mercado): compra $' + _fmtM(_d.compra) + ' / venta $' + _fmtM(_d.venta) + '. Actualizado: ' + (_d.fecha || 's/d') + '.';
+          if (_montoDl != null && !isNaN(_montoDl) && _d.venta != null) {
+            _resDolarTxt += ' Conversion pedida: USD ' + _fmtM(_montoDl) + ' equivalen a $' + _fmtM(_montoDl * Number(_d.venta)) + ' (al valor de venta del ' + (_d.nombre || _d.tipo) + ').';
+          }
+          _resDolarTxt += ' Aclarale al lead que es una referencia de mercado y puede variar; no inventes otros valores.';
+        }
+      } catch (eDl) { console.error('tool cotizacion_dolar:', eDl && eDl.message); _resDolarTxt = 'No se pudo consultar la cotizacion ahora. Segui la conversacion sin inventar valores.'; }
+      reply = await _cerrarTurnoFuente(_toolDolar, _resDolarTxt, 'dolar', _textoPrevioDl, 'Dejame chequear la cotizacion y te confirmo.');
+    } else if (_toolClima) {
+      // FUENTE #2 clima (gated ia_clima): pronostico por lat/lon o por id_propiedad. Fuera de 16 dias -> no hay dato.
+      const _textoPrevioCl = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resClimaTxt = '';
+      try {
+        let _la = (_toolClima.input && _toolClima.input.lat != null) ? Number(_toolClima.input.lat) : null;
+        let _lo = (_toolClima.input && _toolClima.input.lon != null) ? Number(_toolClima.input.lon) : null;
+        const _idPc = (_toolClima.input && _toolClima.input.id_propiedad != null) ? _toolClima.input.id_propiedad : null;
+        if ((_la == null || _lo == null || isNaN(_la) || isNaN(_lo)) && _idPc != null) {
+          const _coC = await _coordsDeIdPropiedad(user_id, rubro, properties, _idPc);
+          if (_coC) { _la = _coC.lat; _lo = _coC.lng; }
+        }
+        const _fdC = (_toolClima.input && _toolClima.input.fecha_desde) ? String(_toolClima.input.fecha_desde).trim() : '';
+        let _diasC = (_toolClima.input && _toolClima.input.dias != null) ? parseInt(_toolClima.input.dias, 10) : 3;
+        if (!(_diasC >= 1)) _diasC = 3;
+        if (_diasC > 16) _diasC = 16;
+        if (_la == null || _lo == null || isNaN(_la) || isNaN(_lo)) {
+          _resClimaTxt = 'No tengo la ubicacion (lat/lon) para el pronostico. Pedile al lead la zona o la propiedad concreta; no inventes el clima.';
+        } else {
+          let _fueraRango = false;
+          if (_fdC && /^\d{4}-\d{2}-\d{2}$/.test(_fdC)) {
+            try { var _hoyC = new Date(); _hoyC.setHours(0, 0, 0, 0); var _difC = Math.round((new Date(_fdC + 'T12:00:00Z').getTime() - _hoyC.getTime()) / 86400000); if (_difC > 16) _fueraRango = true; } catch (eR) {}
+          }
+          if (_fueraRango) {
+            _resClimaTxt = 'Todavia no hay pronostico para esa fecha (el pronostico llega hasta ~16 dias). Decile al lead que mas cerca de la fecha se lo podes chequear; no inventes el clima.';
+          } else {
+            const _cl = await _fuenteClima(_la, _lo, _fdC, _diasC);
+            if (!_cl || !_cl.dias || !_cl.dias.length) {
+              _resClimaTxt = 'No se pudo obtener el pronostico en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes el clima.';
+            } else {
+              const _NLc = String.fromCharCode(10);
+              const _lineasCl = _cl.dias.map(function(x){ return '- ' + x.fecha + ': ' + x.cielo + ', minima ' + (x.tmin != null ? Math.round(x.tmin) + '°' : '?') + ' / maxima ' + (x.tmax != null ? Math.round(x.tmax) + '°' : '?') + (x.prob_lluvia != null ? (', probabilidad de lluvia ' + Math.round(x.prob_lluvia) + '%') : ''); });
+              _resClimaTxt = 'Pronostico (valor de referencia):' + _NLc + _lineasCl.join(_NLc) + _NLc + 'Contaselo al lead de forma clara y natural; no agregues dias ni datos que no esten en esta lista.';
+            }
+          }
+        }
+      } catch (eCl) { console.error('tool pronostico_clima:', eCl && eCl.message); _resClimaTxt = 'No se pudo consultar el clima ahora. Segui la conversacion sin inventar el pronostico.'; }
+      reply = await _cerrarTurnoFuente(_toolClima, _resClimaTxt, 'clima', _textoPrevioCl, 'Dejame chequear el pronostico y te confirmo.');
+    } else if (_toolFeriados) {
+      // FUENTE #3 feriados (gated ia_feriados): feriados NACIONALES + findes largos (Nager.Date). Ante fallo -> fallback.
+      const _textoPrevioFe = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resFeriTxt = '';
+      const _aclaraFe = ' IMPORTANTE: son SOLO feriados NACIONALES (no incluye feriados turisticos por decreto ni provinciales); aclaraselo al lead si corresponde.';
+      try {
+        const _modoFe = (_toolFeriados.input && _toolFeriados.input.modo) ? String(_toolFeriados.input.modo).trim() : 'proximos';
+        const _anioFe = (_toolFeriados.input && _toolFeriados.input.anio) ? parseInt(_toolFeriados.input.anio, 10) : new Date().getFullYear();
+        const _fechaFe = (_toolFeriados.input && _toolFeriados.input.fecha) ? String(_toolFeriados.input.fecha).trim() : '';
+        const _NLf = String.fromCharCode(10);
+        if (_modoFe === 'finde_largo') {
+          const _lw = await _fuenteFeriadosURL('https://date.nager.at/api/v3/LongWeekend/' + _anioFe + '/AR');
+          if (!_lw) _resFeriTxt = 'No se pudo obtener la info de fines de semana largos en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes fechas.';
+          else if (!_lw.length) _resFeriTxt = 'No figuran fines de semana largos para ' + _anioFe + '.' + _aclaraFe;
+          else _resFeriTxt = 'Fines de semana largos ' + _anioFe + ':' + _NLf + _lw.map(function(w){ return '- del ' + w.startDate + ' al ' + w.endDate + ' (' + w.dayCount + ' dias)'; }).join(_NLf) + _NLf + 'Contaselos al lead con naturalidad.' + _aclaraFe;
+        } else if (_modoFe === 'es_feriado') {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(_fechaFe)) {
+            _resFeriTxt = 'Para saber si es feriado necesito la fecha exacta (AAAA-MM-DD). Pedisela al lead con naturalidad.';
+          } else {
+            const _anioDe = parseInt(_fechaFe.slice(0, 4), 10) || _anioFe;
+            const _ph = await _fuenteFeriadosURL('https://date.nager.at/api/v3/PublicHolidays/' + _anioDe + '/AR');
+            if (!_ph) _resFeriTxt = 'No se pudo verificar el feriado en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes.';
+            else {
+              const _match = _ph.find(function(h){ return h && h.date === _fechaFe; });
+              _resFeriTxt = _match ? ('El ' + _fechaFe + ' SI es feriado nacional: ' + (_match.localName || _match.name || 'feriado') + '.' + _aclaraFe) : ('El ' + _fechaFe + ' NO es feriado nacional.' + _aclaraFe);
+            }
+          }
+        } else if (_modoFe === 'del_anio') {
+          const _ph = await _fuenteFeriadosURL('https://date.nager.at/api/v3/PublicHolidays/' + _anioFe + '/AR');
+          if (!_ph) _resFeriTxt = 'No se pudo obtener el listado de feriados en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes.';
+          else if (!_ph.length) _resFeriTxt = 'No figuran feriados para ' + _anioFe + '.' + _aclaraFe;
+          else _resFeriTxt = 'Feriados nacionales ' + _anioFe + ':' + _NLf + _ph.map(function(h){ return '- ' + h.date + ': ' + (h.localName || h.name || ''); }).join(_NLf) + _NLf + 'Compartilos con naturalidad segun lo que pregunte el lead.' + _aclaraFe;
+        } else {
+          const _np = await _fuenteFeriadosURL('https://date.nager.at/api/v3/NextPublicHolidays/AR');
+          if (!_np) _resFeriTxt = 'No se pudo obtener los proximos feriados en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes fechas.';
+          else if (!_np.length) _resFeriTxt = 'No figuran proximos feriados nacionales.' + _aclaraFe;
+          else _resFeriTxt = 'Proximos feriados nacionales:' + _NLf + _np.slice(0, 6).map(function(h){ return '- ' + h.date + ': ' + (h.localName || h.name || ''); }).join(_NLf) + _NLf + 'Deciles el/los que correspondan a lo que pregunto el lead.' + _aclaraFe;
+        }
+      } catch (eFe) { console.error('tool feriados_ar:', eFe && eFe.message); _resFeriTxt = 'No se pudo consultar los feriados ahora. Segui la conversacion sin inventar fechas.'; }
+      reply = await _cerrarTurnoFuente(_toolFeriados, _resFeriTxt, 'feriados', _textoPrevioFe, 'Dejame chequear los feriados y te confirmo.');
+    } else if (_toolGeoref) {
+      // FUENTE #4 georef (gated ia_georef): normaliza una direccion argentina. Si no matchea -> pedir localidad/provincia.
+      const _textoPrevioGe = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resGeoTxt = '';
+      try {
+        const _dirGe = (_toolGeoref.input && _toolGeoref.input.direccion) ? String(_toolGeoref.input.direccion).trim() : '';
+        const _provGe = (_toolGeoref.input && _toolGeoref.input.provincia) ? String(_toolGeoref.input.provincia).trim() : '';
+        const _locGe = (_toolGeoref.input && _toolGeoref.input.localidad) ? String(_toolGeoref.input.localidad).trim() : '';
+        if (!_dirGe) {
+          _resGeoTxt = 'No recibi una direccion para normalizar. Pedile al lead la calle y la altura.';
+        } else {
+          const _g = await _fuenteGeoref(_dirGe, _provGe, _locGe);
+          if (!_g) {
+            _resGeoTxt = 'No pude normalizar la direccion "' + _dirGe + '". Pedile al lead que aclare la localidad y la provincia; NO inventes el partido ni la localidad.';
+          } else {
+            _resGeoTxt = 'Direccion normalizada (fuente oficial Georef): ' + (_g.nomenclatura || _dirGe) + '. Provincia: ' + (_g.provincia || 's/d') + '. Departamento/partido: ' + (_g.departamento || 's/d') + '. Localidad: ' + (_g.localidad || 's/d') + '.' + ((_g.lat != null && _g.lon != null) ? (' Coordenadas: ' + _g.lat + ', ' + _g.lon + '.') : '') + ' Usala para confirmarle la zona/partido al lead; no agregues datos que no esten en este resultado.';
+          }
+        }
+      } catch (eGe) { console.error('tool normalizar_direccion_ar:', eGe && eGe.message); _resGeoTxt = 'No se pudo normalizar la direccion ahora. Segui la conversacion sin inventar el partido ni la localidad.'; }
+      reply = await _cerrarTurnoFuente(_toolGeoref, _resGeoTxt, 'georef', _textoPrevioGe, 'Dejame chequear bien esa direccion y te confirmo la zona.');
+    } else if (_toolOsrm) {
+      // FUENTE #5 distancia (gated ia_osrm): distancia/tiempo en auto (OSRM). Si no hay ruta -> haversine aclarandolo.
+      const _textoPrevioOs = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resOsrmTxt = '';
+      try {
+        let _la1 = (_toolOsrm.input && _toolOsrm.input.origen_lat != null) ? Number(_toolOsrm.input.origen_lat) : null;
+        let _lo1 = (_toolOsrm.input && _toolOsrm.input.origen_lon != null) ? Number(_toolOsrm.input.origen_lon) : null;
+        let _la2 = (_toolOsrm.input && _toolOsrm.input.destino_lat != null) ? Number(_toolOsrm.input.destino_lat) : null;
+        let _lo2 = (_toolOsrm.input && _toolOsrm.input.destino_lon != null) ? Number(_toolOsrm.input.destino_lon) : null;
+        const _idPo = (_toolOsrm.input && _toolOsrm.input.id_propiedad != null) ? _toolOsrm.input.id_propiedad : null;
+        const _destTxtO = (_toolOsrm.input && _toolOsrm.input.destino_texto) ? String(_toolOsrm.input.destino_texto).trim() : '';
+        const _ciuO = (_toolOsrm.input && _toolOsrm.input.ciudad) ? String(_toolOsrm.input.ciudad).trim() : '';
+        // id_propiedad completa el extremo que falte (primero el origen; si el origen ya vino, el destino).
+        if (_idPo != null) {
+          const _coO = await _coordsDeIdPropiedad(user_id, rubro, properties, _idPo);
+          if (_coO) {
+            if (_la1 == null || _lo1 == null || isNaN(_la1) || isNaN(_lo1)) { _la1 = _coO.lat; _lo1 = _coO.lng; }
+            else if (_la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2)) { _la2 = _coO.lat; _lo2 = _coO.lng; }
+          }
+        }
+        // destino_texto geocodifica el extremo destino si falta (reusa geocodificarTextoOSM, con cache OSM).
+        if ((_la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2)) && _destTxtO) {
+          const _geoO = await geocodificarTextoOSM(_destTxtO, _ciuO);
+          if (_geoO) { _la2 = _geoO.lat; _lo2 = _geoO.lng; }
+        }
+        const _faltan = (_la1 == null || _lo1 == null || isNaN(_la1) || isNaN(_lo1) || _la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2));
+        if (_faltan) {
+          _resOsrmTxt = 'No tengo los dos puntos para calcular la distancia (faltan coordenadas o no pude ubicar el destino). Pedile al lead una referencia mas precisa; no inventes la distancia ni el tiempo.';
+        } else {
+          const _ru = await _fuenteOsrm(_la1, _lo1, _la2, _lo2);
+          if (_ru) {
+            _resOsrmTxt = 'Distancia EN AUTO (ruta real): ' + _fmtDistancia(_ru.distancia_m / 1000) + ', tiempo estimado ' + _fmtDuracionMin(_ru.duracion_s) + '. Contaselo al lead como estimado de manejo; no inventes otro tiempo.';
+          } else {
+            const _kmL = haversineKm(_la1, _lo1, _la2, _lo2);
+            _resOsrmTxt = 'No se pudo calcular la ruta en auto ahora. En LINEA RECTA hay ~' + _fmtDistancia(_kmL) + ' (NO es la distancia por calle ni un tiempo de viaje). Aclarale al lead que es una aproximacion en linea recta y que no tenes el tiempo exacto de manejo; NO inventes un tiempo.';
+          }
+        }
+      } catch (eOs) { console.error('tool distancia_viaje:', eOs && eOs.message); _resOsrmTxt = 'No se pudo calcular la distancia ahora. Segui la conversacion sin inventar distancias ni tiempos.'; }
+      reply = await _cerrarTurnoFuente(_toolOsrm, _resOsrmTxt, 'distancia', _textoPrevioOs, 'Dejame chequear esa distancia y te confirmo.');
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
@@ -14142,6 +14453,203 @@ async function referenciasZonaOSM(lat, lng) {
     var tipos = Object.keys(mejorPorTipo).sort(function (a, b) { return mejorPorTipo[a].km - mejorPorTipo[b].km; }).slice(0, 8);
     return tipos.map(function (k) { var v = mejorPorTipo[k]; return k + (v.nombre ? ' ' + v.nombre : '') + ' a ' + _fmtDistancia(v.km); }).join('; ');
   } catch (e) { return ''; }
+}
+
+// ============================================================================
+// 5 FUENTES EXTERNAS PARA LA IA — dolar / clima / feriados / georef / distancia
+// ----------------------------------------------------------------------------
+// Todas GRATIS y SIN API key ($0 recurrente). Reglas comunes (pedido de Diego):
+//  - fetch con User-Agent identificable + timeout corto (AbortController).
+//  - cache EN MEMORIA por clave (Map con TTL) para no repegarle a la fuente.
+//  - ante timeout o cualquier fallo -> null; el branch de la tool arma un texto
+//    de FALLBACK y la IA NUNCA inventa el dato (regla anti-invento).
+// Se llaman desde generarRespuestaAgente (arriba); son function declarations /
+// var asignadas en el load, asi que estan disponibles en tiempo de request.
+// ============================================================================
+var _FUENTE_UA = 'RaicesCRM/1.0 (soporte@raicescrm.com)';
+
+// GET JSON con timeout. Devuelve el objeto parseado o null (nunca tira).
+async function _fetchFuenteJSON(url, ms) {
+  var ctrl = new AbortController();
+  var to = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, ms || 3500);
+  try {
+    var r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': _FUENTE_UA, 'Accept': 'application/json' } });
+    if (!r || !r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+  finally { clearTimeout(to); }
+}
+
+// Cache generico en memoria: Map(clave -> { ts, data }). TTL en ms. Fail-safe total.
+function _fuenteCacheGet(map, clave, ttlMs) {
+  try { var e = map.get(clave); if (e && (Date.now() - e.ts) < ttlMs) return e.data; } catch (x) {}
+  return null;
+}
+function _fuenteCacheSet(map, clave, data) {
+  try { map.set(clave, { ts: Date.now(), data: data }); } catch (x) {}
+}
+function _sumarDiasISO(iso, n) {
+  try { var dt = new Date(iso + 'T12:00:00Z'); dt.setUTCDate(dt.getUTCDate() + n); return dt.toISOString().slice(0, 10); } catch (e) { return iso; }
+}
+// Resuelve coordenadas de una propiedad/emprendimiento/complejo del inventario por id_propiedad
+// (numero o id, o nombre para dev/hotel). Solo devuelve si tiene lat/lng REALES (geocodificadas por el
+// cron a partir de la direccion) -> NUNCA el pin default del tema. { lat, lng, nombre } | null.
+async function _coordsDeIdPropiedad(user_id, rubro, properties, idProp) {
+  var id = String(idProp == null ? '' : idProp).trim();
+  if (!id || !user_id) return null;
+  var idN = id.toLowerCase();
+  try {
+    // Inmobiliaria / generico: las properties ya vienen cargadas en generarRespuestaAgente (con lat/lng).
+    var p = (properties || []).find(function (x) {
+      return x && ((x.numero != null && String(x.numero).trim() === id) || (x.id != null && String(x.id) === id));
+    });
+    if (p && p.lat != null && p.lng != null) return { lat: Number(p.lat), lng: Number(p.lng), nombre: (p.title || ('propiedad ' + id)) };
+    var r = normalizarRubro(rubro);
+    if (r === 'desarrolladora') {
+      var dv = await supabase.from('developments').select('id, nombre, lat, lng').eq('user_id', user_id).eq('activo', true);
+      var d = (dv.data || []).find(function (x) {
+        return x && (String(x.id) === id || (x.nombre && String(x.nombre).toLowerCase().indexOf(idN) >= 0));
+      });
+      if (d && d.lat != null && d.lng != null) return { lat: Number(d.lat), lng: Number(d.lng), nombre: (d.nombre || ('emprendimiento ' + id)) };
+    } else if (r === 'hotel_cabanas') {
+      var hc = await supabase.from('hotel_complejos').select('id, nombre, atributos').eq('user_id', user_id);
+      var c = (hc.data || []).find(function (x) {
+        return x && (String(x.id) === id || (x.nombre && String(x.nombre).toLowerCase().indexOf(idN) >= 0));
+      });
+      if (c) { var a = (c.atributos && typeof c.atributos === 'object') ? c.atributos : {}; if (a.lat != null && a.lng != null) return { lat: Number(a.lat), lng: Number(a.lng), nombre: (c.nombre || ('complejo ' + id)) }; }
+    }
+  } catch (e) {}
+  return null;
+}
+
+// --- FUENTE #1: cotizacion del dolar (dolarapi.com). Cache 10 min por tipo. ---
+var _cacheDolar = new Map();
+var _DOLAR_TIPOS = ['oficial', 'blue', 'bolsa', 'contadoconliqui', 'tarjeta', 'cripto'];
+async function _fuenteDolar(tipo) {
+  var t = String(tipo || 'blue').trim().toLowerCase();
+  if (_DOLAR_TIPOS.indexOf(t) < 0) t = 'blue';
+  var hit = _fuenteCacheGet(_cacheDolar, t, 10 * 60 * 1000);
+  if (hit) return hit;
+  var j = await _fetchFuenteJSON('https://dolarapi.com/v1/dolares/' + t, 3500);
+  if (!j || (j.compra == null && j.venta == null)) return null;
+  var out = {
+    tipo: t,
+    nombre: j.nombre || t,
+    compra: (j.compra != null ? Number(j.compra) : null),
+    venta: (j.venta != null ? Number(j.venta) : null),
+    fecha: j.fechaActualizacion || ''
+  };
+  _fuenteCacheSet(_cacheDolar, t, out);
+  return out;
+}
+
+// --- FUENTE #2: pronostico (Open-Meteo). Cache 30 min. WMO -> texto ANTES de la IA. ---
+var _cacheClima = new Map();
+function _wmoATexto(code) {
+  var c = Number(code);
+  if (c === 0) return 'despejado';
+  if (c >= 1 && c <= 3) return 'parcialmente nublado';
+  if (c === 45 || c === 48) return 'niebla';
+  if (c >= 51 && c <= 67) return 'lluvia';
+  if (c >= 71 && c <= 77) return 'nieve';
+  if (c >= 80 && c <= 82) return 'chaparrones';
+  if (c >= 85 && c <= 86) return 'nieve';
+  if (c >= 95 && c <= 99) return 'tormenta';
+  return 'variable';
+}
+async function _fuenteClima(lat, lon, startDate, dias) {
+  var la = Number(lat), lo = Number(lon);
+  if (isNaN(la) || isNaN(lo)) return null;
+  var d = Math.max(1, Math.min(16, parseInt(dias, 10) || 3));
+  var sd = (startDate && /^\d{4}-\d{2}-\d{2}$/.test(String(startDate))) ? String(startDate) : '';
+  var clave = la.toFixed(3) + ',' + lo.toFixed(3) + '|' + sd + '|' + d;
+  var hit = _fuenteCacheGet(_cacheClima, clave, 30 * 60 * 1000);
+  if (hit) return hit;
+  var url = 'https://api.open-meteo.com/v1/forecast?latitude=' + la + '&longitude=' + lo +
+    '&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weathercode' +
+    '&timezone=America/Argentina/Buenos_Aires';
+  if (sd) url += '&start_date=' + sd + '&end_date=' + _sumarDiasISO(sd, d - 1);
+  else url += '&forecast_days=' + d;
+  var j = await _fetchFuenteJSON(url, 3500);
+  if (!j || !j.daily || !Array.isArray(j.daily.time) || !j.daily.time.length) return null;
+  var dd = j.daily;
+  var diasArr = dd.time.map(function (fecha, i) {
+    return {
+      fecha: fecha,
+      tmax: (dd.temperature_2m_max ? dd.temperature_2m_max[i] : null),
+      tmin: (dd.temperature_2m_min ? dd.temperature_2m_min[i] : null),
+      prob_lluvia: (dd.precipitation_probability_max ? dd.precipitation_probability_max[i] : null),
+      cielo: _wmoATexto(dd.weathercode ? dd.weathercode[i] : null)
+    };
+  });
+  var out = { lat: la, lon: lo, dias: diasArr };
+  _fuenteCacheSet(_cacheClima, clave, out);
+  return out;
+}
+
+// --- FUENTE #3: feriados nacionales AR (Nager.Date). Cache 24 h por URL. ---
+var _cacheFeriados = new Map();
+async function _fuenteFeriadosURL(url) {
+  var hit = _fuenteCacheGet(_cacheFeriados, url, 24 * 60 * 60 * 1000);
+  if (hit) return hit;
+  var j = await _fetchFuenteJSON(url, 3500);
+  if (!Array.isArray(j)) return null;
+  _fuenteCacheSet(_cacheFeriados, url, j);
+  return j;
+}
+
+// --- FUENTE #4: normalizar direccion AR (Georef, datos.gob.ar). Cache 30 dias. ---
+var _cacheGeoref = new Map();
+async function _fuenteGeoref(direccion, provincia, localidad) {
+  var dir = String(direccion || '').trim();
+  if (!dir) return null;
+  var prov = String(provincia || '').trim();
+  var loc = String(localidad || '').trim();
+  var clave = _normGeoTexto(dir + '|' + prov + '|' + loc);
+  var hit = _fuenteCacheGet(_cacheGeoref, clave, 30 * 24 * 60 * 60 * 1000);
+  if (hit) return hit;
+  var url = 'https://apis.datos.gob.ar/georef/api/direcciones?max=1&direccion=' + encodeURIComponent(dir);
+  if (prov) url += '&provincia=' + encodeURIComponent(prov);
+  if (loc) url += '&localidad=' + encodeURIComponent(loc);
+  var j = await _fetchFuenteJSON(url, 3500);
+  if (!j || !Array.isArray(j.direcciones) || !j.direcciones.length) return null;
+  var x = j.direcciones[0];
+  var out = {
+    nomenclatura: x.nomenclatura || '',
+    provincia: (x.provincia && x.provincia.nombre) || '',
+    provincia_id: (x.provincia && x.provincia.id) || '',
+    departamento: (x.departamento && x.departamento.nombre) || '',
+    departamento_id: (x.departamento && x.departamento.id) || '',
+    localidad: (x.localidad_censal && x.localidad_censal.nombre) || (x.localidad && x.localidad.nombre) || '',
+    localidad_id: (x.localidad_censal && x.localidad_censal.id) || (x.localidad && x.localidad.id) || '',
+    lat: (x.ubicacion && x.ubicacion.lat != null) ? Number(x.ubicacion.lat) : null,
+    lon: (x.ubicacion && x.ubicacion.lon != null) ? Number(x.ubicacion.lon) : null
+  };
+  _fuenteCacheSet(_cacheGeoref, clave, out);
+  return out;
+}
+
+// --- FUENTE #5: distancia/tiempo en auto (OSRM publico). Cache 7 dias. OJO orden lon,lat. ---
+var _cacheOsrm = new Map();
+async function _fuenteOsrm(lat1, lon1, lat2, lon2) {
+  var a1 = Number(lat1), o1 = Number(lon1), a2 = Number(lat2), o2 = Number(lon2);
+  if ([a1, o1, a2, o2].some(function (n) { return isNaN(n); })) return null;
+  var clave = a1.toFixed(4) + ',' + o1.toFixed(4) + ';' + a2.toFixed(4) + ',' + o2.toFixed(4);
+  var hit = _fuenteCacheGet(_cacheOsrm, clave, 7 * 24 * 60 * 60 * 1000);
+  if (hit) return hit;
+  // OSRM exige el orden {lon},{lat};{lon},{lat}.
+  var url = 'https://router.project-osrm.org/route/v1/driving/' + o1 + ',' + a1 + ';' + o2 + ',' + a2 + '?overview=false';
+  var j = await _fetchFuenteJSON(url, 4000);
+  if (!j || j.code !== 'Ok' || !Array.isArray(j.routes) || !j.routes.length) return null;
+  var out = { distancia_m: Number(j.routes[0].distance), duracion_s: Number(j.routes[0].duration) };
+  _fuenteCacheSet(_cacheOsrm, clave, out);
+  return out;
+}
+function _fmtDuracionMin(seg) {
+  var min = Math.round((Number(seg) || 0) / 60);
+  if (min < 60) return min + ' min';
+  var h = Math.floor(min / 60), m = min % 60;
+  return h + ' h' + (m ? ' ' + m + ' min' : '');
 }
 
 // CRON: geocodifica el inventario de las cuentas con ia_ubicacion ON (fail-closed: sin flag/columna

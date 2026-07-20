@@ -11126,6 +11126,37 @@ async function revisarWatchdogWhatsapp() {
 setInterval(reintentarFallidos, 60 * 1000);
 setInterval(revisarInactividad, 60 * 60 * 1000);
 
+// RED DE SEGURIDAD DE RECONTACTO (Diego 2026-07-20): un lead que RESPONDE estando en 'recontacto' debe volver a
+// 'en_conversacion' (lo hace el webhook en ~server.js:6962). Pero si esa transicion NO corrio (respondio ANTES del fix,
+// o con sticker/boton/reaccion, o la cuenta estaba en pausa, o el mensaje entro por Meta), el lead queda PEGADO en
+// recontacto y el motor lo sigue recontactando. Este barrido lo detecta: conv en 'recontacto' cuyo ULTIMO mensaje es
+// del LEAD (last_role='contact') -> la devuelve a su estado previo (o en_conversacion) + resetea el contador de
+// recontactos. 0 IA: SOLO cambia el status (la IA NO responde aca; responde cuando entra un mensaje nuevo). Corrige
+// tambien los YA pegados (hace de barrido). Mismo write/temperatura que la transicion del webhook.
+var _rescateRecontactoEnCurso = false;
+async function rescatarRecontactosRespondidos() {
+  if (_rescateRecontactoEnCurso) return;
+  _rescateRecontactoEnCurso = true;
+  try {
+    const { data: pegados } = await supabase.from('conversations')
+      .select('id, user_id, estado_previo')
+      .eq('status', 'recontacto').eq('last_role', 'contact').limit(500);
+    for (const c of (pegados || [])) {
+      try {
+        const volverA = c.estado_previo || 'en_conversacion';
+        const _temp = await _tempConDecayParaConv(c.id, temperaturaPorEstado(volverA), c.user_id);
+        await supabase.from('conversations').update({
+          status: volverA, temperatura: _temp, estado_previo: null, recontacto_count: 0, updated_at: new Date().toISOString()
+        }).eq('id', c.id).eq('status', 'recontacto').eq('last_role', 'contact'); // condicional: solo si sigue pegado (anti-carrera)
+      } catch (eOne) { /* seguir con el resto */ }
+    }
+    if (pegados && pegados.length) console.log('rescatarRecontactosRespondidos: ' + pegados.length + ' lead(s) devuelto(s) de recontacto a conversacion');
+  } catch (e) { console.error('rescatarRecontactosRespondidos:', e && e.message); }
+  finally { _rescateRecontactoEnCurso = false; }
+}
+setInterval(rescatarRecontactosRespondidos, 5 * 60 * 1000);   // cada 5 min
+setTimeout(rescatarRecontactosRespondidos, 45 * 1000);        // primer barrido a los 45s del arranque
+
 // ============================================================================
 // WATCHDOG DE WHATSAPP: avisa al MAESTRO cuando el WhatsApp de un cliente se DESCONECTA (o queda restringido y cae la
 // sesion). Motivo: Diego no se enteraba de la desconexion de Anton. Cada 5 min chequea la instancia de cada cliente

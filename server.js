@@ -24452,17 +24452,36 @@ async function revisarSuscripciones() {
           updates.trial_con_tarjeta = false;   // deja de capear-a-100/atender gratis
         }
       }
-      var ini = s.period_start ? new Date(s.period_start).getTime() : null;
-      // M11: el rollover de 30d NO debe regalar cupo a quien no pago. Solo se RESETEA el contador si la suscripcion
-      // esta 'active' (pago al dia). Para past_due/suspended/trial avanzamos el period_start (la ventana rueda) pero
-      // NO ponemos ai_messages_this_period=0 -> no recuperan cupo gratis hasta que el pago los vuelva a 'active'
-      // (ahi el webhook trial->active ya resetea, y un active que renueva pasa por aca y se resetea normalmente).
-      // 'estVigente' calcula el estado efectivo igual que el resto: si recien lo pasamos a 'suspended', NO es active.
       var estVigente = updates.status || s.status;
-      if (!ini) updates.period_start = new Date(ahora).toISOString();
-      else if (ahora - ini > 30 * 24 * 3600 * 1000) {
-        updates.period_start = new Date(ahora).toISOString();
-        if (estVigente === 'active') updates.ai_messages_this_period = 0; // solo el que paga recupera cupo
+      var ini = s.period_start ? new Date(s.period_start).getTime() : null;
+      var fin = s.current_period_end ? new Date(s.current_period_end).getTime() : null;
+      // RESET DEL CUPO ALINEADO AL COBRO REAL DE MERCADOPAGO (Diego 2026-07-20): el contador se resetea cuando
+      // TERMINA el periodo segun MP (current_period_end = next_payment_date), NO a los 30 dias fijos. Al llegar esa
+      // fecha re-consultamos el preapproval en MP para tomar la PROXIMA fecha de cobro real y anclar ahi el nuevo
+      // periodo: asi el reseteo queda pegado al cobro, y el borde del dia 31 (o meses sin 31) lo resuelve MP, no nosotros.
+      if (estVigente === 'active' && fin && s.mp_preapproval_id) {
+        if (ahora >= fin) {
+          var freshEnd = null;
+          try {
+            var susMP = await mpConsultarSuscripcion(s.mp_preapproval_id);
+            if (susMP && susMP.next_payment_date) freshEnd = new Date(susMP.next_payment_date).getTime();
+          } catch (eMP) { /* si MP falla, NO reseteamos este ciclo; reintenta el proximo cron */ }
+          if (freshEnd && freshEnd > ahora) {
+            updates.current_period_end = new Date(freshEnd).toISOString(); // proxima fecha de cobro real (MP)
+            updates.ai_messages_this_period = 0;                           // arranca el nuevo mes en limpio
+            updates.period_start = new Date(ahora).toISOString();
+          }
+          // si MP aun no adelanto la fecha (cobro pendiente/fallido), NO reseteamos -> no se regala cupo
+        }
+        // ahora < fin: todavia dentro del periodo pago, no se toca el contador
+      } else {
+        // FALLBACK: sin current_period_end conocido (o no-active) mantenemos el rollover de 30d de antes.
+        // Solo se resetea el contador si esta 'active'; para past_due/suspended/trial la ventana rueda sin regalar cupo.
+        if (!ini) updates.period_start = new Date(ahora).toISOString();
+        else if (ahora - ini > 30 * 24 * 3600 * 1000) {
+          updates.period_start = new Date(ahora).toISOString();
+          if (estVigente === 'active') updates.ai_messages_this_period = 0;
+        }
       }
       if (Object.keys(updates).length) { try { await supabase.from('subscriptions').update(updates).eq('user_id', s.user_id); } catch (eU) {} }
     }

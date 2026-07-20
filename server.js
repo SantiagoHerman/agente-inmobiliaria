@@ -6472,6 +6472,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (!remoteJid || remoteJid.includes('@g.us')) return; // ignorar grupos
     const telefono = remoteJid.split('@')[0];
 
+    // #7 COLA DURABLE (rama feature/cola-durable): capturamos el payload CRUDO apenas entra, ANTES de procesar.
+    // Si el procesamiento crashea o Supabase parpadea justo ahi, el mensaje queda guardado y se puede reprocesar
+    // o auditar (el reconciliador de abajo detecta los que nunca llegaron a `messages`). Best-effort: si la tabla
+    // cola_entrantes todavia no existe, es un NO-OP (no rompe el webhook). Solo entrantes (no fromMe).
+    if (!esFromMe) {
+      try { await supabase.from('cola_entrantes').insert({ wa_message_id: (key.id || null), instancia: instanciaNombre, telefono: telefono, payload: body, estado: 'recibido' }); } catch (eCola) {}
+    }
+
     const msg = data.message || {};
     let texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
     // Detectar multimedia entrante
@@ -11137,6 +11145,32 @@ async function revisarWhatsappDesconexiones() {
 }
 setInterval(revisarWhatsappDesconexiones, 5 * 60 * 1000);
 setTimeout(function () { revisarWhatsappDesconexiones().catch(function () {}); }, 60 * 1000); // siembra inicial a los 60s
+
+// #7 COLA DURABLE (rama feature/cola-durable) — reconciliador cada 2 min. Marca 'procesado' las filas cuyo
+// wa_message_id YA esta en `messages` (se proceso bien; los entrantes guardan wa_message_id, ~1446). Las
+// 'recibido' de hace > 10 min SIN match pasan a 'perdido' (queda el crudo en payload para reprocesar/auditar)
+// + log; por ahora NO manda alerta al Maestro (evita falsos como el watchdog; la alerta+reproceso automatico se
+// activan al APLICAR la feature). Limpia 'procesado' de mas de 3 dias. Best-effort: si la tabla no existe, no-op.
+async function _reconciliarColaEntrantes() {
+  try {
+    var q = await supabase.from('cola_entrantes').select('id, wa_message_id, created_at').eq('estado', 'recibido').limit(500);
+    if (!q || q.error || !q.data || !q.data.length) return;
+    var lim = Date.now() - 10 * 60 * 1000;
+    for (var i = 0; i < q.data.length; i++) {
+      var row = q.data[i];
+      var ok = false;
+      if (row.wa_message_id) { try { var m = await supabase.from('messages').select('id').eq('wa_message_id', row.wa_message_id).limit(1); ok = !!(m && m.data && m.data.length); } catch (e) {} }
+      if (ok) { try { await supabase.from('cola_entrantes').update({ estado: 'procesado', updated_at: new Date().toISOString() }).eq('id', row.id); } catch (e) {} }
+      else if (row.created_at && new Date(row.created_at).getTime() < lim) {
+        try { await supabase.from('cola_entrantes').update({ estado: 'perdido', updated_at: new Date().toISOString() }).eq('id', row.id); } catch (e) {}
+        console.warn('[cola-durable] entrante NO procesado (perdido), queda el crudo id=' + row.id);
+      }
+    }
+    try { var viejo = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString(); await supabase.from('cola_entrantes').delete().eq('estado', 'procesado').lt('created_at', viejo); } catch (e) {}
+  } catch (e) { console.error('_reconciliarColaEntrantes:', e && e.message); }
+}
+setInterval(_reconciliarColaEntrantes, 2 * 60 * 1000);
+setTimeout(function () { _reconciliarColaEntrantes().catch(function () {}); }, 90 * 1000);
 
 // ============================================================================
 // FOTOS DE PERFIL DE LOS LEADS (avatar) — se traen de WhatsApp UNA vez y se guardan en NUESTRO bucket.

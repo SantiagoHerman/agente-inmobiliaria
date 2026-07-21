@@ -10567,8 +10567,9 @@ async function revisarAvisosInternos() {
       const texto = 'Lead ' + leadRef + ' esperando respuesta ' + esperaMin + ' min, Departamento ' + (deptoNombre || 'sin asignar') + ', usuario ' + (aseNombre || 'sin asignar');
       // Marcar en memoria YA (antes de enviar) para que ticks concurrentes no re-disparen este escalon.
       _slaAvisoMem.add(_keyMem(_paso));
-      // TODOS los escalones postean en el canal "Todos".
-      try { await _postearAvisoInterno(ownerId, 'general', texto); } catch (eGen) {}
+      // AVISO AL CANAL "Todos": SACADO por decision de Diego (2026-07-20). Antes CADA escalon posteaba en el canal
+      // general y ensuciaba a todo el equipo. Ahora cada paso avisa SOLO a quien corresponde: paso 1 al asesor
+      // asignado, paso 2 a Administracion (o admins/dueno), paso 3 el escalon mas alto.
       if (_paso === 1) {
         // PASO 1: push al asesor asignado.
         if (aseAuth) { try { await enviarPushAsesor(aseAuth, 'Lead esperando tu respuesta', '', texto.slice(0, 180)); } catch (eP1) {} }

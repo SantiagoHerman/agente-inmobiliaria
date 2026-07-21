@@ -10513,11 +10513,18 @@ async function revisarAvisosInternos() {
       if (!(ownerId in _slaCfgCache)) _slaCfgCache[ownerId] = await _avisosConfig(ownerId);
       const cfg = _slaCfgCache[ownerId];
       if (!cfg.sla_humano || !cfg.sla_humano.on) continue;  // DEFAULT OFF
-      // Anchor: ULTIMO mensaje de la conv. Debe ser del LEAD (role='contact'); si hay un human/ai posterior, se saltea.
+      // Anchor: ULTIMO mensaje REAL de la conv (solo lead / IA / humano). Debe ser del LEAD (role='contact'); si hay un
+      // human/ai posterior, se saltea (ya le respondieron). FIX 2026-07-20 (Diego): los mensajes de SISTEMA se IGNORAN.
+      // Antes se miraba el ultimo mensaje SEA CUAL SEA, y al derivar un lead el sistema escribe el cartelito
+      // "Derivado a X" JUSTO DESPUES del mensaje del lead -> el anchor veia 'sistema', lo tomaba como "ya respondieron"
+      // y SALTEABA el lead. Resultado: el SLA no avisaba nunca en el caso tipico (lead derivado esperando al asesor),
+      // que es EXACTAMENTE el incidente que origino esta funcion (lead esperando 4hs sin aviso al dueno). Un cartelito
+      // de sistema NO es atender al lead. Solo cuenta como respuesta un mensaje real de la IA o de una persona.
       let _ult = null;
       try {
         const r = await supabase.from('messages').select('role, created_at')
-          .eq('conversation_id', conv.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+          .eq('conversation_id', conv.id).in('role', ['contact', 'ai', 'human'])
+          .order('created_at', { ascending: false }).limit(1).maybeSingle();
         _ult = r.data;
       } catch (eUlt) { _ult = null; }
       if (!_ult || _ult.role !== 'contact' || !_ult.created_at) continue; // ya respondieron (o sin datos)

@@ -1774,10 +1774,26 @@ function _tomarPautaMetaPend(convId) {
   } catch (e) { return null; }
 }
 
-// Normalizacion de URL para el match ($0). Devuelve {host, path, key} o null. null = no matcheable (invalida, o un
-// redirect/shortlink de Meta que no es la ficha real). Saca www, scheme, fragmento y trailing slash; conserva SOLO
-// los params que identifican una ficha (whitelist) y descarta tracking (utm_*, fbclid, etc). Un path vacio ('' o '/')
-// devuelve path='' -> el caller NO matchea por host solo (regla dura anti-falso-positivo de la home/landing).
+// Params de TRACKING conocidos: NO identifican la ficha, se descartan del match. Lista negra (blacklist), no blanca:
+// cualquier OTRO param (id/p/property_id... o uno propio del sitio ?inmueble=/?ficha=/?cod=/?listing=/?ref=...) se
+// asume IDENTIFICADOR y se CONSERVA en la key -> dos fichas con el mismo path y distinto id NO colapsan. 'ref' es
+// ambiguo (referrer vs codigo de ficha): ante la duda se conserva (peor adjuntar la ficha equivocada que no adjuntar).
+function _esTrackingPauta(k) {
+  try {
+    const _kl = String(k || '').toLowerCase();
+    if (!_kl) return true;
+    if (_kl.indexOf('utm_') === 0) return true;   // utm_source/medium/campaign/...
+    if (_kl.indexOf('mc_') === 0) return true;     // mailchimp
+    const _tr = ['fbclid', 'gclid', 'gclsrc', 'dclid', 'msclkid', 'yclid', 'twclid', 'ttclid', 'igshid', 'wbraid', 'gbraid', '_ga', '_gl', 'ref_src', 'ref_url', 'fb_action_ids', 'fb_action_types', 'fb_source', 'fb_ref', 'fbadid', 'ad_id', 'adset_id', 'campaign_id'];
+    return _tr.indexOf(_kl) >= 0;
+  } catch (e) { return false; } // ante la duda, NO es tracking -> se conserva (mas conservador para el match)
+}
+// Normalizacion de URL para el match ($0). Devuelve {host, path, hasQ, key} o null. null = no matcheable (invalida, o
+// un redirect/shortlink de Meta que no es la ficha real). Saca www, scheme, fragmento y trailing slash; DESCARTA solo
+// el tracking conocido (utm_*, fbclid, etc) y CONSERVA en la key cualquier otro param (identifica la ficha). hasQ=true
+// si quedo algun param identificador -> el caller NO permite el fallback host+path (evita colapsar dos fichas con el
+// mismo path y distinto id). Un path vacio ('' o '/') devuelve path='' -> el caller NO matchea por host solo (regla
+// dura anti-falso-positivo de la home/landing).
 function _normUrlPauta(u) {
   try {
     if (!u) return null;
@@ -1792,11 +1808,20 @@ function _normUrlPauta(u) {
     const _redir = ['fb.me', 'l.facebook.com', 'lm.facebook.com', 'm.facebook.com', 'facebook.com', 'fb.com', 'wa.me', 'api.whatsapp.com', 'l.instagram.com', 'instagram.com', 'bit.ly', 'linktr.ee', 'goo.gl', 't.co'];
     if (_redir.indexOf(host) >= 0) return null;
     let path = (url.pathname || '').toLowerCase().replace(/\/+$/, '');
-    const _wl = ['p', 'page_id', 'property_id', 'id', 'pid'];
+    // Conservar TODO param que no sea tracking conocido (identifica la ficha); descartar el tracking. hasQ marca que
+    // la URL trae al menos un identificador por query -> el caller bloquea el fallback host+path.
     const _kept = [];
-    try { _wl.forEach(function (k) { const v = url.searchParams.get(k); if (v) _kept.push(k + '=' + String(v).toLowerCase()); }); } catch (e) {}
+    let _hasQ = false;
+    try {
+      url.searchParams.forEach(function (v, k) {
+        if (v === '' || v === null || v === undefined) return;
+        if (_esTrackingPauta(k)) return;
+        _kept.push(String(k).toLowerCase() + '=' + String(v).toLowerCase());
+        _hasQ = true;
+      });
+    } catch (e) {}
     _kept.sort();
-    return { host: host, path: path, key: host + path + (_kept.length ? ('?' + _kept.join('&')) : '') };
+    return { host: host, path: path, hasQ: _hasQ, key: host + path + (_kept.length ? ('?' + _kept.join('&')) : '') };
   } catch (e) { return null; }
 }
 // Normalizacion de texto para el fallback por titulo: minusculas, sin tildes, sin signos, espacios colapsados.
@@ -1804,6 +1829,30 @@ function _normTxtPauta(s) {
   try { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
   catch (e) { return ''; }
 }
+// Genericos de rubro + stopwords: NO distinguen una ficha de otra. Se restan del titulo para decidir si es especifico.
+const _PAUTA_GEN = ['departamento', 'departamentos', 'depto', 'deptos', 'dpto', 'casa', 'casas', 'venta', 'ventas', 'vende', 'vendo', 'vender', 'alquiler', 'alquileres', 'alquila', 'alquilar', 'renta', 'rentas', 'propiedad', 'propiedades', 'oportunidad', 'oportunidades', 'consulta', 'lote', 'lotes', 'terreno', 'terrenos', 'emprendimiento', 'emprendimientos', 'alojamiento', 'alojamientos', 'cabana', 'cabanas', 'hotel', 'hoteles', 'hospedaje', 'inmueble', 'inmuebles', 'local', 'locales', 'oficina', 'oficinas', 'ph', 'duplex', 'triplex', 'monoambiente', 'disponible', 'estrenar', 'nuevo', 'nueva', 'ambientes', 'ambiente', 'amb'];
+const _PAUTA_STOP = ['en', 'de', 'del', 'a', 'al', 'el', 'la', 'lo', 'los', 'las', 'un', 'una', 'unos', 'unas', 'y', 'o', 'u', 'con', 'sin', 'para', 'por', 'su', 'sus', 'mi', 'mis', 'the', 'of', 'in'];
+// Tokens DISTINTIVOS de un titulo ya normalizado: sin genericos de rubro, sin stopwords, sin ruido (< 3 chars o puro
+// numero). Si no quedan >= 2 -> el titulo es generico ('Casa en venta', 'Lote en venta'...) y NO debe matchear nada.
+function _distintivosPauta(ct) {
+  try {
+    const _skip = {};
+    _PAUTA_GEN.forEach(function (g) { _skip[g] = true; });
+    _PAUTA_STOP.forEach(function (g) { _skip[g] = true; });
+    return String(ct || '').split(' ').filter(function (t) { return t && t.length >= 3 && !_skip[t] && !/^\d+$/.test(t); });
+  } catch (e) { return []; }
+}
+// ¿El token es un IDENTIFICADOR de ficha (romano I-XII o numero corto)? Sirve para el caso prefijo/fase: si el aviso
+// trae uno PEGADO al nombre que el inventario NO tiene ('Casa Playa Grande' vs '...II' / 'Torre Aqua 2'), son fichas
+// DISTINTAS -> no matchear. NO incluye letra suelta: 'a'/'y'/'o' son preposiciones comunes ('a estrenar', 'a 2
+// cuadras') y matarian matches legitimos; la letra-torre ('Torre B') se maneja solo tras un marcador de fase.
+function _esIdTokenPauta(t) {
+  try { return /^(i{1,3}|iv|vi{0,3}|ix|xi{0,2}|x)$/.test(t) || /^\d{1,3}$/.test(t); }
+  catch (e) { return false; }
+}
+// Marcadores de fase/unidad: si aparecen PEGADOS al nombre seguidos de un id ('Fase 3', 'Torre B', 'Etapa 2') marcan
+// una ficha DISTINTA del nombre pelado.
+const _PAUTA_PHASE = ['fase', 'etapa', 'torre', 'sector', 'bloque', 'modulo', 'manzana', 'mza', 'unidad', 'lote', 'edificio', 'nucleo'];
 // Elige UN candidato del inventario para la pauta, o null. Reglas anti-falso-positivo (adjuntar la equivocada es
 // PEOR que no adjuntar): URL fuerte primero (exacta o host+path, nunca por host/home solo, nunca link vacio del
 // inventario); si 0 -> fallback por titulo (titulo especifico del inventario contenido en el titulo del aviso);
@@ -1816,15 +1865,15 @@ function _elegirCandidatoPauta(cands, pautaU, pautaT) {
       // ¿La URL de la pauta identifica la ficha por un param whitelisted (?id=/?p=...)? Si SI, exigimos igualdad EXACTA
       // de key: el fallback host+path NO puede matchear (dos fichas con el mismo path y distinto id serian un falso
       // positivo). El fallback host+path (ignorando query) solo aplica cuando NINGUN lado trae params identificadores.
-      const _pautaHasQ = pautaU.key !== (pautaU.host + pautaU.path);
+      const _pautaHasQ = pautaU.hasQ === true;
       const _hits = [];
       cands.forEach(function (c) {
         let _hit = false;
         (c.links || []).forEach(function (lk) {
           const _cu = _normUrlPauta(lk);
           if (!_cu || !_cu.path || _cu.path.length === 0) return; // link vacio/home del inventario: nunca matchea
-          if (_cu.key === pautaU.key) { _hit = true; return; }     // exacto (host+path+params whitelisted)
-          const _cuHasQ = _cu.key !== (_cu.host + _cu.path);
+          if (_cu.key === pautaU.key) { _hit = true; return; }     // exacto (host+path+params identificadores)
+          const _cuHasQ = _cu.hasQ === true;
           if (!_pautaHasQ && !_cuHasQ && _cu.host === pautaU.host && _cu.path === pautaU.path) _hit = true; // host+path (sin ids en query)
         });
         if (_hit) _hits.push(c);
@@ -1834,16 +1883,40 @@ function _elegirCandidatoPauta(cands, pautaU, pautaT) {
       if (_ids.length === 1) return _hits.find(function (c) { return c.id === _ids[0]; });
       if (_ids.length > 1) return null; // ambiguo -> Nivel 1
     }
-    // 2) FALLBACK POR TITULO (debil): titulo del inventario (especifico, >=2 tokens, >=8 chars) dentro del aviso.
+    // 2) FALLBACK POR TITULO (debil), a NIVEL TOKEN (no substring crudo). Anti-falso-positivo:
+    //   (a) del titulo del inventario se restan genericos/stopwords/ruido -> exigir >= 2 tokens DISTINTIVOS. Asi
+    //       'Casa en venta' / 'Lote en venta' / 'Departamento' (0 distintivos) NO matchean nada (mata el generico).
+    //   (b) TODOS esos tokens distintivos deben aparecer como PALABRA COMPLETA en el aviso (word-boundary, no substring
+    //       -> 'grande' no matchea dentro de 'grandeza').
+    //   (c) el aviso NO puede traer, PEGADO al nombre, un IDENTIFICADOR (romano/numero, o marcador de fase + id) que
+    //       el inventario no tenga -> mata 'Casa Playa Grande' (inv) vs 'Casa Playa Grande II' / 'Torre Aqua 2' /
+    //       'Aregua Forest Fase 3'. Solo se mira el token PEGADO al nombre: un numero de descripcion ('a 2 cuadras',
+    //       '3 ambientes' suelto) no va pegado y NO descarta el match legitimo.
+    // 0 o >1 candidato -> null (Nivel 1). La ambiguedad (>1) tambien cubre 'igual cantidad de tokens' en el aviso.
     if (pautaT && pautaT.length >= 8) {
-      const _GEN = ['departamento', 'casa', 'venta', 'alquiler', 'propiedad', 'oportunidad', 'consulta', 'lote', 'terreno', 'emprendimiento', 'alojamiento', 'cabana', 'cabanas', 'hotel', 'inmueble', 'local', 'oficina', 'ph', 'duplex'];
+      const _adToks = pautaT.split(' ').filter(Boolean);
+      const _adSet = {};
+      _adToks.forEach(function (t) { _adSet[t] = true; });
       const _hits = [];
       cands.forEach(function (c) {
         const _ct = _normTxtPauta(c.title);
-        if (!_ct || _ct.length < 8) return;         // titulo corto/vacio del inventario: descartar
-        if (_ct.split(' ').length < 2) return;      // exigir identificador propio (>=2 tokens)
-        if (_GEN.indexOf(_ct) >= 0) return;         // titulo generico exacto: descartar
-        if (pautaT.indexOf(_ct) >= 0) _hits.push(c);
+        if (!_ct || _ct.length < 8) return;                       // titulo corto/vacio del inventario: descartar
+        const _dist = _distintivosPauta(_ct);
+        if (_dist.length < 2) return;                             // sin >=2 tokens distintivos: generico -> descartar
+        const _distSet = {};
+        for (let i = 0; i < _dist.length; i++) { if (!_adSet[_dist[i]]) return; _distSet[_dist[i]] = true; } // (b) todos, palabra completa, en el aviso
+        // (c) mirar SOLO el token pegado al nombre (tras el ultimo token distintivo del inventario en el aviso)
+        const _invSet = {};
+        _ct.split(' ').forEach(function (t) { if (t) _invSet[t] = true; });
+        let _maxPos = -1;
+        for (let k = 0; k < _adToks.length; k++) { if (_distSet[_adToks[k]]) _maxPos = k; }
+        if (_maxPos >= 0 && _maxPos + 1 < _adToks.length) {
+          const _sfx = _adToks[_maxPos + 1];
+          const _sfx2 = (_maxPos + 2 < _adToks.length) ? _adToks[_maxPos + 2] : '';
+          if (_esIdTokenPauta(_sfx) && !_invSet[_sfx]) return;                                            // Nombre + II / + 2
+          if (_PAUTA_PHASE.indexOf(_sfx) >= 0 && _sfx2 && (_esIdTokenPauta(_sfx2) || /^[a-z]$/.test(_sfx2)) && !_invSet[_sfx2]) return; // Nombre + Fase 3 / Torre B
+        }
+        _hits.push(c);
       });
       const _ids = [];
       _hits.forEach(function (c) { if (_ids.indexOf(c.id) < 0) _ids.push(c.id); });

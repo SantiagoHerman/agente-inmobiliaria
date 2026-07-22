@@ -28618,4 +28618,38 @@ app.post('/api/cloud-api/embedded-signup', async function(req, res) {
 });
 // ===== FIN MODULO WHATSAPP CLOUD API ========================================
 
+// ===== TEMPORAL (Diego 2026-07-22): medir costo REAL de ia_uso 30d. SOLO LECTURA, guardado por secreto. BORRAR tras leer. =====
+app.get('/api/_costo30d', async function(req, res){
+  try {
+    if ((req.query.k || '') !== 'rz-costo-9x2Qp7Kv3Rt8Lz-medir') return res.status(404).end();
+    var dias = Math.min(90, Math.max(1, parseInt(req.query.d, 10) || 30));
+    var desde = new Date(Date.now() - dias*24*3600*1000).toISOString();
+    var porEtq = {}, totOps = 0, totCost = 0, respOps = 0, respCost = 0;
+    var PAGE = 1000, page = 0;
+    while (page <= 300) {
+      var r = await supabase.from('ia_uso').select('cost_usd, etiqueta').gte('created_at', desde).range(page*PAGE, page*PAGE + PAGE - 1);
+      if (r.error) return res.status(500).json({ error: r.error.message });
+      var rows = r.data || [];
+      for (var i = 0; i < rows.length; i++) {
+        var c = Number(rows[i].cost_usd) || 0;
+        var et = rows[i].etiqueta || '(respuesta_lead_null)';
+        totOps++; totCost += c;
+        if (!rows[i].etiqueta) { respOps++; respCost += c; }
+        if (!porEtq[et]) porEtq[et] = { ops: 0, cost: 0 };
+        porEtq[et].ops++; porEtq[et].cost += c;
+      }
+      if (rows.length < PAGE) break;
+      page++;
+    }
+    var lista = Object.keys(porEtq).map(function(k){ return { etiqueta: k, ops: porEtq[k].ops, total_usd: +porEtq[k].cost.toFixed(4), prom_usd: +(porEtq[k].cost / porEtq[k].ops).toFixed(6) }; }).sort(function(a,b){ return b.total_usd - a.total_usd; });
+    return res.json({
+      dias: dias, desde: desde,
+      total_ops: totOps, total_usd: +totCost.toFixed(2),
+      respuesta_lead: { ops: respOps, total_usd: +respCost.toFixed(4), prom_usd_por_mensaje: respOps ? +(respCost / respOps).toFixed(6) : 0 },
+      por_etiqueta: lista
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+// ===== FIN TEMPORAL costo30d =====
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

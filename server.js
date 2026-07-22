@@ -303,7 +303,11 @@ async function enviarPushAsesor(authUserId, leadNombre, texto, bodyLiteral, meta
   try { await _enviarPushFCM(); } catch (e) { console.error('Error enviarPushAsesor:', e && e.message); }
   // FASE 2: ESPEJO del push por-usuario a WhatsApp. SIEMPRE se intenta (independiente del push): para los usuarios
   // sin dispositivo push (iPhone) es la UNICA notificacion que reciben. Best-effort, NUNCA rompe nada (gates propios).
-  try { await _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral); } catch (eDm) { console.error('Error _espejarPushAWhatsApp:', eDm && eDm.message); }
+  // TEMA 7 (anti-baneo): los mensajes DIRIGIDOS del Maestro pasan meta.sinEspejoWA=true para NO tocar WhatsApp
+  // (solo push in-app). El resto de los callers (sin meta) mantienen el espejo EXACTAMENTE igual.
+  if (!(meta && meta.sinEspejoWA === true)) {
+    try { await _espejarPushAWhatsApp(authUserId, leadNombre, texto, bodyLiteral); } catch (eDm) { console.error('Error _espejarPushAWhatsApp:', eDm && eDm.message); }
+  }
 }
 
 // ===== FASE 2: NOTIFICACION INDIVIDUAL POR WHATSAPP (espejo del PUSH por-usuario) =====
@@ -6490,11 +6494,16 @@ async function enviarReportesProgramados() {
   try {
     const { data: cuentas } = await supabase.from('business_settings').select('user_id, reportes_config').not('reportes_config', 'is', null);
     if (!cuentas || !cuentas.length) return;
-    const ahora = new Date();
-    const hoyStr = ahora.toISOString().substring(0, 10); // YYYY-MM-DD
-    const diaSemana = ahora.getDay(); // 0=domingo, 1=lunes
-    const diaMes = ahora.getDate();
-    const hora = ahora.getHours();
+    // FIX HORARIO (TEMA 4): los tenants son de ARGENTINA (UTC-3). Antes se usaba la hora/fecha del SERVER
+    // (getHours/getDay/getDate = UTC en Railway) -> un reporte configurado a las 09:00 llegaba 06:00 AR.
+    // Copiamos el MISMO criterio ya validado en el cron gemelo del "resumen diario" (aviso #3): offset fijo
+    // Argentina (-3) y lectura via getUTC* sobre la fecha desplazada. A futuro podria ser offset por-tenant.
+    const _ARG_OFFSET_HORAS = -3;
+    const ahora = new Date(Date.now() + _ARG_OFFSET_HORAS * 60 * 60 * 1000); // "ahora" en hora local Argentina (leido via getUTC*)
+    const hoyStr = ahora.toISOString().substring(0, 10); // YYYY-MM-DD en fecha LOCAL Argentina (dedupe diario correcto)
+    const diaSemana = ahora.getUTCDay(); // 0=domingo, 1=lunes (hora local AR)
+    const diaMes = ahora.getUTCDate();   // dia del mes (hora local AR)
+    const hora = ahora.getUTCHours();    // hora local Argentina (0-23)
     // La hora de envio la define cada cuenta (cfg.hora). Se compara dentro del loop.
     for (const cta of cuentas) {
       const cfg = cta.reportes_config || {};
@@ -6549,22 +6558,34 @@ async function guardarSnapshotDiario() {
       try {
         const base = function () { return supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', uid); };
         const _c = function (q) { return q.then(function (r) { return (r && r.count) || 0; }).catch(function () { return 0; }); };
+        // TEMA 4: sumamos en_conversacion (donde vive la mayoria de los leads) al snapshot para que el baseline
+        // sea comparable con el actual del reporte. Conteo EXACTO (head:true), igual criterio que el resto.
         const _res = await Promise.all([
           _c(base()),
           _c(base().eq('status', 'interesado')),
           _c(base().eq('status', 'listo_humano')),
           _c(base().eq('status', 'cerrado')),
-          _c(base().eq('status', 'recontacto'))
+          _c(base().eq('status', 'recontacto')),
+          _c(base().eq('status', 'en_conversacion'))
         ]);
         const conversaciones = _res[0];
         if (conversaciones === 0) continue; // sin conversaciones -> no snapshot (comportamiento previo)
         let totalMsgs = 0;
         try { const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', uid); totalMsgs = count || 0; } catch (eMsg) { totalMsgs = 0; }
-        await supabase.from('reportes_snapshots').upsert({
+        // DEFENSIVO: la columna en_conversacion puede no existir aun (migracion sin correr). Intentamos CON ella;
+        // si el upsert falla por eso, reintentamos SIN ella (asi el snapshot no se pierde: el delta de en_conversacion
+        // cae a "solo total" hasta que exista la columna). El resto del snapshot queda igual que antes.
+        const _snapRow = {
           user_id: uid, fecha: hoyStr,
           conversaciones: conversaciones, interesados: _res[1], listo_humano: _res[2],
-          cierres: _res[3], recontactos: _res[4], mensajes: totalMsgs
-        }, { onConflict: 'user_id,fecha' });
+          cierres: _res[3], recontactos: _res[4], mensajes: totalMsgs,
+          en_conversacion: _res[5]
+        };
+        const _upSnap = await supabase.from('reportes_snapshots').upsert(_snapRow, { onConflict: 'user_id,fecha' });
+        if (_upSnap && _upSnap.error) {
+          const _rowSinEC = Object.assign({}, _snapRow); delete _rowSinEC.en_conversacion;
+          await supabase.from('reportes_snapshots').upsert(_rowSinEC, { onConflict: 'user_id,fecha' });
+        }
       } catch (ePer) { /* seguir con el siguiente tenant */ }
     }
   } catch (e) { /* silencioso */ }
@@ -6584,14 +6605,37 @@ async function generarReporteAdmin(user_id, cfg, periodo) {
   lineas.push('_' + _periodoTxt + '_');
   lineas.push('');
   try {
-    // Valores ACTUALES (totales acumulados a hoy).
-    const { data: convs } = await supabase.from('conversations').select('status').eq('user_id', user_id);
-    const lista = convs || [];
-    const cuenta = function (st) { return lista.filter(function (x) { return x.status === st; }).length; };
-    const actual = { conversaciones: lista.length, interesado: cuenta('interesado'), listo_humano: cuenta('listo_humano'), cerrado: cuenta('cerrado'), recontacto: cuenta('recontacto') };
+    // Valores ACTUALES (totales acumulados a hoy). TEMA 4 (BUG cifras): antes se traia el LISTADO de status y se
+    // contaba en memoria -> PostgREST corta en 1000 filas, asi que en cuentas +1000 conversaciones los conteos
+    // salian TOPEADOS en 1000. Como el snapshot (baseline) SI cuenta exacto, el delta podia dar NEGATIVO
+    // ("-500 (total 1000)"). Ahora contamos EXACTO por estado con count:'exact',head:true (mismo criterio que
+    // Mensajes y que el snapshot) -> baseline y actual comparables a cualquier escala. Suma en_conversacion.
+    const _cntEstado = async function (st) {
+      try {
+        let q = supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
+        if (st != null) q = q.eq('status', st);
+        const { count } = await q;
+        return count || 0;
+      } catch (e) { return 0; }
+    };
+    const actual = {
+      conversaciones: await _cntEstado(null),
+      interesado: await _cntEstado('interesado'),
+      listo_humano: await _cntEstado('listo_humano'),
+      cerrado: await _cntEstado('cerrado'),
+      recontacto: await _cntEstado('recontacto'),
+      en_conversacion: await _cntEstado('en_conversacion')
+    };
     let mensajesTotal = null;
     if (info.mensajes) { try { const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', user_id); mensajesTotal = count || 0; } catch (eMsg) {} }
     // BASELINE: snapshot mas reciente en/antes del inicio del periodo -> para calcular DELTAS.
+    // RIESGO DE TRANSICION (post-deploy, tenants +1000): este baseline puede ser un snapshot escrito por la logica
+    // ANTERIOR (que contaba TOPEADO en 1000). En ese caso el PRIMER delta del periodo puede salir inflado o incluso
+    // negativo (baseline viejo sobre/sub-conto un bucket). Se AUTO-CURA en el proximo periodo, cuando el baseline pasa
+    // a ser un snapshot exacto nuevo (guardarSnapshotDiario ya cuenta exacto). NO forzamos la cifra: un delta negativo
+    // tambien es LEGITIMO cuando un estado baja (p.ej. leads que salen de 'interesado'), asi que suprimirlo ocultaria
+    // caidas reales. Si Diego quiere evitar el primer delta erroneo, la via limpia es backfillear/recomputar los
+    // snapshots recientes con conteos exactos al desplegar (no se hace aca para no tocar datos historicos sin su OK).
     const dias = periodo === 'semanal' ? 7 : periodo === 'mensual' ? 30 : 1;
     const baseFecha = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString().slice(0, 10);
     let base = null;
@@ -6609,12 +6653,17 @@ async function generarReporteAdmin(user_id, cfg, periodo) {
         lineas.push(label + ': ' + actualVal);
       }
     };
+    // TEMA 4 (etiquetas): que cada renglon diga lo que el numero REALMENTE es.
+    //  - "recontactos" es la cantidad de leads EN ESTADO recontacto (NO "recontactos enviados").
+    //  - "mensajes" son TODOS los mensajes, incluidos los de la IA.
+    //  - en_conversacion (donde vive la mayoria de los leads) se agrega como opcion ADITIVA (checkbox nuevo).
     if (info.conversaciones_nuevas) linea('Conversaciones', actual.conversaciones, 'conversaciones');
+    if (info.en_conversacion) linea('Leads en conversacion', actual.en_conversacion, 'en_conversacion');
     if (info.interesados) linea('Interesados', actual.interesado, 'interesados');
     if (info.listo_humano) linea('Listos para humano', actual.listo_humano, 'listo_humano');
     if (info.cierres) linea('Cierres', actual.cerrado, 'cierres');
-    if (info.recontactos) linea('En recontacto', actual.recontacto, 'recontactos');
-    if (info.mensajes && mensajesTotal != null) linea('Mensajes', mensajesTotal, 'mensajes');
+    if (info.recontactos) linea('Leads en estado recontacto', actual.recontacto, 'recontactos');
+    if (info.mensajes && mensajesTotal != null) linea('Mensajes (todos, incluye IA)', mensajesTotal, 'mensajes');
     if (!base) { lineas.push(''); lineas.push('_(Primer reporte: se muestran totales. Los proximos van a mostrar las novedades del periodo.)_'); }
   } catch (e) {
     lineas.push('(No se pudieron cargar todos los datos)');
@@ -6627,10 +6676,24 @@ async function generarReporteAdmin(user_id, cfg, periodo) {
 // El admin pregunta por WhatsApp lo que necesite; la IA responde con los datos reales del tenant.
 async function responderConsultaAdmin(user_id, pregunta) {
   try {
-    const resConv = await supabase.from('conversations').select('id, status, asesor_id').eq('user_id', user_id);
+    // TEMA 4 (cifras, camino gemelo on-demand): PostgREST corta un select en 1000 filas. Este reporte se arma contando
+    // en memoria sobre el LISTADO de conversaciones, asi que en tenants con +1000 conversaciones los conteos por estado
+    // y por asesor salian TOPEADOS/incompletos. Traemos TODAS paginando con .range() en lotes de 1000 (mismo objetivo
+    // que el count:'exact' del reporte programado, pero aca necesitamos las filas para el desglose por asesor).
+    const _todasConversaciones = async function (cols) {
+      let acc = [], from = 0; const size = 1000, cap = 200000;
+      while (from < cap) {
+        const q = await supabase.from('conversations').select(cols).eq('user_id', user_id).range(from, from + size - 1);
+        const rows = (q && q.data) || [];
+        acc = acc.concat(rows);
+        if (rows.length < size) break;
+        from += size;
+      }
+      return acc;
+    };
+    const lista = await _todasConversaciones('id, status, asesor_id');
     const resAse = await supabase.from('asesores').select('id, nombre, usuario, activo').eq('admin_id', user_id);
     const resCont = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
-    const lista = resConv.data || [];
     const ases = resAse.data || [];
     const convAsesor = {}; lista.forEach(function (c) { convAsesor[c.id] = c.asesor_id; });
     const porEstado = {}; lista.forEach(function (c) { porEstado[c.status] = (porEstado[c.status] || 0) + 1; });
@@ -6693,9 +6756,10 @@ async function responderConsultaAdmin(user_id, pregunta) {
       const props = resProps.data || [];
       const leads = resLeads.data || [];
       // Solo leads de conversaciones NO cerradas (abiertas/calientes). contact_id -> mejor status.
-      const resConvC = await supabase.from('conversations').select('contact_id, status').eq('user_id', user_id);
+      // TEMA 4 (cifras): paginado (reusa el helper) para no cortar el estado por contacto en 1000 filas en tenants grandes.
+      const listaC = await _todasConversaciones('contact_id, status');
       const estadoContacto = {};
-      (resConvC.data || []).forEach(function (c) { if (c.contact_id) estadoContacto[c.contact_id] = c.status; });
+      listaC.forEach(function (c) { if (c.contact_id) estadoContacto[c.contact_id] = c.status; });
       const norm = function (s) { return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); };
       const tokensZona = function (s) { return norm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(function (w) { return w.length >= 4; }); };
       const numPresupuesto = function (s) { const m = norm(s).replace(/\./g, '').match(/\d{4,}/g); return m ? m.map(Number) : []; };
@@ -9419,8 +9483,12 @@ app.post('/api/maestro/aviso', async function(req, res){
     var mensaje = (req.body && req.body.mensaje != null) ? String(req.body.mensaje).slice(0, 2000).trim() : '';
     if (!mensaje) return res.status(400).json({ error: 'El mensaje esta vacio' });
     var nivel = (req.body && String(req.body.nivel || '').toLowerCase() === 'critico') ? 'critico' : 'normal';
-    // Desactiva TODO aviso activo previo (solo uno vigente a la vez).
-    var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true);
+    // Desactiva el aviso GLOBAL activo previo (solo uno vigente a la vez). TEMA 7: filtramos por destinatario_user_id
+    // IS NULL para NO pisar los avisos DIRIGIDOS. DEFENSIVO: si la columna aun no existe (migracion sin correr) el
+    // filtro .is() falla -> caemos al comportamiento PREVIO EXACTO (desactivar todos los activos). El insert del
+    // aviso global NO setea destinatario_user_id: una columna nueva nullable arranca en NULL = global (no rompe nada).
+    var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true).is('destinatario_user_id', null);
+    if (up && up.error) { up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true); }
     if (up && up.error) return res.status(503).json({ error: 'No se pudo actualizar avisos previos: ' + up.error.message });
     var ins = await supabase.from('avisos_maestro').insert({ mensaje: mensaje, nivel: nivel, activo: true }).select('id').maybeSingle();
     if (!ins || ins.error || !ins.data) return res.status(503).json({ error: 'No se pudo publicar el aviso: ' + ((ins && ins.error && ins.error.message) || 'sin id') });
@@ -9432,7 +9500,10 @@ app.delete('/api/maestro/aviso', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
-    var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true);
+    // TEMA 7: "Quitar aviso" (global) solo desactiva los avisos GLOBALES (destinatario_user_id IS NULL), para NO
+    // borrar los DIRIGIDOS. DEFENSIVO: si la columna no existe, cae al comportamiento previo (desactivar todos).
+    var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true).is('destinatario_user_id', null);
+    if (up && up.error) { up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true); }
     if (up && up.error) return res.status(503).json({ error: 'No se pudo quitar el aviso: ' + up.error.message });
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
@@ -9446,15 +9517,171 @@ app.get('/api/maestro/aviso', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    // TEMA 7: el panel muestra el aviso GLOBAL vigente (destinatario_user_id IS NULL). DEFENSIVO: si la columna no
+    // existe todavia, cae al query previo (aviso activo mas reciente, sin filtro).
     var r = await supabase.from('avisos_maestro')
       .select('id, mensaje, nivel')
       .eq('activo', true)
+      .is('destinatario_user_id', null)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+    if (r && r.error) {
+      r = await supabase.from('avisos_maestro').select('id, mensaje, nivel').eq('activo', true).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    }
     if (!r || r.error || !r.data) return res.json({ aviso: null });
     return res.json({ aviso: { id: r.data.id, mensaje: r.data.mensaje, nivel: r.data.nivel } });
   }catch(e){ return res.json({ aviso: null }); }
+});
+
+// ===== TEMA 7: MENSAJE DIRIGIDO DEL MAESTRO (elegir destinatarios) =====
+// El Maestro ya tenia el aviso GLOBAL (a TODOS los dashboards, uno activo a la vez) y el soporte 1-a-1. Esto agrega
+// poder ELEGIR destinatarios por scope. Efecto por destinatario: (1) PUSH in-app (motor FCM existente, enviarPushAsesor)
+// y (2) un aviso DIRIGIDO en su dashboard (fila en avisos_maestro con destinatario_user_id; /api/aviso-activo ya sabe
+// leer global+dirigido). RIESGO baneo: NO usa WhatsApp (meta.sinEspejoWA=true). Envio en LOTES/goteo. Registra el envio
+// en las notificaciones del Maestro (auditoria). ADITIVO: no toca el aviso global. DEFENSIVO: si la columna
+// destinatario_user_id no existe aun (migracion sin correr), el aviso dirigido NO se persiste (aviso_persistido:false)
+// pero el PUSH igual se manda y se devuelve el conteo de destinatarios. NO inventa tablas.
+// scope: 'duenos' (todos los duenos) | 'duenos_usuarios' (duenos + sus asesores activos) | 'seleccion' (ids de duenos).
+app.post('/api/maestro/mensaje-dirigido', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var b = req.body || {};
+    var scope = (b.scope ? String(b.scope) : '').trim();
+    if (['duenos','duenos_usuarios','seleccion'].indexOf(scope) === -1) return res.status(400).json({ error: 'scope invalido (duenos | duenos_usuarios | seleccion)' });
+    var titulo = (b.titulo != null) ? String(b.titulo).slice(0, 140).trim() : '';
+    var texto = (b.texto != null) ? String(b.texto).slice(0, 2000).trim() : '';
+    if (!texto) return res.status(400).json({ error: 'El texto esta vacio' });
+    var critico = (b.critico === true);
+    var nivel = critico ? 'critico' : 'normal';
+
+    // 1) Universo de DUENOS (owners): business_settings.user_id, PAGINADO. Excluimos eliminados (defensivo si la col no existe).
+    var owners = [];
+    try {
+      var from = 0; var size = 1000; var cap = 100000;
+      while (from < cap) {
+        var q = await supabase.from('business_settings').select('user_id, eliminado_at').range(from, from + size - 1);
+        if (q && q.error) { q = await supabase.from('business_settings').select('user_id').range(from, from + size - 1); }
+        var rows = (q && q.data) || [];
+        rows.forEach(function(r){ if (r && r.user_id && !r.eliminado_at) owners.push(String(r.user_id)); });
+        if (rows.length < size) break;
+        from += size;
+      }
+    } catch (eOwners) {}
+    owners = Array.from(new Set(owners));
+
+    // 2) Segun scope, armar el set de OWNERS objetivo.
+    var ownersObjetivo;
+    if (scope === 'seleccion') {
+      var ids = Array.isArray(b.ids) ? b.ids.map(function(x){ return String(x); }) : [];
+      var ownerSet = new Set(owners);
+      ownersObjetivo = ids.filter(function(id){ return ownerSet.has(id); }); // solo ids que sean owners reales
+      if (!ownersObjetivo.length) return res.status(400).json({ error: 'Ninguno de los ids es un dueno valido' });
+    } else {
+      ownersObjetivo = owners.slice();
+    }
+
+    // 3) Lista final de DESTINATARIOS (auth_user_ids: sirven para el push Y como destinatario_user_id del aviso).
+    //    El OWNER no tiene fila en asesores: su user_id ES su auth uid. Para 'duenos_usuarios' sumamos los asesores
+    //    ACTIVOS de cada dueno objetivo (auth_user_id), consultando IN por lotes de 100 admin_id.
+    var destinatarios = ownersObjetivo.slice();
+    if (scope === 'duenos_usuarios' && ownersObjetivo.length) {
+      for (var i = 0; i < ownersObjetivo.length; i += 100) {
+        var lote = ownersObjetivo.slice(i, i + 100);
+        try {
+          var qa = await supabase.from('asesores').select('auth_user_id, activo').in('admin_id', lote).eq('activo', true);
+          var arows = (qa && qa.data) || [];
+          arows.forEach(function(a){ if (a && a.auth_user_id) destinatarios.push(String(a.auth_user_id)); });
+        } catch (eAses) {}
+      }
+    }
+    destinatarios = Array.from(new Set(destinatarios));
+    var totalDest = destinatarios.length;
+    if (!totalDest) return res.json({ ok: true, scope: scope, destinatarios: 0, push_enviados: 0, aviso_persistido: false, nota: 'Sin destinatarios' });
+
+    // 4) PERSISTIR el aviso DIRIGIDO (una fila por destinatario) en avisos_maestro, EN LOTES de 200. DEFENSIVO: si la
+    //    columna destinatario_user_id no existe (migracion sin correr) el insert falla -> no se persiste (el push igual va).
+    var mensajeAviso = ((titulo ? (titulo + ': ') : '') + texto).slice(0, 2000);
+    // ANTES de insertar: DESACTIVAR los avisos DIRIGIDOS activos previos de estos MISMOS destinatarios. Asi un reenvio
+    // REEMPLAZA al anterior (no se apilan banners) y avisos_maestro no acumula filas activas indefinidamente. Es tambien
+    // el "retracto por reenvio". DEFENSIVO: si la columna destinatario_user_id no existe, el .in() falla -> no hay
+    // dirigidos que desactivar (ignoramos el error). NUNCA toca los globales (destinatario_user_id IS NULL).
+    try {
+      for (var dp = 0; dp < destinatarios.length; dp += 200) {
+        var lotePrev = destinatarios.slice(dp, dp + 200);
+        var upPrev = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true).in('destinatario_user_id', lotePrev);
+        if (upPrev && upPrev.error) break; // columna ausente u otro error -> no habia dirigidos previos que tocar
+      }
+    } catch (ePrev) {}
+    // Persistir tracqueando CUANTOS destinatarios quedaron persistidos: avisoPersistido = true SOLO si cubre a TODOS
+    // (antes okAlgo pasaba a true tras el 1er lote y un fallo posterior devolvia aviso_persistido:true con solo un
+    // subconjunto persistido). Reportamos ademas el conteo real (aviso_persistidos).
+    var avisoPersistido = false;
+    var avisoPersistidos = 0;
+    try {
+      for (var j = 0; j < destinatarios.length; j += 200) {
+        var chunk = destinatarios.slice(j, j + 200).map(function(d){ return { mensaje: mensajeAviso, nivel: nivel, activo: true, destinatario_user_id: d }; });
+        var insAv = await supabase.from('avisos_maestro').insert(chunk);
+        if (insAv && insAv.error) { break; } // columna ausente u otro error -> cortar (best-effort, push sigue)
+        avisoPersistidos += chunk.length;
+      }
+      avisoPersistido = (avisoPersistidos >= totalDest); // true solo si se persistio a TODOS los destinatarios
+    } catch (eAv) { avisoPersistido = false; }
+
+    // 5) PUSH in-app a cada destinatario, EN LOTES de 25 (goteo, pausa 100ms). SIN WhatsApp (meta.sinEspejoWA=true).
+    var pushEnviados = 0;
+    var tituloPush = titulo || 'Aviso de Raices';
+    for (var k = 0; k < destinatarios.length; k += 25) {
+      var batch = destinatarios.slice(k, k + 25);
+      await Promise.all(batch.map(function(d){
+        return enviarPushAsesor(d, tituloPush, texto, texto.slice(0, 180), { tipo: 'maestro_dirigido', sinEspejoWA: true }).then(function(){ pushEnviados++; }).catch(function(){});
+      }));
+      if (k + 25 < destinatarios.length) { await new Promise(function(r){ setTimeout(r, 100); }); }
+    }
+
+    // 6) AUDITORIA: registrar el envio reusando el patron de notificaciones del Maestro + admin_audit. Best-effort.
+    var _persistTxt = avisoPersistido ? '' : (avisoPersistidos > 0 ? (' - aviso persistido parcial ' + avisoPersistidos + '/' + totalDest) : ' - aviso no persistido');
+    try {
+      crearNotifMaestro('mensaje_dirigido', 'Mensaje dirigido enviado (' + scope + ')', 'Destinatarios: ' + totalDest + ' - Push: ' + pushEnviados + _persistTxt + '\n' + texto.slice(0, 300), { severidad: critico ? 'critico' : 'info' }).catch(function(){});
+    } catch (eNM) {}
+    try { await supabase.from('admin_audit').insert({ accion: 'mensaje_dirigido', detalle: JSON.stringify({ scope: scope, destinatarios: totalDest, push_enviados: pushEnviados, aviso_persistido: avisoPersistido, aviso_persistidos: avisoPersistidos, titulo: titulo, texto: texto.slice(0, 500) }) }); } catch (eAA) {}
+
+    return res.json({ ok: true, scope: scope, destinatarios: totalDest, push_enviados: pushEnviados, aviso_persistido: avisoPersistido, aviso_persistidos: avisoPersistidos });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// TEMA 7 (retracto): "Quitar" avisos DIRIGIDOS activos (el DELETE /api/maestro/aviso solo apaga los GLOBALES). Analogo
+// al DELETE global pero para dirigidos (destinatario_user_id NOT NULL). Body opcional: { ids:[user_ids] } -> desactiva
+// solo los de esos destinatarios; sin ids (o scope:'todos') -> desactiva TODOS los dirigidos activos. NUNCA toca los
+// globales. DEFENSIVO: si la columna destinatario_user_id no existe (migracion sin correr) no hay dirigidos -> ok con 0.
+app.post('/api/maestro/mensaje-dirigido/quitar', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'notificaciones'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var b = req.body || {};
+    var ids = Array.isArray(b.ids) ? b.ids.map(function(x){ return String(x); }).filter(Boolean) : null;
+    var _esColAusente = function(err){ var m = String((err && err.message) || '').toLowerCase(); return m.indexOf('destinatario_user_id') !== -1 || m.indexOf('column') !== -1 || m.indexOf('does not exist') !== -1; };
+    if (ids && ids.length) {
+      // Seleccion: desactivar los dirigidos activos de esos destinatarios, EN LOTES de 200.
+      for (var i = 0; i < ids.length; i += 200) {
+        var lote = ids.slice(i, i + 200);
+        var up = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true).in('destinatario_user_id', lote);
+        if (up && up.error) {
+          if (_esColAusente(up.error)) return res.json({ ok: true, scope: 'seleccion', destinatarios: ids.length, nota: 'Sin avisos dirigidos (feature no migrada)' });
+          return res.status(503).json({ error: 'No se pudieron quitar los avisos dirigidos: ' + up.error.message });
+        }
+      }
+      return res.json({ ok: true, scope: 'seleccion', destinatarios: ids.length });
+    }
+    // TODOS los dirigidos activos (destinatario_user_id NOT NULL). NO toca los globales (IS NULL).
+    var upAll = await supabase.from('avisos_maestro').update({ activo: false }).eq('activo', true).not('destinatario_user_id', 'is', null);
+    if (upAll && upAll.error) {
+      if (_esColAusente(upAll.error)) return res.json({ ok: true, scope: 'todos', nota: 'Sin avisos dirigidos (feature no migrada)' });
+      return res.status(503).json({ error: 'No se pudieron quitar los avisos dirigidos: ' + upAll.error.message });
+    }
+    return res.json({ ok: true, scope: 'todos' });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
 // ===== BACKUPS (Maestro) — VER y DESCARGAR los respaldos de un cliente =====
@@ -9493,12 +9720,19 @@ app.get('/api/aviso-activo', async function(req, res){
   try{
     var uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    // TEMA 7: el dashboard ve el aviso GLOBAL (destinatario_user_id IS NULL) o uno DIRIGIDO a ESTE usuario
+    // (destinatario_user_id = su uid). Se toma el mas reciente de ambos. DEFENSIVO: si la columna destinatario_user_id
+    // aun no existe (migracion sin correr) el .or() falla -> caemos al query PREVIO EXACTO (aviso global unico).
     var r = await supabase.from('avisos_maestro')
       .select('id, mensaje, nivel')
       .eq('activo', true)
+      .or('destinatario_user_id.is.null,destinatario_user_id.eq.' + uid)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+    if (r && r.error) {
+      r = await supabase.from('avisos_maestro').select('id, mensaje, nivel').eq('activo', true).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    }
     // FAIL-SAFE: si la tabla no existe todavia (migracion sin correr) o cualquier
     // error de lectura -> devolvemos aviso:null y NO rompemos el dashboard.
     if (!r || r.error || !r.data) return res.json({ aviso: null });
@@ -12534,20 +12768,34 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
         if (!r3.error && r3.data) ase = r3.data;
       } catch (e3) {}
     }
-    // Solo un ASESOR (fila en `asesores`) puede cargar contactos. El dueno "puro" (sin fila de asesor) no pasa por aca;
-    // en esta app el dueno se loguea como un asesor con capacidad de administrador (rol='administrador' o visibilidad
-    // 'generales'), asi que SI entra por el camino admin de abajo (decision de Diego).
-    if (!ase || !ase.admin_id) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
-
-    // 3) PERMISO (refinamiento v2): el ADMINISTRADOR SIEMPRE puede; el asesor comun necesita puede_cargar_contacto===true.
-    //    esAdministrador() es el criterio unico y centralizado (rol legacy 'administrador' O visibilidad='generales').
-    //    Fail-safe para el asesor comun: columna ausente / null / false -> 403.
-    const _esAdmin = esAdministrador(ase);
-    if (!_esAdmin && ase.puede_cargar_contacto !== true) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
-
-    const ownerId = ase.admin_id;        // el contacto/conversacion son del DUENO (multi-tenant)
-    const asesorId = ase.id;             // asignado a ESTE asesor
-    const asesorNombre = (ase.nombre ? String(ase.nombre) : 'un asesor');
+    // 3) QUIEN CARGA + PERMISO. Dos caminos:
+    //    A) ASESOR (fila en `asesores`, incluye al dueno logueado como asesor administrador): permiso como hasta hoy.
+    //       El ADMINISTRADOR SIEMPRE puede; el asesor comun necesita puede_cargar_contacto===true. esAdministrador()
+    //       es el criterio unico (rol legacy 'administrador' O visibilidad='generales'). Fail-safe: columna ausente
+    //       / null / false -> 403.
+    //    B) DUENO "PURO" (TEMA 2): sin fila en `asesores`. Antes caia en 403 porque el endpoint asumia que TODO
+    //       cargador es un asesor. Ahora, si el uid es el OWNER de un tenant (tiene fila en business_settings), lo
+    //       dejamos cargar: ownerId = uid y SIN asesor_id (el dueno no es una fila de asesores -> no rompe la FK).
+    //       El contacto/conv quedan igual que hoy (listo_humano + IA off), solo que sin asignar a un asesor
+    //       (el dueno ve todo). DEFENSIVO / fail-closed: si no podemos confirmar que es owner -> 403.
+    let ownerId, asesorId, asesorNombre;
+    if (ase && ase.admin_id) {
+      const _esAdmin = esAdministrador(ase);
+      if (!_esAdmin && ase.puede_cargar_contacto !== true) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+      ownerId = ase.admin_id;        // el contacto/conversacion son del DUENO (multi-tenant)
+      asesorId = ase.id;             // asignado a ESTE asesor
+      asesorNombre = (ase.nombre ? String(ase.nombre) : 'un asesor');
+    } else {
+      let esDueno = false;
+      try {
+        const { data: _bsOwner, error: _eBsOwner } = await supabase.from('business_settings').select('user_id').eq('user_id', uid).maybeSingle();
+        if (!_eBsOwner && _bsOwner && _bsOwner.user_id) esDueno = true;
+      } catch (eOwner) {}
+      if (!esDueno) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+      ownerId = uid;                 // el uid autenticado ES el dueno del tenant
+      asesorId = null;               // el dueno no tiene fila en asesores -> conv SIN asesor_id (no rompe la FK)
+      asesorNombre = 'el titular';
+    }
 
     // 4) BODY + validacion. nombre y telefono obligatorios.
     const b = req.body || {};
@@ -12650,7 +12898,7 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
     // 7) Mensaje de SISTEMA (0 IA): SOLO cuando creamos algo nuevo. Si el lead ya existia, NO dejamos traza (no tocar).
     if (!_yaExistiaFinal) {
       try {
-        const _txtSis = 'Contacto cargado manualmente por ' + asesorNombre + ' — asignado y listo para humano';
+        const _txtSis = 'Contacto cargado manualmente por ' + asesorNombre + (asesorId ? ' — asignado y listo para humano' : ' — listo para humano');
         await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txtSis, enviado_por: 'Sistema' });
       } catch (eSis) { console.error('cargar-manual mensaje sistema (best-effort):', eSis && eSis.message); }
     }
@@ -13851,23 +14099,15 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto, opts) {
     } catch (eIns) {
       try { await supabase.from('team_messages').insert(_baseAviso); } catch (eIns2) { return; }
     }
-    // ===== FEATURE "grupo TODOS" [gated, DEFAULT OFF] =====
-    // SOLO en la rama 'general' (= el canal interno "Todos"): si el tenant activo el flag y eligio un grupo
-    // de WhatsApp, espejamos este mismo aviso al grupo. Best-effort ABSOLUTO: cualquier fallo aca (flag,
-    // read, envio) NUNCA rompe el aviso interno ni el push de abajo. Con el flag OFF o sin JID -> no manda nada.
-    if (departamentoId === 'general') {
-      try {
-        const { data: _bsG, error: _eBsG } = await supabase.from('business_settings')
-          .select('grupo_todos_jid, grupo_todos_wa_on').eq('user_id', ownerId).maybeSingle();
-        if (!_eBsG && _bsG && _bsG.grupo_todos_wa_on === true && _bsG.grupo_todos_jid && String(_bsG.grupo_todos_jid).trim()) {
-          await enviarTextoGrupoWA(nombreInstancia(ownerId), String(_bsG.grupo_todos_jid).trim(), cuerpo);
-        }
-      } catch (eGrupo) { console.error('grupo TODOS (espejo WA):', eGrupo && eGrupo.message); } // NUNCA romper el aviso interno
-    }
-    // FEATURE notif dirigidas [gated notif_solo_involucrado]: si el caller pide `soloRegistro`, se OMITE el PUSH
-    // MASIVO a los integrantes del canal, MANTENIENDO todo lo de arriba: (1) el registro del aviso en el HILO y
-    // (2) el espejo al grupo WhatsApp "Todos". El caller ya empujo el push DIRECTO a quien corresponde (asesor del
-    // lead / dueno-admin). Sin opts (todos los callers actuales por defecto) -> comportamiento BYTE-IDENTICO al actual.
+    // ===== FEATURE "grupo TODOS" — ESPEJO AL GRUPO DE WHATSAPP: DESACTIVADO (TEMA 6) =====
+    // El espejo del canal interno "Todos" hacia un grupo de WhatsApp queda NEUTRALIZADO: NUNCA reenvia al grupo,
+    // aunque una cuenta tenga el flag grupo_todos_wa_on en ON. El canal interno "Todos" (team_messages, insertado
+    // arriba) sigue EXACTAMENTE igual, y el push a los miembros (abajo) tambien. NO se toca enviarTextoGrupoWA:
+    // la sigue usando la notificacion por WhatsApp por-usuario (_espejarPushAWhatsApp). Los endpoints de config
+    // del grupo quedan (se sacan del front en otra tanda); simplemente ya no se consumen desde aca.
+    // FEATURE notif dirigidas [gated notif_solo_involucrado] (VIVO en main): si el caller pide `soloRegistro`, se OMITE
+    // el PUSH MASIVO a los integrantes del canal, MANTENIENDO el registro del aviso en el HILO (arriba). El caller ya
+    // empujo el push DIRECTO a quien corresponde (asesor del lead / dueno-admin). Sin opts -> comportamiento como hoy.
     if (opts && opts.soloRegistro === true) return;
     // Push a los miembros (0 tokens IA). Excluir al remitente. Dedupe.
     const vistos = {};
@@ -23897,6 +24137,9 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
       }
     } else if (accion === 'cortesia') {
       var darCortesia = (req.body && req.body.activo === true);
+      // TEMA 1: bandera de fallo REAL de la escritura a subscriptions. Si queda true, el endpoint NO devuelve ok
+      // (antes un fallo inesperado de DB igual respondia 'listo' = falla silenciosa). No cambia la logica de los 3 casos.
+      var _cortesiaFalloDB = false;
       var subC = await getSubscription(uid);
       if (darCortesia) {
         // DAR cortesia: acceso libre e ILIMITADO. cortesia=true ya manda sobre el estado en debeBloquearAcceso/planActual.
@@ -23918,9 +24161,26 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
         // DEFENSIVO: si la columna snapshot_cortesia aun no existe (migracion sin correr), el upsert con esa key
         // falla -> reintentamos SIN ella (la cortesia se da igual, solo no se guarda el snapshot).
         var upDar = await supabase.from('subscriptions').upsert(updDar, { onConflict: 'user_id' });
-        if (upDar && upDar.error && updDar.snapshot_cortesia) {
-          console.error('cortesia snapshot upsert (columna ausente?):', upDar.error.message);
-          await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' });
+        if (upDar && upDar.error) {
+          // ESPEJO de la guarda de SACAR (TEMA 1): SOLO reintentamos SIN snapshot cuando (a) se intento incluir
+          // snapshot_cortesia y (b) el error es por columna inexistente (migracion sin correr, lo detectamos por el
+          // mensaje). Ante CUALQUIER OTRO error (fallo REAL de DB) NO reintentamos a ciegas: marcamos
+          // _cortesiaFalloDB=true. Antes el reintento se disparaba por la sola PRESENCIA de la key snapshot -> un
+          // fallo real de DB podia enmascararse (reintento sin snapshot exitoso -> ok), perdiendo en silencio el
+          // snapshot que sirve para RESTAURAR el plan real al sacar la cortesia.
+          var msgDar = String((upDar.error && upDar.error.message) || '').toLowerCase();
+          var esColumnaAusenteDar = msgDar.indexOf('snapshot_cortesia') !== -1 || msgDar.indexOf('column') !== -1 || msgDar.indexOf('does not exist') !== -1;
+          if (updDar.snapshot_cortesia && esColumnaAusenteDar) {
+            // La columna snapshot_cortesia no existe (migracion sin correr): reintentar SIN ella (la cortesia
+            // se da igual, solo no se guarda el snapshot). Si el reintento TAMBIEN falla -> es un fallo real de DB.
+            console.error('cortesia snapshot upsert (columna ausente?):', upDar.error.message);
+            var upDar2 = await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' });
+            if (upDar2 && upDar2.error) { _cortesiaFalloDB = true; console.error('cortesia DAR upsert (reintento sin snapshot fallo):', upDar2.error.message); }
+          } else {
+            // TEMA 1: error REAL de DB (no la columna opcional ausente) -> NO devolver ok, sin reintento a ciegas.
+            _cortesiaFalloDB = true;
+            console.error('cortesia DAR upsert (error no recuperable):', upDar.error.message);
+          }
         }
       } else {
         // SACAR la cortesia. Tres casos:
@@ -23958,8 +24218,11 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
           if (esColumnaAusente) {
             console.error('cortesia sacar upsert (columna ausente, reintento sin snapshot):', upSacar.error.message);
             var updSinSnap = Object.assign({}, updC); delete updSinSnap.snapshot_cortesia;
-            await supabase.from('subscriptions').upsert(updSinSnap, { onConflict: 'user_id' });
+            var upSacar2 = await supabase.from('subscriptions').upsert(updSinSnap, { onConflict: 'user_id' });
+            if (upSacar2 && upSacar2.error) { _cortesiaFalloDB = true; console.error('cortesia sacar upsert (reintento sin snapshot fallo):', upSacar2.error.message); }
           } else {
+            // TEMA 1: error REAL de DB (no la columna opcional ausente) -> NO devolver ok.
+            _cortesiaFalloDB = true;
             console.error('cortesia sacar upsert (error no recuperable):', upSacar.error.message);
           }
         }
@@ -23978,6 +24241,11 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
       try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify({ cancelado: canceladoMaestro }) }); } catch(eA){}
       return res.json({ ok: true, cancelado: canceladoMaestro });
     } else { return res.status(400).json({ error: 'Accion invalida' }); }
+    // TEMA 1: si el cambio de cortesia fallo por un error REAL de la base (no una columna opcional ausente),
+    // NO devolver ok. Antes cualquier fallo inesperado igual respondia 'listo' (falla silenciosa).
+    if (accion === 'cortesia' && _cortesiaFalloDB === true) {
+      return res.status(503).json({ error: 'No se pudo aplicar el cambio de cortesia (error de base de datos)' });
+    }
     try { await supabase.from('admin_audit').insert({ accion: accion, target_user_id: uid, detalle: JSON.stringify(req.body || {}) }); } catch(eA){}
     return res.json({ ok: true });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }

@@ -5357,6 +5357,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // cosas que ya se derivan a un humano ni para datos puntuales de un solo cliente.
     aprendizajeActivo ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes: usa la herramienta consultar_al_dueno con la pregunta concreta, y decile al lead con naturalidad que lo consultas y le confirmas enseguida.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
+    (settings && settings.horario_oficina && _horarioLegible(settings.horario_oficina)) ? ('HORARIO DE ATENCION de la oficina (si el lead pregunta cuando pueden atenderlo, visitarlos, llamar, o si estan abiertos, deciselo con naturalidad; NO inventes horarios distintos a estos): ' + _horarioLegible(settings.horario_oficina) + '. (Zona horaria Argentina.)') : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
     // Para hotel NO se muestra "Propiedades disponibles" (usa el bloque de unidades de abajo); inmobiliaria/desarrolladora igual que siempre.
     // RAG (gated ia_rag_v1): con _ragActivo, el catalogo COMPLETO se reemplaza por el INDICE + guardrail del buscador.
@@ -10583,6 +10584,43 @@ function dentroHorarioOficinaEn(horario, tsMs) {
     }
     return enFranjaLegacy(cfg.desde, cfg.hasta);
   } catch (e) { return false; }
+}
+
+// Resumen LEGIBLE del horario_oficina para el PROMPT de la IA (para que pueda responderle al lead cuando pregunta el horario).
+// Reusa la MISMA estructura que dentroHorarioOficina (dias con `franjas` [{desde,hasta}] o legacy desde/hasta; `cerrado`/`atiende:false`).
+// Agrupa dias consecutivos con el mismo horario. Devuelve '' si no hay nada valido -> el prompt queda BYTE-IDENTICO.
+function _horarioLegible(horario) {
+  try {
+    if (!horario || typeof horario !== 'object') return '';
+    var orden = ['lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo'];
+    var lbl = { lunes: 'Lun', martes: 'Mar', miercoles: 'Mie', jueves: 'Jue', viernes: 'Vie', sabado: 'Sab', domingo: 'Dom' };
+    var hhmm = function (s) {
+      s = String(s == null ? '' : s).trim(); if (!s) return null;
+      var p = s.split(':'); var h = Number(p[0]); var m = (p.length > 1) ? Number(p[1]) : 0;
+      if (!Number.isFinite(h) || h < 0 || h > 23 || !Number.isFinite(m) || m < 0 || m > 59) return null;
+      return (m === 0) ? ('' + h) : (h + ':' + (m < 10 ? '0' + m : '' + m));
+    };
+    var sig = function (cfg) {
+      if (!cfg || cfg.cerrado || cfg.atiende === false) return 'cerrado';
+      var pares = [];
+      if (Array.isArray(cfg.franjas)) {
+        for (var k = 0; k < cfg.franjas.length; k++) { var f = cfg.franjas[k]; if (f) { var d = hhmm(f.desde), h = hhmm(f.hasta); if (d != null && h != null && d !== h) pares.push(d + ' a ' + h); } }
+      } else {
+        var d2 = hhmm(cfg.desde) || '9', h2 = hhmm(cfg.hasta) || '18'; pares.push(d2 + ' a ' + h2);
+      }
+      return pares.length ? pares.join(' y ') : 'cerrado';
+    };
+    var out = [], i = 0;
+    while (i < orden.length) {
+      var s = sig(horario[orden[i]]); var j = i;
+      while (j + 1 < orden.length && sig(horario[orden[j + 1]]) === s) j++;
+      var etq = (i === j) ? lbl[orden[i]] : (lbl[orden[i]] + ' a ' + lbl[orden[j]]);
+      out.push(etq + ' ' + (s === 'cerrado' ? 'cerrado' : (s + ' hs')));
+      i = j + 1;
+    }
+    var hayAbierto = out.some(function (x) { return x.indexOf('cerrado') < 0; });
+    return hayAbierto ? out.join('; ') : '';
+  } catch (e) { return ''; }
 }
 
 // Compat: misma firma/comportamiento de siempre (evalua "ahora"). Todos los call-sites existentes la siguen usando.

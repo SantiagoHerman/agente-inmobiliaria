@@ -28618,37 +28618,4 @@ app.post('/api/cloud-api/embedded-signup', async function(req, res) {
 });
 // ===== FIN MODULO WHATSAPP CLOUD API ========================================
 
-// ===== TEMPORAL (Diego 2026-07-22): medir peso del inventario (full vs comprimido). SOLO LECTURA. BORRAR. =====
-app.get('/api/_invsize', async function(req, res){
-  try {
-    if ((req.query.k || '') !== 'rz-costo-9x2Qp7Kv3Rt8Lz-medir') return res.status(404).end();
-    var q = req.query.c || 'anton';
-    var bs = await supabase.from('business_settings').select('user_id, company_name').ilike('company_name', '%' + q + '%').limit(1);
-    if (!bs.data || !bs.data.length) return res.json({ error: 'cuenta no encontrada', q: q });
-    var uid = bs.data[0].user_id, comp = bs.data[0].company_name;
-    var cols = 'title, type, zone, price, operation, rooms, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, caracteristicas, amenities, images, link';
-    var pr = await supabase.from('properties').select(cols).eq('user_id', uid).eq('activa', true).limit(3000);
-    if (pr.error) pr = await supabase.from('properties').select(cols).eq('user_id', uid).limit(3000);
-    if (pr.error) return res.status(500).json({ error: pr.error.message });
-    var props = pr.data || [];
-    var LIGHT = ['title','type','zone','price','operation','rooms','dormitorios','banos','cocheras','superficie_cubierta','superficie_total','expensas','apto_credito','link'];
-    var HEAVY = ['caracteristicas','amenities','images'];
-    var fullC = 0, lightC = 0, heavyC = 0;
-    props.forEach(function(p){
-      LIGHT.forEach(function(k){ if (p[k] != null) { var s = '' + (typeof p[k] === 'object' ? JSON.stringify(p[k]) : p[k]); lightC += s.length + k.length + 3; fullC += s.length + k.length + 3; } });
-      HEAVY.forEach(function(k){ if (p[k] != null) { var s = '' + (typeof p[k] === 'object' ? JSON.stringify(p[k]) : p[k]); heavyC += s.length + k.length + 3; fullC += s.length + k.length + 3; } });
-    });
-    var tok = function(c){ return Math.round(c / 4); };
-    var costo = function(t){ return +(t * 3 / 1000000).toFixed(4); };
-    return res.json({
-      cuenta: comp, propiedades: props.length,
-      full_tokens: tok(fullC), comprimido_tokens: tok(lightC), removible_tokens: tok(heavyC),
-      pct_removible: fullC ? Math.round(heavyC * 100 / fullC) : 0,
-      costo_inv_full_usd_x_msg: costo(tok(fullC)), costo_inv_comprimido_usd_x_msg: costo(tok(lightC)),
-      ahorro_x_mensaje_usd: +(costo(tok(fullC)) - costo(tok(lightC))).toFixed(4)
-    });
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
-});
-// ===== FIN TEMPORAL invsize =====
-
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

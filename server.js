@@ -9739,66 +9739,66 @@ const _RUBRO_CTX = {
 const RECONTACTO_TEXTOS_FABRICA = {
   inmobiliaria: {
     primer_contacto: [
-      '¡Hola! ¿Como estas? Soy {agente} de {empresa}. Te escribo para saber si seguis buscando. Si es asi, contame que necesitas y te muestro opciones. ¿Seguis en la busqueda?',
-      '¡Hola! Soy {agente} de {empresa}. Me pongo a disposicion para acompanarte en la busqueda. Contame que estas necesitando y te paso lo que tengamos. ¿Seguis interesado/a?',
-      '¡Hola, que gusto! Soy {agente} de {empresa}. Te contacto por si te puedo dar una mano buscando algo que se ajuste a lo que necesitas. ¿Que tenias en mente?',
-      '¡Hola! Soy {agente} de {empresa}. ¿Todavia estas con la busqueda de una propiedad? Si queres, contame que zona y que tipo buscas y lo vemos juntos.',
-      '¡Hola! ¿Como va? Soy {agente} de {empresa}. Queria saber si seguis interesado/a en encontrar tu proxima propiedad. Con gusto te acompano cuando quieras.',
-      '¡Hola! Soy {agente} de {empresa}. Me quede con ganas de ayudarte con la busqueda. ¿Seguis mirando? Contame que estas necesitando y arrancamos.'
+      '¡Hola! ¿Cómo estás? Soy {agente} de {empresa}. Tengo agendado que ya habías realizado una consulta con nosotros. ¿Seguís interesado/a? Contame y te muestro opciones.',
+      '¡Hola! ¿Cómo estás? Soy {agente} de {empresa}. Ingresaron nuevas propiedades y quería saber si te interesa conocer más. ¿Te paso lo nuevo?',
+      '¡Hola! Soy {agente} de {empresa}. Me pongo a disposición para acompañarte en la búsqueda. Contame qué estás necesitando y te paso lo que tengamos.',
+      '¡Hola! ¿Cómo va? Soy {agente} de {empresa}. Quería saber si seguís buscando tu próxima propiedad. Con gusto te acompaño cuando quieras.',
+      '¡Hola, qué gusto! Soy {agente} de {empresa}. Te contacto por si te puedo dar una mano con la búsqueda. ¿Qué tenías en mente?',
+      '¡Hola! Soy {agente} de {empresa}. Me quedé con ganas de ayudarte. ¿Seguís interesado/a? Contame qué estás buscando y arrancamos.'
     ],
     seguimiento: [
-      '¡Hola {nombre}! ¿Seguis interesado/a? Quedo a disposicion por si queres que avancemos.',
-      '¡Hola {nombre}! ¿Como va? Por si te quedo alguna duda sobre lo que veniamos hablando. Si todavia estas buscando, con gusto te paso mas info.',
-      '¡Hola {nombre}! Te escribo para saber si seguis interesado/a. Cualquier cosa me decis y seguimos.',
-      '¿Como andas {nombre}? Me quede con ganas de ayudarte. Si todavia estas con la busqueda, avisame y seguimos.',
-      '¡Hola {nombre}! ¿Retomamos? Si me contas un poco mas de lo que buscas, te acerco algunas opciones para ver.',
-      '¡Hola {nombre}! Sigo por aca para lo que necesites. ¿Queres que sigamos con la busqueda o preferis que te escriba mas adelante?'
+      '¡Hola {nombre}! ¿Seguís interesado/a? Quedo a disposición por si querés que avancemos.',
+      '¡Hola {nombre}! ¿Cómo va? Por si te quedó alguna duda de lo que veníamos hablando. Si seguís buscando, con gusto te paso más info.',
+      '¡Hola {nombre}! Te escribo para saber si seguís interesado/a. Cualquier cosa me decís y seguimos.',
+      '¿Cómo andás {nombre}? Me quedé con ganas de ayudarte. Si seguís con la búsqueda, avisame y retomamos.',
+      '¡Hola {nombre}! ¿Retomamos? Si me contás un poco más de lo que buscás, te acerco algunas opciones para ver.',
+      '¡Hola {nombre}! Sigo por acá para lo que necesites. ¿Seguimos con la búsqueda o preferís que te escriba más adelante?'
     ]
   },
   hotel_cabanas: {
     primer_contacto: [
-      '¡Hola! ¿Como estas? Soy {agente} de {empresa}. Te escribo por si seguis pensando en una escapada. Si queres, contame para que fecha y cuantas personas y vemos disponibilidad.',
-      '¡Hola! Soy {agente} de {empresa}. Queria saber si todavia estas con ganas de una estadia por la zona. Contame que fechas tenias en mente y te ayudo.',
-      '¡Hola, que gusto! Soy {agente} de {empresa}. Por si seguis buscando alojamiento, quedo a disposicion para acomodarte lo mejor posible. ¿Tenias fechas en mente?',
-      '¡Hola! Soy {agente} de {empresa}. ¿Seguis pensando en venir? Si me contas las fechas y cuantos son, con gusto te paso las opciones.',
-      '¡Hola! ¿Como va? Soy {agente} de {empresa}. Me pongo a disposicion para tu proxima escapada. ¿Para que fecha lo estabas pensando?',
-      '¡Hola! Soy {agente} de {empresa}. Me quede con ganas de ayudarte con la reserva. ¿Seguis interesado/a? Contame fechas y cantidad de personas y arrancamos.'
+      '¡Hola! ¿Cómo estás? Soy {agente} de {empresa}. Si estás pensando en tomarte unos días, tenemos promociones para vos. ¿Querés que te cuente?',
+      '¡Hola! Soy {agente} de {empresa}. Tengo agendado que consultaste por una estadía. ¿Seguís interesado/a? Decime las fechas y vemos disponibilidad.',
+      '¡Hola! ¿Cómo va? Soy {agente} de {empresa}. ¿Seguís pensando en una escapada? Contame para cuándo y cuántos son y te ayudo.',
+      '¡Hola, qué gusto! Soy {agente} de {empresa}. Tenemos muy buenas opciones para tu próxima escapada. ¿Seguís interesado/a?',
+      '¡Hola! Soy {agente} de {empresa}. Me pongo a disposición para tu estadía. ¿Para qué fecha lo estabas pensando?',
+      '¡Hola! Soy {agente} de {empresa}. Me quedé con ganas de ayudarte con la reserva. ¿Seguís interesado/a? Contame fechas y cuántas personas.'
     ],
     // Seguimiento SIN fecha: el lead no tiene fecha de ingreso cargada -> podemos preguntar por fechas.
     seguimiento_sin_fecha: [
-      '¡Hola {nombre}! ¿Seguis pensando en la escapada? Si me contas las fechas, con gusto reviso disponibilidad.',
-      '¡Hola {nombre}! ¿Como va? Por si te quedo alguna duda sobre la estadia. ¿Tenias fechas en mente? Cualquier cosa me decis y seguimos.',
-      '¡Hola {nombre}! Te escribo para saber si seguis interesado/a en venir. Contame que fechas y cuantos son y avanzamos.',
-      '¿Como andas {nombre}? Me quede con ganas de ayudarte con la reserva. Si todavia lo estas pensando, decime las fechas y vemos.',
-      '¡Hola {nombre}! ¿Retomamos lo de la estadia? Si me pasas las fechas y la cantidad de personas, te acerco las opciones.',
-      '¡Hola {nombre}! Sigo por aca para ayudarte con el alojamiento. ¿Seguis con la idea? Contame las fechas cuando puedas.'
+      '¡Hola {nombre}! ¿Seguís pensando en la escapada? Si me contás las fechas, con gusto reviso disponibilidad.',
+      '¡Hola {nombre}! ¿Cómo va? Por si te quedó alguna duda sobre la estadía. ¿Tenías fechas en mente? Cualquier cosa me decís y seguimos.',
+      '¡Hola {nombre}! Te escribo para saber si seguís interesado/a en venir. Contame qué fechas y cuántos son y avanzamos.',
+      '¿Cómo andás {nombre}? Me quedé con ganas de ayudarte con la reserva. Si todavía lo estás pensando, decime las fechas y vemos.',
+      '¡Hola {nombre}! ¿Retomamos lo de la estadía? Si me pasás las fechas y la cantidad de personas, te acerco las opciones.',
+      '¡Hola {nombre}! Sigo por acá para ayudarte con el alojamiento. ¿Seguís con la idea? Contame las fechas cuando puedas.'
     ],
     // Seguimiento CON fecha: el lead YA tiene una fecha de ingreso futura -> NO preguntar por fechas.
     seguimiento_con_fecha: [
-      '¡Hola {nombre}! ¿Seguis pensando en la estadia? Quedo a disposicion para dejarte todo listo cuando quieras confirmar.',
-      '¡Hola {nombre}! ¿Como va? Por si te quedo alguna duda sobre la reserva. Cualquier cosa me decis y la dejamos armada.',
-      '¡Hola {nombre}! Te escribo para saber si seguis interesado/a. Si queres, avanzamos con la reserva asi te la aseguramos.',
-      '¿Como andas {nombre}? Me quede a disposicion para ayudarte con la estadia. Si queres confirmar, lo dejamos todo listo.',
-      '¡Hola {nombre}! ¿Retomamos? Puedo dejarte la reserva preparada para esos dias cuando me digas.',
-      '¡Hola {nombre}! Sigo por aca para lo que necesites de la estadia. Avisame y coordinamos los detalles.'
+      '¡Hola {nombre}! ¿Seguís pensando en la estadía? Quedo a disposición para dejarte todo listo cuando quieras confirmar.',
+      '¡Hola {nombre}! ¿Cómo va? Por si te quedó alguna duda sobre la reserva. Cualquier cosa me decís y la dejamos armada.',
+      '¡Hola {nombre}! Te escribo para saber si seguís interesado/a. Si querés, avanzamos con la reserva así te la aseguramos.',
+      '¿Cómo andás {nombre}? Quedo a disposición para ayudarte con la estadía. Si querés confirmar, lo dejamos todo listo.',
+      '¡Hola {nombre}! ¿Retomamos? Puedo dejarte la reserva preparada para esos días cuando me digas.',
+      '¡Hola {nombre}! Sigo por acá para lo que necesites de la estadía. Avisame y coordinamos los detalles.'
     ]
   },
   desarrolladora: {
     primer_contacto: [
-      '¡Hola! ¿Como estas? Soy {agente} de {empresa}. Te escribo por si seguis interesado/a en el emprendimiento. Contame que estas buscando y te paso la info que tengamos.',
-      '¡Hola! Soy {agente} de {empresa}. Me pongo a disposicion por si seguis evaluando invertir o mudarte. ¿Queres que te cuente como viene el proyecto?',
-      '¡Hola, que gusto! Soy {agente} de {empresa}. Por si seguis mirando opciones de unidades o lotes, quedo a disposicion para lo que necesites. ¿Que tenias en mente?',
-      '¡Hola! Soy {agente} de {empresa}. ¿Todavia estas interesado/a en el desarrollo? Si queres, te cuento las alternativas disponibles y las formas de avanzar.',
-      '¡Hola! ¿Como va? Soy {agente} de {empresa}. Queria saber si seguis pensando en el proyecto. Con gusto te acompano para resolver tus dudas.',
-      '¡Hola! Soy {agente} de {empresa}. Me quede con ganas de ayudarte con la busqueda. ¿Seguis interesado/a? Contame que estas necesitando y arrancamos.'
+      '¡Hola! ¿Cómo estás? Soy {agente} de {empresa}. Tengo agendado que habías consultado por el emprendimiento. ¿Seguís interesado/a? Te paso las novedades.',
+      '¡Hola! Soy {agente} de {empresa}. Hay nuevas unidades y opciones de financiación disponibles. ¿Querés que te cuente cómo viene el proyecto?',
+      '¡Hola! ¿Cómo va? Soy {agente} de {empresa}. ¿Seguís evaluando el emprendimiento? Con gusto te acompaño para resolver tus dudas.',
+      '¡Hola! Soy {agente} de {empresa}. Me pongo a disposición por si seguís pensando en invertir o mudarte. ¿Te cuento las alternativas?',
+      '¡Hola, qué gusto! Soy {agente} de {empresa}. Te contacto por si seguís mirando unidades o lotes. ¿Qué tenías en mente?',
+      '¡Hola! Soy {agente} de {empresa}. Me quedé con ganas de ayudarte. ¿Seguís interesado/a en el desarrollo? Contame y arrancamos.'
     ],
     seguimiento: [
-      '¡Hola {nombre}! ¿Seguis interesado/a en el emprendimiento? Quedo a disposicion por si queres que avancemos.',
-      '¡Hola {nombre}! ¿Como va? Por si te quedo alguna duda sobre el proyecto. Si todavia lo estas evaluando, con gusto te paso mas info.',
-      '¡Hola {nombre}! Te escribo para saber si seguis interesado/a. Cualquier cosa me decis y seguimos viendo las opciones.',
-      '¿Como andas {nombre}? Me quede con ganas de ayudarte. Si seguis pensando en el desarrollo, avisame y retomamos.',
-      '¡Hola {nombre}! ¿Retomamos? Si me contas un poco mas de lo que buscas, te acerco las alternativas que mejor encajen.',
-      '¡Hola {nombre}! Sigo por aca para lo que necesites. ¿Queres que sigamos con la busqueda o preferis que te escriba mas adelante?'
+      '¡Hola {nombre}! ¿Seguís interesado/a en el emprendimiento? Quedo a disposición por si querés que avancemos.',
+      '¡Hola {nombre}! ¿Cómo va? Por si te quedó alguna duda sobre el proyecto. Si seguís evaluándolo, con gusto te paso más info.',
+      '¡Hola {nombre}! Te escribo para saber si seguís interesado/a. Cualquier cosa me decís y seguimos viendo las opciones.',
+      '¿Cómo andás {nombre}? Me quedé con ganas de ayudarte. Si seguís pensando en el desarrollo, avisame y retomamos.',
+      '¡Hola {nombre}! ¿Retomamos? Si me contás un poco más de lo que buscás, te acerco las alternativas que mejor encajen.',
+      '¡Hola {nombre}! Sigo por acá para lo que necesites. ¿Seguimos o preferís que te escriba más adelante?'
     ]
   }
 };

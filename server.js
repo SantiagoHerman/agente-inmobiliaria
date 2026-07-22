@@ -28618,31 +28618,4 @@ app.post('/api/cloud-api/embedded-signup', async function(req, res) {
 });
 // ===== FIN MODULO WHATSAPP CLOUD API ========================================
 
-// ===== TEMPORAL (Diego 2026-07-22): costo real por CUENTA de la respuesta al lead (etiqueta null). SOLO LECTURA. BORRAR. =====
-app.get('/api/_costo30d', async function(req, res){
-  try {
-    if ((req.query.k || '') !== 'rz-costo-9x2Qp7Kv3Rt8Lz-medir') return res.status(404).end();
-    var dias = Math.min(90, Math.max(1, parseInt(req.query.d, 10) || 30));
-    var desde = new Date(Date.now() - dias*24*3600*1000).toISOString();
-    var porUser = {}, totOps = 0, totCost = 0, PAGE = 1000, page = 0;
-    while (page <= 300) {
-      var r = await supabase.from('ia_uso').select('cost_usd, user_id').is('etiqueta', null).gte('created_at', desde).range(page*PAGE, page*PAGE + PAGE - 1);
-      if (r.error) return res.status(500).json({ error: r.error.message });
-      var rows = r.data || [];
-      for (var i = 0; i < rows.length; i++) {
-        var c = Number(rows[i].cost_usd) || 0, u = rows[i].user_id || '?';
-        totOps++; totCost += c;
-        if (!porUser[u]) porUser[u] = { ops: 0, cost: 0 };
-        porUser[u].ops++; porUser[u].cost += c;
-      }
-      if (rows.length < PAGE) break; page++;
-    }
-    var uids = Object.keys(porUser), nombres = {};
-    try { var bs = await supabase.from('business_settings').select('user_id, company_name').in('user_id', uids); (bs.data || []).forEach(function(x){ nombres[x.user_id] = x.company_name; }); } catch (e) {}
-    var lista = uids.map(function(u){ return { cuenta: nombres[u] || String(u).slice(0,8), ops: porUser[u].ops, total_usd: +porUser[u].cost.toFixed(3), prom_usd_msg: +(porUser[u].cost / porUser[u].ops).toFixed(5) }; }).sort(function(a,b){ return b.ops - a.ops; });
-    return res.json({ dias: dias, msgs_total: totOps, costo_total_usd: +totCost.toFixed(2), prom_global: totOps ? +(totCost / totOps).toFixed(5) : 0, por_cuenta: lista });
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
-});
-// ===== FIN TEMPORAL costo30d =====
-
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

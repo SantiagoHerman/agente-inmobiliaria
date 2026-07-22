@@ -2084,6 +2084,24 @@ async function iaDisponibilidadActivo(user_id, bs) {
   } catch (e) { return false; }
 }
 
+// ===== RAG DE INVENTARIO (gated ia_rag_v1) =====
+// Con ON: la IA deja de recibir el catalogo COMPLETO en el prompt (para Anton ~152k tokens/mensaje) y recibe un
+// INDICE compacto + las tools buscar_inventario / ficha_inventario. FAIL-CLOSED (mismo patron EXACTO que
+// iaDisponibilidadActivo / iaAgendaActivo): si el flag no esta (columna ausente porque no se corrio la migracion /
+// select error / null / false) -> OFF => el codigo queda INERTE (indice+tools NO se agregan, prompt+flujo
+// BYTE-IDENTICOS al actual) hasta correr migracion-rag-inventario-flag.sql. A DIFERENCIA de otras features, la
+// activacion es SOLO por cuenta (piloto gradual): la migracion agrega la columna en false y NO hay UPDATE masivo a
+// true. "Raices Meta Test" (congelada) jamas se activa. Reusa un `bs` ya cargado => 0 queries extra. Ante error -> OFF.
+async function iaRagActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_rag_v1')) return bs.ia_rag_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_rag_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ia_rag_v1 === true);
+  } catch (e) { return false; }
+}
+
 // ===== 5 FUENTES EXTERNAS PARA LA IA (dolar / clima / feriados / georef / distancia) =====
 // Cada tool nueva se gatea por SU flag propio en business_settings. FAIL-CLOSED, mismo patron EXACTO
 // que iaAgendaActivo / iaDisponibilidadActivo / marketingIaActivo: si el flag no esta (columna ausente
@@ -4551,6 +4569,196 @@ app.post('/api/enviar-media', async (req, res) => {
     }, function(err){ console.error('envio media bg:', err && err.message); if (msgIns && msgIns.id) { supabase.from('messages').update({ estado_envio: 'fallido' }).eq('id', msgIns.id).then(function(){}, function(){}); } });
   } catch (e) { console.error('enviar-media error:', e && e.message); if (!res.headersSent) return res.status(500).json({ error: e && e.message }); }
 });
+
+// ===== RAG DE INVENTARIO (gated ia_rag_v1) — helpers de INDICE + BUSCADOR + FICHA =====
+// Funciones PURAS (operan sobre el array `properties` ya cargado en generarRespuestaAgente; 0 queries extra, 0 IA).
+// Solo rubro de propiedades (inmobiliaria). Con el flag OFF NO se llaman => prompt/flujo BYTE-IDENTICOS al actual.
+// Function declarations => hoisted (se pueden llamar desde generarRespuestaAgente aunque esten declaradas aca).
+function _ragMiles(n) {
+  var x = Number(n);
+  if (!isFinite(x)) return String(n);
+  return String(Math.round(x)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+function _ragNorm(s) {
+  return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+}
+// Operaciones ACTIVAS de una propiedad (MISMA logica que el armado del inventario del prompt: venta no vendida,
+// anual no alquilada, temporal). Devuelve [{op,label,precio(Number),moneda,raw,sufijo}].
+function _ragOpsProp(p) {
+  var ops = [];
+  if (p.venta_activa && p.venta_estado !== 'vendida') ops.push({ op: 'venta', label: 'VENTA', precio: Number(p.venta_precio), moneda: 'USD', raw: p.venta_precio, sufijo: '' });
+  if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push({ op: 'alquiler_anual', label: 'ALQUILER ANUAL', precio: Number(p.anual_precio), moneda: '$', raw: p.anual_precio, sufijo: '/mes' });
+  if (p.temporal_activa) ops.push({ op: 'alquiler_temporal', label: 'ALQUILER TEMPORAL', precio: Number(p.temporal_precio_dia), moneda: '$', raw: p.temporal_precio_dia, sufijo: '/dia' });
+  return ops;
+}
+// INDICE MINIMO del inventario (~el panorama, no el catalogo): total + operaciones con rango de precio + tipos +
+// zonas con conteo + rango de dormitorios. Esta pieza es la que PRESERVA la calidad (la IA sabe QUE existe sin
+// tener el catalogo entero). Devuelve '' si no hay propiedades.
+function _construirIndiceInventario(properties) {
+  var props = Array.isArray(properties) ? properties : [];
+  if (!props.length) return '';
+  var NL = String.fromCharCode(10);
+  var nOp = { venta: 0, alquiler_anual: 0, alquiler_temporal: 0 };
+  var precios = { venta: [], alquiler_anual: [], alquiler_temporal: [] };
+  var porTipo = {}, porZona = {}, dorms = [];
+  props.forEach(function (p) {
+    _ragOpsProp(p).forEach(function (o) {
+      nOp[o.op] = (nOp[o.op] || 0) + 1;
+      if (o.raw && isFinite(o.precio)) precios[o.op].push(o.precio);
+    });
+    var t = (String(p.type || '').trim()) || 'sin tipo';
+    porTipo[t] = (porTipo[t] || 0) + 1;
+    var z = (String(p.zone || '').trim()) || 'sin zona';
+    porZona[z] = (porZona[z] || 0) + 1;
+    var d = Number(p.dormitorios);
+    if (p.dormitorios && isFinite(d)) dorms.push(d);
+  });
+  function rango(arr) { if (!arr.length) return null; return { min: Math.min.apply(null, arr), max: Math.max.apply(null, arr) }; }
+  var lineas = [];
+  lineas.push('Total de propiedades activas: ' + props.length + '.');
+  var opsTxt = [];
+  if (nOp.venta) { var rv = rango(precios.venta); opsTxt.push('venta: ' + nOp.venta + (rv ? ' (USD ' + _ragMiles(rv.min) + (rv.min !== rv.max ? ' a USD ' + _ragMiles(rv.max) : '') + ')' : '')); }
+  if (nOp.alquiler_anual) { var ra = rango(precios.alquiler_anual); opsTxt.push('alquiler anual: ' + nOp.alquiler_anual + (ra ? ' ($' + _ragMiles(ra.min) + (ra.min !== ra.max ? ' a $' + _ragMiles(ra.max) : '') + '/mes)' : '')); }
+  if (nOp.alquiler_temporal) { var rt = rango(precios.alquiler_temporal); opsTxt.push('alquiler temporal: ' + nOp.alquiler_temporal + (rt ? ' ($' + _ragMiles(rt.min) + (rt.min !== rt.max ? ' a $' + _ragMiles(rt.max) : '') + '/dia)' : '')); }
+  if (opsTxt.length) lineas.push('Operaciones disponibles (cantidad y rango de precio): ' + opsTxt.join(' | ') + '.');
+  var tipos = Object.keys(porTipo).sort(function (a, b) { return porTipo[b] - porTipo[a]; });
+  if (tipos.length) lineas.push('Tipos de propiedad: ' + tipos.map(function (t) { return t + ' (' + porTipo[t] + ')'; }).join(', ') + '.');
+  var zonas = Object.keys(porZona).sort(function (a, b) { return porZona[b] - porZona[a]; });
+  var zTop = zonas.slice(0, 60);
+  var zTxt = zTop.map(function (z) { return z + ' (' + porZona[z] + ')'; }).join(', ');
+  if (zonas.length > zTop.length) zTxt += ', y ' + (zonas.length - zTop.length) + ' zona(s) mas';
+  if (zTop.length) lineas.push('Zonas/barrios con propiedades: ' + zTxt + '.');
+  if (dorms.length) { var rd = rango(dorms); lineas.push('Dormitorios: de ' + rd.min + ' a ' + rd.max + '.'); }
+  return lineas.join(NL);
+}
+// Ficha COMPACTA de UNA propiedad (una linea): id/numero, titulo, zona, tipo, medidas, operaciones+precio, link.
+// Es el formato de los RESULTADOS de buscar_inventario y del catalogo comprimido de fail-open.
+function _fichaCompactaProp(p) {
+  if (!p) return '';
+  var id = (p.numero != null && String(p.numero).trim()) ? ('#' + String(p.numero).trim()) : ('id ' + p.id);
+  var ops = _ragOpsProp(p).map(function (o) {
+    var pr = (o.raw && isFinite(o.precio)) ? (o.moneda + ' ' + _ragMiles(o.precio) + (o.sufijo || '')) : 'consultar';
+    return o.label + ' ' + pr;
+  });
+  var partes = [id, (p.title || 'sin titulo')];
+  if (p.zone && String(p.zone).trim()) partes.push(String(p.zone).trim());
+  if (p.type && String(p.type).trim()) partes.push(String(p.type).trim());
+  var med = [];
+  if (p.dormitorios) med.push(p.dormitorios + ' dorm');
+  else if (p.rooms) med.push(p.rooms + ' amb');
+  if (p.superficie_cubierta) med.push(p.superficie_cubierta + ' m2 cub');
+  if (med.length) partes.push(med.join(' '));
+  partes.push(ops.length ? ops.join(' ; ') : 'sin operacion activa');
+  if (p.link) partes.push('link: ' + p.link);
+  return '- ' + partes.join(' | ');
+}
+// Catalogo COMPLETO comprimido (todas las propiedades, una linea c/u). Sirve de fail-open a la CALIDAD si el
+// buscador falla: se le pasa a la IA por tool_result para que NUNCA responda a ciegas.
+function _inventarioCompactoProps(properties) {
+  var props = Array.isArray(properties) ? properties : [];
+  if (!props.length) return '';
+  return props.map(_fichaCompactaProp).join(String.fromCharCode(10));
+}
+// Ficha COMPLETA de UNA propiedad (para ficha_inventario, cuando la IA ya eligio y quiere dar detalles).
+function _fichaCompletaProp(p) {
+  if (!p) return '';
+  var id = (p.numero != null && String(p.numero).trim()) ? ('#' + String(p.numero).trim()) : ('id ' + p.id);
+  var ops = _ragOpsProp(p).map(function (o) {
+    var pr = (o.raw && isFinite(o.precio)) ? (o.moneda + ' ' + _ragMiles(o.precio) + (o.sufijo || '')) : 'consultar';
+    return o.label + ': ' + pr;
+  });
+  var partes = [id + ' - ' + (p.title || 'sin titulo')];
+  if (p.zone && String(p.zone).trim()) partes.push('zona: ' + String(p.zone).trim());
+  if (p.caracteristicas && String(p.caracteristicas).trim()) partes.push(String(p.caracteristicas).trim());
+  var dir = [];
+  if (p.direccion && String(p.direccion).trim()) dir.push(String(p.direccion).trim());
+  if (p.entre_calles && String(p.entre_calles).trim()) dir.push('entre ' + String(p.entre_calles).trim());
+  if (p.ciudad && String(p.ciudad).trim()) dir.push(String(p.ciudad).trim());
+  if (dir.length) partes.push('direccion: ' + dir.join(', '));
+  if (p.type && String(p.type).trim()) partes.push('tipo: ' + String(p.type).trim());
+  if (p.rooms) partes.push('ambientes: ' + p.rooms);
+  if (p.dormitorios) partes.push('dormitorios: ' + p.dormitorios);
+  if (p.banos) partes.push('banos: ' + p.banos);
+  if (p.cocheras) partes.push('cocheras: ' + p.cocheras);
+  if (p.capacity) partes.push('capacidad: ' + p.capacity);
+  if (p.superficie_cubierta) partes.push('m2 cubiertos: ' + p.superficie_cubierta);
+  if (p.superficie_total) partes.push('m2 totales: ' + p.superficie_total);
+  if (p.expensas) partes.push('expensas: $' + p.expensas);
+  if (p.apto_credito) partes.push('apto credito');
+  if (p.antiguedad) partes.push('antiguedad: ' + p.antiguedad);
+  if (p.orientacion) partes.push('orientacion: ' + p.orientacion);
+  partes.push(ops.length ? ops.join(' ; ') : 'sin operacion activa');
+  if (p.amenities && String(p.amenities).trim()) partes.push('amenities: ' + String(p.amenities).trim());
+  if (p.link) partes.push('link: ' + p.link);
+  try {
+    var imgs = Array.isArray(p.images) ? p.images : [];
+    if (imgs.length) {
+      var cats = [];
+      imgs.forEach(function (im) { var c = im && im.categoria; if (c && cats.indexOf(c) === -1) cats.push(c); });
+      partes.push('fotos disponibles: ' + (cats.length ? cats.join(', ') : 'si (sin categorizar)'));
+    }
+  } catch (eImg) {}
+  return partes.join(' | ');
+}
+// BUSCADOR: filtro en memoria sobre `properties`. zonas = ARRAY (OR de varias zonas). operacion / tipo / rango de
+// precio / dormitorios_min / ambientes_min / capacidad_min / texto_libre. Ordena por relevancia de texto y luego
+// por precio ascendente. Devuelve hasta N (default 8, tope 12) coincidencias. PURA, sin IA.
+function _buscarInventarioProps(properties, f) {
+  var props = Array.isArray(properties) ? properties : [];
+  f = f || {};
+  var arr = props.slice();
+  var op = f.operacion ? _ragNorm(f.operacion) : '';
+  function esVenta() { return op.indexOf('venta') >= 0 || op.indexOf('compra') >= 0; }
+  function esTemp() { return op.indexOf('temporal') >= 0; }
+  function esAnual() { return (op.indexOf('anual') >= 0) || (op.indexOf('alquil') >= 0 && !esTemp()); }
+  function opActiva(p) {
+    if (esVenta()) return !!(p.venta_activa && p.venta_estado !== 'vendida');
+    if (esTemp()) return !!p.temporal_activa;
+    if (esAnual()) return !!(p.anual_activa && p.anual_estado !== 'alquilada');
+    return true;
+  }
+  function precioDe(p) {
+    if (esVenta()) return Number(p.venta_precio);
+    if (esTemp()) return Number(p.temporal_precio_dia);
+    if (esAnual()) return Number(p.anual_precio);
+    var cand = [p.venta_precio, p.anual_precio, p.temporal_precio_dia].map(Number).filter(function (x) { return isFinite(x) && x > 0; });
+    return cand.length ? Math.min.apply(null, cand) : NaN;
+  }
+  if (op) arr = arr.filter(opActiva);
+  if (Array.isArray(f.zonas) && f.zonas.length) {
+    var zs = f.zonas.map(_ragNorm).filter(Boolean);
+    if (zs.length) arr = arr.filter(function (p) {
+      var hay = _ragNorm(p.zone) + ' ' + _ragNorm(p.ciudad) + ' ' + _ragNorm(p.direccion) + ' ' + _ragNorm(p.entre_calles) + ' ' + _ragNorm(p.title);
+      return zs.some(function (q) { return hay.indexOf(q) >= 0; });
+    });
+  }
+  if (f.tipo) { var t = _ragNorm(f.tipo); if (t) arr = arr.filter(function (p) { return _ragNorm(p.type).indexOf(t) >= 0 || _ragNorm(p.title).indexOf(t) >= 0; }); }
+  if (f.dormitorios_min != null && f.dormitorios_min !== '') { var dm = Number(f.dormitorios_min); if (isFinite(dm)) arr = arr.filter(function (p) { var d = Number(p.dormitorios); return isFinite(d) ? d >= dm : false; }); }
+  if (f.ambientes_min != null && f.ambientes_min !== '') { var am = Number(f.ambientes_min); if (isFinite(am)) arr = arr.filter(function (p) { var a = Number(p.rooms); return isFinite(a) ? a >= am : false; }); }
+  if (f.capacidad_min != null && f.capacidad_min !== '') { var cm = Number(f.capacidad_min); if (isFinite(cm)) arr = arr.filter(function (p) { var c = Number(p.capacity); return isFinite(c) ? c >= cm : false; }); }
+  // Precio: si el valor esta cargado, se filtra; si es "consultar" (NaN) NO se excluye (mejor para la calidad).
+  if (f.precio_min != null && f.precio_min !== '') { var pm = Number(f.precio_min); if (isFinite(pm)) arr = arr.filter(function (p) { var v = precioDe(p); return isFinite(v) ? v >= pm : true; }); }
+  if (f.precio_max != null && f.precio_max !== '') { var px = Number(f.precio_max); if (isFinite(px)) arr = arr.filter(function (p) { var v = precioDe(p); return isFinite(v) ? v <= px : true; }); }
+  var txt = f.texto_libre ? _ragNorm(f.texto_libre) : '';
+  var palabras = txt ? txt.split(/\s+/).filter(function (w) { return w.length >= 3; }) : [];
+  function score(p) {
+    if (!palabras.length) return 0;
+    var hay = _ragNorm([p.title, p.caracteristicas, p.zone, p.type, p.amenities, p.direccion, p.ciudad].join(' '));
+    var s = 0;
+    palabras.forEach(function (w) { if (hay.indexOf(w) >= 0) s++; });
+    return s;
+  }
+  arr.sort(function (a, b) {
+    var sb = score(b) - score(a);
+    if (sb !== 0) return sb;
+    var pa = precioDe(a), pb = precioDe(b);
+    if (isFinite(pa) && isFinite(pb) && pa !== pb) return pa - pb;
+    return 0;
+  });
+  var N = (f.limite && Number(f.limite) > 0) ? Math.min(Number(f.limite), 12) : 8;
+  return arr.slice(0, N);
+}
+
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;
   const historialManual = (opciones && opciones.historialManual) || null;
@@ -4585,6 +4793,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // DISPONIBILIDAD PXSOL (gated ia_disponibilidad): ¿ofrecer la tool consultar_disponibilidad? SOLO hotel + flag ON.
   let _iaDisponibilidadOn = false;
   if (conversation_id && !modoPrueba) { try { _iaDisponibilidadOn = await iaDisponibilidadActivo(user_id, settings || undefined); } catch (eIaDi) { _iaDisponibilidadOn = false; } }
+  // RAG DE INVENTARIO (gated ia_rag_v1): ¿reemplazar el catalogo COMPLETO del prompt por el INDICE + las tools
+  // buscar_inventario / ficha_inventario? FAIL-CLOSED: con el flag OFF -> false => prompt/tools/flujo BYTE-IDENTICOS
+  // al actual. Reusa el `settings` ya cargado (0 queries extra). El _ragActivo real (que ademas exige inventario de
+  // propiedades cargado y rubro no-hotel, con fail-open a la calidad ante cualquier error) se resuelve mas abajo.
+  let _iaRagOn = false;
+  if (conversation_id && !modoPrueba) { try { _iaRagOn = await iaRagActivo(user_id, settings || undefined); } catch (eIaRag) { _iaRagOn = false; } }
   // 5 FUENTES EXTERNAS (gated c/u por su flag): dolar / clima / feriados / georef / distancia. FAIL-CLOSED:
   // con la columna ausente el helper devuelve false -> la tool NO se ofrece y el prompt+flujo son BYTE-IDENTICOS
   // al actual (codigo INERTE hasta correr migracion-5-fuentes-flags.sql). SOLO en conv REAL (no modoPrueba).
@@ -5078,6 +5292,29 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   const bloqueIANoHacer = _ic.noHacer ? ('LO QUE NO DEBES HACER (limites estrictos, respetalos siempre): ' + _ic.noHacer) : '';
   const bloqueIADatos = _ic.datosQueUsa ? ('QUE DATOS PODES USAR (de los datos del negocio cargados mas abajo, usa SOLO los que correspondan a esto): ' + _ic.datosQueUsa) : '';
 
+  // ===== RAG DE INVENTARIO (gated ia_rag_v1): resolucion FINAL =====
+  // Con el flag ON + rubro de propiedades (no hotel) + inventario cargado, la IA recibe un INDICE compacto en vez
+  // del catalogo COMPLETO, mas las tools buscar_inventario / ficha_inventario. FAIL-OPEN A LA CALIDAD: ante
+  // CUALQUIER error al armar el indice, _ragActivo queda false => se usa el inventario completo EXACTO de hoy (nunca
+  // se degrada la respuesta). FAIL-CLOSED: con el flag OFF, _iaRagOn=false => _ragActivo=false => prompt/flujo
+  // BYTE-IDENTICOS al actual. Hotel/desarrolladora NO se tocan (su inventario viaja como hoy).
+  let _ragActivo = false;
+  let _indiceInv = '';
+  let _invCompactoRag = '';
+  let _headerIndiceRag = '';
+  if (_iaRagOn && !_esHotel) {
+    try {
+      if (properties && properties.length > 0) {
+        _indiceInv = _construirIndiceInventario(properties);
+        _invCompactoRag = _inventarioCompactoProps(properties);
+        if (_indiceInv && _invCompactoRag) {
+          _ragActivo = true;
+          _headerIndiceRag = 'INVENTARIO (modo buscador): NO tenes el catalogo completo aca, solo el INDICE de abajo. Tenes dos herramientas: buscar_inventario (encontrar propiedades por zona, operacion, tipo, precio, ambientes, dormitorios o texto libre) y ficha_inventario (detalle completo de UNA propiedad por su numero/id). REGLA DURA: NUNCA nombres, ofrezcas, describas ni des por existente una propiedad concreta que no haya salido de buscar_inventario o ficha_inventario en esta conversacion; para recomendar u ofrecer algo puntual, PRIMERO busca. Para preguntas de panorama ("que tenes?", "en que zonas?", consejos, comparaciones) apoyate en el INDICE. Nunca inventes propiedades, precios ni zonas fuera del indice o de los resultados de la herramienta. INDICE DEL INVENTARIO:';
+        }
+      }
+    } catch (eRagIdx) { console.error('RAG indice:', eRagIdx && eRagIdx.message); _ragActivo = false; }
+  }
+
   // Parte ESTATICA del system: identica para el tenant entre mensajes y leads -> se CACHEA con cache_control
   // (prompt caching de Anthropic, ~-90% en relecturas). Los datos del lead (dinamicos) van en un bloque aparte.
   const systemStatic = [
@@ -5121,8 +5358,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
     // Para hotel NO se muestra "Propiedades disponibles" (usa el bloque de unidades de abajo); inmobiliaria/desarrolladora igual que siempre.
-    _esHotel ? '' : 'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:',
-    _esHotel ? '' : inventario,
+    // RAG (gated ia_rag_v1): con _ragActivo, el catalogo COMPLETO se reemplaza por el INDICE + guardrail del buscador.
+    // Con _ragActivo=false (flag OFF / hotel / sin inventario / error) estas 2 lineas son BYTE-IDENTICAS a las de hoy.
+    _esHotel ? '' : (_ragActivo ? _headerIndiceRag : 'Propiedades disponibles (usalas SOLO estas para recomendar; no inventes ni ofrezcas propiedades que no esten en esta lista). Si una propiedad tiene link, incluilo cuando la recomiendes asi el cliente ve las fotos. Distingui bien el tipo de operacion (venta, alquiler anual, alquiler temporal) y ofrece segun lo que pida el cliente:'),
+    _esHotel ? '' : (_ragActivo ? _indiceInv : inventario),
     '',
     // INVENTARIO DE HOTEL / CABAÑAS (ADITIVO + GATEADO por rubro): unidades con capacidad + tarifas por noche/temporada.
     inventarioHotel ? 'Unidades / habitaciones / cabanias disponibles (ofrecelas SOLO estas; no inventes). Distingui por capacidad y por temporada/fechas; las tarifas son POR NOCHE. Si el cliente te da fechas y cantidad de personas, cruzalas contra la capacidad y la temporada; ante dudas de disponibilidad exacta, ofrece confirmar la reserva:' : '',
@@ -5268,6 +5507,35 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // RAG DE INVENTARIO (gated ia_rag_v1): tools buscar_inventario + ficha_inventario. ADITIVO: solo se agregan con
+  // _ragActivo (flag ON + rubro propiedades + inventario cargado) => con el flag OFF NO se agregan y el prompt/flujo
+  // son BYTE-IDENTICOS al actual. Van en el prefijo CACHEADO junto al resto de las definiciones de tools. El filtro
+  // corre en memoria sobre `properties` (0 IA, 0 query). El turno de busqueda NO se cobra aparte (ver _ragToolUsado).
+  if (_ragActivo) {
+    toolsAgente.push({
+      name: 'buscar_inventario',
+      description: 'Usala para BUSCAR propiedades en el inventario segun lo que pide el lead (por zona, operacion, tipo, precio, ambientes o dormitorios). Es la UNICA forma de saber que propiedades concretas existen: NO tenes el catalogo completo, solo el indice. Llamala ANTES de nombrar, ofrecer o describir cualquier propiedad puntual. Podes pasar VARIAS zonas a la vez (se buscan con OR). Si no hay coincidencias, relaja filtros y volve a llamarla, o pedile un dato al lead; NUNCA inventes propiedades.',
+      input_schema: { type: 'object', properties: {
+        zonas: { type: 'array', items: { type: 'string' }, description: 'Una o mas zonas/barrios/ciudades donde busca el lead (ej: ["Palermo","Villa Crespo"]). Se buscan con OR (cualquiera de ellas).' },
+        operacion: { type: 'string', enum: ['venta', 'alquiler_anual', 'alquiler_temporal'], description: 'Tipo de operacion que busca el lead. Omitila si el lead no lo aclaro.' },
+        tipo: { type: 'string', description: 'Tipo de propiedad (ej: "departamento", "casa", "PH", "lote", "local"). Opcional.' },
+        precio_min: { type: 'number', description: 'Precio minimo, en la moneda de la operacion (USD para venta, $ para alquiler). Opcional.' },
+        precio_max: { type: 'number', description: 'Precio maximo, en la moneda de la operacion. Opcional.' },
+        dormitorios_min: { type: 'integer', description: 'Cantidad minima de dormitorios. Opcional.' },
+        ambientes_min: { type: 'integer', description: 'Cantidad minima de ambientes. Opcional.' },
+        capacidad_min: { type: 'integer', description: 'Capacidad minima de personas (util para alquiler temporal). Opcional.' },
+        texto_libre: { type: 'string', description: 'Palabras clave sueltas del pedido (ej: "luminoso con patio", "a estrenar", "vista al mar"). Opcional.' }
+      }, required: [] }
+    });
+    toolsAgente.push({
+      name: 'ficha_inventario',
+      description: 'Usala cuando ya identificaste UNA propiedad concreta (por su numero/id, salido de buscar_inventario) y queres su DETALLE completo para darle datos precisos al lead (medidas, expensas, amenities, direccion, fotos disponibles). Para MANDAR una foto usa enviar_foto_propiedad. No inventes datos: si la propiedad no aparece, volve a buscar con buscar_inventario.',
+      input_schema: { type: 'object', properties: {
+        id: { type: 'string', description: 'El numero/id de la propiedad tal como figura en los resultados de buscar_inventario (ej: "12").' }
+      }, required: ['id'] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -5338,6 +5606,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // no existe) -> el return es identico al actual. 0 tokens: NO hacemos 2do turno de cortesia; reusamos el texto que
   // el agente ya escribio junto a la tool (o un fallback fijo) como reply.
   let _pidioDerivarV3 = false, _derivarMotivoV3 = null, _derivarDeptoV3 = null;
+  // RAG DE INVENTARIO (gated ia_rag_v1): marca si la IA uso buscar_inventario / ficha_inventario en ESTA respuesta.
+  // Se usa al final para NO cobrar el turno de busqueda como mensaje extra (plan Principio 2 / decision Diego #1:
+  // sigue 1 mensaje por respuesta; el RAG es ahorro de Diego, no gasto del cliente). Con el flag OFF queda false =>
+  // el flag `usoTool` que se retorna es BYTE-IDENTICO al actual.
+  let _ragToolUsado = false;
   // PARTE B (punto 6 / regla 19): ¿la IA pidio consultar_al_dueno? Lo manejamos ANTES de la tool de foto. Registra
   // la duda + avisa al dueno (registrarConsultaAprendizaje, sin tokens de IA en ese paso) y hace un SEGUNDO turno
   // para que la IA cierre con un mensaje natural al lead ("lo consulto y te confirmo"). Gateado: la tool solo existe
@@ -5393,6 +5666,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     const _toolFeriados = _iaFeriadosOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'feriados_ar'; }) : null;
     const _toolGeoref = _iaGeorefOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'normalizar_direccion_ar'; }) : null;
     const _toolOsrm = _iaOsrmOn ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'distancia_viaje'; }) : null;
+    // RAG DE INVENTARIO (gated ia_rag_v1): ¿la IA pidio buscar_inventario / ficha_inventario? Solo se detectan con
+    // _ragActivo => con el flag OFF la rama nunca se entra (ACTUAL EXACTO).
+    const _toolBuscarInv = _ragActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_inventario'; }) : null;
+    const _toolFichaInv = _ragActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ficha_inventario'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       let _resCercaTxt = '';
@@ -5719,6 +5996,54 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         }
       } catch (eOs) { console.error('tool distancia_viaje:', eOs && eOs.message); _resOsrmTxt = 'No se pudo calcular la distancia ahora. Segui la conversacion sin inventar distancias ni tiempos.'; }
       reply = await _cerrarTurnoFuente(_toolOsrm, _resOsrmTxt, 'distancia', _textoPrevioOs, 'Dejame chequear esa distancia y te confirmo.');
+    } else if (_toolBuscarInv) {
+      // RAG (gated ia_rag_v1): la IA pidio buscar_inventario. Filtro en memoria sobre `properties` (0 IA, 0 query)
+      // + 2do turno para que redacte (usage acumulado en _cerrarTurnoFuente). La tool solo existe con _ragActivo =>
+      // nunca se entra con el flag OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
+      _ragToolUsado = true;
+      const _NLbi = String.fromCharCode(10);
+      const _textoPrevioBi = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resBiTxt = '';
+      try {
+        const _inpBi = _toolBuscarInv.input || {};
+        const _resBi = _buscarInventarioProps(properties, {
+          zonas: _inpBi.zonas, operacion: _inpBi.operacion, tipo: _inpBi.tipo,
+          precio_min: _inpBi.precio_min, precio_max: _inpBi.precio_max,
+          dormitorios_min: _inpBi.dormitorios_min, ambientes_min: _inpBi.ambientes_min,
+          capacidad_min: _inpBi.capacidad_min, texto_libre: _inpBi.texto_libre
+        });
+        if (!_resBi.length) {
+          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
+          _resBiTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes propiedades. Opciones: (a) relaja algun filtro (ampli el rango de precio o suma zonas) y volve a llamar buscar_inventario; (b) pedile al lead un dato que acote mejor (zona, presupuesto, ambientes). Para referencia, este es el panorama del inventario:' + _NLbi + _indiceInv;
+        } else {
+          _resBiTxt = 'Resultados del inventario (' + _resBi.length + '; usa SOLO estos, no inventes otros). Para dar fotos o el detalle completo de una, usa ficha_inventario con su numero:' + _NLbi + _resBi.map(_fichaCompactaProp).join(_NLbi) + _NLbi + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su precio y link si tiene. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.';
+        }
+      } catch (eBi) {
+        console.error('tool buscar_inventario:', eBi && eBi.message);
+        // FAIL-OPEN A LA CALIDAD: si el buscador falla, le pasamos el CATALOGO COMPLETO comprimido para que la IA NO
+        // responda a ciegas (nunca degradar la respuesta; el costo extra es raro y solo ante error).
+        _resBiTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el CATALOGO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbi + (_invCompactoRag || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
+      }
+      reply = await _cerrarTurnoFuente(_toolBuscarInv, _resBiTxt, 'buscar-inventario', _textoPrevioBi, 'Dejame buscar en el inventario y te paso opciones.');
+    } else if (_toolFichaInv) {
+      // RAG (gated ia_rag_v1): detalle completo de UNA propiedad por numero/id (sobre `properties` en memoria).
+      _ragToolUsado = true;
+      const _NLfi = String.fromCharCode(10);
+      const _textoPrevioFi = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resFiTxt = '';
+      try {
+        const _inpFi = _toolFichaInv.input || {};
+        const _idRaw = (_inpFi.id != null && _inpFi.id !== '') ? _inpFi.id : (_inpFi.numero != null ? _inpFi.numero : '');
+        const _idPed = String(_idRaw).trim();
+        let _pFi = null;
+        if (_idPed) _pFi = (properties || []).find(function(p){ return (p.numero != null && String(p.numero).trim() === _idPed) || (p.id != null && String(p.id).trim() === _idPed); });
+        if (!_pFi) {
+          _resFiTxt = 'No encontre una propiedad con ese numero/id (' + _idPed + '). Volve a buscar con buscar_inventario o pedile al lead que aclare cual le interesa. No inventes datos.';
+        } else {
+          _resFiTxt = 'Ficha completa de la propiedad pedida (usa SOLO estos datos):' + _NLfi + _fichaCompletaProp(_pFi) + _NLfi + 'Para mandarle una FOTO usa enviar_foto_propiedad con el numero. No inventes datos que no figuren aca.';
+        }
+      } catch (eFi) { console.error('tool ficha_inventario:', eFi && eFi.message); _resFiTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del inventario, sin inventar.'; }
+      reply = await _cerrarTurnoFuente(_toolFichaInv, _resFiTxt, 'ficha-inventario', _textoPrevioFi, 'Dejame traer los detalles y te confirmo.');
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
@@ -5892,7 +6217,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }
 
   // COBRO v2: flags para que el caller cobre +1 si hubo traducción saliente y +1 si la IA usó una tool (foto/consultar).
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use'), pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3 };
+  // RAG (gated ia_rag_v1): si la respuesta uso buscar_inventario/ficha_inventario, NO se cuenta como "uso de tool"
+  // para el cobro (plan Principio 2 / decision Diego #1: la busqueda no se cobra aparte; sigue 1 msg por respuesta).
+  // Con el flag OFF, _ragToolUsado=false => usoTool es BYTE-IDENTICO al actual. Si Diego decide cobrarla, quitar el
+  // `&& !_ragToolUsado`.
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3 };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier

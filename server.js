@@ -6808,6 +6808,48 @@ app.get('/health/deep', async (req, res) => {
   const payload = { status: degradado ? 'degraded' : 'ok', ts: Date.now(), protected: protegido, checks: checks };
   res.status(degradado ? 503 : 200).json(payload);
 });
+// ===== TEMP DIAG PAUTA (read-only, se BORRA) — guard ?k=rz-diag-pauta-9f =====
+app.get('/_diag-pauta2', async (req, res) => {
+  try {
+    if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
+    const out = {};
+    // 1) user_id de Anton
+    const { data: bs } = await supabase.from('business_settings').select('user_id, company_name, ia_pauta_meta').ilike('company_name', '%anton%');
+    out.anton = (bs || []).map(function(b){ return { user_id: b.user_id, company: b.company_name, flag: b.ia_pauta_meta }; });
+    const uid = bs && bs[0] && bs[0].user_id;
+    if (!uid) { out.err = 'no anton'; return res.json(out); }
+    // 2) contacto Dani Navarro
+    const { data: cts } = await supabase.from('contacts').select('id, name, phone, created_at').eq('user_id', uid).ilike('name', '%dani%');
+    out.contactos = cts || [];
+    // 3) por cada contacto Dani: conversation + primer mensaje humano + total + tiene pauta
+    out.convs = [];
+    for (const c of (cts || [])) {
+      const { data: cv } = await supabase.from('conversations').select('id, created_at, last_message').eq('user_id', uid).eq('contact_id', c.id).maybeSingle();
+      if (!cv) continue;
+      const { data: prim } = await supabase.from('messages').select('created_at, role, content').eq('conversation_id', cv.id).order('created_at', { ascending: true }).limit(1);
+      const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('conversation_id', cv.id);
+      const { data: pta } = await supabase.from('messages').select('created_at, pauta_meta').eq('conversation_id', cv.id).not('pauta_meta', 'is', null).limit(3);
+      out.convs.push({ contacto: c.name, conv_id: cv.id, conv_creada: cv.created_at, primer_msg: prim && prim[0], total_msgs: count, con_pauta: pta || [] });
+    }
+    // 4) TODOS los mensajes de Anton con pauta_meta (para ver desde cuando captura)
+    const { data: convIds } = await supabase.from('conversations').select('id').eq('user_id', uid);
+    const ids = (convIds || []).map(function(x){ return x.id; });
+    let allPauta = [];
+    if (ids.length) {
+      // chunk para no pasar limite de .in()
+      for (let i = 0; i < ids.length; i += 100) {
+        const chunk = ids.slice(i, i + 100);
+        const { data: mp } = await supabase.from('messages').select('created_at, conversation_id, content, pauta_meta').in('conversation_id', chunk).not('pauta_meta', 'is', null);
+        if (mp && mp.length) allPauta = allPauta.concat(mp);
+      }
+    }
+    allPauta.sort(function(a,b){ return String(b.created_at).localeCompare(String(a.created_at)); });
+    out.total_convs_anton = ids.length;
+    out.total_msgs_con_pauta = allPauta.length;
+    out.ejemplos_pauta = allPauta.slice(0, 10).map(function(m){ return { fecha: m.created_at, txt: String(m.content || '').slice(0, 40), pauta: m.pauta_meta }; });
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ e: e && e.message }); }
+});
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
 
 // Endpoint para probar el agente desde el CRM (escribir como cliente)

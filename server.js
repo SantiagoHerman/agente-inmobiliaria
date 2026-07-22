@@ -770,10 +770,10 @@ function precioPlanARS(nivel) {
 }
 
 // ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====
-// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 9.000 msgs) a USD 0,05 c/u x dolar.
-// Recarga: pago UNICO (Checkout Pro) para sumar mensajes al pool, min 200 a USD 0,06 c/u x dolar (requiere plan activo).
+// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 9.000 msgs) a USD 0,06 c/u x dolar.
+// Recarga: pago UNICO (Checkout Pro) para sumar mensajes al pool, min 200 a USD 0,08 c/u x dolar (requiere plan activo).
 // Ambos precios atados al MISMO dolar ratchet (dolarRefSync) que los planes fijos.
-const PERSONAL_USD_POR_MSG = 0.05;
+const PERSONAL_USD_POR_MSG = 0.06;
 const PERSONAL_MIN_MSGS = 9000;
 const PERSONAL_MAX_MSGS = 2000000; // tope de cordura: evita montos absurdos por typo/manipulacion
 const RECARGA_USD_POR_MSG = 0.08;

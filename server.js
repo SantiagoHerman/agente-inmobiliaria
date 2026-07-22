@@ -10310,29 +10310,6 @@ async function resetearWebhooksNivel2() {
 }
 setTimeout(resetearWebhooksNivel2, 120 * 1000); // ~2 min despues de arrancar (cuando ya esta estable)
 
-// ===== TEMP DIAG (Diego 2026-07-22): estado de ia-pauta-meta (migracion + mensajes con aviso). BORRAR despues. =====
-app.get('/api/maestro/_diag-pauta', async function (req, res) {
-  try {
-    if ((req.query.k || '') !== 'rz-pauta-diag-9x2Qp7Kv3Rt8Lz') return res.status(404).end();
-    const out = {};
-    try {
-      const { data, error } = await supabase.from('business_settings').select('company_name, ia_pauta_meta, congelada');
-      if (error) out.flag_columna = 'AUSENTE / error (migracion NO corrida): ' + (error.message || 'x');
-      else {
-        out.flag_columna = 'existe';
-        out.cuentas_ON = (data || []).filter(function (r) { return r.ia_pauta_meta === true; }).map(function (r) { return r.company_name; });
-        out.cuentas_OFF = (data || []).filter(function (r) { return r.ia_pauta_meta !== true; }).map(function (r) { return (r.company_name || '?') + (r.congelada ? ' (congelada)' : ''); });
-      }
-    } catch (e) { out.flag_columna = 'error: ' + ((e && e.message) || 'x'); }
-    try {
-      const { data, error } = await supabase.from('messages').select('created_at, pauta_meta').not('pauta_meta', 'is', null).order('created_at', { ascending: false }).limit(8);
-      if (error) out.pauta_meta_columna = 'AUSENTE / error: ' + (error.message || 'x');
-      else { out.mensajes_con_aviso = (data || []).length; out.ejemplos = (data || []).map(function (m) { return { fecha: m.created_at, aviso: m.pauta_meta }; }); }
-    } catch (e) { out.pauta_meta_columna = 'error: ' + ((e && e.message) || 'x'); }
-    return res.json({ ok: true, diag: out });
-  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'error' }); }
-});
-
 // POST /api/whatsapp/conectar -> crea (o reusa) la instancia del user y devuelve el QR
 app.post('/api/whatsapp/conectar', async (req, res) => {
   try {

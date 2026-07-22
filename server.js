@@ -749,15 +749,18 @@ async function actualizarDolarRef() {
 
 // Precios BASE en ARS a dolar_ref=1530 (los 4 planes fijos). A 1530 dan EXACTO estos valores; si el blue sube, suben proporcional.
 const BASE_PESOS = { basico: 55000, pro: 130000, premium: 350000, enterprise: 620000 };
+// Redondeo "limpio" de precios: al proximo multiplo de 5000 HACIA ARRIBA (Diego 2026-07-22, sin centavos).
+function _redondear5000(x) { return Math.ceil(x / 5000) * 5000; }
 function precioPlanARS(nivel) {
   var base = BASE_PESOS[nivel];
   if (typeof base === 'undefined' || base === null) return null;
   var ref = dolarRefSync();
   if (!ref || !isFinite(ref) || ref < DOLAR_REF_BASE) ref = DOLAR_REF_BASE;
-  // REDONDEO (Diego 2026-07-22): sin centavos, siempre al proximo multiplo de 5000 HACIA ARRIBA (precio "limpio").
-  // Ej: 131.275 -> 135.000, 353.431 -> 355.000, 626.078 -> 630.000. A dolar base 1530 los 4 planes ya son multiplos
-  // de 5000, asi que no cambian; recien sube en escalones de 5000 cuando el dolar empuja el precio por encima.
-  return Math.ceil((base * ref / DOLAR_REF_BASE) / 5000) * 5000;
+  var bruto = base * ref / DOLAR_REF_BASE;
+  // REDONDEO (Diego 2026-07-22): al proximo multiplo de 5000 HACIA ARRIBA. Ej 131.275->135.000, 353.431->355.000,
+  // 626.078->630.000. BASICO queda SIN redondear (Diego: que no salte a 60.000, ~55.500). A dolar base 1530 los planes
+  // ya son multiplos de 5000; recien suben en escalones de 5000 cuando el dolar los empuja arriba.
+  return (nivel === 'basico') ? Math.round(bruto) : _redondear5000(bruto);
 }
 
 // ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====
@@ -775,12 +778,12 @@ function _dolarSeguro() { var ref = dolarRefSync(); return (!ref || !isFinite(re
 function precioPersonalARS(cantMsgs) {
   var n = parseInt(cantMsgs, 10);
   if (!Number.isSafeInteger(n) || n < PERSONAL_MIN_MSGS || n > PERSONAL_MAX_MSGS) return null;
-  return Math.round(n * PERSONAL_USD_POR_MSG * _dolarSeguro());
+  return _redondear5000(n * PERSONAL_USD_POR_MSG * _dolarSeguro()); // redondeo a 5000 (Diego 2026-07-22)
 }
 function precioRecargaARS(cantMsgs) {
   var n = parseInt(cantMsgs, 10);
   if (!Number.isSafeInteger(n) || n < RECARGA_MIN_MSGS || n > RECARGA_MAX_MSGS) return null;
-  return Math.round(n * RECARGA_USD_POR_MSG * _dolarSeguro());
+  return _redondear5000(n * RECARGA_USD_POR_MSG * _dolarSeguro()); // redondeo a 5000 (Diego 2026-07-22)
 }
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)

@@ -6809,9 +6809,13 @@ app.get('/health/deep', async (req, res) => {
   res.status(degradado ? 503 : 200).json(payload);
 });
 // ===== TEMP DIAG PAUTA (read-only, se BORRA) — guard ?k=rz-diag-pauta-9f =====
+// Ring buffer en memoria: graba el SHAPE de mensajes entrantes que mencionen un aviso (externalAdReply/sourceUrl).
+globalThis._diagPautaRB = globalThis._diagPautaRB || [];
 app.get('/_diag-pauta2', async (req, res) => {
   try {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
+    // vista rapida del ring buffer (shapes crudos capturados en el webhook)
+    if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
     const out = {};
     // 1) user_id de Anton
     const { data: bs } = await supabase.from('business_settings').select('user_id, company_name, ia_pauta_meta').ilike('company_name', '%anton%');
@@ -7737,6 +7741,34 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     const msg = data.message || {};
     let texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
+    // ===== TEMP DIAG PAUTA (se BORRA): graba el shape crudo de mensajes que mencionen un aviso =====
+    try {
+      const _rawStr = JSON.stringify(data);
+      if (_rawStr.indexOf('externalAdReply') >= 0 || _rawStr.indexOf('sourceUrl') >= 0 || _rawStr.indexOf('sourceId') >= 0) {
+        globalThis._diagPautaRB = globalThis._diagPautaRB || [];
+        const _cands = {
+          'extendedTextMessage.contextInfo': msg.extendedTextMessage && msg.extendedTextMessage.contextInfo,
+          'imageMessage.contextInfo': msg.imageMessage && msg.imageMessage.contextInfo,
+          'videoMessage.contextInfo': msg.videoMessage && msg.videoMessage.contextInfo,
+          'msg.messageContextInfo': msg.messageContextInfo,
+          'msg.contextInfo': msg.contextInfo,
+          'data.contextInfo': data.contextInfo
+        };
+        let _foundPath = null, _foundEar = null;
+        for (const _k in _cands) { if (_cands[_k] && _cands[_k].externalAdReply) { _foundPath = _k; _foundEar = _cands[_k].externalAdReply; break; } }
+        globalThis._diagPautaRB.unshift({
+          ts: new Date().toISOString(),
+          tel: telefono,
+          txt: String(texto || '').slice(0, 60),
+          msgKeys: Object.keys(msg),
+          rawTieneEAR: _rawStr.indexOf('externalAdReply') >= 0,
+          pathEncontrado: _foundPath,
+          ear: _foundEar ? { title: _foundEar.title, body: _foundEar.body, sourceUrl: _foundEar.sourceUrl, sourceId: _foundEar.sourceId } : null,
+          rawSnippet: _foundPath ? null : _rawStr.slice(0, 1500)
+        });
+        if (globalThis._diagPautaRB.length > 40) globalThis._diagPautaRB.length = 40;
+      }
+    } catch (eDiagRB) {}
     // Detectar multimedia entrante
     let tipoMediaEntrante = null;
     // UBICACION ENTRANTE: lat/lng vienen en locationMessage (Baileys: degreesLatitude/degreesLongitude). Antes esto caia

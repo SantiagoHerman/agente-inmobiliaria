@@ -2765,7 +2765,7 @@ async function procesarRespuestaAprendizaje(user_id, respuestaDueno, instancia, 
 //   columna OPCIONAL departamentos.responsable_id (DEFENSIVO: si la columna no existe o no hay
 //   responsable disponible, cae al equitativo). Si no hay ningun candidato disponible -> null
 //   (derivarAHumano ya encola + avisa al dueno). Esta funcion NO escribe nada, solo elige.
-async function elegirAsesorParaDepartamento(user_id, departamentoId) {
+async function elegirAsesorParaDepartamento(user_id, departamentoId, excluirIds) {
   try {
     if (!user_id || !departamentoId) return null;
     // 1) Miembros del departamento. PARTE A (punto 8): ademas del asesor_id traemos `modo` para quedarnos
@@ -2827,7 +2827,13 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId) {
     // pool de seleccion (responsable_fijo + equitativo) se restringe a humanos y los IA se ignoran.
     const humanos = candidatos.filter(function(a){ return a.es_ia !== true; });
     const efectivos = humanos.length ? humanos : candidatos; // si no hay humanos, quedan los IA disponibles
-    const idsCand = efectivos.map(function(a){ return a.id; });
+    let idsCand = efectivos.map(function(a){ return a.id; });
+    // FIX ping-pong rotacion: excluir a los asesores YA INTENTADOS en la vuelta actual (los que la rotacion ya probo
+    // sin respuesta), para no re-elegirlos y poder rotar por TODOS los del depto. `excluirIds` es OPCIONAL: sin el (o
+    // vacio) el comportamiento es EXACTAMENTE el de hoy (ningun caller viejo lo pasa -> idsCand queda identico).
+    if (Array.isArray(excluirIds) && excluirIds.length) {
+      idsCand = idsCand.filter(function(id){ return excluirIds.indexOf(id) < 0; });
+    }
     // 3) modo_reparto del depto + (opcional) responsable_id. DEFENSIVO ante columna inexistente.
     let modoReparto = 'equitativo';
     let responsableId = null;
@@ -3656,6 +3662,10 @@ async function _limpiarRotacionV3(convId) {
     // derivacion_sin_nadie_desde) no existen todavia, este catch lo traga SIN afectar el reset de arriba (que usa
     // columnas viejas). Con el flag OFF esta funcion no se llama por leads reales.
     try { await supabase.from('conversations').update({ derivacion_aviso_dueno: false, derivacion_sin_nadie_desde: null }).eq('id', convId); } catch (eAd) {}
+    // FIX ping-pong: resetear el set de "ya intentados" de la vuelta de rotacion. UPDATE APARTE/best-effort: si la
+    // columna derivacion_intentados no existe todavia (migracion no corrida), este catch lo traga SIN afectar los
+    // resets de arriba. Asi cada rotacion nueva arranca la vuelta limpia (al FINALIZAR y al CANCELAR).
+    try { await supabase.from('conversations').update({ derivacion_intentados: null }).eq('id', convId); } catch (eInt) {}
     try { _rotacionV3AnuncioLead.delete(convId); } catch (eS) {}
   } catch (e) {}
 }
@@ -3672,12 +3682,16 @@ async function _limpiarRotacionV3(convId) {
 //    asesor_id: null -> .is('asesor_id', null); no-null -> .eq('asesor_id', <id>)). Si NO matchea ninguna fila, otro
 //    proceso gano (toma/asignacion/cancelacion/finalizacion manual): devuelve false y el cron NO renotifica ni loguea.
 //    Con `preImage` NO se usa el fallback degradado (los guards viven en columnas de rotacion; si no existen, no rota).
-async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional, preImage) {
+async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional, preImage, intentados) {
   const _upd = {
     asesor_id: asesorId, ultimo_asesor_id: asesorId,
     derivacion_rotando: true, derivacion_depto_id: deptoId || null, derivacion_ultimo_intento: nowIso,
     updated_at: nowIso
   };
+  // FIX ping-pong: persistir el set de asesores YA INTENTADOS en esta vuelta. Solo cuando el caller lo pasa (array) ->
+  // implica que la columna existe (el cron ya la sondeo). Aditivo/best-effort: si por lo que fuera la columna faltara,
+  // el catch de mas abajo degrada al UPDATE minimo (identico al previo). Sin este param -> _upd IDENTICO al de hoy.
+  if (Array.isArray(intentados)) { _upd.derivacion_intentados = intentados; }
   // BUG 1a (derivacion-v3-refinements): al asignar/rotar a un asesor REAL (asesorId no-null) se CIERRA el streak
   // "sin nadie": derivacion_sin_nadie_desde=null (proxima ausencia arranca un ancla nueva) y derivacion_aviso_dueno=
   // false (rearmar el aviso al dueno para un segundo streak real sin nadie). SOLO cuando asesorId es no-null: si fuera
@@ -3733,6 +3747,10 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (!_cv) return { ok: false };
     if (_cv.asesor_id || _cv.admin_tomo === true) return { ok: false, yaTomado: true }; // ya hay humano a cargo
     if (_cv.ai_enabled === false) return { ok: false }; // IA apagada: un humano ya intervino
+    // FIX ping-pong: arranque LIMPIO de la vuelta de rotacion (reset del set de "ya intentados"). Aditivo/best-effort:
+    // si la columna derivacion_intentados no existe (migracion no corrida), este catch lo traga (no-op) y todo sigue
+    // como hoy. Asi una rotacion nueva nunca hereda intentados viejos (ademas de _limpiarRotacionV3 al terminar).
+    try { await supabase.from('conversations').update({ derivacion_intentados: null }).eq('id', convId); } catch (eFreshInt) {}
     // Resolver el depto objetivo (FIX 3): PRECEDENCIA -> (1) hint del agente (opts.deptoHint = nombre de la tool) si
     // resuelve a un depto ACTIVO valido del owner; (2) el de la conv (departamento_id, que el clasificador congela
     // apenas deduce uno); (3) el es_default. El hint MANDA sobre el depto viejo de la conv porque el lead pudo pivotear
@@ -3981,12 +3999,22 @@ async function revisarRotacionDerivacionV3() {
   try {
     const ahoraMs = Date.now();
     let rotando = [];
+    let _tieneIntentados = false; // ¿existe conversations.derivacion_intentados? (deploy-safe: sin ella caemos al flujo actual)
+    // Columnas base (identicas a las de hoy) + intentamos ademas la columna nueva `derivacion_intentados`. RETRY
+    // DEFENSIVO (mismo patron de fallback de columnas que elegirAsesorParaDepartamento): si el SELECT con la columna
+    // nueva falla (migracion no corrida), reintentamos el MISMO select SIN ella -> intentados undefined -> flujo ACTUAL.
+    const _colsBase = 'id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, derivacion_sin_nadie_desde, contact_id';
     try {
-      const { data, error } = await supabase.from('conversations')
-        .select('id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, derivacion_sin_nadie_desde, contact_id')
-        .eq('derivacion_rotando', true);
-      if (error) return; // columna ausente (migracion no corrida) -> nada que hacer (comportamiento actual)
-      rotando = data || [];
+      const r1 = await supabase.from('conversations').select(_colsBase + ', derivacion_intentados').eq('derivacion_rotando', true);
+      if (r1.error) {
+        // La columna nueva puede no existir aun: reintentar el MISMO select SIN ella (identico al de hoy).
+        const r2 = await supabase.from('conversations').select(_colsBase).eq('derivacion_rotando', true);
+        if (r2.error) return; // otra causa (columna base ausente) -> nada que hacer (comportamiento actual)
+        rotando = r2.data || [];
+      } else {
+        rotando = r1.data || [];
+        _tieneIntentados = true;
+      }
     } catch (eSel) { return; }
     if (!rotando.length) return;
     const _flagCache = {};   // derivacion_v3 ON? por tenant
@@ -4041,8 +4069,15 @@ async function revisarRotacionDerivacionV3() {
         try { if (conv.contact_id) { const { data: _c } = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', conv.contact_id).maybeSingle(); _leadRef = (_c && (_c.nombre_manual || _c.name || _c.phone)) || null; } } catch (eLr) {}
         const _deptoId = conv.derivacion_depto_id || conv.departamento_id || null;
         let _siguiente = null;
+        let _resetVuelta = false; // el picker reinicio la vuelta (ya se habian intentado TODOS) -> arrancar set nuevo
         if (_deptoId) {
-          try { _siguiente = await _elegirSiguienteRotacionV3(ownerId, _deptoId, conv.asesor_id); } catch (eSig) { _siguiente = null; }
+          // FIX ping-pong: pasar el set de YA INTENTADOS de esta vuelta (solo si la columna existe) para rotar por TODOS
+          // los del depto, no solo los 2 de menor carga. Sin la columna (_tieneIntentados=false) -> undefined -> flujo ACTUAL.
+          try {
+            const _ri = _tieneIntentados ? (Array.isArray(conv.derivacion_intentados) ? conv.derivacion_intentados : []) : undefined;
+            const _r = await _elegirSiguienteRotacionV3(ownerId, _deptoId, conv.asesor_id, _ri);
+            if (_r) { _siguiente = _r.asesor || null; _resetVuelta = !!_r.reset; }
+          } catch (eSig) { _siguiente = null; }
         } else {
           try { _siguiente = await elegirAsesorActivo(ownerId); } catch (ePa) { _siguiente = null; }
         }
@@ -4054,17 +4089,32 @@ async function revisarRotacionDerivacionV3() {
         // de rotación (toma manual / IA off) también (se chequea arriba). NO tocamos el timer ni asesor_id.
         if (_siguiente && conv.asesor_id && String(_siguiente) === String(conv.asesor_id)) continue;
         if (_siguiente) {
+          // FIX ping-pong: construir el nuevo set de intentados de la vuelta (SOLO si la columna existe -> deploy-safe).
+          //  - vuelta reiniciada (_resetVuelta): ya se probaron TODOS -> arranca limpia con el nuevo asignado [_siguiente];
+          //  - continua la vuelta: set previo + el actual que fallo (conv.asesor_id) + el nuevo asignado (_siguiente), unicos.
+          // Con la columna ausente (_tieneIntentados=false) -> undefined -> _asignarRotacionV3 NO toca esa columna (identico).
+          let _nuevoIntentados = undefined;
+          if (_tieneIntentados && _deptoId) {
+            if (_resetVuelta) {
+              _nuevoIntentados = [_siguiente];
+            } else {
+              const _prev = Array.isArray(conv.derivacion_intentados) ? conv.derivacion_intentados.slice() : [];
+              if (conv.asesor_id && _prev.indexOf(conv.asesor_id) < 0) _prev.push(conv.asesor_id);
+              if (_prev.indexOf(_siguiente) < 0) _prev.push(_siguiente);
+              _nuevoIntentados = _prev;
+            }
+          }
           // Reasignar CONDICIONAL (FIX 1+4): optimistic concurrency contra el snapshot del batch (preImage). Si otro
           // proceso gano en el interin (toma/asignacion manual que puso asesor_id + _limpiarRotacionV3 -> rotando=false;
           // o un humano que finalizo -> ai_enabled=false/status listo_humano), el UPDATE NO matchea -> NO reasignar, NO
           // renotificar, NO loguear: tratar como skip (respetar al humano). Solo notificamos si tocamos una fila.
-          const _reOk = await _asignarRotacionV3(conv.id, _siguiente, _deptoId, nowIso, false, { asesor_id: (conv.asesor_id || null) });
+          const _reOk = await _asignarRotacionV3(conv.id, _siguiente, _deptoId, nowIso, false, { asesor_id: (conv.asesor_id || null) }, _nuevoIntentados);
           if (!_reOk) { continue; } // otro proceso gano (toma/asignacion/cancelacion/finalizacion manual): skip
           // HISTORIAL DE PASES INMUTABLE: la rotacion pasa el lead al siguiente asesor porque el anterior no respondio.
           // Origen = quien lo tenia (conv.asesor_id; null si estaba sin asesor -> "la IA"). Destino = _siguiente. Append-only.
           try { await registrarPaseAsesor(conv.id, ownerId, (conv.asesor_id || null), _siguiente, 'La IA'); } catch (ePase) {}
           await _notificarRotacionV3(ownerId, conv.id, _siguiente, _leadRef, !!conv.asesor_id);
-          console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)'));
+          console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)') + (_resetVuelta ? ' [vuelta reiniciada]' : ''));
         } else {
           // Sigue sin nadie disponible. La IA sigue atendiendo. NO se toca asesor_id (puede seguir null o el anterior,
           // que tampoco respondio). NO renovamos derivacion_ultimo_intento en esta rama: eso hace que el cron REINTENTE
@@ -4140,16 +4190,40 @@ async function revisarRotacionDerivacionV3() {
 // Reusa el picker equitativo (elegirAsesorParaDepartamento) y, si devuelve el mismo que ya estaba y hay otros
 // disponibles, elige uno distinto. Si el unico disponible es el actual, lo devuelve igual (mejor que dejarlo solo).
 // 0 tokens de IA (solo SQL). Defensivo: ante error, null.
-async function _elegirSiguienteRotacionV3(ownerId, deptoId, actualAsesorId) {
+// FIX ping-pong: `intentados` (array OPCIONAL) = asesores YA probados en la vuelta actual (persistidos en
+// conversations.derivacion_intentados). Devuelve { asesor, reset } o null (nadie en absoluto):
+//   - reset=false: rotacion normal por un asesor NUEVO (excluye intentados + el actual);
+//   - reset=true : ya se habian probado TODOS los disponibles -> NO frenar (decision de Diego): REINICIAR la vuelta y
+//     seguir rotando por todos otra vez (el caller arranca el set nuevo). Nunca detiene ni escala-con-freno.
+// Si `intentados` es undefined (columna ausente / migracion no corrida) -> comportamiento IDENTICO al de hoy: excluir
+// SOLO al actual, con el reintento por desempate aleatorio. Reusa el picker equitativo elegirAsesorParaDepartamento.
+async function _elegirSiguienteRotacionV3(ownerId, deptoId, actualAsesorId, intentados) {
   try {
-    const _pick = await elegirAsesorParaDepartamento(ownerId, deptoId);
-    if (!_pick) return null;
-    if (!actualAsesorId || _pick !== actualAsesorId) return _pick;
-    // El picker devolvio al mismo de antes: intentar encontrar OTRO disponible del depto (reusa el estado del depto).
-    // Como elegirAsesorParaDepartamento ya aplica disponibilidad+horario+equitativo, un segundo llamado puede devolver
-    // otro por el desempate aleatorio; si no, nos quedamos con el actual (no dejar al lead sin nadie).
-    const _pick2 = await elegirAsesorParaDepartamento(ownerId, deptoId);
-    return _pick2 || _pick;
+    // Caso SIN registro de intentados (deploy-safe): EXACTAMENTE lo de hoy — excluir solo al actual, con el reintento
+    // por desempate aleatorio si el picker devolvio al mismo. Se envuelve en { asesor, reset:false } para el caller.
+    if (!Array.isArray(intentados)) {
+      const _pick = await elegirAsesorParaDepartamento(ownerId, deptoId);
+      if (!_pick) return null;
+      if (!actualAsesorId || _pick !== actualAsesorId) return { asesor: _pick, reset: false };
+      const _pick2 = await elegirAsesorParaDepartamento(ownerId, deptoId);
+      return { asesor: (_pick2 || _pick), reset: false };
+    }
+    // Caso CON registro de intentados: excluir a TODOS los ya probados en la vuelta + el actual, para rotar por
+    // asesores NUEVOS del depto (mata el ping-pong: ya no vuelve siempre a los 2 de menor carga).
+    const _excl = intentados.slice();
+    if (actualAsesorId && _excl.indexOf(actualAsesorId) < 0) _excl.push(actualAsesorId);
+    const _pick = await elegirAsesorParaDepartamento(ownerId, deptoId, _excl);
+    if (_pick) return { asesor: _pick, reset: false };
+    // Ya se probaron TODOS los disponibles en esta vuelta -> NO frenar: REINICIAR la vuelta. Volver a elegir excluyendo
+    // SOLO al actual (para darle el turno a otro antes de repetir al que recien fallo) y seguir rotando por todos.
+    const _reset = await elegirAsesorParaDepartamento(ownerId, deptoId, actualAsesorId ? [actualAsesorId] : []);
+    if (_reset) return { asesor: _reset, reset: true };
+    // Ni siquiera excluyendo al actual hay otro (el actual es el UNICO disponible): devolverlo con reset para arrancar
+    // la vuelta limpia. El caller (FIX churn) detecta _siguiente===actual y espera en silencio (no re-notifica).
+    const _solo = await elegirAsesorParaDepartamento(ownerId, deptoId);
+    if (_solo) return { asesor: _solo, reset: true };
+    // Nadie en absoluto disponible -> null (misma rama "sin nadie" que hoy: la IA sigue, el cron reintenta).
+    return null;
   } catch (e) { return null; }
 }
 

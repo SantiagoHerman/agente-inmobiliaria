@@ -10327,13 +10327,7 @@ app.get('/api/maestro/_diag-webhook', async function (req, res) {
       try { const r = await fetch(EVOLUTION_URL + '/webhook/find/' + instancia, { headers: { apikey: EVOLUTION_KEY } }); before = await r.json(); } catch (e) { before = { _err: (e && e.message) || 'x' }; }
       try { await configurarWebhookInstancia(instancia); reAplicado = true; } catch (e) {}
       try { const r2 = await fetch(EVOLUTION_URL + '/webhook/find/' + instancia, { headers: { apikey: EVOLUTION_KEY } }); after = await r2.json(); } catch (e) { after = { _err: (e && e.message) || 'x' }; }
-      let msgs = null;
-      try {
-        let q = await supabase.from('messages').select('id, role, estado_envio, estado_entrega, wa_message_id, created_at').eq('user_id', row.user_id).in('role', ['ai', 'human']).order('created_at', { ascending: false }).limit(8);
-        if (q && q.error) { q = await supabase.from('messages').select('id, role, estado_envio, wa_message_id, created_at').eq('user_id', row.user_id).in('role', ['ai', 'human']).order('created_at', { ascending: false }).limit(8); }
-        msgs = (q && q.data) || null;
-      } catch (e) { msgs = { _err: (e && e.message) || 'x' }; }
-      out.push({ company_name: row.company_name, instancia: instancia, eventos_antes: evOf(before), eventos_despues: evOf(after), reAplicado: reAplicado, ultimos_salientes: msgs });
+      out.push({ company_name: row.company_name, instancia: instancia, eventos_antes: evOf(before), eventos_despues: evOf(after), reAplicado: reAplicado, before_raw: before, after_raw: after });
     }
     return res.json({ ok: true, cuenta: cuenta, resultados: out });
   } catch (e) { return res.status(500).json({ error: (e && e.message) || 'error' }); }

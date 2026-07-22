@@ -10787,8 +10787,13 @@ async function enviarRecontactosPendientes() {
       if (!texto || !texto.trim()) continue; // defensa: nunca mandar un WhatsApp vacio
       // Si el lead habla otro idioma y el traductor esta activo, traducir el recontacto antes de enviar (igual que el camino reactivo/manual)
       let textoEnviar = texto, idiomaRec = null;
+      // NO FUGAS (Diego 2026-07-22): la traduccion usa el modelo CARO -> solo traducir si estamos DENTRO del tope del plan.
+      // Fuera de tope o error -> se manda el recontacto en el idioma base (plantilla $0), sin gastar IA por fuera del cupo.
       if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es' && await planPermite(conv.user_id, 'audio_traduccion')) {
-        try { const tr = await traducir(texto, conv.idioma_lead, conv.user_id); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto:', eTr && eTr.message); }
+        let _puedeTrad = false; try { _puedeTrad = await dentroDelTopeIA(conv.user_id); } catch (eTpT) { _puedeTrad = false; }
+        if (_puedeTrad) {
+          try { const tr = await traducir(texto, conv.idioma_lead, conv.user_id); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto:', eTr && eTr.message); }
+        }
       }
       // Registrar primero en messages (con id) para marcar estado de envio. content = lo que recibe el cliente; content_original = castellano para el asesor.
       const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
@@ -11321,8 +11326,12 @@ async function _enviarRecontactosV2(ahoraMs) {
 
         // Traduccion (igual que legacy)
         let textoEnviar = texto, idiomaRec = null;
+        // NO FUGAS (Diego 2026-07-22): la traduccion usa el modelo CARO -> solo traducir si estamos DENTRO del tope del plan.
         if (conv.traductor_activo && conv.idioma_lead && conv.idioma_lead !== 'es' && await planPermite(uid, 'audio_traduccion')) {
-          try { const tr = await traducir(texto, conv.idioma_lead, uid); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto v2:', eTr && eTr.message); }
+          let _puedeTrad = false; try { _puedeTrad = await dentroDelTopeIA(uid); } catch (eTpT) { _puedeTrad = false; }
+          if (_puedeTrad) {
+            try { const tr = await traducir(texto, conv.idioma_lead, uid); if (tr && tr.trim()) { textoEnviar = tr; idiomaRec = conv.idioma_lead; } } catch (eTr) { console.error('trad recontacto v2:', eTr && eTr.message); }
+          }
         }
 
         // Registrar + enviar (mismo flujo que legacy)

@@ -754,7 +754,10 @@ function precioPlanARS(nivel) {
   if (typeof base === 'undefined' || base === null) return null;
   var ref = dolarRefSync();
   if (!ref || !isFinite(ref) || ref < DOLAR_REF_BASE) ref = DOLAR_REF_BASE;
-  return Math.round(base * ref / DOLAR_REF_BASE);
+  // REDONDEO (Diego 2026-07-22): sin centavos, siempre al proximo multiplo de 5000 HACIA ARRIBA (precio "limpio").
+  // Ej: 131.275 -> 135.000, 353.431 -> 355.000, 626.078 -> 630.000. A dolar base 1530 los 4 planes ya son multiplos
+  // de 5000, asi que no cambian; recien sube en escalones de 5000 cuando el dolar empuja el precio por encima.
+  return Math.ceil((base * ref / DOLAR_REF_BASE) / 5000) * 5000;
 }
 
 // ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====

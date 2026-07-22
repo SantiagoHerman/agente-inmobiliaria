@@ -757,10 +757,11 @@ function precioPlanARS(nivel) {
   var ref = dolarRefSync();
   if (!ref || !isFinite(ref) || ref < DOLAR_REF_BASE) ref = DOLAR_REF_BASE;
   var bruto = base * ref / DOLAR_REF_BASE;
-  // REDONDEO (Diego 2026-07-22): al proximo multiplo de 5000 HACIA ARRIBA. Ej 131.275->135.000, 353.431->355.000,
-  // 626.078->630.000. BASICO queda SIN redondear (Diego: que no salte a 60.000, ~55.500). A dolar base 1530 los planes
-  // ya son multiplos de 5000; recien suben en escalones de 5000 cuando el dolar los empuja arriba.
-  return (nivel === 'basico') ? Math.round(bruto) : _redondear5000(bruto);
+  // REDONDEO (Diego 2026-07-22): los 4 planes FIJOS al proximo multiplo de 5000 HACIA ARRIBA (Basico, Pro, Premium,
+  // Enterprise). Ej 55.539->60.000, 131.275->135.000, 353.431->355.000, 626.078->630.000. A dolar base 1530 ya son
+  // multiplos de 5000; suben en escalones de 5000 cuando el dolar los empuja. (Personal y Recarga NO usan esto: solo
+  // redondean a peso entero, sin centavos.)
+  return _redondear5000(bruto);
 }
 
 // ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====
@@ -778,12 +779,12 @@ function _dolarSeguro() { var ref = dolarRefSync(); return (!ref || !isFinite(re
 function precioPersonalARS(cantMsgs) {
   var n = parseInt(cantMsgs, 10);
   if (!Number.isSafeInteger(n) || n < PERSONAL_MIN_MSGS || n > PERSONAL_MAX_MSGS) return null;
-  return _redondear5000(n * PERSONAL_USD_POR_MSG * _dolarSeguro()); // redondeo a 5000 (Diego 2026-07-22)
+  return Math.round(n * PERSONAL_USD_POR_MSG * _dolarSeguro()); // peso entero, sin centavos, sube con el dolar (Diego 2026-07-22: NO a 5000)
 }
 function precioRecargaARS(cantMsgs) {
   var n = parseInt(cantMsgs, 10);
   if (!Number.isSafeInteger(n) || n < RECARGA_MIN_MSGS || n > RECARGA_MAX_MSGS) return null;
-  return _redondear5000(n * RECARGA_USD_POR_MSG * _dolarSeguro()); // redondeo a 5000 (Diego 2026-07-22)
+  return Math.round(n * RECARGA_USD_POR_MSG * _dolarSeguro()); // peso entero, sin centavos, sube con el dolar (Diego 2026-07-22: NO a 5000)
 }
 
 // Topes y features por nivel. (Los precios viven en MercadoPago, no aca.)

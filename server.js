@@ -9971,6 +9971,72 @@ async function _elegirTextoRecontacto(opts) {
   } catch (e) { return null; }
 }
 
+// ============================================================================
+// TEXTOS DE RECONTACTO EDITABLES POR TENANT — lectura EFECTIVA para el editor del front.
+// ----------------------------------------------------------------------------
+// Los DOS motores (legacy ~L11020 y v2 ~L11590) ya arman el texto con los EFECTIVOS del tenant:
+// _recontactoPlantillasLeer(jsonb recontacto_plantillas) -> _elegirTextoRecontacto -> _recontactoPlantillasMerge
+// (owner-custom mezclado con fabrica del rubro). Esto de aca abajo NO toca esa seleccion: solo EXPONE los textos
+// efectivos (custom-o-fabrica) para que el dueño los vea/edite desde el front (endpoints /api/recontacto/textos).
+//
+// TIPOS EDITABLES: los unicos que los motores honran son 'primer_contacto' y 'seguimiento'
+// (_elegirTextoRecontacto usa tipo = esPrimerContacto ? 'primer_contacto' : 'seguimiento'). Hotel COLAPSA su
+// seguimiento (con/sin fecha) en UN solo banco 'seguimiento' editable: si el dueño lo edita, ese banco pisa a
+// AMBAS variantes; si no lo edita, la fabrica sigue eligiendo con/sin fecha en runtime (comportamiento intacto).
+const _REC_TIPOS_EDITABLES = ['primer_contacto', 'seguimiento'];
+
+// Fabrica "aplanada" a los 2 tipos editables, por rubro. Para el 'seguimiento' de hotel usamos seguimiento_sin_fecha
+// como representativo (la variante que puede preguntar por fechas). Devuelve copias (nunca la referencia viva).
+function _recFabricaEditable(rubroCanon) {
+  const banco = RECONTACTO_TEXTOS_FABRICA[rubroCanon] || RECONTACTO_TEXTOS_FABRICA.inmobiliaria;
+  const seg = Array.isArray(banco.seguimiento) ? banco.seguimiento
+            : (Array.isArray(banco.seguimiento_sin_fecha) ? banco.seguimiento_sin_fecha : []);
+  return {
+    primer_contacto: (banco.primer_contacto || []).slice(),
+    seguimiento: seg.slice()
+  };
+}
+
+// Cache CORTO (por ownerId) de la lectura efectiva, para no repegarle a la base en llamadas seguidas del front.
+// Se invalida explicitamente al guardar (POST) para que el editor siempre vea lo ultimo.
+const _REC_TEXTOS_CACHE = new Map();       // ownerId -> { at:ms, val:{...} }
+const _REC_TEXTOS_CACHE_TTL_MS = 5000;     // 5s: corto; el guardado invalida igual
+function _invalidarTextosRecontacto(ownerId) { try { if (ownerId) _REC_TEXTOS_CACHE.delete(ownerId); } catch (e) {} }
+
+// getTextosRecontacto(user_id): devuelve los TEXTOS EFECTIVOS de recontacto del tenant (custom-o-fabrica),
+// agrupados por tipo editable, para el editor. Resuelve SIEMPRE el DUEÑO (idempotente). AISLADO/DEFENSIVO:
+// sin columnas/registro/error cae a la FABRICA del rubro (editado=false). NUNCA tira. Cache corto invalidable.
+async function getTextosRecontacto(user_id) {
+  const ownerId = await _resolverOwnerId(user_id);
+  try { const c = _REC_TEXTOS_CACHE.get(ownerId); if (c && (Date.now() - c.at) < _REC_TEXTOS_CACHE_TTL_MS) return c.val; } catch (eC) {}
+  // Rubro del tenant (defensivo: sin registro/columna/error -> inmobiliaria).
+  let rubroCanon = 'inmobiliaria';
+  try { const { data } = await supabase.from('business_settings').select('rubro').eq('user_id', ownerId).maybeSingle(); rubroCanon = normalizarRubro(data && data.rubro); } catch (eR) { rubroCanon = 'inmobiliaria'; }
+  const flagOn = await _recontactoTextosOn(ownerId);            // fail-closed OFF sin columna/error
+  const plantillasRaw = await _recontactoPlantillasLeer(ownerId); // null sin columna/custom/error
+  const fabrica = _recFabricaEditable(rubroCanon);
+  const efectivos = {};
+  for (const tipo of _REC_TIPOS_EDITABLES) {
+    const ownerArr = (plantillasRaw && plantillasRaw[tipo] && Array.isArray(plantillasRaw[tipo].textos))
+      ? plantillasRaw[tipo].textos.map(function (o) { return (o && typeof o === 'object') ? String(o.texto || '') : String(o == null ? '' : o); }).filter(function (s) { return s && s.trim(); })
+      : [];
+    const editado = ownerArr.length > 0;
+    efectivos[tipo] = { textos: editado ? ownerArr : (fabrica[tipo] || []).slice(), editado: editado };
+  }
+  const val = {
+    ownerId: ownerId,
+    rubro: rubroCanon,
+    flag_on: flagOn,
+    editado: (efectivos.primer_contacto.editado || efectivos.seguimiento.editado),
+    tipos: _REC_TIPOS_EDITABLES.slice(),
+    efectivos: efectivos,
+    fabrica: fabrica,
+    fabrica_completa: RECONTACTO_TEXTOS_FABRICA[rubroCanon] || RECONTACTO_TEXTOS_FABRICA.inmobiliaria
+  };
+  try { _REC_TEXTOS_CACHE.set(ownerId, { at: Date.now(), val: val }); } catch (eS) {}
+  return val;
+}
+
 var _inactividadEnCurso = false;
 async function revisarInactividad() {
   // RACE #6: guard de no-solapamiento (mismo patron que escalarLeadsEnColaVencidos / _escalarEnCurso). Dos ticks
@@ -13383,6 +13449,83 @@ app.post('/api/instrucciones-agente', async function(req, res) {
     const { error } = await supabase.from('business_settings').update({ instrucciones_agente: payload }).eq('user_id', ident.ownerId);
     if (error) return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar instrucciones_agente?): ' + (error.message || 'error de esquema') });
     return res.json({ ok: true, items: items });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============ TEXTOS DE RECONTACTO EDITABLES POR TENANT ============
+// El dueño edita los textos de recontacto de SU rubro (los que hoy salen de RECONTACTO_TEXTOS_FABRICA). Se guardan
+// por tenant en business_settings.recontacto_plantillas (jsonb) — la MISMA columna que los DOS motores ya leen
+// (helper getTextosRecontacto / _recontactoPlantillasLeer). Solo el dueño. Deploy-safe: sin migrar, GET cae a la
+// FABRICA (nunca 500 por esquema) y POST devuelve un 409 controlado ("falta migrar"); el motor queda intacto.
+//
+// GET  /api/recontacto/textos  -> { ok, rubro, flag_on, editado, tipos:['primer_contacto','seguimiento'],
+//                                   textos:{ primer_contacto:{textos:[str...],editado}, seguimiento:{...} },
+//                                   fabrica:{ primer_contacto:[str...], seguimiento:[str...] },   // referencia (2 tipos editables)
+//                                   fabrica_rubro:{...} }                                          // fabrica cruda del rubro (hotel: 3 tipos)
+// POST /api/recontacto/textos  body:
+//   { primer_contacto:[str...], seguimiento:[str...] } -> guarda el set custom (tipos desconocidos se descartan)
+//   { reset:true }                                     -> borra el custom (vuelve a fabrica)
+//   Respuesta = misma forma que el GET (los textos efectivos ya recalculados).
+app.get('/api/recontacto/textos', async function (req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede ver esta configuración' });
+    const t = await getTextosRecontacto(ident.ownerId); // AISLADO/defensivo: sin migrar -> fabrica (no rompe)
+    return res.json({ ok: true, rubro: t.rubro, flag_on: t.flag_on, editado: t.editado, tipos: t.tipos, textos: t.efectivos, fabrica: t.fabrica, fabrica_rubro: t.fabrica_completa });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/recontacto/textos', async function (req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el dueño puede cambiar esta configuración' });
+    const b = req.body || {};
+
+    // Estado previo (para el backup "Deshacer ultimo" en recontacto_plantillas_prev). Si la columna NO existe
+    // (migracion no corrida) el select trae r.error -> 409 controlado, patron IGUAL a instrucciones_agente.
+    const prevRead = await supabase.from('business_settings').select('recontacto_plantillas').eq('user_id', ident.ownerId).maybeSingle();
+    if (prevRead.error) return res.status(409).json({ error: 'Falta migrar (recontacto_plantillas). Corré la migración e intentá de nuevo.' });
+    const prevVal = (prevRead.data && prevRead.data.recontacto_plantillas && typeof prevRead.data.recontacto_plantillas === 'object') ? prevRead.data.recontacto_plantillas : null;
+
+    // RESET: borrar el custom -> el motor vuelve a la fabrica del rubro.
+    if (b.reset === true) {
+      const { error: eR } = await supabase.from('business_settings').update({ recontacto_plantillas: null, recontacto_plantillas_prev: prevVal }).eq('user_id', ident.ownerId);
+      if (eR) return res.status(409).json({ error: 'No se pudo restaurar (¿falta migrar recontacto_plantillas?): ' + (eR.message || 'error de esquema') });
+      _invalidarTextosRecontacto(ident.ownerId);
+      const t0 = await getTextosRecontacto(ident.ownerId);
+      return res.json({ ok: true, reset: true, rubro: t0.rubro, flag_on: t0.flag_on, editado: t0.editado, tipos: t0.tipos, textos: t0.efectivos, fabrica: t0.fabrica, fabrica_rubro: t0.fabrica_completa });
+    }
+
+    // Construir el jsonb custom SOLO con los tipos editables conocidos; las keys desconocidas del body se descartan.
+    // Cada texto se SANEA con el mismo _recSanearTexto que usa el motor (1 linea, sin emojis, <=300, primer_contacto
+    // sin {nombre}), se rechazan los que traen links y se deduplican (normalizado) dentro del tipo. Guardar basura
+    // NO rompe: el motor igual sanea/completa con la fabrica al leer.
+    const nuevo = {};
+    for (const tipo of _REC_TIPOS_EDITABLES) {
+      if (!Array.isArray(b[tipo])) continue; // tipo no enviado -> no se persiste para ese tipo (queda sin custom)
+      const seen = new Set(); const dedup = [];
+      for (const x of b[tipo].slice(0, 50)) {
+        const s = _recSanearTexto(x, tipo);
+        if (!s || !s.trim()) continue;
+        if (/(https?:\/\/|wa\.me)/i.test(s)) continue; // sin links
+        const k = _recNormTexto(s);
+        if (!k || seen.has(k)) continue;               // dedupe normalizado
+        seen.add(k); dedup.push({ texto: s });
+      }
+      nuevo[tipo] = { textos: dedup };
+    }
+    // Si no quedo NINGUN texto valido en ningun tipo -> tratar como reset (no guardar un {} inutil que dejaria el
+    // motor sin owner-custom igual, pero mas prolijo: null = "usar fabrica").
+    const hayAlgo = _REC_TIPOS_EDITABLES.some(function (tp) { return nuevo[tp] && Array.isArray(nuevo[tp].textos) && nuevo[tp].textos.length > 0; });
+    const guardar = hayAlgo ? nuevo : null;
+
+    const { error } = await supabase.from('business_settings').update({ recontacto_plantillas: guardar, recontacto_plantillas_prev: prevVal }).eq('user_id', ident.ownerId);
+    if (error) return res.status(409).json({ error: 'No se pudo guardar (¿falta migrar recontacto_plantillas?): ' + (error.message || 'error de esquema') });
+    _invalidarTextosRecontacto(ident.ownerId);
+    const t = await getTextosRecontacto(ident.ownerId);
+    return res.json({ ok: true, rubro: t.rubro, flag_on: t.flag_on, editado: t.editado, tipos: t.tipos, textos: t.efectivos, fabrica: t.fabrica, fabrica_rubro: t.fabrica_completa });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

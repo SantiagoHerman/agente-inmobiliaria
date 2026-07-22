@@ -770,11 +770,11 @@ function precioPlanARS(nivel) {
 }
 
 // ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====
-// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 15.000 msgs) a USD 0,04 c/u x dolar.
+// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 9.000 msgs) a USD 0,05 c/u x dolar.
 // Recarga: pago UNICO (Checkout Pro) para sumar mensajes al pool, min 200 a USD 0,06 c/u x dolar (requiere plan activo).
 // Ambos precios atados al MISMO dolar ratchet (dolarRefSync) que los planes fijos.
 const PERSONAL_USD_POR_MSG = 0.05;
-const PERSONAL_MIN_MSGS = 15000;
+const PERSONAL_MIN_MSGS = 9000;
 const PERSONAL_MAX_MSGS = 2000000; // tope de cordura: evita montos absurdos por typo/manipulacion
 const RECARGA_USD_POR_MSG = 0.08;
 const RECARGA_MIN_MSGS = 200;
@@ -796,12 +796,12 @@ function precioRecargaARS(cantMsgs) {
 const PLAN_LIMITS = {
   trial:      { ai_messages: 100,   asesores: 5,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: false, multi_whatsapp: false },
   basico:     { ai_messages: 350,   asesores: 3,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: false },
-  pro:        { ai_messages: 1500,  asesores: 6,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: false },
-  premium:    { ai_messages: 3000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
-  enterprise: { ai_messages: 6000,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
-  // 'personal' (a medida): el CUPO real lo fija limits_override.ai_messages = la cantidad elegida (>=15.000) al contratar.
-  // Aca ai_messages: 15000 es solo el piso/fallback si por algun motivo no hubiera override.
-  personal:   { ai_messages: 15000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+  pro:        { ai_messages: 900,   asesores: 6,        contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: false },
+  premium:    { ai_messages: 2500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
+  enterprise: { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
+  // 'personal' (a medida): el CUPO real lo fija limits_override.ai_messages = la cantidad elegida (>=9.000) al contratar.
+  // Aca ai_messages: 9000 es solo el piso/fallback si por algun motivo no hubiera override.
+  personal:   { ai_messages: 9000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
 };
 // SIN grandfathering de topes (Diego 2026-07-20): se ELIMINO. TODOS los clientes (viejos y nuevos) usan los topes
 // actuales de PLAN_LIMITS. Ya no hay PLAN_LIMITS_LEGACY ni fecha de corte: nadie conserva topes "viejos" mas altos.

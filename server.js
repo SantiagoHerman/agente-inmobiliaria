@@ -10310,6 +10310,29 @@ async function resetearWebhooksNivel2() {
 }
 setTimeout(resetearWebhooksNivel2, 120 * 1000); // ~2 min despues de arrancar (cuando ya esta estable)
 
+// ===== TEMP DIAG (Diego 2026-07-22): tildes de entrega en Anton. Lee + RE-APLICA el webhook de una cuenta. BORRAR despues. =====
+app.get('/api/maestro/_diag-webhook', async function (req, res) {
+  try {
+    if ((req.query.k || '') !== 'rz-tildes-diag-9x2Qp7Kv3Rt8Lz') return res.status(404).end();
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return res.status(500).json({ error: 'Evolution no configurado' });
+    const cuenta = String(req.query.cuenta || '').trim();
+    if (!cuenta) return res.status(400).json({ error: 'falta ?cuenta=<nombre>' });
+    const { data: rows } = await supabase.from('business_settings').select('user_id, company_name').ilike('company_name', '%' + cuenta + '%').limit(5);
+    if (!rows || !rows.length) return res.json({ error: 'sin cuenta con ese nombre', cuenta: cuenta });
+    const evOf = function (x) { if (!x || typeof x !== 'object') return null; return x.events || (x.webhook && x.webhook.events) || (x.data && x.data.events) || null; };
+    const out = [];
+    for (const row of rows) {
+      const instancia = nombreInstancia(row.user_id);
+      let before = null, after = null, reAplicado = false;
+      try { const r = await fetch(EVOLUTION_URL + '/webhook/find/' + instancia, { headers: { apikey: EVOLUTION_KEY } }); before = await r.json(); } catch (e) { before = { _err: (e && e.message) || 'x' }; }
+      try { await configurarWebhookInstancia(instancia); reAplicado = true; } catch (e) {}
+      try { const r2 = await fetch(EVOLUTION_URL + '/webhook/find/' + instancia, { headers: { apikey: EVOLUTION_KEY } }); after = await r2.json(); } catch (e) { after = { _err: (e && e.message) || 'x' }; }
+      out.push({ company_name: row.company_name, instancia: instancia, eventos_antes: evOf(before), eventos_despues: evOf(after), reAplicado: reAplicado, before_raw: before, after_raw: after });
+    }
+    return res.json({ ok: true, cuenta: cuenta, resultados: out });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'error' }); }
+});
+
 // POST /api/whatsapp/conectar -> crea (o reusa) la instancia del user y devuelve el QR
 app.post('/api/whatsapp/conectar', async (req, res) => {
   try {

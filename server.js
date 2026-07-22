@@ -1738,6 +1738,302 @@ async function derivacionV4Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== PAUTA META (Click-to-WhatsApp): flag ia_pauta_meta + Nivel 1/Nivel 2 =====
+// Cuando un lead escribe viniendo de una PUBLICIDAD de Meta en WhatsApp, Baileys pone los datos del aviso en
+// contextInfo.externalAdReply. Con este flag ON la IA recibe esos datos como CONTEXTO (Nivel 1) y, si el aviso
+// matchea $0 (codigo puro, sin IA) contra una opcion del inventario del tenant, tambien se nombra esa opcion
+// (Nivel 2). FAIL-CLOSED, mismo patron EXACTO que derivacionV4Activo / iaAgendaActivo: columna ausente / null /
+// false / cualquier error -> OFF => el webhook y la IA quedan BYTE-IDENTICOS a hoy (codigo INERTE hasta correr la
+// migracion). Ante cualquier error -> OFF (nunca romper). No usa API key. Reusa un `bs` ya cargado si lo trae.
+async function iaPautaMetaActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_pauta_meta')) return bs.ia_pauta_meta === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ia_pauta_meta').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.ia_pauta_meta === true);
+  } catch (e) { return false; }
+}
+
+// Estado en memoria (proceso): pauta CRUDA (externalAdReply) pendiente de consumir por conversacion. Se setea en el
+// webhook cuando llega un mensaje con pauta y el flag esta ON; se CONSUME (y borra) en el 1er turno de la IA. TTL de
+// seguridad para no acumular si la generacion se aborta (humano tomo el lead / handoff). $0: solo memoria, sin DB.
+const _pautaMetaPend = new Map(); // conv.id -> { pauta, ts }
+const _PAUTA_META_TTL_MS = 15 * 60 * 1000;
+function _setPautaMetaPend(convId, pauta) {
+  try {
+    if (!convId || !pauta) return;
+    const _now = Date.now();
+    const _stale = [];
+    _pautaMetaPend.forEach(function (v, k) { if (!v || (_now - v.ts) > _PAUTA_META_TTL_MS) _stale.push(k); });
+    _stale.forEach(function (k) { _pautaMetaPend.delete(k); });
+    _pautaMetaPend.set(convId, { pauta: pauta, ts: _now });
+  } catch (e) {}
+}
+function _tomarPautaMetaPend(convId) {
+  try {
+    if (!convId) return null;
+    const v = _pautaMetaPend.get(convId);
+    if (!v) return null;
+    _pautaMetaPend.delete(convId);
+    if ((Date.now() - v.ts) > _PAUTA_META_TTL_MS) return null;
+    return v.pauta;
+  } catch (e) { return null; }
+}
+
+// Params de TRACKING conocidos: NO identifican la ficha, se descartan del match. Lista negra (blacklist), no blanca:
+// cualquier OTRO param (id/p/property_id... o uno propio del sitio ?inmueble=/?ficha=/?cod=/?listing=/?ref=...) se
+// asume IDENTIFICADOR y se CONSERVA en la key -> dos fichas con el mismo path y distinto id NO colapsan. 'ref' es
+// ambiguo (referrer vs codigo de ficha): ante la duda se conserva (peor adjuntar la ficha equivocada que no adjuntar).
+function _esTrackingPauta(k) {
+  try {
+    const _kl = String(k || '').toLowerCase();
+    if (!_kl) return true;
+    if (_kl.indexOf('utm_') === 0) return true;   // utm_source/medium/campaign/...
+    if (_kl.indexOf('mc_') === 0) return true;     // mailchimp
+    const _tr = ['fbclid', 'gclid', 'gclsrc', 'dclid', 'msclkid', 'yclid', 'twclid', 'ttclid', 'igshid', 'wbraid', 'gbraid', '_ga', '_gl', 'ref_src', 'ref_url', 'fb_action_ids', 'fb_action_types', 'fb_source', 'fb_ref', 'fbadid', 'ad_id', 'adset_id', 'campaign_id'];
+    return _tr.indexOf(_kl) >= 0;
+  } catch (e) { return false; } // ante la duda, NO es tracking -> se conserva (mas conservador para el match)
+}
+// Normalizacion de URL para el match ($0). Devuelve {host, path, hasQ, key} o null. null = no matcheable (invalida, o
+// un redirect/shortlink de Meta que no es la ficha real). Saca www, scheme, fragmento y trailing slash; DESCARTA solo
+// el tracking conocido (utm_*, fbclid, etc) y CONSERVA en la key cualquier otro param (identifica la ficha). hasQ=true
+// si quedo algun param identificador -> el caller NO permite el fallback host+path (evita colapsar dos fichas con el
+// mismo path y distinto id). Un path vacio ('' o '/') devuelve path='' -> el caller NO matchea por host solo (regla
+// dura anti-falso-positivo de la home/landing).
+function _normUrlPauta(u) {
+  try {
+    if (!u) return null;
+    let s = String(u).trim();
+    if (!s) return null;
+    if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+    let url;
+    try { url = new URL(s); } catch (e) { return null; }
+    let host = (url.hostname || '').toLowerCase().replace(/^www\./, '');
+    if (!host) return null;
+    // Redirects/shortlinks: sin resolver la redireccion no sabemos la ficha real -> NO matchear (caer a Nivel 1).
+    const _redir = ['fb.me', 'l.facebook.com', 'lm.facebook.com', 'm.facebook.com', 'facebook.com', 'fb.com', 'wa.me', 'api.whatsapp.com', 'l.instagram.com', 'instagram.com', 'bit.ly', 'linktr.ee', 'goo.gl', 't.co'];
+    if (_redir.indexOf(host) >= 0) return null;
+    let path = (url.pathname || '').toLowerCase().replace(/\/+$/, '');
+    // Conservar TODO param que no sea tracking conocido (identifica la ficha); descartar el tracking. hasQ marca que
+    // la URL trae al menos un identificador por query -> el caller bloquea el fallback host+path.
+    const _kept = [];
+    let _hasQ = false;
+    try {
+      url.searchParams.forEach(function (v, k) {
+        if (v === '' || v === null || v === undefined) return;
+        if (_esTrackingPauta(k)) return;
+        _kept.push(String(k).toLowerCase() + '=' + String(v).toLowerCase());
+        _hasQ = true;
+      });
+    } catch (e) {}
+    _kept.sort();
+    return { host: host, path: path, hasQ: _hasQ, key: host + path + (_kept.length ? ('?' + _kept.join('&')) : '') };
+  } catch (e) { return null; }
+}
+// Normalizacion de texto para el fallback por titulo: minusculas, sin tildes, sin signos, espacios colapsados.
+function _normTxtPauta(s) {
+  try { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
+  catch (e) { return ''; }
+}
+// Genericos de rubro + stopwords: NO distinguen una ficha de otra. Se restan del titulo para decidir si es especifico.
+const _PAUTA_GEN = ['departamento', 'departamentos', 'depto', 'deptos', 'dpto', 'casa', 'casas', 'venta', 'ventas', 'vende', 'vendo', 'vender', 'alquiler', 'alquileres', 'alquila', 'alquilar', 'renta', 'rentas', 'propiedad', 'propiedades', 'oportunidad', 'oportunidades', 'consulta', 'lote', 'lotes', 'terreno', 'terrenos', 'emprendimiento', 'emprendimientos', 'alojamiento', 'alojamientos', 'cabana', 'cabanas', 'hotel', 'hoteles', 'hospedaje', 'inmueble', 'inmuebles', 'local', 'locales', 'oficina', 'oficinas', 'ph', 'duplex', 'triplex', 'monoambiente', 'disponible', 'estrenar', 'nuevo', 'nueva', 'ambientes', 'ambiente', 'amb'];
+const _PAUTA_STOP = ['en', 'de', 'del', 'a', 'al', 'el', 'la', 'lo', 'los', 'las', 'un', 'una', 'unos', 'unas', 'y', 'o', 'u', 'con', 'sin', 'para', 'por', 'su', 'sus', 'mi', 'mis', 'the', 'of', 'in'];
+// Tokens DISTINTIVOS de un titulo ya normalizado: sin genericos de rubro, sin stopwords, sin ruido (< 3 chars o puro
+// numero). Si no quedan >= 2 -> el titulo es generico ('Casa en venta', 'Lote en venta'...) y NO debe matchear nada.
+function _distintivosPauta(ct) {
+  try {
+    const _skip = {};
+    _PAUTA_GEN.forEach(function (g) { _skip[g] = true; });
+    _PAUTA_STOP.forEach(function (g) { _skip[g] = true; });
+    return String(ct || '').split(' ').filter(function (t) { return t && t.length >= 3 && !_skip[t] && !/^\d+$/.test(t); });
+  } catch (e) { return []; }
+}
+// ¿El token es un IDENTIFICADOR de ficha (romano I-XII o numero corto)? Sirve para el caso prefijo/fase: si el aviso
+// trae uno PEGADO al nombre que el inventario NO tiene ('Casa Playa Grande' vs '...II' / 'Torre Aqua 2'), son fichas
+// DISTINTAS -> no matchear. NO incluye letra suelta: 'a'/'y'/'o' son preposiciones comunes ('a estrenar', 'a 2
+// cuadras') y matarian matches legitimos; la letra-torre ('Torre B') se maneja solo tras un marcador de fase.
+function _esIdTokenPauta(t) {
+  try { return /^(i{1,3}|iv|vi{0,3}|ix|xi{0,2}|x)$/.test(t) || /^\d{1,3}$/.test(t); }
+  catch (e) { return false; }
+}
+// Marcadores de fase/unidad: si aparecen PEGADOS al nombre seguidos de un id ('Fase 3', 'Torre B', 'Etapa 2') marcan
+// una ficha DISTINTA del nombre pelado.
+const _PAUTA_PHASE = ['fase', 'etapa', 'torre', 'sector', 'bloque', 'modulo', 'manzana', 'mza', 'unidad', 'lote', 'edificio', 'nucleo'];
+// Elige UN candidato del inventario para la pauta, o null. Reglas anti-falso-positivo (adjuntar la equivocada es
+// PEOR que no adjuntar): URL fuerte primero (exacta o host+path, nunca por host/home solo, nunca link vacio del
+// inventario); si 0 -> fallback por titulo (titulo especifico del inventario contenido en el titulo del aviso);
+// 0 o >1 candidato en cualquier nivel -> null (Nivel 1). cands: [{id, links:[...], title, resumen}].
+function _elegirCandidatoPauta(cands, pautaU, pautaT) {
+  try {
+    if (!cands || !cands.length) return null;
+    // 1) MATCH POR URL (fuerte): solo si la pauta trae una URL util (path no vacio; no redirect/home).
+    if (pautaU && pautaU.path && pautaU.path.length > 0) {
+      // ¿La URL de la pauta identifica la ficha por un param whitelisted (?id=/?p=...)? Si SI, exigimos igualdad EXACTA
+      // de key: el fallback host+path NO puede matchear (dos fichas con el mismo path y distinto id serian un falso
+      // positivo). El fallback host+path (ignorando query) solo aplica cuando NINGUN lado trae params identificadores.
+      const _pautaHasQ = pautaU.hasQ === true;
+      const _hits = [];
+      cands.forEach(function (c) {
+        let _hit = false;
+        (c.links || []).forEach(function (lk) {
+          const _cu = _normUrlPauta(lk);
+          if (!_cu || !_cu.path || _cu.path.length === 0) return; // link vacio/home del inventario: nunca matchea
+          if (_cu.key === pautaU.key) { _hit = true; return; }     // exacto (host+path+params identificadores)
+          const _cuHasQ = _cu.hasQ === true;
+          if (!_pautaHasQ && !_cuHasQ && _cu.host === pautaU.host && _cu.path === pautaU.path) _hit = true; // host+path (sin ids en query)
+        });
+        if (_hit) _hits.push(c);
+      });
+      const _ids = [];
+      _hits.forEach(function (c) { if (_ids.indexOf(c.id) < 0) _ids.push(c.id); });
+      if (_ids.length === 1) return _hits.find(function (c) { return c.id === _ids[0]; });
+      if (_ids.length > 1) return null; // ambiguo -> Nivel 1
+    }
+    // 2) FALLBACK POR TITULO (debil), a NIVEL TOKEN (no substring crudo). Anti-falso-positivo:
+    //   (a) del titulo del inventario se restan genericos/stopwords/ruido -> exigir >= 2 tokens DISTINTIVOS. Asi
+    //       'Casa en venta' / 'Lote en venta' / 'Departamento' (0 distintivos) NO matchean nada (mata el generico).
+    //   (b) TODOS esos tokens distintivos deben aparecer como PALABRA COMPLETA en el aviso (word-boundary, no substring
+    //       -> 'grande' no matchea dentro de 'grandeza').
+    //   (c) el aviso NO puede traer, PEGADO al nombre, un IDENTIFICADOR (romano/numero, o marcador de fase + id) que
+    //       el inventario no tenga -> mata 'Casa Playa Grande' (inv) vs 'Casa Playa Grande II' / 'Torre Aqua 2' /
+    //       'Aregua Forest Fase 3'. Solo se mira el token PEGADO al nombre: un numero de descripcion ('a 2 cuadras',
+    //       '3 ambientes' suelto) no va pegado y NO descarta el match legitimo.
+    // 0 o >1 candidato -> null (Nivel 1). La ambiguedad (>1) tambien cubre 'igual cantidad de tokens' en el aviso.
+    if (pautaT && pautaT.length >= 8) {
+      const _adToks = pautaT.split(' ').filter(Boolean);
+      const _adSet = {};
+      _adToks.forEach(function (t) { _adSet[t] = true; });
+      const _hits = [];
+      cands.forEach(function (c) {
+        const _ct = _normTxtPauta(c.title);
+        if (!_ct || _ct.length < 8) return;                       // titulo corto/vacio del inventario: descartar
+        const _dist = _distintivosPauta(_ct);
+        if (_dist.length < 2) return;                             // sin >=2 tokens distintivos: generico -> descartar
+        const _distSet = {};
+        for (let i = 0; i < _dist.length; i++) { if (!_adSet[_dist[i]]) return; _distSet[_dist[i]] = true; } // (b) todos, palabra completa, en el aviso
+        // (c) mirar SOLO el token pegado al nombre (tras el ultimo token distintivo del inventario en el aviso)
+        const _invSet = {};
+        _ct.split(' ').forEach(function (t) { if (t) _invSet[t] = true; });
+        let _maxPos = -1;
+        for (let k = 0; k < _adToks.length; k++) { if (_distSet[_adToks[k]]) _maxPos = k; }
+        if (_maxPos >= 0 && _maxPos + 1 < _adToks.length) {
+          const _sfx = _adToks[_maxPos + 1];
+          const _sfx2 = (_maxPos + 2 < _adToks.length) ? _adToks[_maxPos + 2] : '';
+          if (_esIdTokenPauta(_sfx) && !_invSet[_sfx]) return;                                            // Nombre + II / + 2
+          if (_PAUTA_PHASE.indexOf(_sfx) >= 0 && _sfx2 && (_esIdTokenPauta(_sfx2) || /^[a-z]$/.test(_sfx2)) && !_invSet[_sfx2]) return; // Nombre + Fase 3 / Torre B
+        }
+        _hits.push(c);
+      });
+      const _ids = [];
+      _hits.forEach(function (c) { if (_ids.indexOf(c.id) < 0) _ids.push(c.id); });
+      if (_ids.length === 1) return _hits.find(function (c) { return c.id === _ids[0]; });
+    }
+    return null; // 0 o >1 -> Nivel 1
+  } catch (e) { return null; }
+}
+// NIVEL 2: match $0 (codigo puro, sin IA) de la pauta contra el inventario REAL del tenant, por rubro. Devuelve el
+// candidato elegido {id, resumen} o null. SIEMPRE filtra por user_id del dueno (nunca cruza tenants). Aislado: ante
+// cualquier error -> null (se responde con Nivel 1). Inmobiliaria=properties.link; desarrolladora=developments.
+// source_url/link (match a nivel EMPRENDIMIENTO, precio "desde" de unidades); hotel=origen_url a nivel COMPLEJO.
+async function _matchPautaInventario(user_id, rubroRaw, pauta) {
+  try {
+    const _rubro = normalizarRubro(rubroRaw);
+    const _pu = _normUrlPauta(pauta && pauta.sourceUrl);
+    const _pt = _normTxtPauta(pauta && pauta.title);
+    if (!_pu && (!_pt || _pt.length < 8)) return null; // sin URL util ni titulo especifico: no hay por donde matchear
+    let _cands = [];
+    if (_rubro === 'desarrolladora') {
+      let _devs = null;
+      try {
+        const _rd = await supabase.from('developments').select('id, nombre, link, source_url, zona, direccion, ciudad').eq('user_id', user_id).eq('activo', true);
+        if (_rd.error) throw _rd.error;
+        _devs = _rd.data;
+      } catch (eD) {
+        try { const _rd2 = await supabase.from('developments').select('id, nombre, link, zona, direccion, ciudad').eq('user_id', user_id).eq('activo', true); _devs = _rd2.data; } catch (eD2) { _devs = null; }
+      }
+      if (_devs && _devs.length) {
+        const _ids = _devs.map(function (d) { return d.id; });
+        const _desde = {};
+        try {
+          const { data: _us } = await supabase.from('development_units').select('development_id, precio, moneda, estado').in('development_id', _ids).eq('user_id', user_id);
+          (_us || []).forEach(function (u) {
+            if ((u.estado || 'disponible') !== 'disponible') return;
+            const _p = Number(u.precio);
+            if (!u.precio || isNaN(_p)) return;
+            if (!_desde[u.development_id] || _p < _desde[u.development_id].min) _desde[u.development_id] = { min: _p, moneda: u.moneda || 'USD' };
+          });
+        } catch (eU) {}
+        _cands = _devs.map(function (d) {
+          const _dsd = _desde[d.id];
+          const _ubic = d.zona ? (' - ' + d.zona) : (d.direccion ? (' - ' + d.direccion) : (d.ciudad ? (' - ' + d.ciudad) : ''));
+          return { id: d.id, links: [d.source_url, d.link], title: d.nombre, resumen: 'emprendimiento ' + (d.nombre || '') + _ubic + (_dsd ? (' - desde ' + _dsd.moneda + ' ' + _dsd.min) : '') };
+        });
+      }
+    } else if (_rubro === 'hotel_cabanas') {
+      let _uds = null;
+      try { const _ru = await supabase.from('hotel_unidades').select('id, title, atributos, precio_base, moneda, complejo_id').eq('user_id', user_id).eq('activa', true); _uds = _ru.data; } catch (eH) { _uds = null; }
+      const _comps = {};
+      try { const { data: _cs } = await supabase.from('hotel_complejos').select('id, nombre, atributos').eq('user_id', user_id); (_cs || []).forEach(function (c) { _comps[c.id] = c; }); } catch (eC) {}
+      if (_uds && _uds.length) {
+        const _porComp = {};
+        _uds.forEach(function (u) {
+          const _cid = u.complejo_id || ('u_' + u.id);
+          if (!_porComp[_cid]) _porComp[_cid] = { links: [], titulos: [], desde: null, moneda: 'USD' };
+          const _ou = (u.atributos && (u.atributos.origen_url || u.atributos.origenUrl)) || null;
+          if (_ou) _porComp[_cid].links.push(_ou);
+          if (u.title) _porComp[_cid].titulos.push(u.title);
+          const _pb = Number(u.precio_base);
+          if (u.precio_base && !isNaN(_pb) && (_porComp[_cid].desde === null || _pb < _porComp[_cid].desde)) { _porComp[_cid].desde = _pb; _porComp[_cid].moneda = u.moneda || 'USD'; }
+        });
+        _cands = Object.keys(_porComp).map(function (cid) {
+          const _g = _porComp[cid];
+          const _c = _comps[cid];
+          const _nombre = (_c && _c.nombre) || _g.titulos[0] || 'Alojamiento';
+          const _linkComp = (_c && _c.atributos && (_c.atributos.origen_url || _c.atributos.origenUrl)) || null;
+          const _links = _linkComp ? [_linkComp].concat(_g.links) : _g.links;
+          return { id: cid, links: _links, title: _nombre, resumen: 'alojamiento ' + _nombre + (_g.desde !== null ? (' - desde ' + _g.moneda + ' ' + _g.desde + ' la noche (segun fechas)') : '') };
+        });
+      }
+    } else {
+      let _props = null;
+      try { const _rp = await supabase.from('properties').select('id, title, link, price, venta_precio, anual_precio, temporal_precio_dia, operation, direccion, ciudad, zone').eq('user_id', user_id).eq('activa', true); _props = _rp.data; } catch (eP) { _props = null; }
+      if (_props && _props.length) {
+        _cands = _props.map(function (p) {
+          const _pp = [];
+          if (p.venta_precio) _pp.push('venta ' + p.venta_precio);
+          if (p.anual_precio) _pp.push('alquiler ' + p.anual_precio);
+          if (p.temporal_precio_dia) _pp.push('temporal ' + p.temporal_precio_dia + '/dia');
+          if (!_pp.length && p.price) _pp.push('precio ' + p.price);
+          const _ubic = p.direccion ? (' - ' + p.direccion + (p.ciudad ? (', ' + p.ciudad) : '')) : (p.ciudad ? (' - ' + p.ciudad) : (p.zone ? (' - ' + p.zone) : ''));
+          return { id: p.id, links: [p.link], title: p.title, resumen: (p.title || 'Propiedad') + _ubic + (_pp.length ? (' - ' + _pp.join(' ; ')) : '') };
+        });
+      }
+    }
+    return _elegirCandidatoPauta(_cands, _pu, _pt);
+  } catch (e) { return null; }
+}
+// Construye el TEXTO de contexto para la IA. NIVEL 1 = datos del aviso (title/body/sourceUrl). NIVEL 2 = si el match
+// $0 encontro 1 opcion del inventario, se NOMBRA esa opcion (la IA ya tiene su ficha completa en el bloque de
+// inventario del prompt). Este texto viaja en el MISMO unico turno de IA que ya se hace -> se cuenta solo (no agrega
+// llamadas de IA). Ante cualquier error -> devuelve al menos el Nivel 1 (o null). NUNCA rompe.
+async function _construirContextoPauta(user_id, pauta, rubroRaw) {
+  try {
+    if (!pauta || (!pauta.title && !pauta.body && !pauta.sourceUrl)) return null;
+    const _l1 = [];
+    if (pauta.title) _l1.push('Aviso: ' + pauta.title);
+    if (pauta.body) _l1.push('Descripcion del aviso: ' + pauta.body);
+    if (pauta.sourceUrl) _l1.push('Link del aviso: ' + pauta.sourceUrl);
+    let _texto = 'IMPORTANTE: este lead llego escribiendo desde una PUBLICIDAD (Meta/Facebook/Instagram). Puede que escriba corto ("precio", "info", "me interesa") dando por hecho que ves el aviso que clickeo. ' + _l1.join('. ') + '. Responde teniendo en cuenta que pregunta por ESE aviso; no le pidas que te repita de que se trata.';
+    let _match = null;
+    try { _match = await _matchPautaInventario(user_id, rubroRaw, pauta); } catch (eM) { _match = null; }
+    if (_match && _match.resumen) {
+      _texto += ' Segun el inventario, esa publicidad corresponde a esta opcion (usa SUS datos exactos, que ya tenes cargados mas arriba en el inventario): ' + _match.resumen + '.';
+    }
+    return _texto;
+  } catch (e) { return null; }
+}
+
 // ===== FEATURE #15: FLAG POR-CUENTA ia_agenda ("la IA agenda citas") =====
 // GATE del comportamiento NUEVO "la IA puede agendar citas tentativas". Con el flag OFF
 // (default: false / ausente / null / columna inexistente / cualquier error) -> comportamiento
@@ -4258,6 +4554,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // Saneado/gateado por el caller (configUsuarioIACobertura): aca solo se USA si trae persona=true. Reusa TODO el
   // motor (mismo Sonnet, mismas tools, misma KB/inventario por user_id del tenant): solo cambia la voz/objetivo.
   const agenteConfig = (opciones && opciones.agenteConfig && opciones.agenteConfig.persona) ? opciones.agenteConfig : null;
+  // PAUTA META (NIVEL 1/2): contexto del aviso Click-to-WhatsApp (armado en el webhook, gated ia_pauta_meta). Es un
+  // string ya listo; aca solo se agrega como bloque DINAMICO (NO cacheado) al system. Con el flag OFF el caller nunca
+  // lo pasa => null => system BYTE-IDENTICO al actual. NO agrega llamadas de IA (viaja en la unica completion de abajo).
+  const _pautaContexto = (opciones && typeof opciones.pautaContexto === 'string' && opciones.pautaContexto.trim()) ? opciones.pautaContexto : null;
   // PARTE B (punto 6 / regla 19): aprendizaje SOLO con reparto_v2 ON. Habilita la tool consultar_al_dueno para que
   // la IA, en vez de inventar cuando NO sabe, pregunte al dueno. Con flag OFF -> false => la tool NO se ofrece y el
   // comportamiento es el ACTUAL EXACTO. En modoPrueba no aplica (no hay conv real ni dueno a quien preguntar).
@@ -4986,6 +5286,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     systemBlocks.push({ type: 'text', text: 'DATOS EN VIVO (fuentes externas): ' + _fp.join('; ') + '. REGLA DURA: estos datos NO los sabes de memoria — pedilos SIEMPRE con la tool correspondiente y NUNCA inventes una cotizacion, un pronostico del clima, un feriado, una direccion normalizada ni una distancia/tiempo de viaje. Los valores son de REFERENCIA. Si la tool no trae el dato (no se pudo consultar), decile al lead con naturalidad que no lo pudiste confirmar en el momento en vez de inventar.' });
   }
   if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada.' });
+  // PAUTA META (NIVEL 1/2, gated ia_pauta_meta): contexto del aviso Click-to-WhatsApp del que viene el lead. Bloque
+  // DINAMICO (NO cacheado, dato por-lead) => NUNCA va dentro del bloque estatico cacheado. Solo se agrega si el caller
+  // lo paso (flag ON + pauta presente); con el flag OFF _pautaContexto es null => system BYTE-IDENTICO al actual.
+  if (_pautaContexto) systemBlocks.push({ type: 'text', text: _pautaContexto });
 
   // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
   // failover a Bedrock si esta gateado/encendido). Sin BEDROCK_ENABLED + creds, es identico a anthropic.messages.create.
@@ -6948,7 +7252,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // en extendedTextMessage para texto, y dentro del nodo del media (imageMessage/videoMessage/...) para media. Lo
     // buscamos de forma ROBUSTA en cualquiera de esos y de forma DEFENSIVA (optional chaining): nunca debe tirar el
     // webhook. Guardamos responde_a_wa_id=stanzaId y cita_texto=texto citado (truncado ~200) en el insert de abajo.
-    let _respondeAId = null, _citaTexto = null;
+    let _respondeAId = null, _citaTexto = null, _pauta = null;
     try {
       const _ctx = (msg.extendedTextMessage && msg.extendedTextMessage.contextInfo)
         || (msg.imageMessage && msg.imageMessage.contextInfo)
@@ -6969,6 +7273,21 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           || '';
         _citaTexto = _qt ? String(_qt).slice(0, 200) : null;
       }
+      // PAUTA META (Click-to-WhatsApp): si el lead entro clickeando una PUBLICIDAD, Baileys pone los datos del aviso
+      // en el MISMO contextInfo (_ctx.externalAdReply): title/body/sourceUrl (+ sourceId). Solo LEEMOS estos datos aca
+      // ($0, sin DB, sin IA); el flag y el uso se deciden mas abajo (con user_id/rubro resueltos). Propio try/catch:
+      // si el shape no es el esperado, _pauta queda null y el mensaje se procesa EXACTO como hoy (no romper webhook).
+      try {
+        const _ear = _ctx && _ctx.externalAdReply;
+        if (_ear && (_ear.title || _ear.body || _ear.sourceUrl)) {
+          _pauta = {
+            title: _ear.title ? String(_ear.title).slice(0, 300) : '',
+            body: _ear.body ? String(_ear.body).slice(0, 600) : '',
+            sourceUrl: _ear.sourceUrl ? String(_ear.sourceUrl).slice(0, 500) : '',
+            sourceId: _ear.sourceId ? String(_ear.sourceId).slice(0, 120) : ''
+          };
+        }
+      } catch (eEar) { _pauta = null; }
     } catch (eCita) { _respondeAId = null; _citaTexto = null; }
     // REACCION ENTRANTE (lead reacciono a un mensaje): NO es un mensaje normal. Se maneja aparte (asociar la reaccion al
     // mensaje reaccionado) y se corta el flujo: no crea lead nuevo, no gasta IA. Se resuelve antes del guard de 'sin texto'.
@@ -7126,6 +7445,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const convExistente = _ocrear.convExistente;
     if (!conv) return;
 
+    // ===== PAUTA META (Click-to-WhatsApp) — NIVEL 1/2, gated ia_pauta_meta (fail-closed) =====
+    // Si el lead llego desde una PUBLICIDAD (_pauta cargado arriba) Y el flag esta ON: guardamos la pauta CRUDA
+    // asociada a la conv (memoria, $0) para que el 1er turno de la IA la reciba como CONTEXTO (se arma recien en
+    // `procesar`). Tambien habilita persistir la pauta en el mensaje (mas abajo, best-effort). Con el flag OFF o sin
+    // _pauta -> _pautaOn=false -> NADA cambia (ni Map, ni columna, ni contexto) => webhook+IA BYTE-IDENTICOS a hoy.
+    // La query del flag solo corre cuando HAY pauta (mensajes de aviso: raros). Aislado: nunca rompe el webhook.
+    let _pautaOn = false;
+    if (_pauta) {
+      try { _pautaOn = await iaPautaMetaActivo(user_id); } catch (ePmF) { _pautaOn = false; }
+      if (_pautaOn) { try { _setPautaMetaPend(conv.id, _pauta); } catch (ePmS) {} }
+    }
+
     // ===== GATE TEMPRANO (antes de gastar 1 solo token de IA) =====
     // La pausa TOTAL del Maestro (crm_pausado) y la papelera (eliminado_at) cortan ACA, ANTES de transcribir
     // (Groq) y de traducir/clasificar/responder (Claude) -> CERO gasto de tokens. La pausa POR-CONVERSACION
@@ -7239,15 +7570,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       // CITA / REPLY: columnas nuevas (migracion aditiva). Si el lead cito otro mensaje, guardamos el id citado y su texto.
       // DEFENSIVO igual que lat/lng: si la migracion no corrio, el insert reintenta SIN estas columnas (ver fallback abajo).
       const _extraCita = _respondeAId ? { responde_a_wa_id: _respondeAId, cita_texto: _citaTexto } : null;
-      // Un solo objeto de "columnas nuevas" (ubicacion + cita); si el insert falla por alguna, reintentamos sin todas ellas.
-      const _extraNuevas = (_extraUbic || _extraCita) ? Object.assign({}, _extraUbic || {}, _extraCita || {}) : null;
+      // PAUTA META: columna aditiva pauta_meta (jsonb) con los datos del aviso, para que quede REGISTRO. Solo con el
+      // flag ON (_pautaOn). DEFENSIVA igual que cita/ubicacion: si la migracion no corrio, el insert reintenta SIN ella.
+      const _extraPauta = (_pautaOn && _pauta) ? { pauta_meta: _pauta } : null;
+      // Un solo objeto de "columnas nuevas" (ubicacion + cita + pauta); si el insert falla por alguna, reintentamos sin todas ellas.
+      const _extraNuevas = (_extraUbic || _extraCita || _extraPauta) ? Object.assign({}, _extraUbic || {}, _extraCita || {}, _extraPauta || {}) : null;
       const _consNuevas = _extraNuevas ? Object.assign({}, _baseIns, _extraNuevas) : _baseIns;
       let _rIns = null;
       try { _rIns = await supabase.from('messages').insert(_consNuevas); } catch (eIns) { _rIns = { error: eIns }; }
       // Si fallo POR una columna nueva (ubicacion o cita, migracion no corrida), reintentar SIN esas columnas -> el mensaje igual se guarda.
       if (_rIns && _rIns.error && _extraNuevas) {
         const _m = String((_rIns.error && (_rIns.error.message || _rIns.error.details || _rIns.error.hint)) || '').toLowerCase();
-        const _esColNueva = (_rIns.error.code === 'PGRST204') || _m.indexOf('latitud') >= 0 || _m.indexOf('longitud') >= 0 || _m.indexOf('responde_a_wa_id') >= 0 || _m.indexOf('cita_texto') >= 0 || (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
+        const _esColNueva = (_rIns.error.code === 'PGRST204') || _m.indexOf('latitud') >= 0 || _m.indexOf('longitud') >= 0 || _m.indexOf('responde_a_wa_id') >= 0 || _m.indexOf('cita_texto') >= 0 || _m.indexOf('pauta_meta') >= 0 || (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
         if (_esColNueva) { try { await supabase.from('messages').insert(_baseIns); } catch (eIns2) { console.error('insert entrante (fallback sin columnas nuevas):', eIns2 && eIns2.message); } }
         else { console.error('insert mensaje entrante:', _rIns.error.message || _rIns.error); }
       }
@@ -7651,7 +7985,24 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // null en el camino genérico => generarRespuestaAgente responde con la persona de la cuenta (ACTUAL EXACTO).
           let _agenteConfigIA = null;
           try { _agenteConfigIA = await configUsuarioIACobertura(user_id, _convId); } catch (eCfgIA) { _agenteConfigIA = null; }
-          const resultado = await generarRespuestaAgente(user_id, _convId, texto, _agenteConfigIA ? { agenteConfig: _agenteConfigIA } : undefined);
+          // PAUTA META (NIVEL 1/2): si esta conv tiene una pauta pendiente (guardada arriba SOLO con el flag ON), la
+          // consumimos AHORA (1 sola vez) y armamos el contexto: Nivel 1 (datos del aviso) + Nivel 2 (match $0 contra
+          // el inventario, codigo puro). Ese texto viaja en el MISMO turno de IA de abajo -> se cuenta solo en
+          // registrarUsoTokens/registrarUsoIA (NO agrega llamadas de IA, $0 extra). Con el flag OFF no hay pauta
+          // pendiente -> _pautaContexto=null -> se pasa el MISMO `opciones` que hoy => byte-identico. Aislado: si algo
+          // falla, se responde sin el contexto (como hoy). El rubro sale de _bsGate (ya leido, 0 queries extra).
+          let _pautaContexto = null;
+          try {
+            const _pp = _tomarPautaMetaPend(_convId);
+            if (_pp) _pautaContexto = await _construirContextoPauta(user_id, _pp, _bsGate && _bsGate.rubro);
+          } catch (ePauCtx) { _pautaContexto = null; }
+          let _opcGen = null;
+          if (_agenteConfigIA || _pautaContexto) {
+            _opcGen = {};
+            if (_agenteConfigIA) _opcGen.agenteConfig = _agenteConfigIA;
+            if (_pautaContexto) _opcGen.pautaContexto = _pautaContexto;
+          }
+          const resultado = await generarRespuestaAgente(user_id, _convId, texto, _opcGen || undefined);
           if (resultado && resultado.reply) {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
             try { await registrarUsoTokens(user_id, resultado.usage); } catch (e) {}

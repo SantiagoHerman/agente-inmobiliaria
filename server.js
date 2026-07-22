@@ -1926,6 +1926,20 @@ async function derivacionAvisarEquipo(user_id, bs) {
   } catch (e) { return true; }
 }
 
+// FEATURE notif dirigidas: ¿el tenant quiere NOTIFICACIONES DIRIGIDAS (que un vendedor solo reciba el push cuando
+// le corresponde a EL)? Flag por-cuenta business_settings.notif_solo_involucrado. FAIL-CLOSED: DEFAULT OFF ->
+// comportamiento BYTE-IDENTICO al actual. Solo devuelve TRUE si la columna existe y === true; columna ausente /
+// null / false / cualquier error -> OFF. (La migracion prende a las cuentas NO congeladas.) 0 IA. Nunca tira.
+async function notifSoloInvolucrado(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'notif_solo_involucrado')) return bs.notif_solo_involucrado === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('notif_solo_involucrado').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> OFF (fail-closed)
+    return !!(data && data.notif_solo_involucrado === true);
+  } catch (e) { return false; }
+}
+
 // TAREA 3 (derivacion-v3-refinements): minutos EN HORARIO DE OFICINA sin nadie disponible del depto antes de avisar
 // al dueno (business_settings.derivacion_aviso_dueno_min). DEFAULT 30. Validado 1..1440. Mismo patron defensivo que
 // derivacionEsperaMin: fuera de rango/ausente/error -> 30. Solo se consulta con el flag ON.
@@ -3287,7 +3301,15 @@ async function _notificarRotacionV3(ownerId, convId, asesorId, leadRef, esRotaci
     // TAREA 1 (derivacion-v3-refinements): el post al canal "Todos" es TOGGLEABLE por business_settings.
     // derivacion_avisar_equipo (default TRUE = comportamiento actual). Solo postear si esta en true. Este bloque solo
     // corre con el flag derivacion_v3 ON (el llamador ya gatea), asi que con el flag OFF nada de esto se ejecuta.
-    try { if (await derivacionAvisarEquipo(ownerId)) await _postearAvisoInterno(ownerId, 'general', _txtCanal); } catch (eG) {}
+    // FEATURE notif dirigidas [gated notif_solo_involucrado]: con el flag ON dejamos el REGISTRO del aviso en el hilo
+    // "Todos" pero SIN push masivo al equipo (el asesor asignado YA recibio su push DIRECTO arriba via enviarPushAsesor;
+    // este es justo el caso "Walter no se entera de la rotacion a Jonathan"). Con el flag OFF -> BYTE-IDENTICO al actual.
+    try {
+      if (await derivacionAvisarEquipo(ownerId)) {
+        if (await notifSoloInvolucrado(ownerId)) await _postearAvisoInterno(ownerId, 'general', _txtCanal, { soloRegistro: true });
+        else await _postearAvisoInterno(ownerId, 'general', _txtCanal);
+      }
+    } catch (eG) {}
   } catch (e) { console.error('_notificarRotacionV3:', e && e.message); }
 }
 
@@ -8966,8 +8988,16 @@ async function _ejecutarMatchingPropiedad(ownerId, prop, label) {
     oportunidad = (ins && ins.data) ? ins.data : null;
   }
   // Aviso interno al dueno (canal "Todos"). Best-effort: nunca rompe. 0 IA.
+  var _txtOp = 'Hay ' + convIds.length + ' lead' + (convIds.length === 1 ? '' : 's') + ' que matchean ' + label + '. Quedo un borrador en Oportunidades: revisalo y lanzalo.';
   try {
-    await _postearAvisoInterno(ownerId, 'general', 'Hay ' + convIds.length + ' lead' + (convIds.length === 1 ? '' : 's') + ' que matchean ' + label + '. Quedo un borrador en Oportunidades: revisalo y lanzalo.');
+    // FEATURE notif dirigidas [gated notif_solo_involucrado]: es GESTION -> con el flag ON el push va SOLO al dueno/admin
+    // (los vendedores no lo reciben); el registro queda visible en el canal "Todos". Flag OFF -> BYTE-IDENTICO al actual.
+    if (await notifSoloInvolucrado(ownerId)) {
+      await _postearAvisoInterno(ownerId, 'general', _txtOp, { soloRegistro: true });
+      try { await _pushDuenoAdmins(ownerId, _txtOp); } catch (eOpP) {}
+    } else {
+      await _postearAvisoInterno(ownerId, 'general', _txtOp);
+    }
   } catch (eAv) {}
   return { candidatos: convIds.length, oportunidad_id: (oportunidad && oportunidad.id) ? oportunidad.id : null, propiedad: label };
 }
@@ -10421,7 +10451,15 @@ async function revisarAvisosInternos() {
       }
       const texto = 'Lead caliente sin respuesta hace ' + minutos + ' min' + (deptoNombre ? (' en ' + deptoNombre) : '') + ': ' + leadRef + '.';
       _avisoCalienteMem.add(conv.id); // marcar YA (anti doble-aviso entre ticks)
-      await _postearAvisoInterno(ownerId, conv.departamento_id || null, texto);
+      // FEATURE notif dirigidas [gated notif_solo_involucrado]: el lead caliente SIEMPRE es SIN asesor (la query lo
+      // garantiza: is('asesor_id', null)) -> con el flag ON el push va SOLO al dueno/admin; el registro queda en el
+      // canal. NUNCA se rutea "al asesor del lead" (seria null). Flag OFF -> BYTE-IDENTICO al actual.
+      if (await notifSoloInvolucrado(ownerId)) {
+        await _postearAvisoInterno(ownerId, conv.departamento_id || null, texto, { soloRegistro: true });
+        try { await _pushDuenoAdmins(ownerId, texto); } catch (eHP) {}
+      } else {
+        await _postearAvisoInterno(ownerId, conv.departamento_id || null, texto);
+      }
       // Dedupe persistente best-effort (defensivo si la columna no existe).
       try { await supabase.from('conversations').update({ aviso_caliente_enviado: true }).eq('id', conv.id); } catch (eMk) {}
     }
@@ -10479,7 +10517,14 @@ async function revisarAvisosInternos() {
       // Postear al canal del depto default si existe, si no DM al dueno.
       let depDefault = null;
       try { const { data: dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); depDefault = dd && dd.id ? dd.id : null; } catch (eDD) {}
-      await _postearAvisoInterno(ownerId, depDefault, texto);
+      // FEATURE notif dirigidas [gated notif_solo_involucrado]: el resumen diario es GESTION -> con el flag ON el push
+      // va SOLO al dueno/admin; el registro queda en el canal. Flag OFF -> BYTE-IDENTICO al actual.
+      if (await notifSoloInvolucrado(ownerId)) {
+        await _postearAvisoInterno(ownerId, depDefault, texto, { soloRegistro: true });
+        try { await _pushDuenoAdmins(ownerId, texto); } catch (eRP) {}
+      } else {
+        await _postearAvisoInterno(ownerId, depDefault, texto);
+      }
       // Dedupe por fecha (best-effort, defensivo si la columna no existe).
       try { await supabase.from('business_settings').update({ aviso_resumen_fecha: hoyStr }).eq('user_id', ownerId); } catch (eMk) {}
     }
@@ -13391,7 +13436,7 @@ async function _avisoRemitente(ownerId) {
 // POSTEA un aviso interno (texto FIJO, sin IA) al canal del depto `departamentoId` (o, si es null/no resuelve,
 // DM al dueno) como team_message del remitente 'Asistente', y manda push a los miembros (reusa enviarPushAsesor).
 // Aislado por tenant. Defensivo: traga errores; nunca tira al caller. NO consume tokens de IA.
-async function _postearAvisoInterno(ownerId, departamentoId, texto) {
+async function _postearAvisoInterno(ownerId, departamentoId, texto, opts) {
   try {
     if (!ownerId || !texto || !String(texto).trim()) return;
     const senderId = await _avisoRemitente(ownerId);
@@ -13446,6 +13491,11 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto) {
         }
       } catch (eGrupo) { console.error('grupo TODOS (espejo WA):', eGrupo && eGrupo.message); } // NUNCA romper el aviso interno
     }
+    // FEATURE notif dirigidas [gated notif_solo_involucrado]: si el caller pide `soloRegistro`, se OMITE el PUSH
+    // MASIVO a los integrantes del canal, MANTENIENDO todo lo de arriba: (1) el registro del aviso en el HILO y
+    // (2) el espejo al grupo WhatsApp "Todos". El caller ya empujo el push DIRECTO a quien corresponde (asesor del
+    // lead / dueno-admin). Sin opts (todos los callers actuales por defecto) -> comportamiento BYTE-IDENTICO al actual.
+    if (opts && opts.soloRegistro === true) return;
     // Push a los miembros (0 tokens IA). Excluir al remitente. Dedupe.
     const vistos = {};
     for (let i = 0; i < destinatarios.length; i++) {
@@ -13455,6 +13505,58 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto) {
       try { await enviarPushAsesor(p, 'Asistente', '', 'Aviso interno: ' + cuerpo.slice(0, 120)); } catch (eP) {}
     }
   } catch (e) { console.error('_postearAvisoInterno:', e && e.message); }
+}
+
+// ===== FEATURE notif dirigidas: destinatarios DIRIGIDOS (0 IA, texto fijo) =====
+// Devuelve el auth_user_id del asesor ASIGNADO a la conversacion del lead, o null si no tiene asesor / no resuelve.
+// Aislado por tenant (admin_id=ownerId). Defensivo: cualquier error -> null.
+async function _asesorAuthDeConv(ownerId, conversationId) {
+  try {
+    if (!ownerId || !conversationId) return null;
+    const { data: cv } = await supabase.from('conversations').select('asesor_id').eq('id', conversationId).eq('user_id', ownerId).maybeSingle();
+    if (!cv || !cv.asesor_id) return null;
+    const { data: ase } = await supabase.from('asesores').select('auth_user_id').eq('id', cv.asesor_id).eq('admin_id', ownerId).maybeSingle();
+    return (ase && ase.auth_user_id) ? ase.auth_user_id : null;
+  } catch (e) { return null; }
+}
+
+// Push DIRIGIDO al DUENO + ADMINISTRADORES del tenant (esAdministrador). REGLA DE ORO: el dueno/admin NUNCA queda
+// ciego. Reusa enviarPushAsesor (mismo push que hoy: el dueno recibe EXACTAMENTE lo que ya recibia por el canal;
+// los admins tambien). Dedupe. 0 IA. Defensivo: nunca tira.
+async function _pushDuenoAdmins(ownerId, cuerpo) {
+  try {
+    if (!ownerId) return;
+    const _cuerpo = 'Aviso interno: ' + String(cuerpo || '').slice(0, 120);
+    const vistos = {};
+    // El DUENO SIEMPRE (su auth_user_id ES el user_id del tenant; enviarPushAsesor busca por device_tokens.user_id).
+    vistos[ownerId] = true;
+    try { await enviarPushAsesor(ownerId, 'Asistente', '', _cuerpo); } catch (eO) {}
+    // Administradores (visibilidad 'generales' o rol legacy 'administrador'), activos, con login.
+    try {
+      const { data: ases } = await supabase.from('asesores').select('auth_user_id, rol, visibilidad').eq('admin_id', ownerId).eq('activo', true);
+      const admins = (ases || []).filter(function (a) { return a && a.auth_user_id && esAdministrador(a); });
+      for (let i = 0; i < admins.length; i++) {
+        const au = admins[i].auth_user_id;
+        if (!au || vistos[au]) continue;
+        vistos[au] = true;
+        try { await enviarPushAsesor(au, 'Asistente', '', _cuerpo); } catch (eA) {}
+      }
+    } catch (eAses) {}
+  } catch (e) { console.error('_pushDuenoAdmins:', e && e.message); }
+}
+
+// Push DIRIGIDO al ASESOR del lead (si la conversacion tiene asesor asignado) o, si NO tiene, al DUENO/ADMINS
+// (regla de oro: nunca nadie queda ciego). 0 IA. Defensivo: nunca tira.
+async function _pushAsesorDeLeadOAdmins(ownerId, conversationId, cuerpo) {
+  try {
+    if (!ownerId) return;
+    const auth = await _asesorAuthDeConv(ownerId, conversationId);
+    if (auth) {
+      try { await enviarPushAsesor(auth, 'Asistente', '', 'Aviso interno: ' + String(cuerpo || '').slice(0, 120)); } catch (eP) {}
+    } else {
+      await _pushDuenoAdmins(ownerId, cuerpo); // lead SIN asesor -> dueno/admin
+    }
+  } catch (e) { console.error('_pushAsesorDeLeadOAdmins:', e && e.message); }
 }
 
 // Resuelve el departamento_id de una conversacion (para rutear el aviso a su canal). Defensivo: null si no hay.
@@ -13549,8 +13651,12 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
     // 7) Aviso al canal "Todos" (0 IA, texto fijo). Best-effort. Ademas, si hay depto, a su canal (opcional).
     const _fechaLegible = _formatearFechaCita(_fhISO);
     const _txtAviso = '📅 Nueva cita para tomar: ' + _fechaLegible + (_leadNombre ? (' — ' + _leadNombre) : '');
-    try { await _postearAvisoInterno(ownerId, 'general', _txtAviso); } catch (eAv) {}
-    if (_deptoId) { try { await _postearAvisoInterno(ownerId, _deptoId, _txtAviso); } catch (eAvD) {} }
+    // FEATURE notif dirigidas [gated notif_solo_involucrado]: con el flag ON el push va SOLO al asesor del lead (o al
+    // dueno/admin si el lead no tiene asesor); el/los registro(s) quedan en el hilo SIN push masivo. Flag OFF -> igual que hoy.
+    const _dirigidoCita = await notifSoloInvolucrado(ownerId);
+    try { await _postearAvisoInterno(ownerId, 'general', _txtAviso, _dirigidoCita ? { soloRegistro: true } : undefined); } catch (eAv) {}
+    if (_deptoId) { try { await _postearAvisoInterno(ownerId, _deptoId, _txtAviso, _dirigidoCita ? { soloRegistro: true } : undefined); } catch (eAvD) {} }
+    if (_dirigidoCita) { try { await _pushAsesorDeLeadOAdmins(ownerId, conversationId, _txtAviso); } catch (eAvP) {} }
     return { ok: true, citaId: _citaId, duplicada: false, fechaLegible: _fechaLegible };
   } catch (e) { console.error('_agendarCitaTentativaAgente:', e && e.message); return { ok: false }; }
 }
@@ -13597,7 +13703,14 @@ async function _avisoNoResuelve(ownerId, conversationId, preguntaTexto) {
     const dep = await _avisoDeptoDeConv(ownerId, conversationId);
     const _q = String(preguntaTexto || '').trim().slice(0, 400);
     const texto = 'La IA no pudo resolver una consulta del lead ' + leadRef + (_q ? (': "' + _q + '"') : '.');
-    await _postearAvisoInterno(ownerId, dep, texto);
+    // FEATURE notif dirigidas [gated notif_solo_involucrado]: con el flag ON el push va SOLO al asesor del lead (o al
+    // dueno/admin si no tiene asesor); el registro queda en el hilo SIN push masivo. Flag OFF -> BYTE-IDENTICO al actual.
+    if (await notifSoloInvolucrado(ownerId)) {
+      await _postearAvisoInterno(ownerId, dep, texto, { soloRegistro: true });
+      try { await _pushAsesorDeLeadOAdmins(ownerId, conversationId, texto); } catch (eNP) {}
+    } else {
+      await _postearAvisoInterno(ownerId, dep, texto);
+    }
   } catch (e) { console.error('_avisoNoResuelve:', e && e.message); }
 }
 
@@ -21601,8 +21714,16 @@ app.post('/api/citas/tomar', async function(req, res) {
       var _fechaTxt = _cTomada.fecha_hora ? (' para ' + _formatearFechaCita(_cTomada.fecha_hora)) : '';
       var _txtTomada = '✅ ' + _quien + ' tomó la cita' + _leadTxt + _fechaTxt + '.';
       var _depTomada = _cTomada.departamento_id || null;
-      if (_depTomada) { try { await _postearAvisoInterno(ownerId, _depTomada, _txtTomada); } catch (eAvD) {} }
-      try { await _postearAvisoInterno(ownerId, 'general', _txtTomada); } catch (eAvG) {}
+      // FEATURE notif dirigidas [gated notif_solo_involucrado]: con el flag ON el push va SOLO al asesor del lead (o al
+      // dueno/admin si no tiene asesor); el/los registro(s) quedan en el hilo SIN push masivo. Flag OFF -> igual que hoy.
+      var _dirigidoTomada = await notifSoloInvolucrado(ownerId);
+      if (_depTomada) { try { await _postearAvisoInterno(ownerId, _depTomada, _txtTomada, _dirigidoTomada ? { soloRegistro: true } : undefined); } catch (eAvD) {} }
+      try { await _postearAvisoInterno(ownerId, 'general', _txtTomada, _dirigidoTomada ? { soloRegistro: true } : undefined); } catch (eAvG) {}
+      if (_dirigidoTomada) {
+        var _convTomada = null;
+        try { var _ctc = await supabase.from('citas').select('conversation_id').eq('id', citaId).eq('user_id', ownerId).maybeSingle(); if (_ctc && _ctc.data) _convTomada = _ctc.data.conversation_id || null; } catch (eCtc) {}
+        try { await _pushAsesorDeLeadOAdmins(ownerId, _convTomada, _txtTomada); } catch (eTP) {}
+      }
     } catch (eAviso) { console.error('tomar cita aviso equipo:', eAviso && eAviso.message); }
     // FEATURE #21: reflejar en Google Calendar (best-effort, inerte sin Calendar conectado).
     try { syncCitaACalendar(ownerId, citaId).catch(function(e){ console.error('tomar cita syncCalendar:', e && e.message); }); } catch (eCal) {}
@@ -24366,7 +24487,17 @@ app.post('/api/public/feed/:token/consulta', async function (req, res) {
     } catch (eM) {}
     try { await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: 'Nueva consulta desde el catálogo web público.', enviado_por: 'Sistema' }); } catch (eS) {}
     // 4) Aviso interno al equipo (canal Todos). CERO IA.
-    try { await _postearAvisoInterno(ownerId, 'general', 'Nueva consulta desde el catálogo web: ' + nombre + ' (' + telefono + ')' + (mensaje ? ' — ' + mensaje.slice(0, 160) : '')); } catch (eAv) {}
+    var _txtCat = 'Nueva consulta desde el catálogo web: ' + nombre + ' (' + telefono + ')' + (mensaje ? ' — ' + mensaje.slice(0, 160) : '');
+    try {
+      // FEATURE notif dirigidas [gated notif_solo_involucrado]: lead SIN asesor (recien creado) -> con el flag ON el
+      // push va SOLO al dueno/admin; el registro queda en el canal "Todos". Flag OFF -> BYTE-IDENTICO al actual.
+      if (await notifSoloInvolucrado(ownerId)) {
+        await _postearAvisoInterno(ownerId, 'general', _txtCat, { soloRegistro: true });
+        try { await _pushDuenoAdmins(ownerId, _txtCat); } catch (eCatP) {}
+      } else {
+        await _postearAvisoInterno(ownerId, 'general', _txtCat);
+      }
+    } catch (eAv) {}
     return res.json({ ok: true, nuevo: (contactoNuevo || convNueva) });
   } catch (e) { return res.status(500).json({ error: 'Error' }); }
 });

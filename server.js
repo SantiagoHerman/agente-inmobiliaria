@@ -6816,6 +6816,16 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // VER IDENTIFICADORES DE PROPIEDADES DE ANTON: ?props=1
+    if (req.query.props === '1') {
+      const { data: bsP } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
+      const uidP = bsP && bsP[0] && bsP[0].user_id;
+      if (!uidP) return res.json({ err: 'no anton' });
+      let pr = null;
+      try { const r = await supabase.from('properties').select('id, numero, ref, referencia, codigo, title, operation, activa').eq('user_id', uidP).limit(12); if (r.error) throw r.error; pr = r.data; }
+      catch (eCols) { const r2 = await supabase.from('properties').select('*').eq('user_id', uidP).limit(12); pr = r2.data; }
+      return res.json({ total_muestra: (pr || []).length, columnas: (pr && pr[0]) ? Object.keys(pr[0]) : [], propiedades: (pr || []).map(function(p){ return { id: p.id, numero: p.numero, ref: p.ref, referencia: p.referencia, codigo: p.codigo, title: String(p.title || '').slice(0, 45), op: p.operation, activa: p.activa }; }) });
+    }
     // VER UN CHAT: ?chat=<subcadena del nombre> -> trae la conversacion de Anton con ese contacto (mensajes + estado)
     if (req.query.chat) {
       const { data: bsC } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');

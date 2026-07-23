@@ -4958,6 +4958,192 @@ function _buscarInventarioProps(properties, f, periodosMap) {
   return arr.slice(0, N);
 }
 
+// ===== RAG DE INVENTARIO HOTEL (gated ia_rag_v1) — ESPEJO de las funciones de inmobiliaria para el rubro hotel =====
+// Funciones PURAS (operan sobre `_hotelUnidades`, el array ya cherry-pickeado y scopeado en generarRespuestaAgente;
+// 0 queries extra, 0 IA). Solo rubro hotel_cabanas. Con el flag OFF NO se llaman => prompt/flujo BYTE-IDENTICOS al
+// actual. Function declarations => hoisted. El buscador RAG da la LISTA CORTA; el precio/disponibilidad EXACTOS se
+// derivan a la tool EN VIVO consultar_disponibilidad (PXSOL) — este buscador NO la reemplaza.
+// Rango de tarifas de UNA unidad (min/max por noche + moneda), tomando las tarifas por temporada o, si no hay, el
+// precio_base. Devuelve null si no hay ningun precio cargado (=> "a consultar", nunca se inventa).
+function _hotelTarifaRango(u) {
+  if (!u) return null;
+  var precios = (Array.isArray(u.tarifas) ? u.tarifas : []).map(function (t) { return Number(t && t.precio_noche); }).filter(function (x) { return isFinite(x) && x > 0; });
+  if (precios.length) {
+    var _mon = (u.tarifas[0] && u.tarifas[0].moneda) || u.moneda || 'ARS';
+    return { min: Math.min.apply(null, precios), max: Math.max.apply(null, precios), moneda: _mon };
+  }
+  var pb = Number(u.precio_base);
+  if (isFinite(pb) && pb > 0) return { min: pb, max: pb, moneda: u.moneda || 'ARS' };
+  return null;
+}
+function _hotelPrecioTxt(u) {
+  var r = _hotelTarifaRango(u);
+  if (!r) return 'tarifa a consultar';
+  return 'desde ' + r.moneda + ' ' + _ragMiles(r.min) + '/noche';
+}
+// ¿La unidad esta LIBRE en [ci, co)? Reusa el solape SEMIABIERTO (mismo criterio que _hrConflictosSolape y las
+// reservas temporales de inmobiliaria): choca si reserva.check_in < pedido.check_out Y reserva.check_out > pedido.check_in
+// (el dia de salida queda libre). FAIL-OPEN A LA CALIDAD: fechas mal formadas o sin reservas => true (no la ocultamos).
+function _hotelUnidLibreEnFechas(u, ci, co) {
+  if (!u) return false;
+  var _ci = String(ci == null ? '' : ci), _co = String(co == null ? '' : co);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(_ci) || !/^\d{4}-\d{2}-\d{2}$/.test(_co) || !(_ci < _co)) return true;
+  var _res = Array.isArray(u.reservas) ? u.reservas : [];
+  var _choca = _res.some(function (r) {
+    if (!r || !r.check_in || !r.check_out) return false;
+    return String(r.check_in) < _co && String(r.check_out) > _ci;
+  });
+  return !_choca;
+}
+// Marca (SIN mutar el original) el estado de fechas de una unidad, para que la ficha compacta muestre LIBRE/OCUPADA
+// en el rango pedido sin excluir la unidad silenciosamente. Si no vienen fechas validas, devuelve la unidad tal cual.
+function _hotelMarcarLibre(u, f) {
+  if (!u || !f || !f.check_in || !f.check_out) return u;
+  var _ci = String(f.check_in), _co = String(f.check_out);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(_ci) || !/^\d{4}-\d{2}-\d{2}$/.test(_co) || !(_ci < _co)) return u;
+  var _c = {}; for (var k in u) { if (Object.prototype.hasOwnProperty.call(u, k)) _c[k] = u[k]; }
+  _c._libreEnFechas = _hotelUnidLibreEnFechas(u, _ci, _co);
+  _c._fechasPed = { ci: _ci, co: _co };
+  return _c;
+}
+// INDICE del alojamiento: headers de complejo VERBATIM (info general: amenities/servicios/politicas/checkin/ubicacion)
+// + panorama comprimido de las unidades (total, por complejo, por tipo, rango de capacidad, rango de precio/noche,
+// temporadas). Es la pieza que PRESERVA la calidad: la IA sabe QUE existe sin tener el listado entero.
+function _construirIndiceHotel(unidades, headersTxt) {
+  var uds = Array.isArray(unidades) ? unidades : [];
+  var NL = String.fromCharCode(10);
+  var lineas = [];
+  var _hdr = (headersTxt != null && String(headersTxt).trim()) ? String(headersTxt).trim() : '';
+  if (_hdr) lineas.push(_hdr);
+  if (!uds.length) return lineas.join(NL + NL);
+  var porComplejo = {}, porTipo = {}, caps = [], precios = [], temporadas = {}, _monedaPan = '';
+  uds.forEach(function (u) {
+    var c = (u.complejo_nombre && String(u.complejo_nombre).trim()) || 'sin complejo';
+    porComplejo[c] = (porComplejo[c] || 0) + 1;
+    var t = (u.type && String(u.type).trim()) || 'sin tipo';
+    porTipo[t] = (porTipo[t] || 0) + 1;
+    var cap = Number(u.capacidad); if (isFinite(cap) && cap > 0) caps.push(cap);
+    var r = _hotelTarifaRango(u); if (r) { precios.push(r.min); if (r.max !== r.min) precios.push(r.max); if (!_monedaPan) _monedaPan = r.moneda; }
+    (Array.isArray(u.tarifas) ? u.tarifas : []).forEach(function (ta) { var nm = ta && ta.temporada && String(ta.temporada).trim(); if (nm) temporadas[nm] = true; });
+  });
+  var pan = [];
+  pan.push('Total de unidades activas: ' + uds.length + '.');
+  var comps = Object.keys(porComplejo);
+  if (comps.length) pan.push('Unidades por complejo: ' + comps.map(function (c) { return c + ' (' + porComplejo[c] + ')'; }).join(', ') + '.');
+  var tipos = Object.keys(porTipo).sort(function (a, b) { return porTipo[b] - porTipo[a]; });
+  if (tipos.length) pan.push('Tipos de unidad: ' + tipos.map(function (t) { return t + ' (' + porTipo[t] + ')'; }).join(', ') + '.');
+  if (caps.length) pan.push('Capacidad: de ' + Math.min.apply(null, caps) + ' a ' + Math.max.apply(null, caps) + ' personas.');
+  if (precios.length) { var _mn = Math.min.apply(null, precios), _mx = Math.max.apply(null, precios); pan.push('Precio por noche: ' + (_monedaPan || 'ARS') + ' ' + _ragMiles(_mn) + (_mn !== _mx ? ' a ' + (_monedaPan || 'ARS') + ' ' + _ragMiles(_mx) : '') + '.'); }
+  var temps = Object.keys(temporadas);
+  if (temps.length) pan.push('Temporadas con tarifa: ' + temps.join(', ') + '.');
+  lineas.push(pan.join(NL));
+  return lineas.join(NL + NL);
+}
+// Ficha COMPACTA de UNA unidad (una linea): id/numero, nombre, tipo, complejo, capacidad/camas/dorm, precio desde,
+// y — si vienen fechas — el estado LIBRE/OCUPADA en el rango. Formato de los RESULTADOS de buscar_unidades y del
+// listado comprimido de fail-open.
+function _fichaCompactaUnidad(u) {
+  if (!u) return '';
+  var id = (u.numero != null && String(u.numero).trim()) ? ('#' + String(u.numero).trim()) : ('id ' + u.id);
+  var partes = [id, (u.title || 'sin nombre')];
+  if (u.type && String(u.type).trim()) partes.push(String(u.type).trim());
+  if (u.complejo_nombre && String(u.complejo_nombre).trim()) partes.push(String(u.complejo_nombre).trim());
+  var med = [];
+  if (u.capacidad) med.push('cap ' + u.capacidad);
+  if (u.dormitorios) med.push(u.dormitorios + ' dorm');
+  else if (u.camas) med.push(u.camas + ' camas');
+  if (med.length) partes.push(med.join(' '));
+  partes.push(_hotelPrecioTxt(u));
+  if (u._fechasPed) partes.push(u._libreEnFechas ? ('LIBRE del ' + u._fechasPed.ci + ' al ' + u._fechasPed.co) : ('OCUPADA del ' + u._fechasPed.ci + ' al ' + u._fechasPed.co));
+  return '- ' + partes.join(' | ');
+}
+// Listado COMPLETO comprimido (todas las unidades, una linea c/u). Fail-open a la CALIDAD si el buscador falla:
+// se le pasa a la IA por tool_result para que NUNCA responda a ciegas.
+function _inventarioCompactoUnidades(unidades) {
+  var uds = Array.isArray(unidades) ? unidades : [];
+  if (!uds.length) return '';
+  return uds.map(_fichaCompactaUnidad).join(String.fromCharCode(10));
+}
+// Ficha COMPLETA de UNA unidad (para ficha_unidad). Paridad con el bloque hotel actual, cherry-pick, SIN volcar
+// atributos crudos (nunca `atributos`/pxsol/credenciales/origen_url).
+function _fichaCompletaUnidad(u) {
+  if (!u) return '';
+  var id = (u.numero != null && String(u.numero).trim()) ? ('#' + String(u.numero).trim()) : ('id ' + u.id);
+  var partes = [id + ' - ' + (u.title || 'sin nombre')];
+  if (u.type && String(u.type).trim()) partes.push('tipo: ' + String(u.type).trim());
+  if (u.complejo_nombre && String(u.complejo_nombre).trim()) partes.push('complejo: ' + String(u.complejo_nombre).trim());
+  if (u.capacidad) partes.push('capacidad: ' + u.capacidad + ' personas');
+  if (u.dormitorios) partes.push('dormitorios: ' + u.dormitorios);
+  if (u.camas) partes.push('camas: ' + u.camas);
+  if (u.banos) partes.push('banos: ' + u.banos);
+  if (u.m2) partes.push('m2: ' + u.m2);
+  if (u.vista) partes.push('vista: ' + u.vista);
+  var _tars = (Array.isArray(u.tarifas) ? u.tarifas : []).map(function (t) {
+    var _rango = (t.fecha_desde || t.fecha_hasta) ? (' [' + (t.fecha_desde || '') + (t.fecha_hasta ? ' al ' + t.fecha_hasta : '') + ']') : '';
+    return (t.temporada || 'tarifa') + ': ' + (t.precio_noche != null ? ((t.moneda || 'ARS') + ' ' + _ragMiles(t.precio_noche) + '/noche') : 'consultar') + (t.min_noches ? ' (min ' + t.min_noches + ' noches)' : '') + _rango;
+  });
+  partes.push('tarifas: ' + (_tars.length ? _tars.join(' ; ') : (u.precio_base != null ? ((u.moneda || 'ARS') + ' ' + _ragMiles(u.precio_base) + '/noche') : 'consultar')));
+  if (Array.isArray(u.amenities) && u.amenities.length) partes.push('servicios: ' + u.amenities.join(', '));
+  if (u.servicios_texto && String(u.servicios_texto).trim()) partes.push('mas servicios: ' + String(u.servicios_texto).trim());
+  if (u.descripcion && String(u.descripcion).trim()) partes.push(String(u.descripcion).trim());
+  var _res = Array.isArray(u.reservas) ? u.reservas : [];
+  if (_res.length) partes.push('ocupada: ' + _res.map(function (r) { return 'del ' + r.check_in + ' al ' + r.check_out; }).join(' ; ') + ' (el dia de salida queda libre)');
+  if (u.tieneFotos) partes.push('fotos disponibles: si');
+  return partes.join(' | ');
+}
+// BUSCADOR de unidades: filtro en memoria sobre `_hotelUnidades`. numero/id EXACTO, complejo, tipo, capacidad_min,
+// precio_min/max por noche, temporada, texto_libre, y check_in/check_out -> marca LIBRE/OCUPADA (NO excluye
+// silenciosamente). Ordena por relevancia de texto y luego por precio ascendente. Devuelve hasta N (default 15,
+// tope 30). PURA, sin IA. El precio/disponibilidad EXACTOS se derivan a consultar_disponibilidad (PXSOL).
+function _buscarUnidadesHotel(unidades, f) {
+  var uds = Array.isArray(unidades) ? unidades : [];
+  f = f || {};
+  var arr = uds.slice();
+  // POR NUMERO/ID EXACTO: si el lead nombra "la 3" o el id, devolvemos ESA sin que la tapen los otros filtros.
+  if (f.numero != null && String(f.numero).trim()) {
+    var _idPed = String(f.numero).trim();
+    var _hitNum = arr.filter(function (u) {
+      return (u.numero != null && String(u.numero).trim() === _idPed) || (u.id != null && String(u.id).trim() === _idPed);
+    });
+    if (_hitNum.length) return _hitNum.slice(0, 1).map(function (u) { return _hotelMarcarLibre(u, f); });
+  }
+  if (f.complejo && String(f.complejo).trim()) {
+    var _cw = _ragNorm(f.complejo).split(/\s+/).filter(function (w) { return w.length >= 3; });
+    if (_cw.length) arr = arr.filter(function (u) {
+      var _hay = _ragNorm(u.complejo_nombre);
+      return _cw.every(function (w) { return _hay.indexOf(w) >= 0; });
+    });
+  }
+  if (f.tipo && String(f.tipo).trim()) { var t = _ragNorm(f.tipo); if (t) arr = arr.filter(function (u) { return _ragNorm(u.type).indexOf(t) >= 0 || _ragNorm(u.title).indexOf(t) >= 0; }); }
+  if (f.capacidad_min != null && f.capacidad_min !== '') { var cm = Number(f.capacidad_min); if (isFinite(cm)) arr = arr.filter(function (u) { var c = Number(u.capacidad); return isFinite(c) ? c >= cm : false; }); }
+  // Precio por noche: filtra contra el rango tarifario; si la unidad no tiene precio cargado (a consultar) NO se excluye.
+  if (f.precio_min != null && f.precio_min !== '') { var pm = Number(f.precio_min); if (isFinite(pm)) arr = arr.filter(function (u) { var r = _hotelTarifaRango(u); return r ? r.max >= pm : true; }); }
+  if (f.precio_max != null && f.precio_max !== '') { var px = Number(f.precio_max); if (isFinite(px)) arr = arr.filter(function (u) { var r = _hotelTarifaRango(u); return r ? r.min <= px : true; }); }
+  if (f.temporada && String(f.temporada).trim()) {
+    var _tw = _ragNorm(f.temporada);
+    if (_tw) arr = arr.filter(function (u) { return (Array.isArray(u.tarifas) ? u.tarifas : []).some(function (ta) { return _ragNorm(ta.temporada).indexOf(_tw) >= 0; }); });
+  }
+  var txt = f.texto_libre ? _ragNorm(f.texto_libre) : '';
+  var palabras = txt ? txt.split(/\s+/).filter(function (w) { return w.length >= 3; }) : [];
+  function score(u) {
+    if (!palabras.length) return 0;
+    var hay = _ragNorm([u.title, u.type, u.complejo_nombre, u.descripcion, u.vista, (Array.isArray(u.amenities) ? u.amenities.join(' ') : ''), u.servicios_texto].join(' '));
+    var s = 0;
+    palabras.forEach(function (w) { if (hay.indexOf(w) >= 0) s++; });
+    return s;
+  }
+  arr.sort(function (a, b) {
+    var sb = score(b) - score(a);
+    if (sb !== 0) return sb;
+    var ra = _hotelTarifaRango(a), rb = _hotelTarifaRango(b);
+    var pa = ra ? ra.min : Infinity, pb = rb ? rb.min : Infinity;
+    if (pa !== pb) return pa - pb;
+    return 0;
+  });
+  var N = (f.limite && Number(f.limite) > 0) ? Math.min(Number(f.limite), 30) : 15;
+  return arr.slice(0, N).map(function (u) { return _hotelMarcarLibre(u, f); });
+}
+
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;
   const historialManual = (opciones && opciones.historialManual) || null;
@@ -5296,6 +5482,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // F6.3: unidades hotel con fotos, accesibles desde el handler de la tool enviar_foto_propiedad
   // (se llena dentro del bloque _esHotel; para inmobiliaria/desarrolladora queda [] = sin efecto).
   let _hotelUnidsFoto = [];
+  // RAG HOTEL (gated ia_rag_v1): unidades cherry-pickeadas + headers de complejo VERBATIM, poblados DENTRO del bloque
+  // _esHotel con la data YA scopeada (0 queries extra). Para inmobiliaria/desarrolladora quedan []/'' => _ragHotelActivo
+  // nunca se activa y el prompt/flujo es BYTE-IDENTICO al actual. NUNCA guardan `atributos` crudo ni pxsol/credenciales.
+  let _hotelUnidades = [];
+  let _hotelHeadersTxt = '';
   if (_esHotel) try {
     // F1: la IA tambien lee los COMPLEJOS (info general del hotel/cabaña) para poder responder
     // "que servicios/amenities/politicas tiene el hotel" y, con cadena, distinguir cada complejo.
@@ -5394,6 +5585,41 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       if (_bloques.length > 0) inventarioHotel = _bloques.join(_NL + _NL);
       // F1.4: fotos GENERALES del complejo -> disponibles para la tool enviar_foto (etiquetadas).
       try { (_complejos || []).forEach(function (c) { const _cim = (c.atributos && Array.isArray(c.atributos.images)) ? c.atributos.images : []; if (_cim.length) _hotelUnidsFoto.push({ id: 'complejo_' + c.id, title: (c.nombre || 'Complejo') + ' (fotos generales)', images: _cim, atributos: {}, type: 'complejo' }); }); } catch (eCF) {}
+      // ===== RAG HOTEL (gated ia_rag_v1): data cherry-pickeada para el buscador en memoria =====
+      // Mismo esquema que el bloque de hotel de arriba (0 queries extra: reusa _uds/_tarsPorU/_ocupadasPorU/_compsById).
+      // NUNCA se vuelca `atributos` crudo, ni pxsol/credenciales/origen_url, ni contact_id/status/id de reserva (solo
+      // fechas). Amenities -> etiquetas legibles (mismo _AMEN_LABEL). El gate _ragHotelActivo decide si se usa; con el
+      // flag OFF esta data queda inerte (el prompt sigue usando inventarioHotel completo). Defensivo: ante error -> [].
+      try {
+        _hotelUnidades = _uds.map(function (u) {
+          var at = u.atributos || {};
+          var _amLabels = [];
+          try {
+            var _am = at.amenities || {};
+            _amLabels = Object.keys(_am).filter(function (k) { return _am[k] && (_am[k] === true || _am[k].on); }).map(function (k) { return _AMEN_LABEL[k] || k; });
+          } catch (eAmR) { _amLabels = []; }
+          var _servTxt = '';
+          try { _servTxt = (at.servicios_texto || (typeof at.servicios === 'string' ? at.servicios : '') || '').toString().trim(); } catch (eSvR) { _servTxt = ''; }
+          var _tarifas = (_tarsPorU[u.id] || []).map(function (t) {
+            return { temporada: t.temporada || null, fecha_desde: t.fecha_desde || null, fecha_hasta: t.fecha_hasta || null, precio_noche: (t.precio_noche != null ? t.precio_noche : null), moneda: t.moneda || u.moneda || 'ARS', min_noches: (t.min_noches != null ? t.min_noches : null) };
+          });
+          var _reservas = (_ocupadasPorU[u.id] || []).map(function (r) { return { check_in: r.check_in, check_out: r.check_out }; });
+          var _comp = _compsById[u.complejo_id];
+          return {
+            id: u.id, numero: (u.numero != null ? u.numero : null), title: u.title || null, type: u.type || null,
+            capacidad: (u.capacidad != null ? u.capacidad : null), descripcion: u.descripcion || null,
+            precio_base: (u.precio_base != null ? u.precio_base : null), moneda: u.moneda || 'ARS',
+            complejo_id: u.complejo_id || null, complejo_nombre: (_comp && _comp.nombre) ? _comp.nombre : null,
+            amenities: _amLabels, servicios_texto: _servTxt,
+            camas: (at.camas != null ? at.camas : null), dormitorios: (at.dormitorios != null ? at.dormitorios : null),
+            banos: (at.banos != null ? at.banos : null), m2: (at.m2 != null ? at.m2 : null), vista: (at.vista != null ? at.vista : null),
+            tarifas: _tarifas, reservas: _reservas,
+            tieneFotos: !!(Array.isArray(u.images) && u.images.length > 0)
+          };
+        });
+      } catch (eHU) { console.error('rag hotel unidades:', eHU && eHU.message); _hotelUnidades = []; }
+      // Headers de complejo VERBATIM (reusa _headerComp ya definido arriba): base del indice del alojamiento.
+      try { _hotelHeadersTxt = (_complejos || []).map(_headerComp).join(_NL + _NL); } catch (eHH) { _hotelHeadersTxt = ''; }
     }
   } catch (eHot) { console.error('inventario hotel:', eHot && eHot.message); inventarioHotel = ''; }
 
@@ -5518,6 +5744,28 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } catch (eRagIdx) { console.error('RAG indice:', eRagIdx && eRagIdx.message); _ragActivo = false; }
   }
 
+  // ===== RAG DE INVENTARIO HOTEL (gated ia_rag_v1): resolucion FINAL (ESPEJO de _ragActivo, para el rubro hotel) =====
+  // Con el flag ON + rubro hotel + unidades cargadas, la IA recibe el INDICE (headers de complejo + panorama) en vez
+  // del listado COMPLETO, mas las tools buscar_unidades / ficha_unidad. FAIL-OPEN A LA CALIDAD: ante CUALQUIER error
+  // al armar el indice, _ragHotelActivo queda false => se usa el inventarioHotel COMPLETO EXACTO de hoy (byte-identico,
+  // nunca se degrada). FAIL-CLOSED: con el flag OFF, _iaRagOn=false => _ragHotelActivo=false => prompt/flujo IDENTICOS.
+  let _ragHotelActivo = false;
+  let _indiceHotel = '';
+  let _invHotelCompacto = '';
+  let _headerIndiceHotel = '';
+  if (_iaRagOn && _esHotel) {
+    try {
+      if (_hotelUnidades && _hotelUnidades.length > 0) {
+        _indiceHotel = _construirIndiceHotel(_hotelUnidades, _hotelHeadersTxt);
+        _invHotelCompacto = _inventarioCompactoUnidades(_hotelUnidades);
+        if (_indiceHotel && _invHotelCompacto) {
+          _ragHotelActivo = true;
+          _headerIndiceHotel = 'INVENTARIO DE ALOJAMIENTO (modo buscador): NO tenes el listado completo de unidades aca, solo el INDICE de abajo (info general de los complejos + panorama). Tenes dos herramientas: buscar_unidades (encontrar cabanias / habitaciones / departamentos por complejo, tipo, capacidad, precio por noche, temporada, texto libre o fechas) y ficha_unidad (detalle completo de UNA unidad por su numero/id). REGLA DURA: NUNCA nombres, ofrezcas ni des por existente una unidad concreta que no haya salido de buscar_unidades o ficha_unidad en esta conversacion; para ofrecer algo puntual, PRIMERO busca. Para preguntas de panorama ("que tenes?", "que tipos de cabania?", servicios/politicas del complejo) apoyate en el INDICE. Si pasas fechas, buscar_unidades te marca cada unidad como LIBRE u OCUPADA en ese rango (nunca inventes disponibilidad). ' + ((_iaDisponibilidadOn && _esHotel) ? 'El PRECIO y la DISPONIBILIDAD EXACTOS para fechas concretas se confirman con la herramienta consultar_disponibilidad (motor en vivo): usala para cerrar, este buscador solo da la lista corta de candidatas. ' : '') + 'INDICE DEL ALOJAMIENTO:';
+        }
+      }
+    } catch (eRagHot) { console.error('RAG hotel indice:', eRagHot && eRagHot.message); _ragHotelActivo = false; }
+  }
+
   // Parte ESTATICA del system: identica para el tenant entre mensajes y leads -> se CACHEA con cache_control
   // (prompt caching de Anthropic, ~-90% en relecturas). Los datos del lead (dinamicos) van en un bloque aparte.
   const systemStatic = [
@@ -5568,10 +5816,15 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     _esHotel ? '' : (_ragActivo ? _indiceInv : inventario),
     '',
     // INVENTARIO DE HOTEL / CABAÑAS (ADITIVO + GATEADO por rubro): unidades con capacidad + tarifas por noche/temporada.
-    inventarioHotel ? 'Unidades / habitaciones / cabanias disponibles (ofrecelas SOLO estas; no inventes). Distingui por capacidad y por temporada/fechas; las tarifas son POR NOCHE. Si el cliente te da fechas y cantidad de personas, cruzalas contra la capacidad y la temporada; ante dudas de disponibilidad exacta, ofrece confirmar la reserva:' : '',
-    inventarioHotel || '',
+    // RAG HOTEL (gated ia_rag_v1): con _ragHotelActivo el listado COMPLETO se reemplaza por el INDICE (headers de
+    // complejo + panorama) + guardrail del buscador. Con _ragHotelActivo=false (flag OFF / no-hotel / sin unidades /
+    // error) estas lineas son BYTE-IDENTICAS a las de hoy.
+    _ragHotelActivo ? _headerIndiceHotel : (inventarioHotel ? 'Unidades / habitaciones / cabanias disponibles (ofrecelas SOLO estas; no inventes). Distingui por capacidad y por temporada/fechas; las tarifas son POR NOCHE. Si el cliente te da fechas y cantidad de personas, cruzalas contra la capacidad y la temporada; ante dudas de disponibilidad exacta, ofrece confirmar la reserva:' : ''),
+    _ragHotelActivo ? _indiceHotel : (inventarioHotel || ''),
     // F1.1: instruccion de disponibilidad real. Solo presente si hay inventario de hotel (=> no afecta otros rubros).
-    inventarioHotel ? 'DISPONIBILIDAD (IMPORTANTE): algunas unidades tienen debajo una o mas lineas "OCUPADA del X al Y" (fechas ya reservadas; la fecha de salida es dia de egreso = queda libre esa noche). NUNCA ofrezcas una unidad para fechas que se SOLAPAN con un periodo OCUPADO. Hay solape si la fecha de ingreso pedida es ANTERIOR a la salida ocupada Y la fecha de salida pedida es POSTERIOR al ingreso ocupado. Si el huesped pide fechas ocupadas, ofrecele OTRA unidad libre para esas fechas o proponele fechas alternativas libres. Las unidades o fechas SIN linea "OCUPADA" estan disponibles.' : '',
+    // Con _ragHotelActivo las lineas "OCUPADA del X al Y" NO estan en el prompt (viajan en los resultados de
+    // buscar_unidades), asi que esta instruccion no aplica -> se apaga. Con RAG off queda BYTE-IDENTICA a hoy.
+    (!_ragHotelActivo && inventarioHotel) ? 'DISPONIBILIDAD (IMPORTANTE): algunas unidades tienen debajo una o mas lineas "OCUPADA del X al Y" (fechas ya reservadas; la fecha de salida es dia de egreso = queda libre esa noche). NUNCA ofrezcas una unidad para fechas que se SOLAPAN con un periodo OCUPADO. Hay solape si la fecha de ingreso pedida es ANTERIOR a la salida ocupada Y la fecha de salida pedida es POSTERIOR al ingreso ocupado. Si el huesped pide fechas ocupadas, ofrecele OTRA unidad libre para esas fechas o proponele fechas alternativas libres. Las unidades o fechas SIN linea "OCUPADA" estan disponibles.' : '',
     // INVENTARIO DE DESARROLLOS (ADITIVO + GATEADO): solo presente si la cuenta tiene el modulo activo.
     // Con el flag OFF, inventarioDesarrollos === '' => .filter(Boolean) descarta estas 2 lineas y el prompt es el ACTUAL EXACTO.
     inventarioDesarrollos ? 'Emprendimientos / desarrollos disponibles (proyectos en pozo, en construccion o terminados; ofrecelos cuando el cliente busca obra nueva, financiacion en cuotas o inversion). Usa SOLO estos; no inventes unidades ni precios. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. Si el emprendimiento tiene link, compartilo:' : '',
@@ -5755,6 +6008,38 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // RAG DE INVENTARIO HOTEL (gated ia_rag_v1): tools buscar_unidades + ficha_unidad (ESPEJO de las de inmobiliaria,
+  // esquema propio de hotel). ADITIVO: solo se agregan con _ragHotelActivo (flag ON + rubro hotel + unidades cargadas)
+  // => con el flag OFF NO se agregan y el prompt/flujo son BYTE-IDENTICOS al actual. El filtro corre en memoria sobre
+  // `_hotelUnidades` (0 IA, 0 query). El turno de busqueda NO se cobra aparte (ver _ragToolUsado). El precio/disponibilidad
+  // EXACTOS se derivan a consultar_disponibilidad (PXSOL) cuando esta activa.
+  if (_ragHotelActivo) {
+    toolsAgente.push({
+      name: 'buscar_unidades',
+      description: 'Usala para BUSCAR unidades del alojamiento (cabanias, habitaciones, departamentos) segun lo que pide el lead (por complejo, tipo, capacidad de personas, precio por noche, temporada o texto libre). Es la UNICA forma de saber que unidades concretas existen: NO tenes el listado completo, solo el indice. Llamala ANTES de nombrar, ofrecer o describir cualquier unidad puntual. Si el lead da fechas, pasalas: te marca cada unidad como LIBRE u OCUPADA en ese rango (no la excluye). Si no hay coincidencias, relaja filtros y volve a llamarla, o pedile un dato al lead; NUNCA inventes unidades.',
+      input_schema: { type: 'object', properties: {
+        complejo: { type: 'string', description: 'Nombre del complejo/hotel donde busca el lead, si lo menciono (ej: "Cabanias del Lago"). Opcional.' },
+        tipo: { type: 'string', description: 'Tipo de unidad (ej: "cabania", "habitacion", "departamento", "suite"). Opcional.' },
+        capacidad_min: { type: 'integer', description: 'Cantidad minima de personas que deben entrar (ej: 4 si son una familia de 4). Opcional.' },
+        precio_min: { type: 'number', description: 'Precio minimo POR NOCHE, en la moneda de las tarifas. Opcional.' },
+        precio_max: { type: 'number', description: 'Precio maximo POR NOCHE, en la moneda de las tarifas. Opcional.' },
+        temporada: { type: 'string', description: 'Nombre de temporada si el lead la nombra (ej: "verano", "temporada alta"). Opcional.' },
+        texto_libre: { type: 'string', description: 'Palabras clave sueltas del pedido (ej: "con hidromasaje", "vista al lago", "pet friendly"). Opcional.' },
+        numero: { type: 'string', description: 'Numero/id EXACTO de una unidad, si el lead lo menciona ("la cabania 3", "la unidad 12"). Devuelve SOLO esa. Opcional.' },
+        check_in: { type: 'string', description: 'Fecha de entrada AAAA-MM-DD, si el lead da fechas. Marca cada unidad LIBRE/OCUPADA en el rango (no filtra). Si el mes ya paso este ano, usa el ano que viene.' },
+        check_out: { type: 'string', description: 'Fecha de salida AAAA-MM-DD (el dia de salida queda libre).' },
+        limite: { type: 'integer', description: 'Cuantos resultados queres (default 15, maximo 30). Opcional.' }
+      }, required: [] }
+    });
+    toolsAgente.push({
+      name: 'ficha_unidad',
+      description: 'Usala cuando ya identificaste UNA unidad concreta (por su numero/id, salido de buscar_unidades) y queres su DETALLE completo para darle datos precisos al lead (capacidad, camas, banos, tarifas por temporada, servicios, fotos disponibles). Para MANDAR una foto usa enviar_foto_propiedad. Para el PRECIO/DISPONIBILIDAD EXACTOS de fechas concretas usa consultar_disponibilidad si esta disponible. No inventes datos: si la unidad no aparece, volve a buscar con buscar_unidades.',
+      input_schema: { type: 'object', properties: {
+        id: { type: 'string', description: 'El numero/id de la unidad tal como figura en los resultados de buscar_unidades (ej: "3").' }
+      }, required: ['id'] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -5783,6 +6068,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // RAG (gated _ragActivo): la IA necesita saber QUE DIA ES HOY para convertir "del 10 al 20 de enero" a AAAA-MM-DD y
   // poder pedir disponibilidad de alquiler TEMPORAL con buscar_inventario. Bloque DINAMICO (NO cacheado: cambia a diario).
   if (_ragActivo) systemBlocks.push({ type: 'text', text: 'HOY es ' + _fechaLocalArg() + ' (formato AAAA-MM-DD). Usalo para resolver el ano de las fechas que diga el lead: si el mes ya paso este ano, es el ano que viene. Cuando el lead pida un ALQUILER TEMPORAL para fechas concretas, pasa fecha_desde y fecha_hasta a buscar_inventario y te devuelve SOLO las que estan libres en ese rango (el dia de salida queda libre). Si el lead no da fechas, no las inventes.' });
+  // RAG HOTEL (gated _ragHotelActivo): igual que arriba, la IA necesita saber QUE DIA ES HOY para convertir las fechas
+  // del lead a AAAA-MM-DD y pasarlas a buscar_unidades (marca LIBRE/OCUPADA). Bloque DINAMICO (NO cacheado: cambia a diario).
+  if (_ragHotelActivo) systemBlocks.push({ type: 'text', text: 'HOY es ' + _fechaLocalArg() + ' (formato AAAA-MM-DD). Usalo para resolver el ano de las fechas que diga el lead: si el mes ya paso este ano, es el ano que viene. Cuando el lead de fechas de estadia, pasa check_in y check_out a buscar_unidades y te marca cada unidad como LIBRE u OCUPADA en ese rango (el dia de salida queda libre). Si el lead no da fechas, no las inventes.' });
   // VISION: instruccion cuando el lead mando una imagen. Bloque DINAMICO (no cacheado, solo con imagen presente).
   if (_imagenUrl) systemBlocks.push({ type: 'text', text: 'EL LEAD TE MANDO UNA IMAGEN y la estas VIENDO arriba (nunca digas que "no te llega la imagen" ni que no la ves). Mirala con atencion: si es una captura de un AVISO, una FICHA o un CARTEL de una propiedad, LEE el texto que tenga (nombre, numero/ID, precio, zona, direccion) y usalo para IDENTIFICAR la propiedad en el inventario (buscala por su numero o por su nombre). Si es una foto de una propiedad SIN texto, describi lo que ves (tipo, ambientes, estado) y pedile una referencia (nombre, zona o numero) para ubicarla. NO inventes datos que no puedas leer en la imagen ni confirmes una propiedad si no estas segura de cual es: mejor pedi el dato que falta.' });
   if (_pautaContexto) systemBlocks.push({ type: 'text', text: _pautaContexto });
@@ -5902,6 +6190,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // _ragActivo => con el flag OFF la rama nunca se entra (ACTUAL EXACTO).
     const _toolBuscarInv = _ragActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_inventario'; }) : null;
     const _toolFichaInv = _ragActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ficha_inventario'; }) : null;
+    // RAG DE INVENTARIO HOTEL (gated ia_rag_v1): ¿la IA pidio buscar_unidades / ficha_unidad? Solo se detectan con
+    // _ragHotelActivo => con el flag OFF (o rubro no-hotel) la rama nunca se entra (ACTUAL EXACTO).
+    const _toolBuscarUni = _ragHotelActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_unidades'; }) : null;
+    const _toolFichaUni = _ragHotelActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ficha_unidad'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       let _resCercaTxt = '';
@@ -6282,6 +6574,57 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         }
       } catch (eFi) { console.error('tool ficha_inventario:', eFi && eFi.message); _resFiTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del inventario, sin inventar.'; }
       reply = await _cerrarTurnoFuente(_toolFichaInv, _resFiTxt, 'ficha-inventario', _textoPrevioFi, 'Dejame traer los detalles y te confirmo.');
+    } else if (_toolBuscarUni) {
+      // RAG HOTEL (gated ia_rag_v1): la IA pidio buscar_unidades. Filtro en memoria sobre `_hotelUnidades` (0 IA, 0 query)
+      // + 2do turno para que redacte (usage acumulado en _cerrarTurnoFuente). La tool solo existe con _ragHotelActivo =>
+      // nunca se entra con el flag OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
+      _ragToolUsado = true;
+      const _NLbu = String.fromCharCode(10);
+      const _textoPrevioBu = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resBuTxt = '';
+      try {
+        const _inpBu = _toolBuscarUni.input || {};
+        const _resBu = _buscarUnidadesHotel(_hotelUnidades, {
+          complejo: _inpBu.complejo, tipo: _inpBu.tipo, capacidad_min: _inpBu.capacidad_min,
+          precio_min: _inpBu.precio_min, precio_max: _inpBu.precio_max, temporada: _inpBu.temporada,
+          texto_libre: _inpBu.texto_libre, numero: _inpBu.numero,
+          check_in: _inpBu.check_in, check_out: _inpBu.check_out, limite: _inpBu.limite
+        });
+        // Si el lead dio fechas y PXSOL esta activo, la lista corta se cierra con la tool EN VIVO (precio/disponibilidad exactos).
+        const _hayFechasBu = !!(_inpBu.check_in && _inpBu.check_out && /^\d{4}-\d{2}-\d{2}$/.test(String(_inpBu.check_in)) && /^\d{4}-\d{2}-\d{2}$/.test(String(_inpBu.check_out)));
+        const _notaDispo = (_hayFechasBu && _iaDisponibilidadOn && _esHotel) ? (_NLbu + 'IMPORTANTE: para el PRECIO y la DISPONIBILIDAD EXACTOS de esas fechas usa la herramienta consultar_disponibilidad (motor en vivo); esta lista es orientativa.') : '';
+        if (!_resBu.length) {
+          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
+          _resBuTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes unidades. Opciones: (a) relaja algun filtro (ampli el rango de precio o quita el complejo) y volve a llamar buscar_unidades; (b) pedile al lead un dato que acote mejor (personas, complejo, presupuesto). Para referencia, este es el panorama del alojamiento:' + _NLbu + _indiceHotel + _notaDispo;
+        } else {
+          _resBuTxt = 'Unidades del alojamiento (' + _resBu.length + '; usa SOLO estas, no inventes otras). Para dar fotos o el detalle completo de una, usa ficha_unidad con su numero:' + _NLbu + _resBu.map(_fichaCompactaUnidad).join(_NLbu) + _NLbu + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su tarifa por noche. Si una figura OCUPADA en las fechas pedidas, no la ofrezcas para ese rango: proponé otra libre o fechas alternativas. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.' + _notaDispo;
+        }
+      } catch (eBu) {
+        console.error('tool buscar_unidades:', eBu && eBu.message);
+        // FAIL-OPEN A LA CALIDAD: si el buscador falla, le pasamos el LISTADO COMPLETO comprimido para que la IA NO
+        // responda a ciegas (nunca degradar la respuesta; el costo extra es raro y solo ante error).
+        _resBuTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el LISTADO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbu + (_invHotelCompacto || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
+      }
+      reply = await _cerrarTurnoFuente(_toolBuscarUni, _resBuTxt, 'buscar-unidades', _textoPrevioBu, 'Dejame ver las unidades disponibles y te paso opciones.');
+    } else if (_toolFichaUni) {
+      // RAG HOTEL (gated ia_rag_v1): detalle completo de UNA unidad por numero/id (sobre `_hotelUnidades` en memoria).
+      _ragToolUsado = true;
+      const _NLfu = String.fromCharCode(10);
+      const _textoPrevioFu = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resFuTxt = '';
+      try {
+        const _inpFu = _toolFichaUni.input || {};
+        const _idRawU = (_inpFu.id != null && _inpFu.id !== '') ? _inpFu.id : (_inpFu.numero != null ? _inpFu.numero : '');
+        const _idPedU = String(_idRawU).trim();
+        let _uFi = null;
+        if (_idPedU) _uFi = (_hotelUnidades || []).find(function(u){ return (u.numero != null && String(u.numero).trim() === _idPedU) || (u.id != null && String(u.id).trim() === _idPedU); });
+        if (!_uFi) {
+          _resFuTxt = 'No encontre una unidad con ese numero/id (' + _idPedU + '). Volve a buscar con buscar_unidades o pedile al lead que aclare cual le interesa. No inventes datos.';
+        } else {
+          _resFuTxt = 'Ficha completa de la unidad pedida (usa SOLO estos datos):' + _NLfu + _fichaCompletaUnidad(_uFi) + _NLfu + 'Para mandarle una FOTO usa enviar_foto_propiedad con el numero.' + ((_iaDisponibilidadOn && _esHotel) ? ' Para el PRECIO/DISPONIBILIDAD EXACTOS de fechas concretas usa consultar_disponibilidad.' : '') + ' No inventes datos que no figuren aca.';
+        }
+      } catch (eFu) { console.error('tool ficha_unidad:', eFu && eFu.message); _resFuTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del alojamiento, sin inventar.'; }
+      reply = await _cerrarTurnoFuente(_toolFichaUni, _resFuTxt, 'ficha-unidad', _textoPrevioFu, 'Dejame traer los detalles y te confirmo.');
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {

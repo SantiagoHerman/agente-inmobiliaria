@@ -4340,7 +4340,7 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
     const endpoint = (mediatype === 'audio') ? '/message/sendWhatsAppAudio/' : '/message/sendMedia/';
     let bodyFinal;
     if (mediatype === 'audio') { bodyFinal = { number: numero, audio: mediaUrl }; }
-    else { let extDef = 'bin'; if (mediatype === 'image') extDef = 'jpg'; else if (mediatype === 'video') extDef = 'mp4'; const nombreArch = 'archivo_' + Date.now() + '.' + extDef; bodyFinal = { number: numero, mediatype: mediatype, media: mediaUrl, fileName: nombreArch }; if (caption) bodyFinal.caption = caption; }
+    else { let extDef = 'bin'; if (mediatype === 'image') extDef = 'jpg'; else if (mediatype === 'video') extDef = 'mp4'; const nombreArch = 'archivo_' + Date.now() + '.' + extDef; bodyFinal = { number: numero, mediatype: mediatype, media: mediaUrl, fileName: nombreArch }; if (caption) bodyFinal.caption = _limpiarEntidadesHtml(caption); }
     const resp = await fetch(EVOLUTION_URL + endpoint + instancia, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
@@ -6634,6 +6634,25 @@ function quitarEmojis(t) {
     .replace(/[ \t]+([,.;:!?])/g, '$1')
     .trim();
 }
+// SACA EMOJIS codificados como ENTIDADES HTML numericas (ej "&#x1f3d6;" = 🏖, "&#xfe0f;") que llegan del scraper en la
+// descripcion de las propiedades y que WhatsApp muestra como TEXTO LITERAL ("parecen errores", Diego 2026-07-23). Los
+// emojis se ELIMINAN (Diego pidio sacarlos, NO decodificarlos). Las entidades numericas que NO son emoji (acentos,
+// simbolos comunes) SI se decodifican al caracter real para no romper el texto. Aplica en el ENVIO -> cubre los 3 mundos.
+function _limpiarEntidadesHtml(t) {
+  var s = String(t == null ? '' : t);
+  if (s.indexOf('&#') < 0) return s; // nada que decodificar: salida rapida (no toca el texto)
+  s = s.replace(/&#(x?)([0-9a-fA-F]+);/g, function (m, hex, num) {
+    var cp = parseInt(num, hex ? 16 : 10);
+    if (!isFinite(cp)) return m; // entidad rara: dejarla como estaba (no romper)
+    // rangos de EMOJI / simbolos pictograficos / selector de variante / ZWJ / banderas -> ELIMINAR
+    var esEmoji = cp >= 0x1F000 || cp === 0xFE0F || cp === 0x200D ||
+      (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x2B00 && cp <= 0x2BFF) ||
+      (cp >= 0x2190 && cp <= 0x21FF) || (cp >= 0x1F1E6 && cp <= 0x1F1FF);
+    if (esEmoji) return '';
+    try { return String.fromCodePoint(cp); } catch (e) { return m; } // no-emoji -> caracter real (acentos, etc.)
+  });
+  return s.replace(/[ \t]{2,}/g, ' ').replace(/[ \t]+([,.;:!?])/g, '$1');
+}
 // Traduce un texto a un idioma destino usando el modelo. Devuelve el texto traducido (o el original si falla).
 async function traducir(texto, idiomaDestino, user_id) {
   try {
@@ -6689,6 +6708,7 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
   if (!conectada) { console.error('No se envia: instancia no conectada (' + instancia + ')'); await registrar('fallido'); return false; }
   // envio con realismo humano: partir en mensajes y simular escritura
   try {
+    texto = _limpiarEntidadesHtml(texto); // SACAR emojis codificados como entidades HTML (&#x1f3d6; etc.) que WhatsApp muestra como texto/error. Cubre los 3 mundos (todo sale por aca).
     const partes = partirMensaje(texto);
     let huboFalloCliente = false;  // 4xx sin key.id: el mensaje NO se envio (reintentar no sirve)
     let huboIndeterminado = false; // timeout/5xx/excepcion sin key.id: PUDO entregarse igual (Evolution issue #1613) -> NO reintentar a ciegas
@@ -8987,6 +9007,10 @@ app.post('/api/whatsapp/send', async (req, res) => {
       textoEnviar = await traducir(texto, conv.idioma_lead, user_id);
       idiomaMsg = conv.idioma_lead;
     }
+    // SACAR emojis codificados como entidades HTML (&#x1f3d6; etc.): el frontend arma la ficha con la descripcion CRUDA
+    // (del scraper) y la manda por aca; sin esto WhatsApp muestra el codigo literal ("parecen errores", Diego 2026-07-23).
+    // Se limpia el texto a ENVIAR -> cubre los 3 canales (Evolution/Cloud/Meta) y los 3 mundos. No decodifica: los saca.
+    textoEnviar = _limpiarEntidadesHtml(textoEnviar);
     // TAREA F (derivacion-v3-refinements, NO gated / aditiva): resolver QUIEN escribe (el asesor autenticado o el
     // dueno) para guardar la atribucion (autor_asesor_id/autor_nombre). _insertMensajeConAutor es DEFENSIVO: si esas
     // columnas todavia no existen, reintenta el insert SIN ellas (no rompe el envio). 0 tokens.

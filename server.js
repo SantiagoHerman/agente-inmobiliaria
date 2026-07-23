@@ -1489,7 +1489,22 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
       _autorEco,
       null
     );
-    await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conv.id);
+    // Un HUMANO respondio DESDE EL CELULAR (es el dueno/admin). Igual que responder desde la app: el lead pasa a
+    // 'listo_humano' con la IA APAGADA (para que la IA no le pise la respuesta al cliente) y, como lo tomo el dueno,
+    // queda "en administracion" (admin_tomo=true) -> ningun cron (recontacto/respaldo/rotacion) lo reasigna. Diego
+    // 2026-07-23. NO se toca si ya esta listo_humano/cerrado; admin_tomo solo si NO hay un asesor humano ya asignado
+    // (no le robamos el lead a un asesor). El dedupe de arriba ya garantiza que aca solo llega un mensaje humano REAL
+    // (los ecos de la propia IA se descartan por contenido) -> no apaga la IA por sus propios envios.
+    {
+      const _updCel = { last_message: texto, last_role: 'human', updated_at: new Date().toISOString() };
+      try {
+        const { data: _cvE } = await supabase.from('conversations').select('status, ai_enabled, asesor_id, admin_tomo').eq('id', conv.id).maybeSingle();
+        if (_cvE && _cvE.status !== 'listo_humano' && _cvE.status !== 'cerrado') { _updCel.status = 'listo_humano'; _updCel.ai_enabled = false; }
+        else if (_cvE && _cvE.ai_enabled === true) { _updCel.ai_enabled = false; }
+        if (_cvE && !_cvE.asesor_id && _cvE.admin_tomo !== true) _updCel.admin_tomo = true;
+      } catch (eFlipCel) { /* si falla la lectura: al menos guardamos last_message/last_role como siempre */ }
+      await supabase.from('conversations').update(_updCel).eq('id', conv.id);
+    }
     // FIX #2: el humano respondio DESDE EL CELULAR (la respuesta entra por el webhook como saliente). Igual que el
     // envio por la app, esto resuelve la espera -> reseteamos la escalada SLA (jsonb sla_avisos + Set _slaAvisoMem)
     // para que un nuevo ciclo de espera vuelva a escalar desde p1. Best-effort/0 IA.
@@ -8061,7 +8076,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // (Groq) y de traducir/clasificar/responder (Claude) -> CERO gasto de tokens. La pausa POR-CONVERSACION
     // (ai_enabled) NO entra aca: esa deja transcribir+traducir para el humano y solo frena al agente (mas abajo).
     let _bsGate = null;
-    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado, idioma, rubro').eq('user_id', user_id).maybeSingle();
+    { const _gq = await supabase.from('business_settings').select('crm_pausado, eliminado_at, agente_pausado, idioma, rubro, respaldo_v2').eq('user_id', user_id).maybeSingle();
       if (_gq && _gq.error) { const _gq2 = await supabase.from('business_settings').select('crm_pausado').eq('user_id', user_id).maybeSingle(); _bsGate = _gq2 && _gq2.data; }
       else { _bsGate = _gq && _gq.data; } }
     // Idioma BASE de la empresa (settings.idioma; default 'es'). Lo tomamos del _bsGate que YA se leyo arriba
@@ -8193,6 +8208,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (_idiomaLeadFinal) { _updConv.idioma_lead = _idiomaLeadFinal; _updConv.traductor_activo = true; }
     else if (_revertirIdiomaBase) { _updConv.idioma_lead = _idiomaBaseEmpresa; _updConv.traductor_activo = false; }
     await supabase.from('conversations').update(_updConv).eq('id', conv.id);
+    // RESPALDO FALLO IA (reloj por mensaje, Diego 2026-07-23): ARMAMOS/reiniciamos el reloj con CADA mensaje del lead.
+    // Va en un update APARTE y DEFENSIVO: si la columna respaldo_reloj todavia no existe (migracion no corrida), falla
+    // en silencio y NO afecta el update de arriba (last_message/last_role/idioma) -> comportamiento BYTE-IDENTICO. Se
+    // se arma SOLO si la cuenta tiene respaldo_v2 ON (asi no llenamos la tabla de relojes al pedo en cuentas sin
+    // respaldo). El cron revisarRespaldoTimeout apaga el reloj cuando la IA/humano responde o el estado ya no corresponde.
+    if (_bsGate && _bsGate.respaldo_v2 === true) {
+      try { await supabase.from('conversations').update({ respaldo_reloj: new Date().toISOString() }).eq('id', conv.id); } catch (eArmRel) {}
+    }
 
     // === MEMORIA DEL LEAD: extraer datos (nombre/origen/interes/presupuesto) y guardarlos en contacts ===
     // NO bloquea el flujo (mismo criterio que clasificarEstado/clasificarTemperatura): fire-and-forget.
@@ -11720,57 +11743,52 @@ async function escalarLeadsEnColaVencidos() {
 // Anti DOBLE-DERIVACION: marca conversations.respaldo_derivado=true (best-effort, defensivo si la columna no existe)
 // + un Set en memoria como red dentro del proceso. Y NO toca conversaciones que ya estan en 'listo_humano' o con
 // asesor humano asignado. Mismo patron que revisarInactividad / escalarLeadsEnColaVencidos (setInterval + guard).
-const _respaldoDerivado = new Set();
 var _respaldoEnCurso = false;
 async function revisarRespaldoTimeout() {
   if (_respaldoEnCurso) return; // evitar solapamiento entre ticks
   _respaldoEnCurso = true;
   try {
-    const UMBRAL_DEFAULT_MIN = 5;     // default del umbral si la cuenta no lo configuro (Diego: 5 min)
+    const UMBRAL_DEFAULT_MIN = 10;    // Diego 2026-07-23: default 10 min
     const ahoraMs = Date.now();
-    // Candidatas: conversaciones donde el lead escribio ultimo (last_role='contact') y la IA todavia atiende
-    // (status NO es 'listo_humano' -> no esta ya en la cola humana). Pre-filtro barato con columnas de la conv;
-    // luego confirmamos contra messages que de verdad no hubo respuesta posterior.
-    // DERIVACION v3 (gated): traemos derivacion_rotando para EXCLUIR las convs en rotacion (la IA sigue atendiendo a
-    // proposito mientras rota/espera un asesor; el respaldo NO debe derivarla por su cuenta). DEFENSIVO: si la columna
-    // no existe, reintentamos SIN ella -> comportamiento BYTE-IDENTICO al actual (el guard queda en no-op).
-    let candidatas = null;
+    // Apaga el reloj de una conv (best-effort; defensivo si la columna no existe).
+    const _limpiarReloj = async function (cid) { try { await supabase.from('conversations').update({ respaldo_reloj: null }).eq('id', cid); } catch (e) {} };
+    // ===== MODELO RELOJ POR MENSAJE (Diego 2026-07-23) =====
+    // Ya NO barremos candidatos por (last_role/status): con >1000 convs eso tomaba SIEMPRE las viejas (tope 1000 de
+    // PostgREST) y se comia las nuevas. Ahora el reloj se ARMA en el webhook con CADA mensaje del lead (respaldo_reloj=
+    // now) y se APAGA cuando la IA/humano responde. Aca solo miramos las convs con el RELOJ ARMADO y ya vencido ->
+    // conjunto CHICO, sin tope que tape a las nuevas. DEPLOY-SAFE: si la columna respaldo_reloj no existe todavia
+    // (migracion no corrida), el select falla -> catch -> el respaldo queda INERTE (no deriva nada, cero riesgo).
+    let armadas = null;
     try {
       const r = await supabase.from('conversations')
-        .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at, derivacion_rotando')
-        .eq('last_role', 'contact')
-        .in('status', ['en_conversacion', 'interesado']);
+        .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, respaldo_reloj')
+        .not('respaldo_reloj', 'is', null)
+        .order('respaldo_reloj', { ascending: true })
+        .limit(500);
       if (r.error) throw r.error;
-      candidatas = r.data;
-    } catch (eRot) {
-      const r2 = await supabase.from('conversations')
-        .select('id, user_id, status, asesor_id, admin_tomo, last_role, ai_enabled, updated_at')
-        .eq('last_role', 'contact')
-        .in('status', ['en_conversacion', 'interesado']); // (e) 'recontacto' fuera: redundante (no es atencion activa de la IA)
-      candidatas = r2.data;
-    }
-    if (!candidatas || candidatas.length === 0) return;
+      armadas = r.data;
+    } catch (eCol) { armadas = null; } // columna ausente / error -> INERTE (no rompe)
+    if (!armadas || armadas.length === 0) return;
     // Caches por tenant (una query chica como mucho por cuenta y por tick).
     const _flagCache = {};   // respaldo_v2 ON?
     const _umbralCache = {}; // respaldo_umbral_min en ms
     const _usuariosCache = {}; // respaldo_usuarios: lista de ids de asesor a los que repartir (vacia = pool normal)
     const _pausaCache = {};  // cuenta pausada / en papelera?
-    for (const conv of candidatas) {
-      if (_respaldoDerivado.has(conv.id)) continue; // ya derivado por respaldo en este proceso
+    for (const conv of armadas) {
       const ownerId = conv.user_id;
       if (!ownerId) continue;
-      // DERIVACION v3 (gated): conv en ROTACION -> la IA la esta atendiendo a proposito; NO derivar por respaldo.
-      // Con la columna ausente, conv.derivacion_rotando es undefined -> no-op (comportamiento actual).
-      if (conv.derivacion_rotando === true) continue;
-      // REGLA Diego: el respaldo SOLO actua si la IA esta ACTIVA en el lead (ai_enabled !== false). Si un humano la apago, no se mete.
-      if (conv.ai_enabled === false) continue;
-      // Doble-derivacion defensiva: si la conv ya tiene asesor HUMANO o el admin la tomo, saltar (no pisar atencion humana).
-      if (conv.asesor_id || conv.admin_tomo === true) continue;
-      // GATING por-tenant: flag OFF (o ausente/columna inexistente) -> NO derivar (comportamiento actual). Fail-safe.
+      // (pto 8) IA APAGADA a mano -> el respaldo NO actua (un humano ya intervino). Apagar reloj.
+      if (conv.ai_enabled === false) { await _limpiarReloj(conv.id); continue; }
+      // Ya lo tomo un humano (asesor asignado o admin_tomo) -> no meterse. Apagar reloj.
+      if (conv.asesor_id || conv.admin_tomo === true) { await _limpiarReloj(conv.id); continue; }
+      // (pto 2) SOLO en 'en_conversacion' / 'interesado' / 'cerrado' (siempre con IA prendida). Otro estado
+      // (listo_humano / recontacto) -> no aplica. Apagar reloj. (Sin exclusion de rotacion: el chequeo de "sin asesor
+      // asignado" de arriba ya cubre el caso de un lead en rotacion que ya tiene asesor -> pto 7 de Diego.)
+      if (['en_conversacion', 'interesado', 'cerrado'].indexOf(conv.status) < 0) { await _limpiarReloj(conv.id); continue; }
+      // GATING por-tenant respaldo_v2 (+ umbral + lista de usuarios). Fail-safe: OFF/ausente/error -> NO derivar y
+      // APAGAR el reloj (no dejar relojes armados inutiles en cuentas sin respaldo).
       if (!(ownerId in _flagCache)) {
         try {
-          // DEFENSIVO: leer respaldo_usuarios aparte para que, si esa columna AUN no existe (migracion no corrida),
-          // el select principal (respaldo_v2/umbral) no falle y el respaldo siga andando sin lista (pool normal).
           const { data: bsF, error: eF } = await supabase.from('business_settings').select('respaldo_v2, respaldo_umbral_min').eq('user_id', ownerId).maybeSingle();
           if (eF) { _flagCache[ownerId] = false; }
           else {
@@ -11783,13 +11801,13 @@ async function revisarRespaldoTimeout() {
           try {
             const { data: bsU } = await supabase.from('business_settings').select('respaldo_usuarios').eq('user_id', ownerId).maybeSingle();
             if (bsU && Array.isArray(bsU.respaldo_usuarios)) _usuarios = bsU.respaldo_usuarios.filter(function(x){ return !!x; });
-          } catch (eU) { _usuarios = []; } // columna ausente / error -> sin lista (pool normal)
+          } catch (eU) { _usuarios = []; }
           _usuariosCache[ownerId] = _usuarios;
-        } catch (eFc) { _flagCache[ownerId] = false; } // ante cualquier fallo -> OFF (nunca romper)
+        } catch (eFc) { _flagCache[ownerId] = false; }
       }
-      if (_flagCache[ownerId] !== true) continue;
+      if (_flagCache[ownerId] !== true) { await _limpiarReloj(conv.id); continue; } // respaldo OFF -> apagar reloj
       const UMBRAL_MS = _umbralCache[ownerId] || (UMBRAL_DEFAULT_MIN * 60 * 1000);
-      // PAUSAS: kill-switch global del Maestro, pausa total de la cuenta (crm_pausado) o papelera (eliminado_at) -> NO derivar.
+      // PAUSAS: kill-switch global / pausa total (crm_pausado) / papelera -> NO derivar (NO apagamos: es pausa temporal).
       if (_pausaGlobal === true) continue;
       if (!(ownerId in _pausaCache)) {
         let _pausada = false;
@@ -11797,30 +11815,21 @@ async function revisarRespaldoTimeout() {
         _pausaCache[ownerId] = _pausada;
       }
       if (_pausaCache[ownerId] === true) continue;
-      // Dedupe persistente (best-effort): si ya se marco respaldo_derivado, saltar. Defensivo si la columna no existe.
-      try {
-        const { data: _d } = await supabase.from('conversations').select('respaldo_derivado').eq('id', conv.id).maybeSingle();
-        if (_d && _d.respaldo_derivado === true) { _respaldoDerivado.add(conv.id); continue; }
-      } catch (eD) { /* columna ausente u otro error: el Set en memoria cubre dentro del proceso */ }
-      // ULTIMO mensaje REAL de la conversacion (solo lead / IA / humano): tiene que ser del LEAD (role='contact') y
-      // tener > umbral minutos. REGLA DE DIEGO (2026-07-20): el disparador es "el lead escribio y pasaron X minutos
-      // SIN SER ATENDIDO". Un mensaje de SISTEMA ('sistema': pases de asesor, avisos internos, cartelitos) NO es
-      // atencion -> se IGNORA. Antes se miraba el ultimo mensaje SEA CUAL SEA, asi que un 'sistema' posterior al
-      // mensaje del lead salteaba el respaldo y el lead quedaba colgado igual (justo lo que este plan B evita).
+      // (pto 3) EL RELOJ todavia no cumplio el umbral (10 min por default) -> esperar (NO apagar; la IA aun puede responder).
+      const _armadoMs = new Date(conv.respaldo_reloj).getTime();
+      if (isNaN(_armadoMs) || (ahoraMs - _armadoMs) < UMBRAL_MS) continue;
+      // ULTIMO mensaje REAL (lead/IA/humano; IGNORA 'sistema'): si ya NO es del LEAD, alguien respondio -> el reloj se
+      // APAGA y NO se deriva. Es la red que confirma "el lead escribio y sigue SIN ser atendido".
       const { data: ult } = await supabase
         .from('messages')
-        .select('role, created_at')
+        .select('role')
         .eq('conversation_id', conv.id)
         .in('role', ['contact', 'ai', 'human'])
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
-      if (!ult || ult.role !== 'contact' || !ult.created_at) continue; // ya lo atendio la IA o un humano, o sin datos
-      const transcurrido = ahoraMs - new Date(ult.created_at).getTime();
-      if (transcurrido < UMBRAL_MS) continue; // todavia no cumplio el umbral: la IA aun puede responder
-      // -> La IA NO respondio en el umbral. DERIVAR a un humano de forma equitativa REUSANDO derivarAHumano.
-      // Marcar en memoria YA (antes de derivar) para que ticks concurrentes no re-deriven.
-      _respaldoDerivado.add(conv.id);
+      if (!ult || ult.role !== 'contact') { await _limpiarReloj(conv.id); continue; } // ya respondio la IA/un humano -> apagar
+      // -> La IA NO respondio en el umbral (10 min por default), IA prendida, sin asesor. DERIVAR reusando derivarAHumano.
       const _minTxt = Math.round(UMBRAL_MS / 60000);
       // MOTIVO de la derivacion (texto en claro para el chat + push). SIN COSTO IA: debeBloquearAcceso y
       // dentroDelTopeIA SOLO leen la DB (suscripcion/uso), no llaman a ningun modelo. Si la cuenta esta sin pago al
@@ -11864,9 +11873,10 @@ async function revisarRespaldoTimeout() {
           : (_fraseMotivo + ': sin asesor disponible -> avisado al responsable');
         await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: _txt, enviado_por: 'Sistema' });
       } catch (eMsg) {}
-      // Marca persistente best-effort para no re-derivar en proximos ticks (defensivo si la columna no existe).
-      try { await supabase.from('conversations').update({ respaldo_derivado: true }).eq('id', conv.id); } catch (eMark) { /* columna ausente: el Set ya dedupea */ }
-      console.log('Respaldo v2: lead ' + conv.id + ' derivado por timeout (' + _minTxt + ' min sin respuesta de la IA, motivo=' + _motivo + (_candidatos ? ', lista=' + _candidatos.length : '') + ')' + (_asesorId ? (' -> asesor ' + _asesorId) : ' -> sin asesor, avisado al dueno'));
+      // APAGAR el reloj tras derivar: por ESE mensaje no se vuelve a disparar. Si el lead escribe de nuevo y sigue sin
+      // atender (IA prendida, sin asesor), un nuevo mensaje re-arma el reloj y puede volver a disparar (correcto).
+      await _limpiarReloj(conv.id);
+      console.log('Respaldo v2 (reloj): lead ' + conv.id + ' derivado por timeout (' + _minTxt + ' min sin respuesta de la IA, motivo=' + _motivo + (_candidatos ? ', lista=' + _candidatos.length : '') + ')' + (_asesorId ? (' -> asesor ' + _asesorId) : ' -> sin asesor, avisado al dueno'));
     }
   } catch (e) { console.error('Error en revisarRespaldoTimeout:', e && e.message); }
   finally { _respaldoEnCurso = false; }

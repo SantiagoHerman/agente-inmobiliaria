@@ -6855,6 +6855,18 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // VERIFICAR RESPALDO RELOJ: ?respaldo=1 -> columna existe? cuentas con respaldo_v2 ON? relojes armados?
+    if (req.query.respaldo === '1') {
+      const salida = {};
+      // columna existe?
+      try { const r = await supabase.from('conversations').select('id, respaldo_reloj').not('respaldo_reloj', 'is', null).limit(5); if (r.error) throw r.error; salida.columna = 'existe'; salida.relojes_armados_muestra = (r.data || []).length; salida.ejemplos = (r.data || []).map(function(x){ return { conv: x.id, reloj: x.respaldo_reloj }; }); }
+      catch (eC) { salida.columna = 'NO existe / error: ' + (eC && eC.message); }
+      // count total de relojes armados
+      try { const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).not('respaldo_reloj', 'is', null); salida.total_relojes_armados = count; } catch (e) { salida.total_relojes_armados = '(no se pudo contar)'; }
+      // cuentas con respaldo_v2 ON
+      try { const { data } = await supabase.from('business_settings').select('company_name, respaldo_v2, respaldo_umbral_min').eq('respaldo_v2', true); salida.cuentas_respaldo_v2_ON = (data || []).map(function(b){ return { cuenta: b.company_name, umbral_min: b.respaldo_umbral_min || '(default 10)' }; }); } catch (e) { salida.cuentas_respaldo_v2_ON = '(no se pudo leer)'; }
+      return res.json(salida);
+    }
     // VER IDENTIFICADORES DE PROPIEDADES DE ANTON: ?props=1
     if (req.query.props === '1') {
       const { data: bsP } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');

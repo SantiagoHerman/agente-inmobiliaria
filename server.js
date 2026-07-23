@@ -7711,6 +7711,23 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // VERIFICAR RAG: ?rag=1 -> flag ia_rag_v1 por cuenta + ultimas respuestas de Anton (cache chico = RAG activo).
+    if (req.query.rag === '1') {
+      const out = {};
+      try {
+        const { data: bsR, error: eR } = await supabase.from('business_settings').select('company_name, ia_rag_v1');
+        if (eR) throw eR;
+        out.flags = (bsR || []).map(function (b) { return { cuenta: b.company_name, ia_rag_v1: b.ia_rag_v1 === true }; });
+      } catch (eF) { out.flags_err = 'columna ia_rag_v1 no existe o error: ' + (eF && eF.message); }
+      try {
+        const { data: bsA } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
+        const uidA = bsA && bsA[0] && bsA[0].user_id;
+        const { data: ult } = await supabase.from('ia_uso').select('created_at, input_tokens, output_tokens, cache_read, cache_creation, cost_usd')
+          .eq('user_id', uidA).is('etiqueta', null).order('created_at', { ascending: false }).limit(8);
+        out.ultimas_respuestas_anton = (ult || []).map(function (r) { return { t: r.created_at, in_tok: r.input_tokens, out_tok: r.output_tokens, cacheR: r.cache_read, cacheW: r.cache_creation, usd: r.cost_usd }; });
+      } catch (eU) { out.uso_err = eU && eU.message; }
+      return res.json(out);
+    }
     // INVESTIGACION GASTO TOKENS: ?costos=1 -> agrega ia_uso de julio por cuenta / operacion / dia. Read-only.
     if (req.query.costos === '1') {
       const desde = String(req.query.desde || '2026-07-01');

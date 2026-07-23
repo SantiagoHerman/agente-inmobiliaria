@@ -6860,6 +6860,30 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // CHEQUEO A/B RETRIEVAL DEL RAG (Anton): corre el buscador real sobre el inventario real con consultas tipo lead. $0.
+    if (req.query.ragcheck === '1') {
+      const { data: bsR } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
+      const uidR = bsR && bsR[0] && bsR[0].user_id;
+      if (!uidR) return res.json({ err: 'no anton' });
+      const { data: props } = await supabase.from('properties').select('*').eq('user_id', uidR).eq('activa', true);
+      const P = props || [];
+      const _fichas = function (arr) { return (arr || []).map(function (p) { try { return _fichaCompactaProp(p); } catch (e) { return '(err)'; } }); };
+      const consultas = [
+        { q: 'departamentos en venta', f: { operacion: 'venta', tipo: 'departamento' } },
+        { q: 'algo en Gesell hasta 80k USD', f: { operacion: 'venta', zonas: ['gesell'], precio_max: 80000 } },
+        { q: 'casa con pileta', f: { tipo: 'casa', texto_libre: 'pileta' } },
+        { q: '2 dormitorios hasta 70k', f: { operacion: 'venta', dormitorios_min: 2, precio_max: 70000 } },
+        { q: 'alquiler temporal', f: { operacion: 'temporal' } },
+        { q: 'lote / terreno', f: { texto_libre: 'lote terreno' } }
+      ];
+      const salida = { total_activas: P.length, indice: (function(){ try { return _construirIndiceInventario(P); } catch(e){ return '(err)'; } })(), busquedas: [] };
+      for (const c of consultas) {
+        let res2 = [];
+        try { res2 = _buscarInventarioProps(P, c.f); } catch (e) { res2 = []; }
+        salida.busquedas.push({ consulta: c.q, filtro: c.f, encontradas: res2.length, resultados: _fichas(res2).slice(0, 6) });
+      }
+      return res.json(salida);
+    }
     // VERIFICAR RESPALDO RELOJ: ?respaldo=1 -> columna existe? cuentas con respaldo_v2 ON? relojes armados?
     if (req.query.respaldo === '1') {
       const salida = {};

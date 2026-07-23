@@ -7986,7 +7986,9 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // ===== TEMP DIAG PAUTA (se BORRA): graba el shape crudo de mensajes que mencionen un aviso =====
     try {
       const _rawStr = JSON.stringify(data);
-      if (_rawStr.indexOf('externalAdReply') >= 0 || _rawStr.indexOf('sourceUrl') >= 0 || _rawStr.indexOf('sourceId') >= 0) {
+      // AHORA GRABA TODOS LOS ENTRANTES (antes solo los que YA traian la marca del aviso -> los que fallaban eran
+      // invisibles). Asi, cuando entra un lead de pauta SIN link, vemos exactamente que mando Evolution. Temporal.
+      {
         globalThis._diagPautaRB = globalThis._diagPautaRB || [];
         const _cands = {
           'extendedTextMessage.contextInfo': msg.extendedTextMessage && msg.extendedTextMessage.contextInfo,

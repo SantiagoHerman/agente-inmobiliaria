@@ -7711,6 +7711,39 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // INVESTIGACION GASTO TOKENS: ?costos=1 -> agrega ia_uso de julio por cuenta / operacion / dia. Read-only.
+    if (req.query.costos === '1') {
+      const desde = String(req.query.desde || '2026-07-01');
+      const out = { desde: desde, hasta: 'ahora' };
+      const { data: bsAll } = await supabase.from('business_settings').select('user_id, company_name');
+      const nom = {}; (bsAll || []).forEach(function (b) { nom[b.user_id] = b.company_name || b.user_id; });
+      let filas = [], from = 0; const PAGE = 1000;
+      while (from < 200000) {
+        const { data: pg, error: e1 } = await supabase.from('ia_uso')
+          .select('user_id, input_tokens, output_tokens, cache_read, cache_creation, cost_usd, etiqueta, created_at')
+          .gte('created_at', desde).order('created_at', { ascending: true }).range(from, from + PAGE - 1);
+        if (e1) { out.err = e1.message; break; }
+        if (!pg || !pg.length) break;
+        filas = filas.concat(pg); if (pg.length < PAGE) break; from += PAGE;
+      }
+      out.total_llamadas = filas.length;
+      const agg = function (keyFn) {
+        const m = {};
+        filas.forEach(function (f) {
+          const k = keyFn(f) || '(sin)';
+          if (!m[k]) m[k] = { llamadas: 0, in_tok: 0, out_tok: 0, cache_read: 0, cache_write: 0, usd: 0 };
+          m[k].llamadas++; m[k].in_tok += (f.input_tokens || 0); m[k].out_tok += (f.output_tokens || 0);
+          m[k].cache_read += (f.cache_read || 0); m[k].cache_write += (f.cache_creation || 0); m[k].usd += (f.cost_usd || 0);
+        });
+        return Object.keys(m).map(function (k) { const v = m[k]; v.usd = Math.round(v.usd * 100) / 100; return Object.assign({ clave: k }, v); })
+          .sort(function (a, b) { return b.usd - a.usd; });
+      };
+      out.por_cuenta = agg(function (f) { return nom[f.user_id] || f.user_id; });
+      out.por_operacion = agg(function (f) { return f.etiqueta || 'respuesta_agente(null)'; });
+      out.por_dia = agg(function (f) { return String(f.created_at).slice(0, 10); }).sort(function (a, b) { return a.clave.localeCompare(b.clave); });
+      out.cuenta_x_operacion = agg(function (f) { return (nom[f.user_id] || f.user_id) + ' | ' + (f.etiqueta || 'respuesta_agente'); }).slice(0, 15);
+      return res.json(out);
+    }
     // PREGUNTARLE A EVOLUTION: ?evo=<telefono> -> trae los mensajes CRUDOS de ese chat y busca el dato del anuncio.
     if (req.query.evo) {
       const _telE = String(req.query.evo).replace(/[^0-9]/g, '');

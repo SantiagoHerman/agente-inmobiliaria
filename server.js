@@ -1945,8 +1945,17 @@ async function _matchPautaInventario(user_id, rubroRaw, pauta) {
   try {
     const _rubro = normalizarRubro(rubroRaw);
     const _pu = _normUrlPauta(pauta && pauta.sourceUrl);
-    const _pt = _normTxtPauta(pauta && pauta.title);
-    if (!_pu && (!_pt || _pt.length < 8)) return null; // sin URL util ni titulo especifico: no hay por donde matchear
+    // TITULO + BODY del aviso (antes solo el titulo): el nombre/id de la propiedad suele venir en la descripcion.
+    const _pt = _normTxtPauta(((pauta && pauta.title) || '') + ' ' + ((pauta && pauta.body) || ''));
+    // NUMERO/ID del inventario que trae el aviso. SOLO con marcador explicito (id/ref/codigo/nro/numero/#) para NO
+    // confundir precios ("70000") ni "3 ambientes". Diego: el aviso puede traer "(id 6400)" / "id: 6400".
+    const _adNums = [];
+    try {
+      const _rawAd = (((pauta && pauta.title) || '') + ' ' + ((pauta && pauta.body) || '')).toLowerCase();
+      const _reId = /(?:#|\b(?:referencia|numero|c[oó]digo|nro|id|ref|n[°º]))\s*[:.\-]?\s*(\d{3,7})\b/g;
+      let _mm; while ((_mm = _reId.exec(_rawAd)) !== null) { if (_adNums.indexOf(_mm[1]) < 0) _adNums.push(_mm[1]); }
+    } catch (eNum) { /* no rompe */ }
+    if (!_pu && (!_pt || _pt.length < 8) && !_adNums.length) return null; // sin URL util, ni titulo/body especifico, ni id: no hay por donde matchear
     let _cands = [];
     if (_rubro === 'desarrolladora') {
       let _devs = null;
@@ -2002,7 +2011,8 @@ async function _matchPautaInventario(user_id, rubroRaw, pauta) {
       }
     } else {
       let _props = null;
-      try { const _rp = await supabase.from('properties').select('id, title, link, price, venta_precio, anual_precio, temporal_precio_dia, operation, direccion, ciudad, zone').eq('user_id', user_id).eq('activa', true); _props = _rp.data; } catch (eP) { _props = null; }
+      try { const _rp = await supabase.from('properties').select('id, numero, title, link, price, venta_precio, anual_precio, temporal_precio_dia, operation, direccion, ciudad, zone').eq('user_id', user_id).eq('activa', true); _props = _rp.data; }
+      catch (eP) { try { const _rp2 = await supabase.from('properties').select('id, title, link, price, venta_precio, anual_precio, temporal_precio_dia, operation, direccion, ciudad, zone').eq('user_id', user_id).eq('activa', true); _props = _rp2.data; } catch (eP2) { _props = null; } }
       if (_props && _props.length) {
         _cands = _props.map(function (p) {
           const _pp = [];
@@ -2011,8 +2021,22 @@ async function _matchPautaInventario(user_id, rubroRaw, pauta) {
           if (p.temporal_precio_dia) _pp.push('temporal ' + p.temporal_precio_dia + '/dia');
           if (!_pp.length && p.price) _pp.push('precio ' + p.price);
           const _ubic = p.direccion ? (' - ' + p.direccion + (p.ciudad ? (', ' + p.ciudad) : '')) : (p.ciudad ? (' - ' + p.ciudad) : (p.zone ? (' - ' + p.zone) : ''));
-          return { id: p.id, links: [p.link], title: p.title, resumen: (p.title || 'Propiedad') + _ubic + (_pp.length ? (' - ' + _pp.join(' ; ')) : '') };
+          return { id: p.id, numero: p.numero, links: [p.link], title: p.title, resumen: (p.title || 'Propiedad') + _ubic + (_pp.length ? (' - ' + _pp.join(' ; ')) : '') };
         });
+      }
+    }
+    // MATCH POR NUMERO/ID (senal fuerte, $0): si el aviso trae un id del inventario, priorizamos el match EXACTO por
+    // `numero`. Red de respaldo: el "ID NNNN" que a veces figura en el TITULO (desincronizado con `numero` en algunas
+    // fichas de Anton). 1 solo candidato -> lo devolvemos; 0 o ambiguo -> caemos al matcher por URL/titulo de siempre.
+    if (_adNums.length && _cands && _cands.length) {
+      for (let _ni = 0; _ni < _adNums.length; _ni++) {
+        const _n = _adNums[_ni];
+        let _hit = _cands.filter(function (c) { return c.numero != null && String(c.numero) === _n; });
+        if (_hit.length !== 1) {
+          const _reTit = new RegExp('\\bid[\\s:.\\-]*' + _n + '\\b', 'i');
+          _hit = _cands.filter(function (c) { return _reTit.test(String(c.title || '')); });
+        }
+        if (_hit.length === 1) return _hit[0];
       }
     }
     return _elegirCandidatoPauta(_cands, _pu, _pt);

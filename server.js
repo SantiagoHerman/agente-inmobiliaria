@@ -1535,6 +1535,13 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
         } catch (eFlipCel) { /* si falla la lectura: al menos guardamos last_message/last_role como siempre */ }
       }
       await supabase.from('conversations').update(_updCel).eq('id', conv.id);
+      // FIX #3 (Diego 2026-07-23): si este eco marco admin_tomo, guardar QUIEN lo tomo. El que escribe desde
+      // el celular es el DUEÑO de la cuenta -> admin_tomo_por = conv.user_id. Write APARTE best-effort: si la
+      // migracion (migracion-admin-tomo-por.sql) no corrio, la columna no existe y este update falla SOLO
+      // (el _updCel de arriba ya se aplico completo) -> deploy-safe, byte-identico al flujo actual.
+      if (_updCel.admin_tomo === true) {
+        try { await supabase.from('conversations').update({ admin_tomo_por: conv.user_id }).eq('id', conv.id); } catch (eTomoPor) {}
+      }
     }
     // FIX #2: el humano respondio DESDE EL CELULAR (la respuesta entra por el webhook como saliente). Igual que el
     // envio por la app, esto resuelve la espera -> reseteamos la escalada SLA (jsonb sla_avisos + Set _slaAvisoMem)
@@ -2862,6 +2869,10 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId, excluirIds)
     if (!idsMiembros.length) return null;
     // 2) Filtrar a asesores de ESTA cuenta, activos, que reciben. PARTE A (punto 8): SIN filtro por rol
     //    (el rol ya no decide elegibilidad). Humano/IA se distingue por es_ia (preferencia humano mas abajo).
+    // FIX #2 (Diego 2026-07-23): EXCEPCION al punto 8 — el rol 'administrador' SI queda excluido del reparto
+    //    AUTOMATICO (igual que en elegirAsesorActivo y el drenaje de cola: un admin no recibe leads solos;
+    //    la asignacion MANUAL a un admin sigue permitida porque no pasa por este picker). Mismo patron
+    //    defensivo: deja pasar rol='asesor' y rol NULL (legacy).
     // ETAPA 9a: ademas traemos horario_modo/horario_json (DEFENSIVO: si las columnas no existen, reintentamos sin ellas).
     // ETAPA 9b: ademas traemos es_ia (DEFENSIVO: si la columna no existe, reintentamos sin ella).
     let ases = null;
@@ -2870,15 +2881,17 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId, excluirIds)
         .select('id, disponibilidad, horario_modo, horario_json, es_ia')
         .eq('admin_id', user_id)
         .eq('activo', true)
+        .or('rol.is.null,rol.neq.administrador')
         .in('id', idsMiembros);
       if (r.error) throw r.error;
       ases = r.data;
     } catch (eHor) {
-      // columnas horario_*/es_ia ausentes u otro error: reintentar con el set minimo (sin esas columnas, SIN filtro de rol)
+      // columnas horario_*/es_ia ausentes u otro error: reintentar con el set minimo (sin esas columnas)
       const r2 = await supabase.from('asesores')
         .select('id, disponibilidad')
         .eq('admin_id', user_id)
         .eq('activo', true)
+        .or('rol.is.null,rol.neq.administrador')
         .in('id', idsMiembros);
       ases = r2.data;
     }
@@ -3205,13 +3218,16 @@ async function estadoDeptoParaReparto(user_id, departamentoId) {
     if (!idsReciben.length) return { estado: 'sin_miembros', asesor: null };
     // Hay miembros (por membresia) que reciben pero ninguno disponible. Ver si TODOS estan en 'no_recibe'
     // (estructural, solo aviso) o si al menos uno esta solo en pausa/horario (transitorio, espera con tope).
+    // FIX #2 (Diego 2026-07-23): mismo filtro que el picker — los rol 'administrador' NO cuentan como
+    // miembros elegibles del reparto automatico. Sin esto, un depto cuyo unico miembro es un admin quedaria
+    // clasificado 'todos_pausa' (esperando a alguien que NUNCA va a recibir) en vez de 'sin_miembros'.
     let ases = null;
     try {
-      const r = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', user_id).eq('activo', true).in('id', idsReciben);
+      const r = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', user_id).eq('activo', true).or('rol.is.null,rol.neq.administrador').in('id', idsReciben);
       ases = r.error ? null : r.data;
     } catch (eA) { ases = null; }
     if (ases == null) return { estado: 'todos_pausa', asesor: null }; // no se pudo leer disponibilidad: tratar como transitorio (conservador)
-    if (!ases.length) return { estado: 'sin_miembros', asesor: null }; // los miembros no estan activos en esta cuenta
+    if (!ases.length) return { estado: 'sin_miembros', asesor: null }; // los miembros no estan activos en esta cuenta (o son admins excluidos)
     const algunoNoEsNoRecibe = ases.some(function(a){ return a.disponibilidad !== 'no_recibe'; });
     return { estado: (algunoNoEsNoRecibe ? 'todos_pausa' : 'solo_no_recibe'), asesor: null };
   } catch (e) { return { estado: 'todos_pausa', asesor: null }; } // ante la duda, tratar como transitorio (espera con tope), no estructural
@@ -4696,7 +4712,13 @@ app.post('/api/enviar-media', async (req, res) => {
       // Admin escribiendo en un lead sin asignar -> congelar (admin_tomo) para que el reparto no lo reasigne.
       if ((enviado_por || 'Asesor') === 'Administrador') {
         const { data: _ca } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).maybeSingle();
-        if (_ca && !_ca.asesor_id) { try { await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id); } catch (e) {} }
+        if (_ca && !_ca.asesor_id) {
+          try { await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id); } catch (e) {}
+          // FIX #3 (Diego 2026-07-23): guardar QUIEN tomo el lead (uid del token) para que "Mis leads" no
+          // mezcle leads entre admins. Write APARTE best-effort: sin la migracion, la columna no existe y
+          // este update falla SOLO (el admin_tomo de arriba ya quedo) -> deploy-safe.
+          try { await supabase.from('conversations').update({ admin_tomo_por: _uid }).eq('id', conversation_id); } catch (eTomoPor) {}
+        }
       }
     }
     // DERIVACION v3 (gated derivacion_v3, FIX 5A): "EL QUE ESCRIBE = LA SEÑAL" tambien con FOTO/VOZ. Este endpoint
@@ -6378,7 +6400,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     if (_iaOsrmOn) _fp.push('para distancia o tiempo en auto entre dos puntos usa distancia_viaje');
     systemBlocks.push({ type: 'text', text: 'DATOS EN VIVO (fuentes externas): ' + _fp.join('; ') + '. REGLA DURA: estos datos NO los sabes de memoria — pedilos SIEMPRE con la tool correspondiente y NUNCA inventes una cotizacion, un pronostico del clima, un feriado, una direccion normalizada ni una distancia/tiempo de viaje. Los valores son de REFERENCIA. Si la tool no trae el dato (no se pudo consultar), decile al lead con naturalidad que no lo pudiste confirmar en el momento en vez de inventar.' });
   }
-  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada.' });
+  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada. REGLA DURA DE DISTANCIAS: NUNCA estimes vos una distancia ("a X cuadras", "cerquita", "a la vuelta") comparando numeros de calles o paseos de memoria — para saber que tan lejos queda algo usa buscar_propiedades_cerca (o distancia_viaje) y repeti el dato que devuelve tal cual (incluidas las cuadras). Si no usaste la tool, no afirmes cercania.' });
   // PAUTA META (NIVEL 1/2, gated ia_pauta_meta): contexto del aviso Click-to-WhatsApp del que viene el lead. Bloque
   // DINAMICO (NO cacheado, dato por-lead) => NUNCA va dentro del bloque estatico cacheado. Solo se agrega si el caller
   // lo paso (flag ON + pauta presente); con el flag OFF _pautaContexto es null => system BYTE-IDENTICO al actual.
@@ -6546,7 +6568,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           } else {
             const _cercanas = _cands.map(function(c){ return { nombre: c.nombre, extra: c.extra, km: haversineKm(_geoRefLead.lat, _geoRefLead.lng, c.lat, c.lng) }; }).sort(function(a,b){ return a.km - b.km; }).slice(0, 5);
             const _lineasC = _cercanas.map(function(c){ return '- ' + c.nombre + (c.extra ? ' (' + c.extra + ')' : '') + ': a ' + _fmtDistancia(c.km); });
-            _resCercaTxt = 'Referencia ubicada: "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Lo mas cercano del inventario (distancia en linea recta):' + String.fromCharCode(10) + _lineasC.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele lo que corresponda con naturalidad mencionando la distancia aproximada. Si nada queda razonablemente cerca, decilo con honestidad y ofrece la opcion menos lejana.';
+            _resCercaTxt = 'Referencia ubicada: "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Lo mas cercano del inventario (distancia en linea recta):' + String.fromCharCode(10) + _lineasC.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele lo que corresponda con naturalidad mencionando la distancia TAL CUAL figura arriba (m/km y cuadras): NO la conviertas, NO la redondees para abajo y NUNCA digas "a pocas cuadras" o "cerquita" si figura a mas de 500 m — decir que algo lejano esta cerca es mentirle al lead. Si nada queda razonablemente cerca, decilo con honestidad y ofrece la opcion menos lejana aclarando su distancia real.';
           }
         }
       } catch (eCerca) {
@@ -10036,6 +10058,11 @@ app.post('/api/whatsapp/send', async (req, res) => {
       const { data: convActual } = await supabase.from('conversations').select('asesor_id').eq('id', conversation_id).single();
       if (convActual && !convActual.asesor_id) {
         await supabase.from('conversations').update({ admin_tomo: true }).eq('id', conversation_id);
+        // FIX #3 (Diego 2026-07-23): admin_tomo es un boolean que NO dice QUIEN lo tomo -> "Mis leads" les
+        // mostraba el lead a TODOS los admins. Guardamos el auth uid del que escribio en admin_tomo_por.
+        // Write APARTE best-effort: si la migracion (migracion-admin-tomo-por.sql) no corrio, la columna no
+        // existe y este update falla SOLO (el admin_tomo de arriba ya quedo) -> deploy-safe, nada se rompe.
+        try { await supabase.from('conversations').update({ admin_tomo_por: _uidToken }).eq('id', conversation_id); } catch (eTomoPor) {}
         // R1 (recontacto_reglas_v2, gated, default OFF): la TOMA MANUAL (admin_tomo) es una derivacion a mano ->
         // CANCELA el reloj de recontacto. Write APARTE best-effort (si la columna no existe, el catch lo traga y el
         // envio NO se rompe). Con el flag OFF no se toca la columna -> comportamiento BYTE-IDENTICO al actual.
@@ -14614,6 +14641,10 @@ app.post('/api/asesores/acceso', async (req, res) => {
     if (!admin_id || !asesor_id || typeof activo !== 'boolean') return res.status(400).json({ error: 'Faltan datos' });
     const { data: ase } = await supabase.from('asesores').select('id, auth_user_id').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
     if (!ase) return res.status(404).json({ error: 'Usuario no encontrado' });
+    // GUARDA ANTI AUTO-DESTRUCCION (FIX #2, Diego 2026-07-23): si la fila de asesores apunta al PROPIO dueño
+    // (auth_user_id === admin_id), desactivarla lo BANEARIA a el mismo (_setBanUsuario) y quedaria afuera de su
+    // propia cuenta. Rechazamos con 400 antes de tocar nada.
+    if (activo === false && ase.auth_user_id && ase.auth_user_id === admin_id) return res.status(400).json({ error: 'No podes desactivarte a vos mismo (sos el dueño de la cuenta)' });
     const { error } = await supabase.from('asesores').update({ activo: activo, estado: activo ? 'activo' : 'pausa' }).eq('id', asesor_id).eq('admin_id', admin_id);
     if (error) return res.status(500).json({ error: error.message });
     if (ase.auth_user_id) {
@@ -15196,6 +15227,10 @@ app.post('/api/asesores/eliminar', async (req, res) => {
     if (!admin_id || !asesor_id) return res.status(400).json({ error: 'Faltan datos' });
     const { data: ases } = await supabase.from('asesores').select('*').eq('id', asesor_id).eq('admin_id', admin_id).maybeSingle();
     if (!ases) return res.status(404).json({ error: 'Asesor no encontrado' });
+    // GUARDA ANTI AUTO-DESTRUCCION (FIX #2, Diego 2026-07-23): si la fila de asesores apunta al PROPIO dueño
+    // (auth_user_id === admin_id), este endpoint le haria auth.admin.deleteUser A SI MISMO -> se borra la
+    // cuenta entera del dueño de un click. Rechazamos con 400 antes del deleteUser.
+    if (ases.auth_user_id && ases.auth_user_id === admin_id) return res.status(400).json({ error: 'No podes eliminarte a vos mismo (sos el dueño de la cuenta)' });
     if (ases.auth_user_id) { try { await supabase.auth.admin.deleteUser(ases.auth_user_id); } catch (e) {} }
     await supabase.from('asesores').delete().eq('id', asesor_id).eq('admin_id', admin_id);
     return res.json({ ok: true });
@@ -17179,8 +17214,12 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 
 function _fmtDistancia(km) {
   if (km == null || isNaN(km)) return '';
-  if (km < 1) return Math.max(50, Math.round(km * 1000 / 50) * 50) + ' m';
-  return (Math.round(km * 10) / 10) + ' km';
+  // CUADRAS (Diego 2026-07-23, caso "122 y playa"): ademas de m/km damos las cuadras aprox (1 cuadra ~ 100 m) para que
+  // la IA REPITA ese numero y no "convierta" por su cuenta (dijo "a dos cuadras" para algo a ~2 km = ~20 cuadras).
+  var _cuadras = Math.round(km * 10);
+  var _sufCuadras = (_cuadras >= 2) ? (' (~' + _cuadras + ' cuadras)') : '';
+  if (km < 1) return Math.max(50, Math.round(km * 1000 / 50) * 50) + ' m' + _sufCuadras;
+  return (Math.round(km * 10) / 10) + ' km' + _sufCuadras;
 }
 
 // User-Agent para OSM: HONESTO, sin "Mozilla" (Overpass devuelve 406 a los UA de navegador;

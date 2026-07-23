@@ -5144,6 +5144,193 @@ function _buscarUnidadesHotel(unidades, f) {
   return arr.slice(0, N).map(function (u) { return _hotelMarcarLibre(u, f); });
 }
 
+// ===== RAG DE INVENTARIO DESARROLLADORA (gated ia_rag_v1) — ESPEJO de inmobiliaria/hotel para el rubro desarrolladora =====
+// Funciones PURAS (operan sobre `_devsRag`/`_unitsRag`, ya cherry-pickeados y scopeados en generarRespuestaAgente;
+// 0 queries extra, 0 IA). Solo rubro desarrolladora. Con el flag OFF NO se llaman => prompt/flujo BYTE-IDENTICOS al
+// actual. Function declarations => hoisted. El buscador RAG RESUELVE el truncado a 30 unidades por emprendimiento del
+// bloque de hoy: el indice agrega sobre TODAS las ofrecibles (sin cap) y el buscador trae la puntual.
+// Estado NORMALIZADO. Ofrecible = 'disponible' o 'libre' (ambos se ofrecen); 'reservado'/'vendido' NO (salvo consulta puntual).
+function _devEstadoNorm(e) { return _ragNorm(e == null || e === '' ? 'disponible' : e); }
+function _devOfrecible(u) { var e = _devEstadoNorm(u && u.estado); return e === 'disponible' || e === 'libre'; }
+// Precio de una unidad/lote: 'a_consultar' (o sin precio) => "a consultar" (nunca se inventa). 'desde' => sufijo.
+function _devPrecioTxt(u) {
+  if (!u) return 'a consultar';
+  var pr = Number(u.precio);
+  if (u.precio_estado === 'a_consultar' || u.precio == null || u.precio === '' || !isFinite(pr) || pr <= 0) return 'a consultar';
+  return (u.moneda || 'USD') + ' ' + _ragMiles(pr) + (u.precio_estado === 'desde' ? ' (desde)' : '');
+}
+// m2 relevante (para filtros/rango): lote => superficie_terreno; construido => m2_cubiertos. NaN si no hay.
+function _devM2(u) {
+  if (!u) return NaN;
+  var m = Number((_ragNorm(u.tipo_producto) === 'lote') ? u.superficie_terreno : u.m2_cubiertos);
+  return isFinite(m) ? m : NaN;
+}
+// Medidas legibles: lote => "X m2 terreno" (+ frente x fondo); construido => "X m2 cub". Sin dato => ''.
+function _devMedidasTxt(u) {
+  if (!u) return '';
+  var partes = [];
+  if (_ragNorm(u.tipo_producto) === 'lote') {
+    if (u.superficie_terreno) partes.push(u.superficie_terreno + ' m2 terreno');
+    if (u.frente && u.fondo) partes.push(u.frente + 'x' + u.fondo + ' m');
+  } else {
+    if (u.m2_cubiertos) partes.push(u.m2_cubiertos + ' m2 cub');
+    if (u.piso) partes.push('piso ' + u.piso);
+  }
+  return partes.join(', ');
+}
+// INDICE de emprendimientos: cabecera de cada development VERBATIM (la misma que arma el bloque de hoy, pre-guardada en
+// d.header) + agregado por TIPOLOGIA y por ETAPA sobre TODAS las unidades ofrecibles (count real, rango de precio
+// min-max, rango de m2) SIN el cap de 30. Es la pieza que PRESERVA la calidad: la IA sabe QUE existe sin el listado entero.
+function _construirIndiceDesarrollos(devs, unitsPorDev, sectorNombrePorId) {
+  var ds = Array.isArray(devs) ? devs : [];
+  var NL = String.fromCharCode(10);
+  var secMap = sectorNombrePorId || {};
+  var lineas = [];
+  ds.forEach(function (d) {
+    var _hdr = (d && d.header != null && String(d.header).trim()) ? String(d.header).trim() : ('* EMPRENDIMIENTO: ' + ((d && d.nombre) || 'Sin nombre'));
+    var _us = (unitsPorDev && unitsPorDev[d.id]) ? unitsPorDev[d.id] : [];
+    var _disp = _us.filter(_devOfrecible);
+    // Agregado por tipologia (count + rango de precio + rango de m2).
+    var byTip = {};
+    _disp.forEach(function (u) {
+      var k = (u.tipologia && String(u.tipologia).trim()) || (u.tipo_producto && String(u.tipo_producto).trim()) || 'unidad';
+      if (!byTip[k]) byTip[k] = { count: 0, min: null, max: null, moneda: u.moneda || 'USD', m2min: null, m2max: null };
+      var g = byTip[k];
+      g.count++;
+      var pr = Number(u.precio);
+      if (u.precio != null && u.precio_estado !== 'a_consultar' && isFinite(pr) && pr > 0) {
+        if (g.min === null || pr < g.min) { g.min = pr; g.moneda = u.moneda || g.moneda; }
+        if (g.max === null || pr > g.max) g.max = pr;
+      }
+      var m2 = _devM2(u);
+      if (isFinite(m2) && m2 > 0) { if (g.m2min === null || m2 < g.m2min) g.m2min = m2; if (g.m2max === null || m2 > g.m2max) g.m2max = m2; }
+    });
+    var tipLineas = Object.keys(byTip).map(function (k) {
+      var g = byTip[k];
+      var _p = (g.min !== null) ? (' desde ' + g.moneda + ' ' + _ragMiles(g.min) + (g.max !== null && g.max !== g.min ? ' a ' + g.moneda + ' ' + _ragMiles(g.max) : '')) : '';
+      var _m = (g.m2min !== null) ? (' | ' + (g.m2min === g.m2max ? (g.m2min + ' m2') : (g.m2min + ' a ' + g.m2max + ' m2'))) : '';
+      return '  Quedan ' + g.count + ' de ' + k + _p + _m;
+    });
+    // Agregado por etapa (conteo de ofrecibles por etapa; etapa ya resuelta a nombre en el cherry-pick, con fallback al map).
+    var byEt = {};
+    _disp.forEach(function (u) {
+      var et = u.etapa || (u.sector_id != null && secMap[String(u.sector_id)]) || null;
+      var k = (et && String(et).trim()) || '(sin etapa)';
+      byEt[k] = (byEt[k] || 0) + 1;
+    });
+    var etKeys = Object.keys(byEt).filter(function (k) { return k !== '(sin etapa)'; });
+    var _etTxt = etKeys.length ? ('  Disponibles por etapa: ' + etKeys.map(function (k) { return k + ' (' + byEt[k] + ')'; }).join(', ')) : '';
+    var _totTxt = '  Disponibilidad: ' + (_disp.length ? (_disp.length + ' unidad(es) ofrecible(s)') : 'consultar (sin unidades disponibles cargadas)');
+    var partes = [_hdr, _totTxt].concat(tipLineas);
+    if (_etTxt) partes.push(_etTxt);
+    lineas.push(partes.join(NL));
+  });
+  return lineas.join(NL + NL);
+}
+// Ficha COMPACTA de UNA unidad/lote (una linea): numero, tipologia, emprendimiento, etapa, medidas, orientacion, precio,
+// estado (si NO es ofrecible), link del emprendimiento. Formato de los RESULTADOS de buscar_desarrollos y del fail-open.
+function _fichaCompactaDevUnit(u, dev) {
+  if (!u) return '';
+  var id = (u.numero != null && String(u.numero).trim()) ? ('N' + String(u.numero).trim()) : 'unidad';
+  var partes = [id, (u.tipologia || u.tipo_producto || 'unidad')];
+  var devNom = u.development_nombre || (dev && dev.nombre) || '';
+  if (devNom) partes.push(devNom);
+  if (u.etapa) partes.push('etapa ' + u.etapa);
+  var med = _devMedidasTxt(u); if (med) partes.push(med);
+  if (u.orientacion) partes.push(u.orientacion);
+  partes.push(_devPrecioTxt(u));
+  var _est = _devEstadoNorm(u.estado);
+  if (_est !== 'disponible' && _est !== 'libre') partes.push('estado: ' + _est);
+  var _link = u.development_link || (dev && dev.link) || '';
+  if (_link) partes.push('link: ' + _link);
+  return '- ' + partes.join(' | ');
+}
+// Listado COMPLETO comprimido (ofrecibles), CAPADO por emprendimiento para no volcar loteos gigantes. Fail-open de
+// respaldo a la calidad si el buscador falla (junto al indice + al inventario ya capado del prompt). 0 IA.
+function _inventarioCompactoDevUnits(unitsPorDev, capPorDev) {
+  var upd = unitsPorDev || {};
+  var cap = (capPorDev && Number(capPorDev) > 0) ? Number(capPorDev) : 30;
+  var out = [];
+  Object.keys(upd).forEach(function (k) {
+    (upd[k] || []).filter(_devOfrecible).slice(0, cap).forEach(function (u) { out.push(_fichaCompactaDevUnit(u, null)); });
+  });
+  return out.join(String.fromCharCode(10));
+}
+// Ficha COMPLETA de UNA unidad/lote (para ficha_desarrollo). Cherry-pick, SIN volcar unit_data crudo ni UUID/sector_id/user_id.
+function _fichaCompletaDevUnit(u, dev, etapaNombre) {
+  if (!u) return '';
+  var id = (u.numero != null && String(u.numero).trim()) ? ('N' + String(u.numero).trim()) : 'unidad';
+  var partes = [id + ' - ' + (u.tipologia || u.tipo_producto || 'unidad')];
+  var devNom = u.development_nombre || (dev && dev.nombre) || '';
+  if (devNom) partes.push('emprendimiento: ' + devNom);
+  var _et = etapaNombre || u.etapa;
+  if (_et) partes.push('etapa: ' + _et);
+  if (u.tipo_producto) partes.push('tipo: ' + u.tipo_producto);
+  if (u.superficie_terreno) partes.push('superficie terreno: ' + u.superficie_terreno + ' m2');
+  if (u.m2_cubiertos) partes.push('m2 cubiertos: ' + u.m2_cubiertos);
+  if (u.m2_totales) partes.push('m2 totales: ' + u.m2_totales);
+  if (u.frente) partes.push('frente: ' + u.frente + ' m');
+  if (u.fondo) partes.push('fondo: ' + u.fondo + ' m');
+  if (u.orientacion) partes.push('orientacion: ' + u.orientacion);
+  if (u.piso) partes.push('piso: ' + u.piso);
+  partes.push('precio: ' + _devPrecioTxt(u));
+  partes.push('estado: ' + _devEstadoNorm(u.estado));
+  var _link = u.development_link || (dev && dev.link) || '';
+  if (_link) partes.push('link: ' + _link);
+  return partes.join(' | ');
+}
+// BUSCADOR de unidades/lotes: filtro en memoria sobre `_unitsRag` (map por development_id, aplanado aca). Filtros:
+// desarrollo/nombre, etapa, estado (default ofrecibles disponible|libre; permite reservado/vendido para consultas
+// puntuales tipo "esta vendido el lote X?"), tipo_producto, tipologia, precio_min/max ("a consultar" NO excluye),
+// m2_min/max, numero exacto, texto_libre. Ordena por relevancia de texto y luego por precio asc. N default 15, tope 30.
+// PURA, sin IA. `devs`/`sectorNombrePorId` se aceptan por paridad de firma (la etapa ya viaja resuelta en cada unidad).
+function _buscarUnidadesDev(devs, unitsPorDev, sectorNombrePorId, f) {
+  f = f || {};
+  var all = [];
+  var upd = unitsPorDev || {};
+  Object.keys(upd).forEach(function (k) { (upd[k] || []).forEach(function (u) { all.push(u); }); });
+  // POR NUMERO EXACTO: si el lead nombra "el lote 12", devolvemos ESE(s) sin que lo tapen los otros filtros (puede
+  // repetirse el numero entre emprendimientos distintos -> devolvemos los que matcheen, hasta 5).
+  if (f.numero != null && String(f.numero).trim()) {
+    var _nPed = _ragNorm(f.numero);
+    var _hit = all.filter(function (u) { return u.numero != null && _ragNorm(u.numero) === _nPed; });
+    if (_hit.length) return _hit.slice(0, 5);
+  }
+  var arr = all.slice();
+  if (f.desarrollo && String(f.desarrollo).trim()) {
+    var _dw = _ragNorm(f.desarrollo).split(/\s+/).filter(function (w) { return w.length >= 3; });
+    if (_dw.length) arr = arr.filter(function (u) { var _h = _ragNorm(u.development_nombre); return _dw.every(function (w) { return _h.indexOf(w) >= 0; }); });
+  }
+  if (f.etapa && String(f.etapa).trim()) { var _ew = _ragNorm(f.etapa); if (_ew) arr = arr.filter(function (u) { return _ragNorm(u.etapa).indexOf(_ew) >= 0; }); }
+  // Estado: si el lead pregunta puntual por reservado/vendido, filtramos por ese; por defecto SOLO ofrecibles.
+  if (f.estado && String(f.estado).trim()) { var _es = _devEstadoNorm(f.estado); arr = arr.filter(function (u) { return _devEstadoNorm(u.estado) === _es; }); }
+  else arr = arr.filter(_devOfrecible);
+  if (f.tipo_producto && String(f.tipo_producto).trim()) { var _tp = _ragNorm(f.tipo_producto); if (_tp) arr = arr.filter(function (u) { return _ragNorm(u.tipo_producto).indexOf(_tp) >= 0; }); }
+  if (f.tipologia && String(f.tipologia).trim()) { var _tw = _ragNorm(f.tipologia); if (_tw) arr = arr.filter(function (u) { return _ragNorm(u.tipologia).indexOf(_tw) >= 0 || _ragNorm(u.tipo_producto).indexOf(_tw) >= 0; }); }
+  function _precioDev(u) { var pr = Number(u.precio); return (u.precio_estado === 'a_consultar' || !isFinite(pr) || pr <= 0) ? NaN : pr; }
+  // Precio: si el valor esta cargado se filtra; si es "a consultar" (NaN) NO se excluye (mejor para la calidad).
+  if (f.precio_min != null && f.precio_min !== '') { var pm = Number(f.precio_min); if (isFinite(pm)) arr = arr.filter(function (u) { var v = _precioDev(u); return isFinite(v) ? v >= pm : true; }); }
+  if (f.precio_max != null && f.precio_max !== '') { var px = Number(f.precio_max); if (isFinite(px)) arr = arr.filter(function (u) { var v = _precioDev(u); return isFinite(v) ? v <= px : true; }); }
+  if (f.m2_min != null && f.m2_min !== '') { var mm = Number(f.m2_min); if (isFinite(mm)) arr = arr.filter(function (u) { var v = _devM2(u); return isFinite(v) ? v >= mm : true; }); }
+  if (f.m2_max != null && f.m2_max !== '') { var mx = Number(f.m2_max); if (isFinite(mx)) arr = arr.filter(function (u) { var v = _devM2(u); return isFinite(v) ? v <= mx : true; }); }
+  var txt = f.texto_libre ? _ragNorm(f.texto_libre) : '';
+  var palabras = txt ? txt.split(/\s+/).filter(function (w) { return w.length >= 3; }) : [];
+  function score(u) {
+    if (!palabras.length) return 0;
+    var hay = _ragNorm([u.tipologia, u.tipo_producto, u.development_nombre, u.etapa, u.orientacion].join(' '));
+    var s = 0; palabras.forEach(function (w) { if (hay.indexOf(w) >= 0) s++; }); return s;
+  }
+  arr.sort(function (a, b) {
+    var sb = score(b) - score(a);
+    if (sb !== 0) return sb;
+    var pa = _precioDev(a), pb = _precioDev(b);
+    if (isFinite(pa) && isFinite(pb) && pa !== pb) return pa - pb;
+    return 0;
+  });
+  var N = (f.limite && Number(f.limite) > 0) ? Math.min(Number(f.limite), 30) : 15;
+  return arr.slice(0, N);
+}
+
 async function generarRespuestaAgente(user_id, conversation_id, message, opciones) {
   const modoPrueba = opciones && opciones.modoPrueba;
   const historialManual = (opciones && opciones.historialManual) || null;
@@ -5364,6 +5551,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // es el ACTUAL EXACTO. Aislamiento por tenant: SIEMPRE filtra por user_id (ademas de RLS).
   // Cero gasto extra de tokens/queries para las cuentas que NO usan el modulo.
   let inventarioDesarrollos = '';
+  // RAG DESARROLLADORA (gated ia_rag_v1): data cherry-pickeada para el buscador en memoria, poblada DENTRO del bloque
+  // de desarrolladora de abajo con la data YA scopeada (reusa _devs/_units; 1 sola query extra de etapas, y SOLO si el
+  // flag esta ON en una cuenta desarrolladora). Para el resto quedan null => _ragDevActivo nunca se activa y el
+  // prompt/flujo es BYTE-IDENTICO al actual. NUNCA guardan unit_data/dev_data crudo ni UUID/sector_id/user_id.
+  let _devsRag = null, _unitsRag = null, _sectorNombrePorId = null;
   try {
     const _rubroCuenta = normalizarRubro(rubro);
     const _devOn = (_rubroCuenta === 'desarrolladora') ||
@@ -5384,10 +5576,15 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       if (!_devErr && _devs && _devs.length > 0) {
         const _devIds = _devs.map(function(d){ return d.id; });
         const { data: _units } = await supabase.from('development_units')
-          .select('development_id, tipo_producto, numero, tipologia, m2_cubiertos, m2_totales, superficie_terreno, piso, orientacion, precio, precio_estado, moneda, estado')
+          .select('development_id, sector_id, tipo_producto, numero, tipologia, m2_cubiertos, m2_totales, superficie_terreno, frente, fondo, piso, orientacion, precio, precio_estado, moneda, estado, unit_data')
           .in('development_id', _devIds).eq('user_id', user_id);
         const _unitsPorDev = {};
         (_units || []).forEach(function(u){ (_unitsPorDev[u.development_id] = _unitsPorDev[u.development_id] || []).push(u); });
+        // RAG (gated ia_rag_v1): mapa de developments por id (para adjuntar nombre/link a cada unidad) y captura de la
+        // cabecera VERBATIM por emprendimiento (se llena dentro del map de abajo cuando el flag esta ON, sin cambiar el
+        // texto que hoy viaja en inventarioDesarrollos). Cero efecto con el flag OFF.
+        const _devsById = {}; _devs.forEach(function(d){ _devsById[d.id] = d; });
+        const _cabPorDevRag = {};
         const _ESTADO_OBRA_TXT = { pozo: 'en pozo', en_construccion: 'en construccion', terminado: 'terminado' };
         const _bloques = _devs.map(function(d){
           const _us = _unitsPorDev[d.id] || [];
@@ -5453,6 +5650,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             _planesTxt + _amen + _etapasTxt +
             (d.link ? ' | link: ' + d.link : '') +
             (d.descripcion ? ' | ' + d.descripcion : '');
+          // RAG (gated ia_rag_v1): guardamos la cabecera VERBATIM para reusarla como header del indice (misma info que
+          // hoy, sin el detalle por unidad). Efecto nulo con el flag OFF (no se lee).
+          if (_iaRagOn) _cabPorDevRag[d.id] = _cab;
           const _resTxt = _resumen.length > 0 ? ('\n  Disponibilidad: ' + _resumen.join(' ; ')) : '\n  Disponibilidad: consultar (sin unidades disponibles cargadas)';
           // Detalle por unidad disponible (acotado a las primeras para no inflar el prompt).
           const _detalle = _disp.slice(0, 30).map(function(u){
@@ -5465,6 +5665,52 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           return _cab + _resTxt + (_detalle.length > 0 ? ('\n' + _detalle.join('\n')) : '');
         });
         if (_bloques.length > 0) inventarioDesarrollos = _bloques.join('\n');
+        // ===== RAG DESARROLLADORA (gated ia_rag_v1): data cherry-pickeada para el buscador en memoria =====
+        // Solo se puebla con el flag ON y en una cuenta DESARROLLADORA (para inmobiliaria con el modulo el inventario
+        // de desarrollos viaja como hoy). Reusa _devs/_units (0 query extra ahi) + 1 query de etapas (development_sectors).
+        // NUNCA vuelca unit_data/dev_data crudo ni id/UUID/sector_id/user_id: cada unidad queda cherry-pickeada. Defensivo:
+        // ante CUALQUIER error las 3 estructuras quedan null => _ragDevActivo=false => fail-open al inventario completo de hoy.
+        if (_iaRagOn && _rubroCuenta === 'desarrolladora') {
+          try {
+            // ETAPA: development_sectors linkeados por unit.sector_id. Map sector_id -> nombre. 1 query, scopeada por tenant.
+            const _sectorMap = {};
+            try {
+              const { data: _sectores } = await supabase.from('development_sectors').select('id, nombre').in('development_id', _devIds).eq('user_id', user_id);
+              (_sectores || []).forEach(function(s){ if (s && s.id != null) _sectorMap[String(s.id)] = (s.nombre != null ? s.nombre : null); });
+            } catch (eSecRag) { console.error('rag desarrollos sectores:', eSecRag && eSecRag.message); }
+            _sectorNombrePorId = _sectorMap;
+            // Devs cherry-pickeados: cabecera VERBATIM (reusa _cabPorDevRag) + campos para filtros/display.
+            _devsRag = _devs.map(function(d){
+              return { id: d.id, nombre: d.nombre || null, link: d.link || null, zona: d.zona || null, tipo: d.tipo || null, estado_obra: d.estado_obra || null, header: (_cabPorDevRag[d.id] != null ? _cabPorDevRag[d.id] : null) };
+            });
+            // Unidades cherry-pickeadas por development_id. Etapa = sectorNombrePorId[sector_id] con fallback unit_data.etapa.
+            _unitsRag = {};
+            (_units || []).forEach(function(u){
+              const _et = (u.sector_id != null && _sectorMap[String(u.sector_id)]) ? _sectorMap[String(u.sector_id)] : ((u.unit_data && u.unit_data.etapa) ? u.unit_data.etapa : null);
+              const _devRef = _devsById[u.development_id] || null;
+              const _u = {
+                numero: (u.numero != null ? u.numero : null),
+                tipologia: u.tipologia || null,
+                tipo_producto: u.tipo_producto || null,
+                estado: u.estado || 'disponible',
+                precio: (u.precio != null ? u.precio : null),
+                precio_estado: u.precio_estado || null,
+                moneda: u.moneda || 'USD',
+                superficie_terreno: (u.superficie_terreno != null ? u.superficie_terreno : null),
+                m2_cubiertos: (u.m2_cubiertos != null ? u.m2_cubiertos : null),
+                m2_totales: (u.m2_totales != null ? u.m2_totales : null),
+                frente: (u.frente != null ? u.frente : null),
+                fondo: (u.fondo != null ? u.fondo : null),
+                orientacion: u.orientacion || null,
+                piso: u.piso || null,
+                etapa: _et,
+                development_nombre: (_devRef && _devRef.nombre) ? _devRef.nombre : null,
+                development_link: (_devRef && _devRef.link) ? _devRef.link : null
+              };
+              (_unitsRag[u.development_id] = _unitsRag[u.development_id] || []).push(_u);
+            });
+          } catch (eRagDev) { console.error('rag desarrollos data:', eRagDev && eRagDev.message); _devsRag = null; _unitsRag = null; _sectorNombrePorId = null; }
+        }
       }
     }
   } catch (eDev) { console.error('inventario desarrollos:', eDev && eDev.message); inventarioDesarrollos = ''; }
@@ -5476,6 +5722,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // => .filter(Boolean) lo descarta y el prompt es el ACTUAL EXACTO. Aislado por user_id. Deploy-safe: si la tabla
   // no existe (migracion no corrida), el select falla y queda sin inventario (no rompe).
   const _esHotel = normalizarRubro(rubro) === 'hotel_cabanas';
+  // RAG DESARROLLADORA (gated ia_rag_v1): rubro desarrolladora (valor canonico de normalizarRubro). Espejo de _esHotel.
+  const _esDesarrolladora = normalizarRubro(rubro) === 'desarrolladora';
   // Cómo se nombra el negocio segun rubro (para que la IA NO se presente siempre como "la inmobiliaria").
   const _negocioLabel = _esHotel ? 'el alojamiento' : (normalizarRubro(rubro) === 'desarrolladora' ? 'la desarrolladora' : 'la inmobiliaria');
   let inventarioHotel = '';
@@ -5766,6 +6014,27 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } catch (eRagHot) { console.error('RAG hotel indice:', eRagHot && eRagHot.message); _ragHotelActivo = false; }
   }
 
+  // ===== RAG DE INVENTARIO DESARROLLADORA (gated ia_rag_v1): resolucion FINAL (ESPEJO de _ragActivo/_ragHotelActivo) =====
+  // Con el flag ON + rubro desarrolladora + emprendimientos cargados, la IA recibe el INDICE (cabecera de cada
+  // emprendimiento + panorama por tipologia/etapa) en vez del listado COMPLETO, mas las tools buscar_desarrollos /
+  // ficha_desarrollo. FAIL-OPEN A LA CALIDAD: ante CUALQUIER error al armar el indice, _ragDevActivo queda false =>
+  // se usa el inventarioDesarrollos COMPLETO EXACTO de hoy (byte-identico, nunca se degrada; ademas RESUELVE el truncado
+  // a 30 unidades por emprendimiento del bloque de hoy). FAIL-CLOSED: con el flag OFF, _iaRagOn=false => _ragDevActivo=false.
+  let _ragDevActivo = false;
+  let _indiceDev = '';
+  let _headerIndiceDev = '';
+  if (_iaRagOn && _esDesarrolladora) {
+    try {
+      if (_devsRag && _devsRag.length > 0 && _unitsRag) {
+        _indiceDev = _construirIndiceDesarrollos(_devsRag, _unitsRag, _sectorNombrePorId);
+        if (_indiceDev) {
+          _ragDevActivo = true;
+          _headerIndiceDev = 'INVENTARIO DE EMPRENDIMIENTOS (modo buscador): NO tenes el listado completo de unidades/lotes aca, solo el INDICE de abajo (cabecera de cada emprendimiento + panorama por tipologia y etapa). Tenes dos herramientas: buscar_desarrollos (encontrar unidades o lotes por emprendimiento, etapa, estado, tipo de producto, tipologia, precio, m2 o numero) y ficha_desarrollo (detalle completo de UNA unidad/lote por su numero). REGLA DURA: NUNCA nombres, ofrezcas ni des por existente una unidad o lote concreto que no haya salido de buscar_desarrollos o ficha_desarrollo en esta conversacion; para ofrecer algo puntual, PRIMERO busca. Por defecto el buscador trae SOLO las ofrecibles (disponibles/libres); si el lead pregunta si un lote esta reservado o vendido, pasa el estado. Para preguntas de panorama ("que tenes?", "que lotes quedan?", cuotas/financiacion/etapas del emprendimiento) apoyate en el INDICE. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. INDICE DE EMPRENDIMIENTOS:';
+        }
+      }
+    } catch (eRagDev2) { console.error('RAG desarrollos indice:', eRagDev2 && eRagDev2.message); _ragDevActivo = false; }
+  }
+
   // Parte ESTATICA del system: identica para el tenant entre mensajes y leads -> se CACHEA con cache_control
   // (prompt caching de Anthropic, ~-90% en relecturas). Los datos del lead (dinamicos) van en un bloque aparte.
   const systemStatic = [
@@ -5827,8 +6096,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     (!_ragHotelActivo && inventarioHotel) ? 'DISPONIBILIDAD (IMPORTANTE): algunas unidades tienen debajo una o mas lineas "OCUPADA del X al Y" (fechas ya reservadas; la fecha de salida es dia de egreso = queda libre esa noche). NUNCA ofrezcas una unidad para fechas que se SOLAPAN con un periodo OCUPADO. Hay solape si la fecha de ingreso pedida es ANTERIOR a la salida ocupada Y la fecha de salida pedida es POSTERIOR al ingreso ocupado. Si el huesped pide fechas ocupadas, ofrecele OTRA unidad libre para esas fechas o proponele fechas alternativas libres. Las unidades o fechas SIN linea "OCUPADA" estan disponibles.' : '',
     // INVENTARIO DE DESARROLLOS (ADITIVO + GATEADO): solo presente si la cuenta tiene el modulo activo.
     // Con el flag OFF, inventarioDesarrollos === '' => .filter(Boolean) descarta estas 2 lineas y el prompt es el ACTUAL EXACTO.
-    inventarioDesarrollos ? 'Emprendimientos / desarrollos disponibles (proyectos en pozo, en construccion o terminados; ofrecelos cuando el cliente busca obra nueva, financiacion en cuotas o inversion). Usa SOLO estos; no inventes unidades ni precios. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. Si el emprendimiento tiene link, compartilo:' : '',
-    inventarioDesarrollos || '',
+    // RAG DESARROLLADORA (gated ia_rag_v1): con _ragDevActivo, el listado COMPLETO se reemplaza por el INDICE (cabecera
+    // de cada emprendimiento + panorama por tipologia/etapa) + guardrail del buscador. Con _ragDevActivo=false (flag OFF /
+    // no-desarrolladora / sin emprendimientos / error) estas 2 lineas son BYTE-IDENTICAS a las de hoy.
+    _ragDevActivo ? _headerIndiceDev : (inventarioDesarrollos ? 'Emprendimientos / desarrollos disponibles (proyectos en pozo, en construccion o terminados; ofrecelos cuando el cliente busca obra nueva, financiacion en cuotas o inversion). Usa SOLO estos; no inventes unidades ni precios. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse por avance de obra o indice. Si el emprendimiento tiene link, compartilo:' : ''),
+    _ragDevActivo ? _indiceDev : (inventarioDesarrollos || ''),
     'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
   ].filter(Boolean).join('\n');
 
@@ -6040,6 +6312,38 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // RAG DE INVENTARIO DESARROLLADORA (gated ia_rag_v1): tools buscar_desarrollos + ficha_desarrollo (ESPEJO de las de
+  // inmobiliaria/hotel, esquema propio de emprendimientos). ADITIVO: solo se agregan con _ragDevActivo (flag ON + rubro
+  // desarrolladora + emprendimientos cargados) => con el flag OFF NO se agregan y el prompt/flujo son BYTE-IDENTICOS al
+  // actual. El filtro corre en memoria sobre `_unitsRag` (0 IA, 0 query). El turno de busqueda NO se cobra aparte (ver _ragToolUsado).
+  if (_ragDevActivo) {
+    toolsAgente.push({
+      name: 'buscar_desarrollos',
+      description: 'Usala para BUSCAR unidades o lotes de los emprendimientos segun lo que pide el lead (por emprendimiento, etapa, estado, tipo de producto, tipologia, precio, m2 o numero). Es la UNICA forma de saber que unidades/lotes concretos existen: NO tenes el listado completo, solo el indice. Llamala ANTES de nombrar, ofrecer o describir cualquier lote/unidad puntual. Por defecto trae SOLO las ofrecibles (disponibles/libres); si el lead pregunta si un lote esta reservado o vendido, pasa el estado. Si no hay coincidencias, relaja filtros y volve a llamarla, o pedile un dato al lead; NUNCA inventes unidades ni lotes.',
+      input_schema: { type: 'object', properties: {
+        desarrollo: { type: 'string', description: 'Nombre del emprendimiento/desarrollo donde busca el lead, si lo menciono (ej: "Aregua Forest"). Opcional.' },
+        etapa: { type: 'string', description: 'Etapa/sector del emprendimiento si el lead la nombra (ej: "Etapa 2", "Fase A"). Opcional.' },
+        estado: { type: 'string', enum: ['disponible', 'libre', 'reservado', 'vendido'], description: 'Estado de la unidad/lote. Por defecto se muestran SOLO las ofrecibles (disponible/libre). Pasalo SOLO si el lead pregunta puntualmente por lotes reservados o vendidos (ej: "esta vendido el lote 12?"). Opcional.' },
+        tipo_producto: { type: 'string', description: 'Tipo de producto (ej: "lote", "departamento", "casa", "local", "cochera"). Opcional.' },
+        tipologia: { type: 'string', description: 'Tipologia (ej: "2 dormitorios", "monoambiente", "lote interno"). Opcional.' },
+        precio_min: { type: 'number', description: 'Precio minimo. Las unidades con precio "a consultar" no se excluyen. Opcional.' },
+        precio_max: { type: 'number', description: 'Precio maximo. Las unidades con precio "a consultar" no se excluyen. Opcional.' },
+        m2_min: { type: 'number', description: 'Metros cuadrados minimos (de terreno para lotes, cubiertos para construido). Opcional.' },
+        m2_max: { type: 'number', description: 'Metros cuadrados maximos. Opcional.' },
+        numero: { type: 'string', description: 'Numero EXACTO de una unidad/lote, si el lead lo menciona ("el lote 12", "la unidad 3B"). Devuelve SOLO esa/s. Opcional.' },
+        texto_libre: { type: 'string', description: 'Palabras clave sueltas del pedido (ej: "esquina", "al contrafrente", "orientacion norte"). Opcional.' },
+        limite: { type: 'integer', description: 'Cuantos resultados queres (default 15, maximo 30). Opcional.' }
+      }, required: [] }
+    });
+    toolsAgente.push({
+      name: 'ficha_desarrollo',
+      description: 'Usala cuando ya identificaste UNA unidad o lote concreto (por su numero, salido de buscar_desarrollos) y queres su DETALLE completo para darle datos precisos al lead (medidas, frente/fondo, orientacion, piso, etapa, precio, estado). No inventes datos: si la unidad no aparece, volve a buscar con buscar_desarrollos.',
+      input_schema: { type: 'object', properties: {
+        numero: { type: 'string', description: 'El numero de la unidad/lote tal como figura en los resultados de buscar_desarrollos (ej: "12").' }
+      }, required: ['numero'] }
+    });
+  }
+
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
@@ -6194,6 +6498,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // _ragHotelActivo => con el flag OFF (o rubro no-hotel) la rama nunca se entra (ACTUAL EXACTO).
     const _toolBuscarUni = _ragHotelActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_unidades'; }) : null;
     const _toolFichaUni = _ragHotelActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ficha_unidad'; }) : null;
+    // RAG DE INVENTARIO DESARROLLADORA (gated ia_rag_v1): ¿la IA pidio buscar_desarrollos / ficha_desarrollo? Solo se
+    // detectan con _ragDevActivo => con el flag OFF (o rubro no-desarrolladora) la rama nunca se entra (ACTUAL EXACTO).
+    const _toolBuscarDev = _ragDevActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'buscar_desarrollos'; }) : null;
+    const _toolFichaDev = _ragDevActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ficha_desarrollo'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       let _resCercaTxt = '';
@@ -6625,6 +6933,61 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         }
       } catch (eFu) { console.error('tool ficha_unidad:', eFu && eFu.message); _resFuTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del alojamiento, sin inventar.'; }
       reply = await _cerrarTurnoFuente(_toolFichaUni, _resFuTxt, 'ficha-unidad', _textoPrevioFu, 'Dejame traer los detalles y te confirmo.');
+    } else if (_toolBuscarDev) {
+      // RAG DESARROLLADORA (gated ia_rag_v1): la IA pidio buscar_desarrollos. Filtro en memoria sobre `_unitsRag` (0 IA,
+      // 0 query) + 2do turno para que redacte (usage acumulado en _cerrarTurnoFuente). La tool solo existe con
+      // _ragDevActivo => nunca se entra con el flag OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
+      _ragToolUsado = true;
+      const _NLbd = String.fromCharCode(10);
+      const _textoPrevioBd = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resBdTxt = '';
+      try {
+        const _inpBd = _toolBuscarDev.input || {};
+        const _resBd = _buscarUnidadesDev(_devsRag, _unitsRag, _sectorNombrePorId, {
+          desarrollo: _inpBd.desarrollo, etapa: _inpBd.etapa, estado: _inpBd.estado,
+          tipo_producto: _inpBd.tipo_producto, tipologia: _inpBd.tipologia,
+          precio_min: _inpBd.precio_min, precio_max: _inpBd.precio_max,
+          m2_min: _inpBd.m2_min, m2_max: _inpBd.m2_max,
+          numero: _inpBd.numero, texto_libre: _inpBd.texto_libre, limite: _inpBd.limite
+        });
+        if (!_resBd.length) {
+          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
+          _resBdTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes unidades ni lotes. Opciones: (a) relaja algun filtro (ampli el rango de precio/m2 o quita el emprendimiento) y volve a llamar buscar_desarrollos; (b) pedile al lead un dato que acote mejor (emprendimiento, presupuesto, tipo de producto). Para referencia, este es el panorama de los emprendimientos:' + _NLbd + _indiceDev;
+        } else {
+          _resBdTxt = 'Unidades / lotes de los emprendimientos (' + _resBd.length + '; usa SOLO estos, no inventes otros). Para dar el detalle completo de uno, usa ficha_desarrollo con su numero:' + _NLbd + _resBd.map(function(u){ return _fichaCompactaDevUnit(u, null); }).join(_NLbd) + _NLbd + 'Ofrece el/los que mejor encajen con lo que pidio el lead, con su precio y estado. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse. Si ninguno encaja del todo, decilo con honestidad y ofrece el mas parecido o pedi un dato para afinar.';
+        }
+      } catch (eBd) {
+        console.error('tool buscar_desarrollos:', eBd && eBd.message);
+        // FAIL-OPEN A LA CALIDAD: para loteos GRANDES NO volcamos miles de lineas -> el INDICE + el inventario ya capado
+        // (mismo piso que hoy). Respaldo bounded: inventarioDesarrollos (cap 30/dev) o el compacto capado.
+        const _respaldoDev = inventarioDesarrollos || _inventarioCompactoDevUnits(_unitsRag, 30);
+        _resBdTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el PANORAMA de los emprendimientos; elegi de aca lo que corresponda (no inventes nada fuera de esto):' + _NLbd + (_indiceDev || '') + (_respaldoDev ? (_NLbd + _respaldoDev) : '');
+      }
+      reply = await _cerrarTurnoFuente(_toolBuscarDev, _resBdTxt, 'buscar-desarrollos', _textoPrevioBd, 'Dejame ver los emprendimientos y te paso opciones.');
+    } else if (_toolFichaDev) {
+      // RAG DESARROLLADORA (gated ia_rag_v1): detalle completo de UNA unidad/lote por numero (sobre `_unitsRag` en memoria).
+      _ragToolUsado = true;
+      const _NLfd = String.fromCharCode(10);
+      const _textoPrevioFd = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
+      let _resFdTxt = '';
+      try {
+        const _inpFd = _toolFichaDev.input || {};
+        const _idRawD = (_inpFd.numero != null && _inpFd.numero !== '') ? _inpFd.numero : (_inpFd.id != null ? _inpFd.id : '');
+        const _idPedD = String(_idRawD).trim();
+        let _uFd = null;
+        if (_idPedD) {
+          const _normD = _ragNorm(_idPedD);
+          const _flatD = [];
+          try { Object.keys(_unitsRag || {}).forEach(function(k){ (_unitsRag[k] || []).forEach(function(u){ _flatD.push(u); }); }); } catch (eFlat) {}
+          _uFd = _flatD.find(function(u){ return u.numero != null && _ragNorm(u.numero) === _normD; }) || null;
+        }
+        if (!_uFd) {
+          _resFdTxt = 'No encontre una unidad/lote con ese numero (' + _idPedD + '). Volve a buscar con buscar_desarrollos o pedile al lead que aclare cual le interesa. No inventes datos.';
+        } else {
+          _resFdTxt = 'Ficha completa de la unidad/lote pedido (usa SOLO estos datos):' + _NLfd + _fichaCompletaDevUnit(_uFd, null, _uFd.etapa) + _NLfd + 'Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse. No inventes datos que no figuren aca.';
+        }
+      } catch (eFd) { console.error('tool ficha_desarrollo:', eFd && eFd.message); _resFdTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes de los emprendimientos, sin inventar.'; }
+      reply = await _cerrarTurnoFuente(_toolFichaDev, _resFdTxt, 'ficha-desarrollo', _textoPrevioFd, 'Dejame traer los detalles y te confirmo.');
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {

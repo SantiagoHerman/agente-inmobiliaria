@@ -1490,18 +1490,23 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
       null
     );
     // Un HUMANO respondio DESDE EL CELULAR (es el dueno/admin). Igual que responder desde la app: el lead pasa a
-    // 'listo_humano' con la IA APAGADA (para que la IA no le pise la respuesta al cliente) y, como lo tomo el dueno,
-    // queda "en administracion" (admin_tomo=true) -> ningun cron (recontacto/respaldo/rotacion) lo reasigna. Diego
-    // 2026-07-23. NO se toca si ya esta listo_humano/cerrado; admin_tomo solo si NO hay un asesor humano ya asignado
-    // (no le robamos el lead a un asesor). El dedupe de arriba ya garantiza que aca solo llega un mensaje humano REAL
-    // (los ecos de la propia IA se descartan por contenido) -> no apaga la IA por sus propios envios.
+    // 'listo_humano' con la IA APAGADA (para que la IA no le pise la respuesta al cliente) y QUEDA EN EL DEPARTAMENTO
+    // "ADMINISTRACION" (el que tiene recibe_fallback). Diego 2026-07-23. NO se toca si ya esta listo_humano/cerrado
+    // ni si ya hay un asesor humano asignado (no le robamos el lead). Si la cuenta NO tiene depto Administracion,
+    // cae a admin_tomo (queda tomado por el admin, sin reasignar). El dedupe de arriba ya garantiza que aca solo llega
+    // un mensaje humano REAL (los ecos de la propia IA se descartan por contenido) -> no apaga la IA por sus envios.
     {
       const _updCel = { last_message: texto, last_role: 'human', updated_at: new Date().toISOString() };
       try {
-        const { data: _cvE } = await supabase.from('conversations').select('status, ai_enabled, asesor_id, admin_tomo').eq('id', conv.id).maybeSingle();
+        const { data: _cvE } = await supabase.from('conversations').select('status, ai_enabled, asesor_id, admin_tomo, departamento_id').eq('id', conv.id).maybeSingle();
         if (_cvE && _cvE.status !== 'listo_humano' && _cvE.status !== 'cerrado') { _updCel.status = 'listo_humano'; _updCel.ai_enabled = false; }
         else if (_cvE && _cvE.ai_enabled === true) { _updCel.ai_enabled = false; }
-        if (_cvE && !_cvE.asesor_id && _cvE.admin_tomo !== true) _updCel.admin_tomo = true;
+        if (_cvE && !_cvE.asesor_id) {
+          let _deptoAdmin = null;
+          try { _deptoAdmin = await deptoFallbackDe(conv.user_id); } catch (eDA) { _deptoAdmin = null; }
+          if (_deptoAdmin) { _updCel.departamento_id = _deptoAdmin; }        // -> departamento Administracion
+          else if (_cvE.admin_tomo !== true) { _updCel.admin_tomo = true; }  // sin depto Admin -> al menos lo toma el admin
+        }
       } catch (eFlipCel) { /* si falla la lectura: al menos guardamos last_message/last_role como siempre */ }
       await supabase.from('conversations').update(_updCel).eq('id', conv.id);
     }

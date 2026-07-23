@@ -2077,7 +2077,9 @@ async function _construirContextoPauta(user_id, pauta, rubroRaw) {
     let _match = null;
     try { _match = await _matchPautaInventario(user_id, rubroRaw, pauta); } catch (eM) { _match = null; }
     if (_match && _match.resumen) {
-      _texto += ' Segun el inventario, esa publicidad corresponde a esta opcion (usa SUS datos exactos, que ya tenes cargados mas arriba en el inventario): ' + _match.resumen + '.';
+      // Incluimos el NUMERO de la propiedad: con el buscador (RAG) la IA NO tiene el catalogo completo en el prompt, asi
+      // que sin el numero no puede traer la ficha. Redaccion NEUTRA: sirve igual con inventario completo y con buscador.
+      _texto += ' Segun el inventario, esa publicidad corresponde a esta opcion: ' + (_match.numero != null && String(_match.numero).trim() ? ('#' + String(_match.numero).trim() + ' - ') : '') + _match.resumen + '. Usa SUS datos exactos; si necesitas el detalle completo (medidas, servicios, fotos), buscala por ese numero.';
     }
     return _texto;
   } catch (e) { return null; }
@@ -4822,10 +4824,19 @@ function _fichaCompletaProp(p) {
 // BUSCADOR: filtro en memoria sobre `properties`. zonas = ARRAY (OR de varias zonas). operacion / tipo / rango de
 // precio / dormitorios_min / ambientes_min / capacidad_min / texto_libre. Ordena por relevancia de texto y luego
 // por precio ascendente. Devuelve hasta N (default 8, tope 12) coincidencias. PURA, sin IA.
-function _buscarInventarioProps(properties, f) {
+function _buscarInventarioProps(properties, f, periodosMap) {
   var props = Array.isArray(properties) ? properties : [];
   f = f || {};
   var arr = props.slice();
+  // POR NUMERO/ID EXACTO (Diego 2026-07-23): si el lead dice "el 6400" o la PAUTA trae el id del aviso, devolvemos ESA
+  // propiedad sin que la tapen los demas filtros. Mismo criterio que ficha_inventario (numero o id). Sin match -> sigue.
+  if (f.numero != null && String(f.numero).trim()) {
+    var _idPed = String(f.numero).trim();
+    var _hitNum = arr.filter(function (p) {
+      return (p.numero != null && String(p.numero).trim() === _idPed) || (p.id != null && String(p.id).trim() === _idPed);
+    });
+    if (_hitNum.length) return _hitNum.slice(0, 1);
+  }
   var op = f.operacion ? _ragNorm(f.operacion) : '';
   function esVenta() { return op.indexOf('venta') >= 0 || op.indexOf('compra') >= 0; }
   function esTemp() { return op.indexOf('temporal') >= 0; }
@@ -4852,12 +4863,55 @@ function _buscarInventarioProps(properties, f) {
     });
   }
   if (f.tipo) { var t = _ragNorm(f.tipo); if (t) arr = arr.filter(function (p) { return _ragNorm(p.type).indexOf(t) >= 0 || _ragNorm(p.title).indexOf(t) >= 0; }); }
+  // POR NOMBRE (filtro REAL): "el Fernando", "Casa Gloria". Antes el nombre iba solo por texto_libre, que ORDENA pero
+  // NO filtra -> con el corte de resultados la propiedad buscada podia quedar afuera. Todas las palabras >=3 en el titulo.
+  if (f.nombre && String(f.nombre).trim()) {
+    var _nw = _ragNorm(f.nombre).split(/\s+/).filter(function (w) { return w.length >= 3; });
+    if (_nw.length) arr = arr.filter(function (p) {
+      var _tt = _ragNorm(p.title) + ' ' + _ragNorm(p.caracteristicas);
+      return _nw.every(function (w) { return _tt.indexOf(w) >= 0; });
+    });
+  }
+  // POR CARACTERISTICAS/AMENITIES (filtro REAL): "pileta", "parrilla", "balcon". Antes tambien solo puntuaba.
+  if (f.caracteristicas && String(f.caracteristicas).trim()) {
+    var _cw = _ragNorm(f.caracteristicas).split(/\s+/).filter(function (w) { return w.length >= 3; });
+    if (_cw.length) arr = arr.filter(function (p) {
+      var _hay = _ragNorm([p.amenities, p.caracteristicas, p.title].join(' '));
+      return _cw.every(function (w) { return _hay.indexOf(w) >= 0; });
+    });
+  }
+  // FILTROS DUROS que faltaban (las columnas ya vienen cargadas): apto credito, cochera, banos, superficie.
+  if (f.apto_credito === true) arr = arr.filter(function (p) { return p.apto_credito === true; });
+  if (f.cocheras_min != null && f.cocheras_min !== '') { var _cm = Number(f.cocheras_min); if (isFinite(_cm)) arr = arr.filter(function (p) { var c = Number(p.cocheras); return isFinite(c) ? c >= _cm : false; }); }
+  if (f.banos_min != null && f.banos_min !== '') { var _bm = Number(f.banos_min); if (isFinite(_bm)) arr = arr.filter(function (p) { var b = Number(p.banos); return isFinite(b) ? b >= _bm : false; }); }
+  if (f.superficie_min != null && f.superficie_min !== '') { var _sm = Number(f.superficie_min); if (isFinite(_sm)) arr = arr.filter(function (p) { var s = Number(p.superficie_cubierta) || Number(p.superficie_total); return (isFinite(s) && s > 0) ? s >= _sm : true; }); }
   if (f.dormitorios_min != null && f.dormitorios_min !== '') { var dm = Number(f.dormitorios_min); if (isFinite(dm)) arr = arr.filter(function (p) { var d = Number(p.dormitorios); return isFinite(d) ? d >= dm : false; }); }
   if (f.ambientes_min != null && f.ambientes_min !== '') { var am = Number(f.ambientes_min); if (isFinite(am)) arr = arr.filter(function (p) { var a = Number(p.rooms); return isFinite(a) ? a >= am : false; }); }
   if (f.capacidad_min != null && f.capacidad_min !== '') { var cm = Number(f.capacidad_min); if (isFinite(cm)) arr = arr.filter(function (p) { var c = Number(p.capacity); return isFinite(c) ? c >= cm : false; }); }
   // Precio: si el valor esta cargado, se filtra; si es "consultar" (NaN) NO se excluye (mejor para la calidad).
   if (f.precio_min != null && f.precio_min !== '') { var pm = Number(f.precio_min); if (isFinite(pm)) arr = arr.filter(function (p) { var v = precioDe(p); return isFinite(v) ? v >= pm : true; }); }
   if (f.precio_max != null && f.precio_max !== '') { var px = Number(f.precio_max); if (isFinite(px)) arr = arr.filter(function (p) { var v = precioDe(p); return isFinite(v) ? v <= px : true; }); }
+  // DISPONIBILIDAD POR FECHAS (alquiler temporal): cada propiedad temporal tiene su calendario propio en
+  // temporario_periodos (estado 'ocupado' = tomado). Si el lead pide un rango, descartamos las temporales con un periodo
+  // ocupado que PISE ese rango. Solape SEMIABIERTO (mismo criterio que las reservas de hotel): choca si
+  // ocupado.desde < pedido.hasta Y ocupado.hasta > pedido.desde (el dia de salida queda libre). Fechas ISO -> compara strings.
+  // FAIL-OPEN a la CALIDAD: fechas mal formadas o sin calendario cargado -> NO filtra (mejor mostrar de mas que ocultar).
+  if (periodosMap && f.fecha_desde && f.fecha_hasta &&
+      /^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha_desde)) && /^\d{4}-\d{2}-\d{2}$/.test(String(f.fecha_hasta))) {
+    var _fd = String(f.fecha_desde), _fh = String(f.fecha_hasta);
+    if (_fd < _fh) {
+      arr = arr.filter(function (p) {
+        if (!p.temporal_activa) return true;           // no hace temporal: las fechas no aplican
+        var _per = periodosMap[p.id] || [];
+        if (!_per.length) return true;                 // sin calendario cargado: no la ocultamos
+        var _choca = _per.some(function (o) {
+          if (!o || o.estado !== 'ocupado' || !o.fecha_desde || !o.fecha_hasta) return false;
+          return String(o.fecha_desde) < _fh && String(o.fecha_hasta) > _fd;
+        });
+        return !_choca;
+      });
+    }
+  }
   var txt = f.texto_libre ? _ragNorm(f.texto_libre) : '';
   var palabras = txt ? txt.split(/\s+/).filter(function (w) { return w.length >= 3; }) : [];
   function score(p) {
@@ -4874,7 +4928,7 @@ function _buscarInventarioProps(properties, f) {
     if (isFinite(pa) && isFinite(pb) && pa !== pb) return pa - pb;
     return 0;
   });
-  var N = (f.limite && Number(f.limite) > 0) ? Math.min(Number(f.limite), 12) : 8;
+  var N = (f.limite && Number(f.limite) > 0) ? Math.min(Number(f.limite), 30) : 15; // Diego: 8 era corto para 255 propiedades
   return arr.slice(0, N);
 }
 
@@ -5644,7 +5698,17 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         dormitorios_min: { type: 'integer', description: 'Cantidad minima de dormitorios. Opcional.' },
         ambientes_min: { type: 'integer', description: 'Cantidad minima de ambientes. Opcional.' },
         capacidad_min: { type: 'integer', description: 'Capacidad minima de personas (util para alquiler temporal). Opcional.' },
-        texto_libre: { type: 'string', description: 'Palabras clave sueltas del pedido (ej: "luminoso con patio", "a estrenar", "vista al mar"). Opcional.' }
+        texto_libre: { type: 'string', description: 'Palabras clave sueltas del pedido (ej: "luminoso con patio", "a estrenar", "vista al mar"). Opcional.' },
+        numero: { type: 'string', description: 'Numero/id EXACTO de una propiedad, si el lead lo menciona ("el 6400", "la propiedad 123") o si viene del aviso por el que consulto. Devuelve SOLO esa. Opcional.' },
+        nombre: { type: 'string', description: 'Nombre/titulo de la propiedad si el lead lo nombra (ej: "el Fernando", "Casa Gloria", "Petunia II"). Opcional.' },
+        caracteristicas: { type: 'string', description: 'Caracteristicas o amenities que el lead pide como REQUISITO (ej: "pileta", "parrilla", "balcon", "cochera cubierta"). Filtra de verdad: usala cuando el lead lo pide si o si. Opcional.' },
+        apto_credito: { type: 'boolean', description: 'true si el lead necesita que sea APTO CREDITO. Opcional.' },
+        cocheras_min: { type: 'integer', description: 'Cantidad minima de cocheras. Opcional.' },
+        banos_min: { type: 'integer', description: 'Cantidad minima de banos. Opcional.' },
+        superficie_min: { type: 'number', description: 'Superficie minima en m2 (cubierta o total). Opcional.' },
+        fecha_desde: { type: 'string', description: 'Solo ALQUILER TEMPORAL: fecha de entrada en formato AAAA-MM-DD. Usala cuando el lead pide fechas concretas: devuelve solo las temporales LIBRES en ese rango. Si el mes ya paso este ano, usa el ano que viene.' },
+        fecha_hasta: { type: 'string', description: 'Solo ALQUILER TEMPORAL: fecha de salida en formato AAAA-MM-DD (el dia de salida queda libre).' },
+        limite: { type: 'integer', description: 'Cuantos resultados queres (default 15, maximo 30). Subilo si el lead pide ver mas opciones. Opcional.' }
       }, required: [] }
     });
     toolsAgente.push({
@@ -5681,6 +5745,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // PAUTA META (NIVEL 1/2, gated ia_pauta_meta): contexto del aviso Click-to-WhatsApp del que viene el lead. Bloque
   // DINAMICO (NO cacheado, dato por-lead) => NUNCA va dentro del bloque estatico cacheado. Solo se agrega si el caller
   // lo paso (flag ON + pauta presente); con el flag OFF _pautaContexto es null => system BYTE-IDENTICO al actual.
+  // RAG (gated _ragActivo): la IA necesita saber QUE DIA ES HOY para convertir "del 10 al 20 de enero" a AAAA-MM-DD y
+  // poder pedir disponibilidad de alquiler TEMPORAL con buscar_inventario. Bloque DINAMICO (NO cacheado: cambia a diario).
+  if (_ragActivo) systemBlocks.push({ type: 'text', text: 'HOY es ' + _fechaLocalArg() + ' (formato AAAA-MM-DD). Usalo para resolver el ano de las fechas que diga el lead: si el mes ya paso este ano, es el ano que viene. Cuando el lead pida un ALQUILER TEMPORAL para fechas concretas, pasa fecha_desde y fecha_hasta a buscar_inventario y te devuelve SOLO las que estan libres en ese rango (el dia de salida queda libre). Si el lead no da fechas, no las inventes.' });
   if (_pautaContexto) systemBlocks.push({ type: 'text', text: _pautaContexto });
 
   // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
@@ -6130,8 +6197,14 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           zonas: _inpBi.zonas, operacion: _inpBi.operacion, tipo: _inpBi.tipo,
           precio_min: _inpBi.precio_min, precio_max: _inpBi.precio_max,
           dormitorios_min: _inpBi.dormitorios_min, ambientes_min: _inpBi.ambientes_min,
-          capacidad_min: _inpBi.capacidad_min, texto_libre: _inpBi.texto_libre
-        });
+          capacidad_min: _inpBi.capacidad_min, texto_libre: _inpBi.texto_libre,
+          // AMPLIACION (Diego 2026-07-23): por numero/id, por nombre, por caracteristicas/amenities, filtros duros,
+          // disponibilidad por fechas (temporal) y limite pedido por la IA.
+          numero: _inpBi.numero, nombre: _inpBi.nombre, caracteristicas: _inpBi.caracteristicas,
+          apto_credito: _inpBi.apto_credito, cocheras_min: _inpBi.cocheras_min,
+          banos_min: _inpBi.banos_min, superficie_min: _inpBi.superficie_min,
+          fecha_desde: _inpBi.fecha_desde, fecha_hasta: _inpBi.fecha_hasta, limite: _inpBi.limite
+        }, periodosPorProp); // calendario temporal (ya cargado arriba, sin query extra)
         if (!_resBi.length) {
           // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
           _resBiTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes propiedades. Opciones: (a) relaja algun filtro (ampli el rango de precio o suma zonas) y volve a llamar buscar_inventario; (b) pedile al lead un dato que acote mejor (zona, presupuesto, ambientes). Para referencia, este es el panorama del inventario:' + _NLbi + _indiceInv;
@@ -6894,20 +6967,33 @@ app.get('/_diag-pauta2', async (req, res) => {
       if (!uidR) return res.json({ err: 'no anton' });
       const { data: props } = await supabase.from('properties').select('*').eq('user_id', uidR).eq('activa', true);
       const P = props || [];
+      // calendario temporal REAL (para probar el filtro por fechas)
+      const _perMap = {};
+      try {
+        const _idsT = P.filter(function (p) { return p.temporal_activa; }).map(function (p) { return p.id; });
+        if (_idsT.length) {
+          const { data: _per } = await supabase.from('temporario_periodos').select('property_id, fecha_desde, fecha_hasta, estado').in('property_id', _idsT);
+          (_per || []).forEach(function (x) { (_perMap[x.property_id] = _perMap[x.property_id] || []).push(x); });
+        }
+      } catch (e) {}
       const _fichas = function (arr) { return (arr || []).map(function (p) { try { return _fichaCompactaProp(p); } catch (e) { return '(err)'; } }); };
+      const _unNum = (P.find(function (p) { return p.numero != null && String(p.numero).trim(); }) || {}).numero;
+      const _unNombre = (function () { var p = P.find(function (x) { return x.title && String(x.title).trim().length > 6; }); return p ? String(p.title).split(/[-|]/)[0].trim() : ''; })();
       const consultas = [
         { q: 'departamentos en venta', f: { operacion: 'venta', tipo: 'departamento' } },
-        { q: 'algo en Gesell hasta 80k USD', f: { operacion: 'venta', zonas: ['gesell'], precio_max: 80000 } },
-        { q: 'casa con pileta', f: { tipo: 'casa', texto_libre: 'pileta' } },
-        { q: '2 dormitorios hasta 70k', f: { operacion: 'venta', dormitorios_min: 2, precio_max: 70000 } },
-        { q: 'alquiler temporal', f: { operacion: 'temporal' } },
-        { q: 'lote / terreno', f: { texto_libre: 'lote terreno' } }
+        { q: 'NUEVO por NUMERO exacto (' + _unNum + ')', f: { numero: _unNum } },
+        { q: 'NUEVO por NOMBRE ("' + _unNombre + '")', f: { nombre: _unNombre } },
+        { q: 'NUEVO caracteristica: pileta', f: { caracteristicas: 'pileta' } },
+        { q: 'NUEVO apto credito + cochera', f: { apto_credito: true, cocheras_min: 1 } },
+        { q: 'NUEVO temporal LIBRE 10-20 ene 2027', f: { operacion: 'temporal', fecha_desde: '2027-01-10', fecha_hasta: '2027-01-20' } },
+        { q: 'temporal SIN fechas (control)', f: { operacion: 'temporal' } },
+        { q: '2 dorm hasta 70k (limite nuevo 15)', f: { operacion: 'venta', dormitorios_min: 2, precio_max: 70000 } }
       ];
-      const salida = { total_activas: P.length, indice: (function(){ try { return _construirIndiceInventario(P); } catch(e){ return '(err)'; } })(), busquedas: [] };
+      const salida = { total_activas: P.length, temporales_con_calendario: Object.keys(_perMap).length, busquedas: [] };
       for (const c of consultas) {
         let res2 = [];
-        try { res2 = _buscarInventarioProps(P, c.f); } catch (e) { res2 = []; }
-        salida.busquedas.push({ consulta: c.q, filtro: c.f, encontradas: res2.length, resultados: _fichas(res2).slice(0, 6) });
+        try { res2 = _buscarInventarioProps(P, c.f, _perMap); } catch (e) { res2 = []; salida.error = (e && e.message); }
+        salida.busquedas.push({ consulta: c.q, encontradas: res2.length, resultados: _fichas(res2).slice(0, 4) });
       }
       return res.json(salida);
     }

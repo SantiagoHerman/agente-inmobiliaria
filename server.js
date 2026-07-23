@@ -1460,7 +1460,7 @@ async function mpCrearPreferencia(titulo, montoARS, externalRef, backUrl, metada
 // waMessageId = key.id del mensaje saliente de WhatsApp (Baileys). B5: deduplicamos por ESE id (idempotente y
 // exacto) en vez de por content+2min (que tragaba mensajes salientes legitimos repetidos -ej. el asesor manda
 // dos veces el mismo texto- y no cubria reenvios del webhook con el MISMO id pasados los 2 min).
-async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
+async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSaliente) {
   try {
     if (!texto) return;
     const telefono = remoteJid.split('@')[0];
@@ -1484,11 +1484,20 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
     // _resolverAutorMensaje(ownerId, ownerId) devuelve exactamente eso. Defensivo: si las columnas no existen, el insert
     // reintenta sin ellas (no rompe el guardado del eco). 0 tokens.
     const _autorEco = await _resolverAutorMensaje(conv.user_id, conv.user_id);
+    // PAUTA PEGADA AL SALIENTE (Diego 2026-07-23): cuando el lead viene de un anuncio Y la cuenta tiene SALUDO
+    // AUTOMATICO en WhatsApp Business, Meta pega los datos del aviso al mensaje SALIENTE (el saludo), no al entrante
+    // del lead. Por eso el link se perdia en casi todos. Lo guardamos en ESTE mensaje (para que se vea el card en el
+    // chat) y lo dejamos PENDIENTE para que la IA lo use como contexto en su proxima respuesta. Gated ia_pauta_meta.
+    let _pautaOk = null;
+    if (pautaSaliente) {
+      try { if (await iaPautaMetaActivo(conv.user_id)) _pautaOk = pautaSaliente; } catch (ePS) { _pautaOk = null; }
+    }
     await _insertMensajeConAutor(
-      { conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null },
+      Object.assign({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null }, _pautaOk ? { pauta_meta: _pautaOk } : {}),
       _autorEco,
       null
     );
+    if (_pautaOk) { try { _setPautaMetaPend(conv.id, _pautaOk); } catch (eSP) {} }
     // Un HUMANO respondio DESDE EL CELULAR (es el dueno/admin). Igual que responder desde la app: el lead pasa a
     // 'listo_humano' con la IA APAGADA (para que la IA no le pise la respuesta al cliente) y QUEDA EN EL DEPARTAMENTO
     // "ADMINISTRACION" (el que tiene recibe_fallback). Diego 2026-07-23. NO se toca si ya esta listo_humano/cerrado
@@ -8087,7 +8096,10 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // Mensaje saliente escrito por un humano desde su WhatsApp: guardarlo con marca y cortar.
     // B5: pasamos key.id (wa_message_id) para deduplicar por id exacto en vez de por content+2min.
     if (esFromMe) {
-      await guardarMensajeSaliente(remoteJid, texto, key.id || null);
+      // PAUTA EN EL SALIENTE (Diego 2026-07-23): con el SALUDO AUTOMATICO de WhatsApp Business, Meta pega el dato del
+      // anuncio al mensaje SALIENTE (el saludo), no al entrante del lead -> por eso se perdia el link en casi todos.
+      // _pauta ya viene extraido arriba; lo pasamos para guardarlo igual. Si no hay pauta, se comporta como siempre.
+      await guardarMensajeSaliente(remoteJid, texto, key.id || null, _pauta);
       return;
     }
 

@@ -6986,6 +6986,51 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // PREGUNTARLE A EVOLUTION: ?evo=<telefono> -> trae los mensajes CRUDOS de ese chat y busca el dato del anuncio.
+    if (req.query.evo) {
+      const _telE = String(req.query.evo).replace(/[^0-9]/g, '');
+      const { data: bsE } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
+      const uidE = bsE && bsE[0] && bsE[0].user_id;
+      if (!uidE) return res.json({ err: 'no anton' });
+      const _inst = nombreInstancia(uidE);
+      const _jid = _telE + '@s.whatsapp.net';
+      const out = { instancia: _inst, jid: _jid };
+      try {
+        const r = await fetch(EVOLUTION_URL + '/chat/findMessages/' + _inst, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+          body: JSON.stringify({ where: { key: { remoteJid: _jid } } })
+        });
+        out.http = r.status;
+        const j = await r.json().catch(function () { return null; });
+        let recs = [];
+        if (j) { if (Array.isArray(j)) recs = j; else if (j.messages && Array.isArray(j.messages.records)) recs = j.messages.records; else if (Array.isArray(j.messages)) recs = j.messages; else if (Array.isArray(j.records)) recs = j.records; }
+        out.total = recs.length;
+        out.mensajes = recs.slice(0, 15).map(function (x) {
+          const s = JSON.stringify(x || {});
+          const mm = (x && x.message) || {};
+          const cands = {
+            'extendedTextMessage.contextInfo': mm.extendedTextMessage && mm.extendedTextMessage.contextInfo,
+            'imageMessage.contextInfo': mm.imageMessage && mm.imageMessage.contextInfo,
+            'videoMessage.contextInfo': mm.videoMessage && mm.videoMessage.contextInfo,
+            'msg.contextInfo': mm.contextInfo,
+            'rec.contextInfo': x && x.contextInfo
+          };
+          let ear = null, path = null;
+          for (const k in cands) { if (cands[k] && cands[k].externalAdReply) { ear = cands[k].externalAdReply; path = k; break; } }
+          return {
+            fromMe: !!(x && x.key && x.key.fromMe),
+            ts: x && x.messageTimestamp,
+            msgKeys: Object.keys(mm),
+            txt: String(mm.conversation || (mm.extendedTextMessage && mm.extendedTextMessage.text) || '').slice(0, 90),
+            tieneEAR: s.indexOf('externalAdReply') >= 0,
+            path: path,
+            ear: ear ? { title: ear.title, body: ear.body, sourceUrl: ear.sourceUrl, sourceId: ear.sourceId } : null,
+            raw: (s.indexOf('externalAdReply') >= 0 && !path) ? s.slice(0, 1800) : null
+          };
+        });
+      } catch (e) { out.err = e && e.message; }
+      return res.json(out);
+    }
     // CHEQUEO A/B RETRIEVAL DEL RAG (Anton): corre el buscador real sobre el inventario real con consultas tipo lead. $0.
     if (req.query.ragcheck === '1') {
       const { data: bsR } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');

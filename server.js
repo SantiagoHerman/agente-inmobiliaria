@@ -2661,6 +2661,10 @@ function sanearAgenteConfig(cfg, nombreFallback) {
     // Lo mapeamos a la FRASE rica de OBJETIVO (igual que el objetivo general) para que el prompt del usuario IA
     // reciba la misma instrucción rica. Fallback: si llega un value desconocido o ya es texto libre, se deja tal cual.
     objetivo: (function(){ var v = _s(c.objetivo); return (v && OBJETIVO[v]) ? OBJETIVO[v] : v; })(),
+    // GATE OBJETIVO->AGENDA (Diego 2026-07-23): ademas de la frase, preservamos el VALUE crudo (informar/agendar_visita/
+    // avanzar_reserva/...) para que el runtime pueda gatear tools por objetivo. Texto libre/desconocido -> null (el gate
+    // cae al objetivo de la CUENTA). No cambia el prompt (la frase de arriba sigue igual).
+    objetivoValor: (function(){ var v = _s(c.objetivo); return (v && OBJETIVO[v]) ? v : null; })(),
     conocimiento: _s(c.conocimiento),
     noHacer: _s(c.no_hacer) || _s(c.noHacer),
     datosQueUsa: _s(c.datos_que_usa) || _s(c.datosQueUsa),
@@ -5476,6 +5480,15 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     ? ('TU OBJETIVO (hasta donde avanzas vos antes de derivar a un compañero): ' + agenteConfig.objetivo)
     : (OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar);
   const largo = LARGO[(agenteConfig && agenteConfig.largo) || (settings && settings.response_length) || 'corto'] || LARGO.corto;
+  // GATE OBJETIVO->AGENDA (Diego 2026-07-23): EL OBJETIVO MANDA. La tool agendar_cita solo se ofrece si el objetivo
+  // EFECTIVO lo permite ('agendar_visita' o 'avanzar_reserva'). Con objetivo 'informar'/'precalificar'/
+  // 'ver_disponibilidad' la IA NO recibe la herramienta -> imposible agendar por error (antes solo lo decia el prompt).
+  // El objetivo del USUARIO IA (agenteConfig.objetivoValor) pisa al de la cuenta; texto libre/desconocido cae al de la
+  // cuenta. Con ia_agenda OFF ya estaba apagada -> esto solo RESTRINGE, nunca habilita de mas.
+  if (_iaAgendaOn) {
+    const _objGate = (agenteConfig && agenteConfig.objetivoValor) || ((settings && settings.agent_objetivo) || 'informar');
+    if (_objGate !== 'agendar_visita' && _objGate !== 'avanzar_reserva') _iaAgendaOn = false;
+  }
   const usaEmojis = (agenteConfig && (agenteConfig.emojis === true || agenteConfig.emojis === false))
     ? agenteConfig.emojis === true
     : (settings && settings.use_emojis === true);

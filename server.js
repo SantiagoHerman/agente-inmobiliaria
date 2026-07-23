@@ -1497,17 +1497,34 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId) {
     // un mensaje humano REAL (los ecos de la propia IA se descartan por contenido) -> no apaga la IA por sus envios.
     {
       const _updCel = { last_message: texto, last_role: 'human', updated_at: new Date().toISOString() };
+      // GUARD ANTI SALUDO-AUTOMATICO (Diego 2026-07-23, caso Marcela Russomanno): WhatsApp Business puede tener un
+      // MENSAJE AUTOMATICO (saludo/ausencia) configurado en el telefono. Ese saludo sale como mensaje saliente del
+      // celular ~1 segundo despues del mensaje del lead; si lo tomamos como "un humano tomo el lead", APAGAMOS LA IA
+      // en TODOS los leads nuevos (eso paso). Un humano no escribe en 1 segundo: si el saliente llega a menos de 20s
+      // del ultimo mensaje del lead, es automatico -> guardamos el mensaje pero NO tocamos estado ni IA.
+      let _esAutoRespuesta = false;
       try {
-        const { data: _cvE } = await supabase.from('conversations').select('status, ai_enabled, asesor_id, admin_tomo, departamento_id').eq('id', conv.id).maybeSingle();
-        if (_cvE && _cvE.status !== 'listo_humano' && _cvE.status !== 'cerrado') { _updCel.status = 'listo_humano'; _updCel.ai_enabled = false; }
-        else if (_cvE && _cvE.ai_enabled === true) { _updCel.ai_enabled = false; }
-        if (_cvE && !_cvE.asesor_id) {
-          let _deptoAdmin = null;
-          try { _deptoAdmin = await deptoFallbackDe(conv.user_id); } catch (eDA) { _deptoAdmin = null; }
-          if (_deptoAdmin) { _updCel.departamento_id = _deptoAdmin; }        // -> departamento Administracion
-          else if (_cvE.admin_tomo !== true) { _updCel.admin_tomo = true; }  // sin depto Admin -> al menos lo toma el admin
+        const { data: _ultIn } = await supabase.from('messages').select('created_at')
+          .eq('conversation_id', conv.id).eq('role', 'contact')
+          .order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if (_ultIn && _ultIn.created_at) {
+          const _gap = Date.now() - new Date(_ultIn.created_at).getTime();
+          if (_gap >= 0 && _gap < 20000) _esAutoRespuesta = true;
         }
-      } catch (eFlipCel) { /* si falla la lectura: al menos guardamos last_message/last_role como siempre */ }
+      } catch (eAuto) { _esAutoRespuesta = false; }
+      if (!_esAutoRespuesta) {
+        try {
+          const { data: _cvE } = await supabase.from('conversations').select('status, ai_enabled, asesor_id, admin_tomo, departamento_id').eq('id', conv.id).maybeSingle();
+          if (_cvE && _cvE.status !== 'listo_humano' && _cvE.status !== 'cerrado') { _updCel.status = 'listo_humano'; _updCel.ai_enabled = false; }
+          else if (_cvE && _cvE.ai_enabled === true) { _updCel.ai_enabled = false; }
+          if (_cvE && !_cvE.asesor_id) {
+            let _deptoAdmin = null;
+            try { _deptoAdmin = await deptoFallbackDe(conv.user_id); } catch (eDA) { _deptoAdmin = null; }
+            if (_deptoAdmin) { _updCel.departamento_id = _deptoAdmin; }        // -> departamento Administracion
+            else if (_cvE.admin_tomo !== true) { _updCel.admin_tomo = true; }  // sin depto Admin -> al menos lo toma el admin
+          }
+        } catch (eFlipCel) { /* si falla la lectura: al menos guardamos last_message/last_role como siempre */ }
+      }
       await supabase.from('conversations').update(_updCel).eq('id', conv.id);
     }
     // FIX #2: el humano respondio DESDE EL CELULAR (la respuesta entra por el webhook como saliente). Igual que el

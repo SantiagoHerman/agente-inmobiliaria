@@ -4969,6 +4969,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // string ya listo; aca solo se agrega como bloque DINAMICO (NO cacheado) al system. Con el flag OFF el caller nunca
   // lo pasa => null => system BYTE-IDENTICO al actual. NO agrega llamadas de IA (viaja en la unica completion de abajo).
   const _pautaContexto = (opciones && typeof opciones.pautaContexto === 'string' && opciones.pautaContexto.trim()) ? opciones.pautaContexto : null;
+  // VISION (Diego 2026-07-23): URL de la IMAGEN que mando el lead en ESTE mensaje. Si viene, se la pasamos a la IA para
+  // que la VEA (Sonnet). Casi siempre es una captura del aviso/ficha con el nombre y el ID de la propiedad -> la IA lee
+  // ese texto y busca en el inventario. Solo la imagen del mensaje ACTUAL (no re-mandamos viejas -> sin costo repetido).
+  const _imagenUrl = (opciones && typeof opciones.imagenUrl === 'string' && /^https?:\/\//.test(opciones.imagenUrl)) ? opciones.imagenUrl : null;
   // PARTE B (punto 6 / regla 19): aprendizaje SOLO con reparto_v2 ON. Habilita la tool consultar_al_dueno para que
   // la IA, en vez de inventar cuando NO sabe, pregunte al dueno. Con flag OFF -> false => la tool NO se ofrece y el
   // comportamiento es el ACTUAL EXACTO. En modoPrueba no aplica (no hay conv real ni dueno a quien preguntar).
@@ -5575,7 +5579,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     'Hablas de forma humana y natural. No inventes datos que no esten en la base de conocimiento.'
   ].filter(Boolean).join('\n');
 
-  const mensajesParaIA = historial.concat([{ role: 'user', content: message }]);
+  // VISION: si el lead mando una imagen en este mensaje, la adjuntamos al mensaje ACTUAL (bloque image por URL, que
+  // Anthropic ya soporta). Si no hay imagen, se pasa el texto tal cual -> BYTE-IDENTICO al comportamiento actual.
+  const _contenidoActual = _imagenUrl
+    ? [{ type: 'image', source: { type: 'url', url: _imagenUrl } }, { type: 'text', text: (message && String(message).trim() && message !== '[imagen]') ? message : 'Te mando esta imagen, decime que ves.' }]
+    : message;
+  const mensajesParaIA = historial.concat([{ role: 'user', content: _contenidoActual }]);
 
   // Tool para que la IA pueda enviar una foto de una propiedad cuando el lead la pide.
   // ADITIVO: si la IA no la usa, el flujo es exactamente el mismo de antes (respuesta de texto).
@@ -5774,17 +5783,27 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // RAG (gated _ragActivo): la IA necesita saber QUE DIA ES HOY para convertir "del 10 al 20 de enero" a AAAA-MM-DD y
   // poder pedir disponibilidad de alquiler TEMPORAL con buscar_inventario. Bloque DINAMICO (NO cacheado: cambia a diario).
   if (_ragActivo) systemBlocks.push({ type: 'text', text: 'HOY es ' + _fechaLocalArg() + ' (formato AAAA-MM-DD). Usalo para resolver el ano de las fechas que diga el lead: si el mes ya paso este ano, es el ano que viene. Cuando el lead pida un ALQUILER TEMPORAL para fechas concretas, pasa fecha_desde y fecha_hasta a buscar_inventario y te devuelve SOLO las que estan libres en ese rango (el dia de salida queda libre). Si el lead no da fechas, no las inventes.' });
+  // VISION: instruccion cuando el lead mando una imagen. Bloque DINAMICO (no cacheado, solo con imagen presente).
+  if (_imagenUrl) systemBlocks.push({ type: 'text', text: 'EL LEAD TE MANDO UNA IMAGEN y la estas VIENDO arriba (nunca digas que "no te llega la imagen" ni que no la ves). Mirala con atencion: si es una captura de un AVISO, una FICHA o un CARTEL de una propiedad, LEE el texto que tenga (nombre, numero/ID, precio, zona, direccion) y usalo para IDENTIFICAR la propiedad en el inventario (buscala por su numero o por su nombre). Si es una foto de una propiedad SIN texto, describi lo que ves (tipo, ambientes, estado) y pedile una referencia (nombre, zona o numero) para ubicarla. NO inventes datos que no puedas leer en la imagen ni confirmes una propiedad si no estas segura de cual es: mejor pedi el dato que falta.' });
   if (_pautaContexto) systemBlocks.push({ type: 'text', text: _pautaContexto });
 
   // FEATURE #23: call principal cliente-facing -> pasa por llamarIAConFailover (Anthropic directo con
   // failover a Bedrock si esta gateado/encendido). Sin BEDROCK_ENABLED + creds, es identico a anthropic.messages.create.
-  const completion = await llamarIAConFailover({
-    model: MODELO_CLIENTE,
-    max_tokens: 500,
-    system: systemBlocks,
-    tools: toolsAgente,
-    messages: mensajesParaIA
-  }, 'generarRespuestaAgente');
+  // VISION — RESGUARDO: si Anthropic no puede leer la URL de la imagen (URL caida, formato no soportado), la respuesta
+  // NO debe caerse: reintentamos UNA vez SIN la imagen (solo texto) para que la IA igual conteste. Sin imagen, no aplica.
+  let completion;
+  try {
+    completion = await llamarIAConFailover({
+      model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: mensajesParaIA
+    }, 'generarRespuestaAgente');
+  } catch (eVis) {
+    if (!_imagenUrl) throw eVis; // sin imagen: el error es otro, que lo maneje el caller como siempre
+    console.error('VISION fallo con imagen, reintento solo texto:', eVis && eVis.message);
+    const _msgsSinImg = historial.concat([{ role: 'user', content: (message && String(message).trim() && message !== '[imagen]') ? message : 'El lead mando una imagen que no pude ver bien. Pedile que te diga el nombre, numero o zona de la propiedad.' }]);
+    completion = await llamarIAConFailover({
+      model: MODELO_CLIENTE, max_tokens: 500, system: systemBlocks, tools: toolsAgente, messages: _msgsSinImg
+    }, 'generarRespuestaAgente-sinimg');
+  }
 
   // mediaAEnviar: fotos que el webhook debera mandar DESPUES del texto. Vacio si la IA no pidio foto.
   let mediaAEnviar = [];
@@ -8853,10 +8872,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             if (_pp) _pautaContexto = await _construirContextoPauta(user_id, _pp, _bsGate && _bsGate.rubro);
           } catch (ePauCtx) { _pautaContexto = null; }
           let _opcGen = null;
-          if (_agenteConfigIA || _pautaContexto) {
+          // VISION (Diego 2026-07-23): si el lead mando una IMAGEN, se la pasamos a la IA para que la VEA. Cubre las
+          // fotos/capturas del aviso donde va el nombre/ID de la propiedad -> la IA las lee y busca en el inventario.
+          const _imgLead = (mediaTipoLead === 'imagen' && mediaUrlLead) ? mediaUrlLead : null;
+          if (_agenteConfigIA || _pautaContexto || _imgLead) {
             _opcGen = {};
             if (_agenteConfigIA) _opcGen.agenteConfig = _agenteConfigIA;
             if (_pautaContexto) _opcGen.pautaContexto = _pautaContexto;
+            if (_imgLead) _opcGen.imagenUrl = _imgLead;
           }
           const resultado = await generarRespuestaAgente(user_id, _convId, texto, _opcGen || undefined);
           if (resultado && resultado.reply) {

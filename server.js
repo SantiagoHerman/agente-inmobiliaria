@@ -6653,6 +6653,13 @@ function _limpiarEntidadesHtml(t) {
   });
   return s.replace(/[ \t]{2,}/g, ' ').replace(/[ \t]+([,.;:!?])/g, '$1');
 }
+// Limpiador de TEXTO de INVENTARIO para GUARDAR (Diego 2026-07-23: el inventario tiene que quedar SIN emojis ni
+// jeroglificos). Saca entidades HTML de emoji (&#x1f3d6;) + emojis reales, conserva acentos. Se usa al importar/scrapear.
+function _limpiarTextoInventario(t) {
+  if (t == null) return t;
+  var out = quitarEmojis(_limpiarEntidadesHtml(String(t)));
+  return out;
+}
 // Traduce un texto a un idioma destino usando el modelo. Devuelve el texto traducido (o el original si falla).
 async function traducir(texto, idiomaDestino, user_id) {
   try {
@@ -18451,7 +18458,7 @@ app.post('/api/scrape/universal', async function(req, res) {
         entre_calles: p.entre_calles || null,
         ciudad: p.ciudad || null,
         price: p.precio || null,
-        description: p.descripcion || null,
+        description: _limpiarTextoInventario(p.descripcion) || null,
         caracteristicas: p.caracteristicas || null,
         link: p.link || null,
         activa: true
@@ -18597,7 +18604,7 @@ async function _alojamientosIA(html, base, ownerId) {
       var nombre = String(p.nombre || '').trim();
       if (!nombre) continue;
       var _imgsU = Array.isArray(p.imagenes) ? p.imagenes.filter(function (u) { return typeof u === 'string' && /^https?:/i.test(u); }).slice(0, 12) : [];
-      out.push({ nombre: nombre, tipo: p.tipo || '', capacidad: p.capacidad || '', precio: (p.precio === 0 ? 0 : (p.precio || '')), moneda: (p.moneda === 'USD' ? 'USD' : 'ARS'), dormitorios: p.dormitorios || '', banos: p.banos || '', servicios: p.servicios || '', descripcion: p.descripcion || '', imagenes: _imgsU, link: base });
+      out.push({ nombre: nombre, tipo: p.tipo || '', capacidad: p.capacidad || '', precio: (p.precio === 0 ? 0 : (p.precio || '')), moneda: (p.moneda === 'USD' ? 'USD' : 'ARS'), dormitorios: p.dormitorios || '', banos: p.banos || '', servicios: p.servicios || '', descripcion: _limpiarTextoInventario(p.descripcion) || '', imagenes: _imgsU, link: base });
     }
     return out;
   } catch (e) { console.error('[scraper alojamiento] _alojamientosIA:', e && e.message); return []; }
@@ -18998,7 +19005,7 @@ async function _guardarComplejoYUnidades(ownerId, data, sitio, modo) {
     var nombreComp = String(comp.nombre || 'Mi alojamiento').slice(0, 200);
     try {
       var cEx = await supabase.from('hotel_complejos').select('id, atributos').eq('user_id', ownerId).eq('nombre', nombreComp).maybeSingle();
-      var atrComp = { descripcion: comp.descripcion || '', direccion: comp.direccion || '', amenities: comp.amenities || '', servicios: comp.servicios || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
+      var atrComp = { descripcion: _limpiarTextoInventario(comp.descripcion) || '', direccion: comp.direccion || '', amenities: comp.amenities || '', servicios: comp.servicios || '', beneficios: comp.beneficios || '', images: Array.isArray(comp.images) ? comp.images.map(function (u) { return { url: u }; }) : [], origen_url: sitio, importado_por: 'scraper_alojamiento' };
       if (comp.subtipo) atrComp.subtipo = comp.subtipo;
       if (comp.politicas && typeof comp.politicas === 'object') atrComp.politicas = comp.politicas;
       if (cEx.data && cEx.data.id) {
@@ -19940,7 +19947,7 @@ async function _scrapeDesarrolloProfundo(url, user_id, opts) {
     emprendimiento: {
       nombre: emp.nombre != null ? String(emp.nombre) : '',
       ubicacion: emp.ubicacion != null ? String(emp.ubicacion) : '',
-      descripcion: emp.descripcion != null ? String(emp.descripcion) : '',
+      descripcion: emp.descripcion != null ? _limpiarTextoInventario(String(emp.descripcion)) : '',
       estado_obra: emp.estado_obra != null ? String(emp.estado_obra) : '',
       fecha_entrega: emp.fecha_entrega != null ? String(emp.fecha_entrega) : '',
       amenities: _arrStr(emp.amenities),
@@ -20146,7 +20153,7 @@ function _mapScrapeAGuardar(data, sourceUrl) {
     direccion: (_ubDet && _ubDet.direccion) ? String(_ubDet.direccion) : '',
     entre_calles: (_ubDet && (_ubDet.entre_calles || _ubDet.entrecalles)) ? String(_ubDet.entre_calles || _ubDet.entrecalles) : '',
     ciudad: (_ubDet && _ubDet.ciudad) ? String(_ubDet.ciudad) : (emp.ubicacion || ''),
-    descripcion: emp.descripcion || '',
+    descripcion: _limpiarTextoInventario(emp.descripcion) || '',
     link: emp.link || '',
     // source_url: URL scrapeada -> guardarDesarrolladora la persiste (v2). Sin esto, un emprendimiento
     // creado por scrape quedaba SIN URL de origen y NO se podia re-actualizar por scraping.
@@ -23903,7 +23910,7 @@ async function correrScrapingDeUsuario(cfg) {
           user_id: cfg.user_id, numero: String(p.numero), title: p.titulo || 'Sin titulo',
           type: p.tipo || null, zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null,
           direccion: p.direccion || null, entre_calles: p.entre_calles || null, ciudad: p.ciudad || null,
-          price: p.precio || null, description: p.descripcion || null,
+          price: p.precio || null, description: _limpiarTextoInventario(p.descripcion) || null,
           caracteristicas: p.caracteristicas || null, link: p.link || null
         };
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
@@ -24063,7 +24070,7 @@ async function correrScrapingPendiente(cfg) {
           numero: String(p.numero), title: p.titulo || 'Sin titulo', type: p.tipo || null,
           zone: [p.ciudad, p.zona].filter(Boolean).join(' - ') || null, price: p.precio || null,
           direccion: p.direccion || null, entre_calles: p.entre_calles || null, ciudad: p.ciudad || null,
-          description: p.descripcion || null, caracteristicas: p.caracteristicas || null, link: p.link || null,
+          description: _limpiarTextoInventario(p.descripcion) || null, caracteristicas: p.caracteristicas || null, link: p.link || null,
           images: _fotosPend.length ? _fotosPend.map(function(u){ return { url: u }; }) : null
         };
         var ex = await supabase.from('properties').select('id,title,price,zone,description,images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
@@ -25909,7 +25916,7 @@ app.post('/api/presencia', async function(req, res){
 // ============================================================================
 const _cryptoInv = require('crypto');
 function _nuevaApiKeyInv() { return 'inv_' + _cryptoInv.randomBytes(24).toString('hex'); }
-function _sInvS(v){ return (v == null) ? null : (String(v).trim() || null); }
+function _sInvS(v){ return (v == null) ? null : (_limpiarTextoInventario(String(v)).trim() || null); }
 function _sInvN(v){ if (v == null || v === '') return null; var n = Number(String(v).replace(/[^0-9.\-]/g, '')); return isNaN(n) ? null : n; }
 function _sInvI(v){ var n = _sInvN(v); return n == null ? null : Math.round(n); }
 function _sInvB(v, def){ if (v === true) return true; if (v === false) return false; return def; }
@@ -26069,7 +26076,7 @@ async function _buildFeedInmobiliaria(ownerId) {
         dormitorios: _feedNum(p.dormitorios) != null ? _feedNum(p.dormitorios) : _feedNum(p.rooms),
         banos: _feedNum(p.banos), cocheras: _feedNum(p.cocheras),
         superficie: _feedNum(p.superficie_cubierta) || _feedNum(p.superficie_total) || null,
-        descripcion: p.description || p.descripcion || p.caracteristicas || null,
+        descripcion: _limpiarTextoInventario(p.description || p.descripcion || p.caracteristicas) || null,
         fotos: _feedImgs(p.images), link: p.link || null
       });
     });

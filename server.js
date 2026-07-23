@@ -7005,6 +7005,10 @@ app.get('/_diag-pauta2', async (req, res) => {
         let recs = [];
         if (j) { if (Array.isArray(j)) recs = j; else if (j.messages && Array.isArray(j.messages.records)) recs = j.messages.records; else if (Array.isArray(j.messages)) recs = j.messages; else if (Array.isArray(j.records)) recs = j.records; }
         out.total = recs.length;
+        // ordenar por timestamp ASCENDENTE (el mensaje inicial del lead -donde iria el anuncio- primero)
+        recs.sort(function (a, b) { return (Number(a && a.messageTimestamp) || 0) - (Number(b && b.messageTimestamp) || 0); });
+        // ademas, resumen: ¿ALGUNO de los 36 tiene el dato del anuncio?
+        out.alguno_con_anuncio = recs.some(function (x) { return JSON.stringify(x || {}).indexOf('externalAdReply') >= 0; });
         out.mensajes = recs.slice(0, 15).map(function (x) {
           const s = JSON.stringify(x || {});
           const mm = (x && x.message) || {};

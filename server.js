@@ -6816,6 +6816,28 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // VER UN CHAT: ?chat=<subcadena del nombre> -> trae la conversacion de Anton con ese contacto (mensajes + estado)
+    if (req.query.chat) {
+      const { data: bsC } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
+      const uidC = bsC && bsC[0] && bsC[0].user_id;
+      if (!uidC) return res.json({ err: 'no anton' });
+      const { data: ctsC } = await supabase.from('contacts').select('id, name, phone, created_at').eq('user_id', uidC).ilike('name', '%' + String(req.query.chat) + '%');
+      const salida = { contactos: (ctsC || []).map(function(c){ return { id: c.id, name: c.name, phone: c.phone }; }), chats: [] };
+      for (const c of (ctsC || [])) {
+        const { data: cv } = await supabase.from('conversations').select('id, status, ai_enabled, asesor_id, admin_tomo, last_role, updated_at, derivacion_rotando').eq('user_id', uidC).eq('contact_id', c.id).maybeSingle();
+        if (!cv) continue;
+        let asesorNom = null;
+        if (cv.asesor_id) { try { const { data: a } = await supabase.from('asesores').select('nombre').eq('id', cv.asesor_id).maybeSingle(); asesorNom = a && a.nombre; } catch (e) {} }
+        const { data: msgs } = await supabase.from('messages').select('created_at, role, content, estado_entrega, wa_message_id, pauta_meta, enviado_por, autor_nombre, origen').eq('conversation_id', cv.id).order('created_at', { ascending: true }).limit(200);
+        salida.chats.push({
+          contacto: c.name,
+          conv: { id: cv.id, status: cv.status, ai_enabled: cv.ai_enabled, asesor_id: cv.asesor_id, asesor: asesorNom, admin_tomo: cv.admin_tomo, last_role: cv.last_role, rotando: cv.derivacion_rotando },
+          total: (msgs || []).length,
+          mensajes: (msgs || []).map(function(m){ return { t: m.created_at, role: m.role, quien: m.role === 'ai' ? 'IA' : (m.role === 'human' ? (m.autor_nombre || m.enviado_por || 'humano') + (m.origen ? ('/' + m.origen) : '') : (m.role === 'sistema' ? 'SISTEMA' : 'lead')), txt: String(m.content || '').slice(0, 500), entrega: m.estado_entrega || null, wa: m.wa_message_id ? 'si' : 'no', pauta: m.pauta_meta || null }; })
+        });
+      }
+      return res.json(salida);
+    }
     const out = {};
     // 1) user_id de Anton
     const { data: bs } = await supabase.from('business_settings').select('user_id, company_name, ia_pauta_meta').ilike('company_name', '%anton%');

@@ -1138,6 +1138,35 @@ function _medidorColsDisponibles() {
   if (Date.now() - _medidorColsFaltanTs > _MEDIDOR_TTL_MS) { _medidorColsFaltan = false; return true; } // reintentar por si ya migraron
   return false;
 }
+// ===== TELEMETRIA DE CACHING (2026-07-23): hashes + ttl del bloque estatico cacheado =====
+// ia_uso gana tres columnas NUEVAS (static_prompt_hash, tools_hash, cache_ttl) que se agregan con
+// migracion-cache-ttl-telemetria.sql. Esa migracion la corre el dueno A MANO y MAS TARDE (puede ser
+// en un momento distinto a la del medidor), asi que estas columnas tienen su PROPIO flag de disponibilidad
+// (independiente del medidor) con el MISMO patron: si el insert con estos campos falla, se reintenta SIN
+// ellos y el flag recuerda 10 min que no estan (se resetea solo por si ya migraron). Es observabilidad pura.
+var _telemColsFaltan = false;
+var _telemColsFaltanTs = 0;
+function _telemColsDisponibles() {
+  if (!_telemColsFaltan) return true;
+  if (Date.now() - _telemColsFaltanTs > _MEDIDOR_TTL_MS) { _telemColsFaltan = false; return true; } // reintentar por si ya migraron
+  return false;
+}
+// Hash CANONICO y determinista de un valor (para telemetria de caching). Serializa con las claves de cada
+// objeto ORDENADAS alfabeticamente (asi dos objetos con las MISMAS claves en distinto ORDEN dan el MISMO hash)
+// y devuelve el sha256 en hex. Sirve para string (systemStatic) y array (toolsAgente). Solo observabilidad:
+// NUNCA toca el prompt ni la respuesta. Ante cualquier error -> null (nunca rompe al que lo llama).
+function _hashCanonico(value) {
+  try {
+    function _canon(v) {
+      if (v === null || typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.map(_canon);
+      var out = {};
+      Object.keys(v).sort().forEach(function (k) { out[k] = _canon(v[k]); });
+      return out;
+    }
+    return crypto.createHash('sha256').update(JSON.stringify(_canon(value))).digest('hex');
+  } catch (e) { return null; }
+}
 // Genera el id de un TURNO. Un TURNO = UN mensaje del lead = las 2 a 9 llamadas de IA
 // que ese mensaje dispara. Se genera al ENTRAR el mensaje en el webhook y se propaga.
 function _nuevoTurnoId() {
@@ -1147,8 +1176,11 @@ function _nuevoTurnoId() {
 }
 // Registra el uso real de tokens de una respuesta de la IA y su costo en USD (best-effort, no rompe).
 // `precio` permite contabilizar al precio del MODELO usado (Haiku vs Sonnet); por defecto Sonnet.
-// `opts` (OPCIONAL, medidor de consumo): { conversation_id, turno_id }. Si NO viene, la fila insertada
-// es BYTE-IDENTICA a la de siempre y no se intenta ningun insert extra (cero cambio de comportamiento).
+// `opts` (OPCIONAL, medidor de consumo + telemetria de caching): { conversation_id, turno_id,
+// static_prompt_hash, tools_hash, cache_ttl }. Si NO viene, la fila insertada es BYTE-IDENTICA a la de
+// siempre y no se intenta ningun insert extra (cero cambio de comportamiento). Los dos grupos de columnas
+// nuevas (medidor / telemetria) son INDEPENDIENTES: cada uno tiene su flag y su reintento, asi el medidor
+// sigue funcionando aunque falten las columnas de telemetria (y viceversa).
 async function registrarUsoTokens(user_id, usage, etiqueta, precio, opts) {
   try {
     if (!user_id || !usage) return;
@@ -1162,15 +1194,36 @@ async function registrarUsoTokens(user_id, usage, etiqueta, precio, opts) {
     // MEDIDOR: atribucion opcional. Solo se intenta si el caller mando datos Y no sabemos que faltan las columnas.
     var _cid = (opts && opts.conversation_id) ? String(opts.conversation_id) : null;
     var _tid = (opts && opts.turno_id) ? String(opts.turno_id) : null;
-    if ((_cid || _tid) && _medidorColsDisponibles()) {
+    // TELEMETRIA DE CACHING: hashes + ttl opcionales, con su propia disponibilidad (columnas de otra migracion).
+    var _sph = (opts && opts.static_prompt_hash) ? String(opts.static_prompt_hash) : null;
+    var _th  = (opts && opts.tools_hash) ? String(opts.tools_hash) : null;
+    var _ctt = (opts && opts.cache_ttl) ? String(opts.cache_ttl) : null;
+    var _hayMed = (_cid || _tid) && _medidorColsDisponibles();
+    var _hayTelem = (_sph || _th || _ctt) && _telemColsDisponibles();
+    if (_hayMed || _hayTelem) {
+      // Intento 1: la fila mas rica posible (medidor + telemetria, segun lo disponible).
       var _filaMed = Object.assign({}, fila);
-      if (_cid) _filaMed.conversation_id = _cid;
-      if (_tid) _filaMed.turno_id = _tid;
+      if (_hayMed) { if (_cid) _filaMed.conversation_id = _cid; if (_tid) _filaMed.turno_id = _tid; }
+      if (_hayTelem) { if (_sph) _filaMed.static_prompt_hash = _sph; if (_th) _filaMed.tools_hash = _th; if (_ctt) _filaMed.cache_ttl = _ctt; }
       var _r1 = await supabase.from('ia_uso').insert(_filaMed);
       if (!_r1 || !_r1.error) return; // insert ampliado OK -> listo
-      // Fallo (tipico: columnas todavia no migradas). Lo recordamos y caemos al insert de SIEMPRE (abajo).
-      _medidorColsFaltan = true; _medidorColsFaltanTs = Date.now();
-      console.error('[BILLING] ia_uso sin columnas del medidor (se registra sin atribucion):', _r1.error && _r1.error.message);
+      // Fallo (tipico: alguna columna todavia no migrada). Si estabamos incluyendo TELEMETRIA, puede ser por
+      // esas columnas nuevas: la desactivamos 10 min y REINTENTAMOS con solo el medidor (que quiza si exista),
+      // para NO perder la atribucion por lead/turno que ya funcionaba.
+      if (_hayTelem) {
+        _telemColsFaltan = true; _telemColsFaltanTs = Date.now();
+        if (_hayMed) {
+          var _filaMed2 = Object.assign({}, fila);
+          if (_cid) _filaMed2.conversation_id = _cid;
+          if (_tid) _filaMed2.turno_id = _tid;
+          var _r2 = await supabase.from('ia_uso').insert(_filaMed2);
+          if (!_r2 || !_r2.error) return; // insert solo-medidor OK -> listo
+          _medidorColsFaltan = true; _medidorColsFaltanTs = Date.now();
+        }
+      } else if (_hayMed) {
+        _medidorColsFaltan = true; _medidorColsFaltanTs = Date.now();
+      }
+      console.error('[BILLING] ia_uso sin columnas extra (se registra sin atribucion):', _r1.error && _r1.error.message);
     }
     await supabase.from('ia_uso').insert(fila);
   } catch (e) { console.error('[BILLING] registrarUsoTokens fallo (gasto IA NO registrado en ia_uso):', e && e.message); } // B6: un fallo aca = costo de tokens que NO aparece en el panel -> hay que poder detectarlo
@@ -2309,6 +2362,20 @@ async function iaRagActivo(user_id, bs) {
     const { data, error } = await supabase.from('business_settings').select('ia_rag_v1').eq('user_id', user_id).maybeSingle();
     if (error) return false;
     return !!(data && data.ia_rag_v1 === true);
+  } catch (e) { return false; }
+}
+// CACHE TTL 1h (gated ai_cache_ttl_1h): ¿pedirle a Anthropic que el bloque estatico cacheado dure 1 HORA en vez
+// de los 5 min por defecto? MISMO patron defensivo FAIL-CLOSED que iaRagActivo / derivacionV3Activo: si el flag no
+// esta (columna ausente porque no se corrio migracion-cache-ttl-telemetria.sql / select error / null / false) -> OFF.
+// Con OFF el cache_control del bloque estatico es BYTE-IDENTICO al actual (ephemeral SIN campo ttl). Reusa el `bs`
+// ya cargado en generarRespuestaAgente (0 queries extra). NO cambia el contenido del prompt, el modelo ni el flujo.
+async function cacheTtl1hActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ai_cache_ttl_1h')) return bs.ai_cache_ttl_1h === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ai_cache_ttl_1h').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> feature OFF
+    return !!(data && data.ai_cache_ttl_1h === true);
   } catch (e) { return false; }
 }
 
@@ -5701,6 +5768,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // propiedades cargado y rubro no-hotel, con fail-open a la calidad ante cualquier error) se resuelve mas abajo.
   let _iaRagOn = false;
   if (conversation_id && !modoPrueba) { try { _iaRagOn = await iaRagActivo(user_id, settings || undefined); } catch (eIaRag) { _iaRagOn = false; } }
+  // CACHE TTL 1h (gated ai_cache_ttl_1h): resuelve UNA vez si el bloque estatico cacheado usa TTL de 1h en vez del
+  // default de 5 min. FAIL-CLOSED: ante columna ausente / error / null -> false. Reusa el `settings` ya cargado
+  // (0 queries extra). `_cacheTtl` es SOLO para la telemetria (registra que TTL efectivo se uso: '5m' u '1h'); el
+  // cache_control real se arma abajo y con el flag OFF queda BYTE-IDENTICO al actual (ephemeral SIN campo ttl).
+  let _ttl1hOn = false;
+  try { _ttl1hOn = await cacheTtl1hActivo(user_id, settings || undefined); } catch (eTtl) { _ttl1hOn = false; }
+  const _cacheTtl = _ttl1hOn ? '1h' : '5m';
   // 5 FUENTES EXTERNAS (gated c/u por su flag): dolar / clima / feriados / georef / distancia. FAIL-CLOSED:
   // con la columna ausente el helper devuelve false -> la tool NO se ofrece y el prompt+flujo son BYTE-IDENTICOS
   // al actual (codigo INERTE hasta correr migracion-5-fuentes-flags.sql). SOLO en conv REAL (no modoPrueba).
@@ -6688,7 +6762,14 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // System en bloques para CACHING: el bloque estatico (instrucciones+KB+catalogo) se cachea con cache_control
   // ephemeral; los datos del lead (dinamicos) van en un bloque aparte que NO se cachea. Asi las relecturas
   // del bloque grande cuestan ~10% (cache_read) en vez del precio full, sin cambiar nada de lo que responde la IA.
-  const systemBlocks = [{ type: 'text', text: systemStatic, cache_control: { type: 'ephemeral' } }];
+  // CACHE TTL (gated ai_cache_ttl_1h): con el flag ON el bloque estatico se cachea 1h; con OFF queda EXACTAMENTE
+  // como hoy (ephemeral SIN campo ttl -> request BYTE-IDENTICO al actual, no se agrega ttl:'5m' explicito).
+  const systemBlocks = [{ type: 'text', text: systemStatic, cache_control: _ttl1hOn ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' } }];
+  // TELEMETRIA DE CACHING (observabilidad, NO toca el request): hash canonico del bloque estatico cacheado y de las
+  // tools. Permite medir en ia_uso los gaps de reuso del cache (5-60 min vs 60+) por tenant + static_prompt_hash y
+  // comparar cache_write/read antes y despues de subir el TTL a 1h. Se calcula UNA vez por respuesta.
+  const _staticPromptHash = _hashCanonico(systemStatic);
+  const _toolsHash = _hashCanonico(toolsAgente);
   if (bloqueDatosLead) systemBlocks.push({ type: 'text', text: bloqueDatosLead });
   // MEMORIA VIVA: resumen-de-avance de esta conversacion para que el agente RETOME donde quedo (no repregunte ni
   // retroceda). Va en bloque dinamico (no cacheado). Permite acortar el historial sin perder contexto -> baja tokens.
@@ -7511,7 +7592,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // para el cobro (plan Principio 2 / decision Diego #1: la busqueda no se cobra aparte; sigue 1 msg por respuesta).
   // Con el flag OFF, _ragToolUsado=false => usoTool es BYTE-IDENTICO al actual. Si Diego decide cobrarla, quitar el
   // `&& !_ragToolUsado`.
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada };
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -10137,7 +10218,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
             // MEDIDOR: etiqueta 'respuesta_agente' (antes null) + atribucion al lead y al turno. PRECIO_IA es el
             // MISMO default que usaba esta llamada, asi que el costo registrado no cambia ni un centavo.
-            try { await registrarUsoTokens(user_id, resultado.usage, 'respuesta_agente', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId }); } catch (e) {}
+            try { await registrarUsoTokens(user_id, resultado.usage, 'respuesta_agente', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
             if (SUBSCRIPTIONS_ENABLED) { try {
               // base 1 (YA cobraba, SIEMPRE). Con cobrar_todo_v2 ON: +1 si tradujo, +1 si uso tool, +1 si el lead mando audio.
               var _extraResp = 0;
@@ -29517,7 +29598,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
       const _ok = await enviarMensajeMeta(creds.page_access_token, senderId, _txt, canal, creds.ig_user_id);
       // Registrar uso (best-effort), igual que el webhook WA.
       // MEDIDOR: etiqueta 'respuesta_agente_meta' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
-      try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_meta', PRECIO_IA, { conversation_id: conv.id, turno_id: _turnoId }); } catch (e) {}
+      try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_meta', PRECIO_IA, { conversation_id: conv.id, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
       try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
       // DERIVACION v3 (gated derivacion_v3): si la IA uso la tool derivar_a_humano en este canal, arrancar la
       // rotacion igual que en WhatsApp (asigna + notifica; la IA sigue). Con el flag OFF resultado.pidioDerivar es
@@ -31900,7 +31981,7 @@ async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil,
           const _env = await enviarTextoCloud(tenantUserId, telefono, _txt);
           if (!_env.ok) console.error('[cloud-api] no se pudo enviar la respuesta:', _env.error);
           // MEDIDOR: etiqueta 'respuesta_agente_cloud' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
-          try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_cloud', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId }); } catch (e) {}
+          try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_cloud', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
           try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
           // NOTA: NO se re-inserta la fila role='ai' ni se actualiza last_message: generarRespuestaAgente()
           // YA lo persiste internamente (igual que en el webhook de Meta, ~24560).

@@ -1888,6 +1888,73 @@ async function derivacionV4Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ============================================================================
+// ===== REDISENO DERIVACION 2026-07-24 (Diego): 5 FLAGS NUEVOS, TODOS DEFAULT OFF =====
+// Mismo patron defensivo EXACTO que derivacionV4Activo/repartoV2Activo: columna ausente / null / false / cualquier
+// error -> OFF => comportamiento BYTE-IDENTICO al actual (codigo INERTE hasta correr la migracion + prender el flag
+// por cuenta). Cada flag es INDEPENDIENTE: prender uno NO altera el path de otro. Reusan un `bs` ya cargado si lo trae.
+//
+// PUNTO 5 (historial_estados): registra cada cambio de status como mensaje role='sistema' en el chat.
+async function historialEstadosActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'historial_estados')) return bs.historial_estados === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('historial_estados').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.historial_estados === true);
+  } catch (e) { return false; }
+}
+// PUNTO 3 (sin_consultar_solo): el modo ia_no_sabe_modo='preguntar' se trata como 'preguntar_derivar' (nunca
+// consultar-solo -> el cron termina derivando). Con OFF -> 'preguntar' se comporta como hoy (consulta y espera).
+async function sinConsultarSoloActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'sin_consultar_solo')) return bs.sin_consultar_solo === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('sin_consultar_solo').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.sin_consultar_solo === true);
+  } catch (e) { return false; }
+}
+// PUNTO 2 (tools_combinadas): si la IA llama derivar_a_humano Y consultar_al_dueno en el MISMO turno, con ON se
+// procesan AMBAS (hoy el if/else excluyente descarta la consulta). Con OFF -> if/else actual intacto.
+async function toolsCombinadasActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'tools_combinadas')) return bs.tools_combinadas === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('tools_combinadas').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.tools_combinadas === true);
+  } catch (e) { return false; }
+}
+// PUNTO 6 (tildar_depto): con ON el clasificador DEDUCE el depto SOLO para escribir conversations.departamento_id
+// como ETIQUETA de visibilidad (si esta vacio/no-manual). AISLADO: ese valor va en un campo separado
+// (departamentoIdTildar) y NO alimenta la re-derivacion por cambio de tema ni la confirmacion (esos consumen
+// departamentoId, que sigue null como hoy). ZONA DEL MISRUTEO DE FABIANA: mantener aislado. Con OFF -> _hayDeptos
+// sigue false (deduccion apagada) = comportamiento ACTUAL EXACTO. AVISO ROJO: con ON el clasificador Haiku pasa de
+// ~20 a ~90 tokens por mensaje (prompt con lista de deptos) -> sube el gasto de IA. Gateado OFF por cuenta.
+async function tildarDeptoActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'tildar_depto')) return bs.tildar_depto === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('tildar_depto').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.tildar_depto === true);
+  } catch (e) { return false; }
+}
+// PUNTO 4 (relay_no_aplicable): cuando la respuesta del dueno NO sirve como regla general (rama no_aplicable), hoy
+// el lead NO recibe nada y queda esperando. Con ON se le manda un mensaje minimo de cortesia (avisa que un asesor lo
+// contacta). Con OFF -> comportamiento ACTUAL EXACTO (el lead no recibe relay en el caso no_aplicable).
+async function relayNoAplicableActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'relay_no_aplicable')) return bs.relay_no_aplicable === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('relay_no_aplicable').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.relay_no_aplicable === true);
+  } catch (e) { return false; }
+}
+// ============================================================================
+
 // ===== PAUTA META (Click-to-WhatsApp): flag ia_pauta_meta + Nivel 1/Nivel 2 =====
 // Cuando un lead escribe viniendo de una PUBLICIDAD de Meta en WhatsApp, Baileys pone los datos del aviso en
 // contextInfo.externalAdReply. Con este flag ON la IA recibe esos datos como CONTEXTO (Nivel 1) y, si el aviso
@@ -2286,6 +2353,9 @@ async function citaAvisoCanales(user_id, bs) {
 //                           en `ia_no_sabe_min` minutos (default 30).
 // FAIL-SAFE TOTAL: columna ausente / null / vacio / valor desconocido / cualquier error -> 'preguntar'
 // (= comportamiento de hoy). Reusa un bs ya cargado si trae la propiedad (0 queries extra por mensaje).
+// REDISENO 2026-07-24 (PUNTO 3): el DEFAULT documentado objetivo pasa a 'preguntar_derivar' (nunca dejar al lead
+// consultando-solo sin red de derivacion), pero se realiza SOLO con el flag sin_consultar_solo ON + la migracion de
+// datos. El _DEF en codigo sigue siendo 'preguntar' para que con el flag OFF el comportamiento sea BYTE-IDENTICO.
 const _IA_NO_SABE_MODOS = ['preguntar', 'derivar', 'preguntar_derivar'];
 async function iaNoSabeModo(user_id, bs) {
   const _DEF = 'preguntar';
@@ -2317,6 +2387,17 @@ async function iaNoSabeMin(user_id, bs) {
     if (_n && _n >= 1 && _n <= 1440) return _n;
     return _DEF;
   } catch (e) { return _DEF; }
+}
+// PUNTO 3 (sin_consultar_solo): MODO EFECTIVO. Devuelve el modo real salvo que el flag sin_consultar_solo este ON y
+// el modo sea 'preguntar', en cuyo caso lo trata como 'preguntar_derivar' (el cron termina derivando -> nunca
+// consultar-solo). Con el flag OFF devuelve EXACTAMENTE iaNoSabeModo (byte-identico). Defensivo: ante error -> el
+// modo crudo (nunca escala solo por un fallo del flag).
+async function iaNoSabeModoEfectivo(user_id, bs) {
+  const _modo = await iaNoSabeModo(user_id, bs);
+  try {
+    if (_modo === 'preguntar' && (await sinConsultarSoloActivo(user_id, bs))) return 'preguntar_derivar';
+  } catch (e) {}
+  return _modo;
 }
 
 // ===== UBICACION OSM (Fase 2/3): flag ia_ubicacion por cuenta =====
@@ -3022,6 +3103,15 @@ async function procesarRespuestaAprendizaje(user_id, respuestaDueno, instancia, 
       // NO aplicable: marcar y avisar el motivo / dar opciones (NO se escribe en knowledge_base).
       const _motivo = String(obj.motivo || 'depende del caso puntual, no sirve como regla general').slice(0, 500);
       try { await supabase.from('aprendizaje_ia').update({ respuesta_dueno: String(respuestaDueno).slice(0, 1000), estado: 'no_aplicable', motivo: _motivo }).eq('id', pend.id); } catch (eUp) {}
+      // PUNTO 4 (relay_no_aplicable): cierra el hueco = cuando la respuesta del dueno NO sirve como regla, hoy el LEAD
+      // no recibe NADA y queda esperando. Con el flag ON le mandamos un mensaje MINIMO de cortesia (sin exponer el
+      // motivo interno) avisandole que un asesor lo va a contactar. Con el flag OFF esta rama no corre (ACTUAL EXACTO:
+      // el lead no recibe relay en el caso no_aplicable). Best-effort/0 tokens: reusa relayRespuestaAlLead.
+      try {
+        if (pend.conversation_id && (await relayNoAplicableActivo(user_id))) {
+          await relayRespuestaAlLead(user_id, pend.conversation_id, 'Perdon la demora con lo que te habia quedado pendiente. Para darte una respuesta precisa lo va a tomar un asesor del equipo, que se va a contactar con vos a la brevedad. Gracias por la paciencia.');
+        }
+      } catch (eRelayNA) { console.error('relay no_aplicable al lead:', eRelayNA && eRelayNA.message); }
       try { if (instancia && telefono) await enviarWhatsapp(instancia, telefono, 'Gracias. Eso NO lo guarde como regla general porque ' + _motivo + '. Si queres, pasamelo de una forma que sirva para cualquier cliente, o lo resolves vos a mano en este caso.'); } catch (eW) {}
     }
     return true; // consumido: era una respuesta al canal de aprendizaje
@@ -3733,6 +3823,39 @@ async function registrarPaseAsesor(convId, ownerId, origenId, destinoId, quien) 
   } catch (e) { /* best-effort: un fallo al registrar el pase NUNCA rompe la asignacion */ }
 }
 
+// ============================================================================
+// PUNTO 5 (historial_estados): HISTORIAL DE INSTANCIAS. Registra CADA cambio de status de la conversacion como un
+// mensaje de SISTEMA (role='sistema', MISMO patron que registrarPaseAsesor) que se VE en el timeline del chat y no
+// cuenta como atencion humana (el last-real-message ignora 'sistema', ver ~13471). GATED por el flag historial_estados:
+// con el flag OFF (default / ausente / error) NO inserta NADA => BYTE-IDENTICO a hoy. Con el flag ON deja el rastro
+// "interesado -> listo_humano", "-> recontacto", "-> cerrado", etc. con quien lo hizo (IA/usuario/sistema) y el motivo.
+// DEFENSIVO al 100%: cualquier fallo se traga; NUNCA rompe el cambio de estado (0 tokens de IA). ownerId opcional: si
+// no se pasa, se resuelve desde la conversacion (best-effort). estadoPrev opcional (si no se sabe, se omite el "de X").
+async function registrarCambioEstadoConv(conversation_id, estadoPrev, estadoNuevo, quien, motivo, ownerId) {
+  try {
+    if (!conversation_id || !estadoNuevo) return;
+    if (estadoPrev && String(estadoPrev) === String(estadoNuevo)) return; // no hubo cambio real: no registrar
+    // Resolver owner (user_id) si no vino: necesario para el gate por cuenta y para el insert (aislamiento por tenant).
+    let _owner = ownerId || null;
+    if (!_owner) {
+      try { const { data: _cv } = await supabase.from('conversations').select('user_id').eq('id', conversation_id).maybeSingle(); _owner = _cv && _cv.user_id ? _cv.user_id : null; } catch (eO) { _owner = null; }
+    }
+    if (!_owner) return;
+    if (!(await historialEstadosActivo(_owner))) return; // flag OFF -> no registrar (BYTE-IDENTICO a hoy)
+    const _linda = function(s){
+      const _m = { en_conversacion: 'en conversacion', interesado: 'interesado', listo_humano: 'listo para humano', recontacto: 'recontacto', cerrado: 'cerrado', nuevo: 'nuevo' };
+      const _k = String(s || '').trim();
+      return _m[_k] || _k;
+    };
+    const _quienStr = (quien && String(quien).trim()) ? (String(quien).trim() + ': ') : '';
+    const _desde = estadoPrev ? ('de ' + _linda(estadoPrev) + ' a ') : 'a ';
+    const _motivoStr = (motivo && String(motivo).trim()) ? (' (' + String(motivo).trim().slice(0, 120) + ')') : '';
+    const _texto = '📋 ' + _quienStr + 'estado ' + _desde + _linda(estadoNuevo) + _motivoStr;
+    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: _owner, role: 'sistema', content: _texto, enviado_por: 'Sistema' });
+  } catch (e) { /* best-effort: un fallo al registrar el estado NUNCA rompe el cambio de estado */ }
+}
+// ============================================================================
+
 async function derivarAHumano(convId, user_id, motivo, opts) {
   opts = opts || {};
   try {
@@ -3748,6 +3871,8 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
       } catch (eDer) {
         try { await supabase.from('conversations').update(_upd).eq('id', convId); } catch (eDer2) {}
       }
+      // PUNTO 5 (historial_estados): registrar el pase a listo_humano. Gated OFF -> no hace nada (BYTE-IDENTICO).
+      try { registrarCambioEstadoConv(convId, null, 'listo_humano', 'La IA', motivo || null, user_id).catch(function(){}); } catch (eHE) {}
     }
     // 2) Elegir/asignar asesor (solo si no tiene y no lo tomo el admin) — criterio identico al actual.
     // ETAPA 7: con reparto_v2 ON tambien necesitamos departamento_id para el picker por departamento.
@@ -4411,6 +4536,8 @@ async function _finalizarRotacionV3(convId, ownerId, writerAsesorId) {
     // SOLO el ganador del clear inserta el mensaje de sistema (evita el duplicado del segundo disparador).
     if (_gano) {
       try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: 'Un asesor tomo la conversacion. La IA deja de responder.', enviado_por: 'Sistema' }); } catch (eIns) {}
+      // PUNTO 5 (historial_estados): registrar el pase a listo_humano por asesor que escribio. Gated OFF -> no-op.
+      try { registrarCambioEstadoConv(convId, null, 'listo_humano', 'Un asesor', 'tomo la conversacion', ownerId).catch(function(){}); } catch (eHE) {}
       console.log('Derivacion v3: lead ' + convId + ' finalizado (un humano escribio) -> listo_humano, IA off');
     }
   } catch (e) { console.error('_finalizarRotacionV3:', e && e.message); }
@@ -6880,6 +7007,27 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         _derivarMotivoV3 = (_toolDerivar.input && _toolDerivar.input.motivo) ? String(_toolDerivar.input.motivo).trim() : null;
         _derivarDeptoV3 = (_toolDerivar.input && _toolDerivar.input.departamento) ? String(_toolDerivar.input.departamento).trim() : null;
       } catch (eInDv) {}
+      // ===== PUNTO 2 (tools_combinadas): CONSULTAR + DERIVAR EN EL MISMO TURNO =====
+      // HOY el manejo de tools es un if/else EXCLUYENTE: si la IA llama derivar_a_humano Y consultar_al_dueno en el
+      // mismo turno, solo corre derivar y la CONSULTA AL DUENO SE PIERDE (nunca se registra). Con el flag ON, ademas de
+      // derivar (que sigue igual, lo dispara el webhook con _pidioDerivarV3), REGISTRAMOS tambien la consulta al dueno
+      // (registrarConsultaAprendizaje, fire-and-forget, mismo helper que usa el branch _toolDueno de mas abajo). Con el
+      // flag OFF esta rama NO corre => el if/else queda BYTE-IDENTICO al actual (la consulta se pierde como hoy). El
+      // flag se lee LAZY (solo en el caso raro derivar+consultar juntos) para no agregar costo por mensaje. Solo puede
+      // haber consultar_al_dueno junto si aprendizajeActivo (la tool solo se ofrece con ese gate).
+      try {
+        if (aprendizajeActivo) {
+          const _toolDuenoJunto = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
+          if (_toolDuenoJunto) {
+            let _tcOn = false;
+            try { _tcOn = await toolsCombinadasActivo(user_id, settings || undefined); } catch (eTc) { _tcOn = false; }
+            if (_tcOn) {
+              const _pregJunto = (_toolDuenoJunto.input && _toolDuenoJunto.input.pregunta) ? String(_toolDuenoJunto.input.pregunta).trim() : '';
+              if (_pregJunto) { registrarConsultaAprendizaje(user_id, conversation_id, _pregJunto).catch(function(){}); }
+            }
+          }
+        }
+      } catch (eComb) { console.error('tools_combinadas (derivar+consultar):', eComb && eComb.message); }
       const _textoPrevioDv = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
       reply = _textoPrevioDv || 'Perfecto, busco un asesor disponible para que te atienda, aguardame un momento.';
       if (!usaEmojis) { const _lDv = quitarEmojis(reply); if (_lDv) reply = _lDv; }
@@ -7635,7 +7783,7 @@ function _pideHumano(texto) {
 // usa todavia para rutear ni cambia el reparto.
 // MEDIDOR (2026-07-23): conversation_id y turnoId son OPCIONALES y van AL FINAL (default null). Solo se usan para
 // atribuir el costo de esta llamada al lead / al mensaje del lead. Si no vienen, el comportamiento es el de siempre.
-async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoId) {
+async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoId, tildarDeptoOn) {
   try {
     // Cargar los departamentos ACTIVOS del tenant (DB, sin IA). Si no hay, el depto queda inerte/null.
     let _deptos = [];
@@ -7650,7 +7798,12 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
     // clasificador usa el prompt de una palabra (20 tokens, mas barato) y departamentoId sale null -> todos los
     // consumidores del webhook estan guardados con if(_departamentoId...) y el area cae a la tool de Sonnet o al
     // es_default (Venta) como fallback seguro. Rollback = volver a `_deptos.length > 0`.
-    const _hayDeptos = false;
+    // PUNTO 6 (tildar_depto, 2026-07-24): con el flag ON (tildarDeptoOn=true) REACTIVAMOS la deduccion del depto, pero
+    // SOLO para TILDAR (etiqueta de visibilidad): el depto deducido se devuelve AISLADO en departamentoIdTildar y NO en
+    // departamentoId (que sigue null) -> los consumidores de re-derivacion/confirmacion/fuera-de-alcance del webhook
+    // quedan INERTES como hoy (evita repetir el misruteo de Fabiana). Con el flag OFF/ausente -> _hayDeptos=false =
+    // comportamiento ACTUAL EXACTO. AVISO ROJO: con ON el prompt sube de ~20 a ~90 tokens Haiku por mensaje (mas gasto).
+    const _hayDeptos = (tildarDeptoOn === true) && (_deptos.length > 0);
     // Mapea el nombre que devuelve la IA -> id de departamento del tenant (match exacto, sin acentos/case).
     const _norm = function(s){ return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
     const _resolverDeptoId = function(nombre){
@@ -7730,9 +7883,22 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
     else if (_outLower.includes('interesado')) _estado = 'interesado';
     // FASE 2 (punto 1): "deducido" = la IA infirio el depto del tema (hay depto y el cliente NO lo pidio explicito).
     const _deducido = !!(_departamentoId && !_pidioArea);
-    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> estado:', JSON.stringify(_estado), 'departamentoId:', JSON.stringify(_departamentoId), 'pidioArea:', _pidioArea, 'fueraAlcance:', _fueraAlcance);
-    return { estado: _estado, departamentoId: _departamentoId, pidioArea: _pidioArea, deducido: _deducido, fueraAlcance: _fueraAlcance };
-  } catch (e) { console.error('Error clasificando estado:', e && e.message); return { estado: null, departamentoId: null, pidioArea: false, deducido: false, fueraAlcance: false }; }
+    // PUNTO 6 (tildar_depto) AISLAMIENTO: en modo tildar el depto deducido va SOLO a departamentoIdTildar (etiqueta),
+    // mientras departamentoId/pidioArea/deducido/fueraAlcance se devuelven en sus valores INERTES (los mismos que con
+    // _hayDeptos=false) para que NINGUN consumidor de re-derivacion/confirmacion/fuera-de-alcance se active. Con el flag
+    // OFF (_hayDeptos=false) _departamentoId ya es null y las senales false => el objeto es BYTE-IDENTICO al de hoy
+    // (departamentoIdTildar queda null y ningun consumidor actual lo lee).
+    const _tildarMode = (tildarDeptoOn === true);
+    console.log('[CLASIFICADOR] mensaje:', mensajeCliente, '=> estado:', JSON.stringify(_estado), 'departamentoId:', JSON.stringify(_tildarMode ? null : _departamentoId), 'departamentoIdTildar:', JSON.stringify(_tildarMode ? _departamentoId : null), 'pidioArea:', _pidioArea, 'fueraAlcance:', _fueraAlcance);
+    return {
+      estado: _estado,
+      departamentoId: _tildarMode ? null : _departamentoId,
+      departamentoIdTildar: _tildarMode ? _departamentoId : null,
+      pidioArea: _tildarMode ? false : _pidioArea,
+      deducido: _tildarMode ? false : _deducido,
+      fueraAlcance: _tildarMode ? false : _fueraAlcance
+    };
+  } catch (e) { console.error('Error clasificando estado:', e && e.message); return { estado: null, departamentoId: null, departamentoIdTildar: null, pidioArea: false, deducido: false, fueraAlcance: false }; }
 }
 
 // Extrae datos que el LEAD menciona (nombre, origen, interes, presupuesto) para tener MEMORIA y no re-preguntar.
@@ -9231,7 +9397,10 @@ async function revisarConsultasDuenoSinResponder() {
     for (const f of filas) {
       try {
         if (!f || !f.user_id || !f.conversation_id) continue;
-        if (modoCache[f.user_id] === undefined) { try { modoCache[f.user_id] = await iaNoSabeModo(f.user_id, null); } catch (eM) { modoCache[f.user_id] = 'preguntar'; } }
+        // PUNTO 3 (sin_consultar_solo): modo EFECTIVO. Con el flag ON, una cuenta en 'preguntar' se trata como
+        // 'preguntar_derivar' y el cron la deriva (nunca consultar-solo). Con el flag OFF, iaNoSabeModoEfectivo
+        // devuelve el modo crudo => BYTE-IDENTICO a hoy (solo 'preguntar_derivar' explicito pasa el filtro).
+        if (modoCache[f.user_id] === undefined) { try { modoCache[f.user_id] = await iaNoSabeModoEfectivo(f.user_id, null); } catch (eM) { modoCache[f.user_id] = 'preguntar'; } }
         if (modoCache[f.user_id] !== 'preguntar_derivar') continue; // default 'preguntar' -> no derivar nada
         if (dv3Cache[f.user_id] === undefined) { try { dv3Cache[f.user_id] = await derivacionV3Activo(f.user_id); } catch (eD) { dv3Cache[f.user_id] = false; } }
         if (!dv3Cache[f.user_id]) continue; // sin derivacion_v3 no hay rotacion: no tocar nada
@@ -9939,6 +10108,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         recontacto_count: 0,
         updated_at: new Date().toISOString()
       }).eq('id', conv.id);
+      // PUNTO 5 (historial_estados): el lead volvio a escribir desde recontacto -> restaura estado previo. Gated OFF -> no-op.
+      try { registrarCambioEstadoConv(conv.id, 'recontacto', volverA, 'El lead', 'volvio a escribir', user_id).catch(function(){}); } catch (eHE) {}
     }
 
     // ===== PARTE A (REGLA 22): RETORNO DEL LEAD A UN CASO CERRADO =====
@@ -10290,10 +10461,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // la RED DE SEGURIDAD): en rotacion la IA responde pero NADIE debe subir el status a listo_humano ni apagar la
           // IA por reclasificacion — la unica salida es que un ASESOR escriba (_finalizarRotacionV3 via /api/whatsapp/send).
           if (!_enRotacion && !_rotacionV3Iniciada && estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
-            // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId, pidioArea, deducido, fueraAlcance }.
-            const _clasif = await clasificarEstado(texto, user_id, _convId, _turnoId); // MEDIDOR: atribucion (no cambia la clasificacion)
+            // PUNTO 6 (tildar_depto): leemos el flag ANTES de clasificar y se lo pasamos al clasificador. Con OFF/ausente
+            // -> _tildarOn=false -> clasificarEstado usa el prompt de una palabra (20 tokens) y departamentoIdTildar=null
+            // -> BYTE-IDENTICO a hoy. Con ON -> deduce el depto SOLO para la etiqueta (departamentoIdTildar), aislado de
+            // la re-derivacion/confirmacion/fuera-de-alcance. Lectura por-mensaje (mismo patron que _repV2Cls de abajo).
+            let _tildarOn = false; try { _tildarOn = await tildarDeptoActivo(user_id); } catch (eTd) { _tildarOn = false; }
+            // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId, departamentoIdTildar, pidioArea, deducido, fueraAlcance }.
+            const _clasif = await clasificarEstado(texto, user_id, _convId, _turnoId, _tildarOn); // MEDIDOR: atribucion (no cambia la clasificacion)
             const nuevoEstado = _clasif && _clasif.estado;
-            const _departamentoId = _clasif && _clasif.departamentoId;
+            const _departamentoId = _clasif && _clasif.departamentoId; // PUNTO 6: sigue null en modo tildar (aislado)
             // FASE 2: senales nuevas (solo se USAN con reparto_v2 ON; con flag OFF se ignoran -> comportamiento ACTUAL).
             const _pidioArea = !!(_clasif && _clasif.pidioArea);     // el lead nombro/pidio el area (punto 1)
             const _deducido = !!(_clasif && _clasif.deducido);       // la IA dedujo el depto (punto 1)
@@ -10321,6 +10497,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     await supabase.from('conversations').update({ departamento_id: _deptoPend, status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
                     // R4: depto fijado por la IA -> departamento_manual=false. Write APARTE best-effort (no romper el update critico de arriba si la columna no existe).
                     try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
+                    // PUNTO 5 (historial_estados): gated OFF -> no-op (BYTE-IDENTICO).
+                    try { registrarCambioEstadoConv(_convId, estadoActual, 'listo_humano', 'La IA', 'confirmacion de derivacion', user_id).catch(function(){}); } catch (eHE) {}
                     await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
                   }
                   _yaDerivoEnEsteMensaje = true;
@@ -10399,6 +10577,27 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               } catch (eDepW) { console.error('Error guardando departamento_id:', eDepW && eDepW.message); }
             }
 
+            // ===== PUNTO 6 (tildar_depto): ETIQUETA DE VISIBILIDAD, AISLADA DE LA DERIVACION =====
+            // Con el flag ON, el clasificador dedujo el depto y lo dejo en _clasif.departamentoIdTildar (SEPARADO de
+            // _departamentoId, que sigue null). Aca lo escribimos en conversations.departamento_id SOLO como etiqueta y
+            // SOLO si la conv NO tiene depto y NO es manual (no pisa una asignacion humana). Este valor NO alimenta la
+            // re-derivacion por cambio de tema (10460), la confirmacion (10557) ni el fuera-de-alcance (10583): esos
+            // consumen _departamentoId (null en modo tildar). Por eso NO repite el misruteo de Fabiana. Con el flag OFF,
+            // _clasif.departamentoIdTildar es null/undefined => este bloque NO corre (BYTE-IDENTICO a hoy). Se re-lee el
+            // flag por defensa (solo cuando hay un valor tildar, es decir cuando ya estaba ON). Best-effort/0 IA.
+            const _deptoTildar = _clasif && _clasif.departamentoIdTildar;
+            if (_deptoTildar) {
+              try {
+                if (_tildarOn) {
+                  const { data: _cvT } = await supabase.from('conversations').select('departamento_id, departamento_manual').eq('id', _convId).maybeSingle();
+                  if (_cvT && !_cvT.departamento_id && _cvT.departamento_manual !== true) {
+                    // Etiqueta automatica -> departamento_manual=false. DEFENSIVO: si la columna no existe, igual escribimos el depto.
+                    try { await supabase.from('conversations').update({ departamento_id: _deptoTildar, departamento_manual: false }).eq('id', _convId); } catch (eT1) { try { await supabase.from('conversations').update({ departamento_id: _deptoTildar }).eq('id', _convId); } catch (eT2) {} }
+                  }
+                }
+              } catch (eTildarW) { console.error('tildar_depto write:', eTildarW && eTildarW.message); }
+            }
+
             // FASE 2 (punto 5): IA NO PUEDE AVANZAR. Si el pedido esta fuera de alcance de la IA, disparar la ESCALERA
             // de derivacion (intenta SIEMPRE derivar por los pasos logicos; el WhatsApp al gerente es la ultima instancia
             // dentro de derivarAHumano). Solo con reparto_v2 ON. Si no se manejo por cambio de tema y aun no derivamos.
@@ -10410,6 +10609,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 catch (eV4Fa) { console.error('v4 fuera de alcance:', eV4Fa && eV4Fa.message); }
               } else {
                 await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
+                // PUNTO 5 (historial_estados): gated OFF -> no-op (BYTE-IDENTICO).
+                try { registrarCambioEstadoConv(_convId, estadoActual, 'listo_humano', 'La IA', 'fuera de alcance', user_id).catch(function(){}); } catch (eHE) {}
                 await derivarAHumano(_convId, user_id, 'ia_fuera_alcance', { setStatus: false, push: true, pushTitulo: 'Lead fuera de alcance de la IA', pushTexto: (data.pushName || telefono), resumen: true });
               }
               _yaDerivoEnEsteMensaje = true;
@@ -10451,6 +10652,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
                   if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
                   await supabase.from('conversations').update(update).eq('id', _convId);
+                  // PUNTO 5 (historial_estados): cambio de estado por clasificacion. Gated OFF -> no-op (BYTE-IDENTICO).
+                  try { registrarCambioEstadoConv(_convId, estadoActual, nuevoEstado, 'La IA', 'clasificacion automatica', user_id).catch(function(){}); } catch (eHE) {}
                   // Si paso a listo_humano: asignar asesor (si no tiene) + generar resumen.
                   if (nuevoEstado === 'listo_humano') {
                     // ETAPA 4: la asignacion de asesor y el resumen al transicionar a listo_humano ahora viven
@@ -10589,6 +10792,8 @@ app.post('/api/whatsapp/send', async (req, res) => {
       // ya es listo_humano o está cerrado.
       if (convEstado && convEstado.status !== 'listo_humano' && convEstado.status !== 'cerrado') {
         await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
+        // PUNTO 5 (historial_estados): un humano respondio -> listo_humano. Gated OFF -> no-op (BYTE-IDENTICO).
+        try { registrarCambioEstadoConv(conversation_id, convEstado.status, 'listo_humano', 'Un asesor', 'respondio el asesor', conv.user_id).catch(function(){}); } catch (eHE) {}
       } else if (convEstado && convEstado.ai_enabled === true) {
         // Ya es listo_humano/cerrado pero la IA quedó encendida -> apagarla igual (no pisar la respuesta humana).
         await supabase.from('conversations').update({ ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
@@ -13046,6 +13251,8 @@ async function revisarInactividad() {
         }).eq('id', conv.id);
         console.log('Recontacto: conversacion ' + conv.id + ' paso a recontacto (72hs sin respuesta); ai_enabled=' + (conv.ai_enabled === true) + ' (preservado: hay humano a cargo)');
       }
+      // PUNTO 5 (historial_estados): paso a recontacto por inactividad. Gated OFF -> no-op (BYTE-IDENTICO).
+      try { registrarCambioEstadoConv(conv.id, conv.status, 'recontacto', 'El sistema', 'inactividad 72hs', conv.user_id).catch(function(){}); } catch (eHE) {}
     }
   } catch (e) { console.error('Error en revisarInactividad:', e && e.message); }
   finally { _inactividadEnCurso = false; } // RACE #6: liberar el guard siempre (nunca queda trabado)
@@ -14477,6 +14684,8 @@ async function _enviarRecontactosV2(ahoraMs) {
               .update({ status: 'cerrado', updated_at: new Date().toISOString() })
               .eq('id', conv.id)
               .eq('status', 'recontacto'); // condicional: solo si sigue en recontacto (no pisa un cambio concurrente)
+            // PUNTO 5 (historial_estados): cierre por agotar recontacto_max. Gated OFF -> no-op (BYTE-IDENTICO).
+            try { registrarCambioEstadoConv(conv.id, 'recontacto', 'cerrado', 'El sistema', 'agoto recontactos', uid).catch(function(){}); } catch (eHE) {}
             console.log('Recontacto v2: conv ' + conv.id + ' AGOTO recontacto_max (' + maxRec + ') -> status=cerrado (cuenta ' + uid + ')');
           } catch (eClose) { console.error('recontacto v2 cerrar agotado conv ' + conv.id + ':', eClose && eClose.message); }
           continue;
@@ -14836,9 +15045,11 @@ async function rescatarRecontactosRespondidos() {
       try {
         const volverA = c.estado_previo || 'en_conversacion';
         const _temp = await _tempConDecayParaConv(c.id, temperaturaPorEstado(volverA), c.user_id);
-        await supabase.from('conversations').update({
+        const { data: _uResc } = await supabase.from('conversations').update({
           status: volverA, temperatura: _temp, estado_previo: null, recontacto_count: 0, updated_at: new Date().toISOString()
-        }).eq('id', c.id).eq('status', 'recontacto').eq('last_role', 'contact'); // condicional: solo si sigue pegado (anti-carrera)
+        }).eq('id', c.id).eq('status', 'recontacto').eq('last_role', 'contact').select('id'); // condicional: solo si sigue pegado (anti-carrera)
+        // PUNTO 5 (historial_estados): solo si el write gano (evita ruido si otro lo movio). Gated OFF -> no-op.
+        if (_uResc && _uResc.length) { try { registrarCambioEstadoConv(c.id, 'recontacto', volverA, 'El sistema', 'rescate: el lead respondio', c.user_id).catch(function(){}); } catch (eHE) {} }
       } catch (eOne) { /* seguir con el resto */ }
     }
     if (pegados && pegados.length) console.log('rescatarRecontactosRespondidos: ' + pegados.length + ' lead(s) devuelto(s) de recontacto a conversacion');
@@ -29143,6 +29354,8 @@ app.post('/api/conversations/cerrar', async function(req, res){
       updated_at: new Date().toISOString()
     }).eq('id', conversation_id);
     if (upd && upd.error) return res.status(409).json({ ok: false, error: 'No se pudo cerrar: ' + (upd.error.message || 'error de esquema') });
+    // PUNTO 5 (historial_estados): cierre manual del caso por un usuario. Gated OFF -> no-op (BYTE-IDENTICO).
+    try { registrarCambioEstadoConv(conversation_id, null, 'cerrado', 'Un usuario', 'cerro el caso', c.data.user_id).catch(function(){}); } catch (eHE) {}
     // E3: MOTIVO DE PERDIDA (opcional, para la tarjeta "Motivos de perdida"). Se escribe en un update SEPARADO y
     // best-effort: si la columna motivo_perdida aun no existe (migracion sin correr), el cierre NO se rompe.
     var _MOTIVOS_PERDIDA = ['precio', 'zona', 'dejo_de_responder', 'comprado_otro', 'otro'];

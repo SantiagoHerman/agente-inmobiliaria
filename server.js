@@ -3733,6 +3733,9 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         if (!(_v2 && !_asesorEsIA)) {
           try { await registrarPaseAsesor(convId, (_cv && _cv.user_id) || user_id, (_cv && _cv.asesor_id) || null, _asesor, 'La IA'); } catch (ePase) {}
         }
+        // TAREA 3 (Diego 2026-07-23): la cita de la IA (origen='agente') sigue al asesor recien asignado en la
+        // derivacion DIRECTA. Best-effort, 0 tokens; si no hay cita toca 0 filas. No rompe la derivacion si falla.
+        try { await _sincronizarCitaConLead((_cv && _cv.user_id) || user_id, convId, _asesor); } catch (eSyncCita) {}
       }
     }
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
@@ -4026,6 +4029,8 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
       // Asignar (condicional: no pisar una toma manual que haya entrado en el interin). IA sigue atendiendo.
       const _ok = await _asignarRotacionV3(convId, _asesor, _deptoId, nowIso, true);
       if (!_ok) return { ok: false, yaTomado: true }; // otro proceso tomo el lead: respetar
+      // TAREA 3 (Diego 2026-07-23): la cita de la IA sigue al asesor asignado por la rotacion inicial. 0 tokens, best-effort.
+      try { await _sincronizarCitaConLead(ownerId, convId, _asesor); } catch (eSyncCita) {}
       await _anunciarLead();
       // HISTORIAL DE PASES INMUTABLE: la IA arranca la rotacion y asigna al primer disponible. La conv NO tenia
       // asesor (guard arriba: si _cv.asesor_id existia, esta funcion retorna antes) -> origen = "la IA". Append-only.
@@ -4204,6 +4209,9 @@ async function _finalizarRotacionV3(convId, ownerId, writerAsesorId) {
       _gano = true;
     }
     await _limpiarRotacionV3(convId);
+    // TAREA 3 (Diego 2026-07-23): "el que escribe se lo queda" -> la cita de la IA pasa al asesor que TOMO el lead.
+    // Solo si vino writerAsesorId (un asesor real, no el dueno sin fila). 0 tokens, best-effort; no rompe la finalizacion.
+    if (writerAsesorId) { try { await _sincronizarCitaConLead(ownerId, convId, writerAsesorId); } catch (eSyncCita) {} }
     // SOLO el ganador del clear inserta el mensaje de sistema (evita el duplicado del segundo disparador).
     if (_gano) {
       try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: 'Un asesor tomo la conversacion. La IA deja de responder.', enviado_por: 'Sistema' }); } catch (eIns) {}
@@ -4336,6 +4344,8 @@ async function revisarRotacionDerivacionV3() {
           // Origen = quien lo tenia (conv.asesor_id; null si estaba sin asesor -> "la IA"). Destino = _siguiente. Append-only.
           try { await registrarPaseAsesor(conv.id, ownerId, (conv.asesor_id || null), _siguiente, 'La IA'); } catch (ePase) {}
           await _notificarRotacionV3(ownerId, conv.id, _siguiente, _leadRef, !!conv.asesor_id);
+          // TAREA 3 (Diego 2026-07-23): al ROTAR el lead al siguiente asesor, la cita de la IA lo sigue. 0 tokens, best-effort.
+          try { await _sincronizarCitaConLead(ownerId, conv.id, _siguiente); } catch (eSyncCita) {}
           console.log('Derivacion v3: lead ' + conv.id + ' ROTADO a ' + _siguiente + (conv.asesor_id ? (' (antes ' + conv.asesor_id + ')') : ' (estaba sin asesor)') + (_resetVuelta ? ' [vuelta reiniciada]' : ''));
         } else {
           // Sigue sin nadie disponible. La IA sigue atendiendo. NO se toca asesor_id (puede seguir null o el anterior,
@@ -5528,11 +5538,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (conversation_id && !modoPrueba) { try { _noSabeModo = await iaNoSabeModo(user_id, settings || undefined); } catch (eNs) { _noSabeModo = 'preguntar'; } }
   const _noSabeDerivar = (_noSabeModo === 'derivar' && _derivacionV3On === true);
   if (_noSabeDerivar) aprendizajeActivo = false; // sin tool consultar_al_dueno: la IA deriva en vez de preguntar
-  // FEATURE #15 (gated ia_agenda): ¿ofrecer la tool agendar_cita? SOLO con ia_agenda ON y en conv REAL
-  // (no modoPrueba). Con flag OFF -> false => la tool NO se agrega a toolsAgente y el prompt/flujo es
-  // BYTE-IDENTICO al actual. Reusa el `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
+  // FEATURE #15: ¿ofrecer la tool agendar_cita? TAREA 1 (Diego 2026-07-23): el gate ya NO depende del flag de cuenta
+  // ia_agenda, sino EXCLUSIVAMENTE del OBJETIVO EFECTIVO de este agente (se resuelve mas abajo, junto al objetivo).
+  // Motivo: un usuario IA nocturno con objetivo 'agendar' debe poder agendar aunque la cuenta este en 'informar'.
+  // Arranca en false; el unico gate (por objetivo efectivo, en conv REAL no modoPrueba) lo prende si corresponde.
+  // Con objetivo 'informar' (default) -> queda false => la tool NO se agrega a toolsAgente y el flujo es el actual.
   let _iaAgendaOn = false;
-  if (conversation_id && !modoPrueba) { try { _iaAgendaOn = await iaAgendaActivo(user_id, settings || undefined); } catch (eIaAg) { _iaAgendaOn = false; } }
   // UBICACION OSM (gated ia_ubicacion): ¿ofrecer la tool buscar_propiedades_cerca + referencias de zona?
   // Con flag OFF -> false => prompt y tools BYTE-IDENTICOS al actual. Reusa settings (0 queries extra).
   let _iaUbicacionOn = false;
@@ -5647,14 +5658,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     ? ('TU OBJETIVO (hasta donde avanzas vos antes de derivar a un compañero): ' + agenteConfig.objetivo)
     : (OBJETIVO[(settings && settings.agent_objetivo) || 'informar'] || OBJETIVO.informar);
   const largo = LARGO[(agenteConfig && agenteConfig.largo) || (settings && settings.response_length) || 'corto'] || LARGO.corto;
-  // GATE OBJETIVO->AGENDA (Diego 2026-07-23): EL OBJETIVO MANDA. La tool agendar_cita solo se ofrece si el objetivo
-  // EFECTIVO lo permite ('agendar_visita' o 'avanzar_reserva'). Con objetivo 'informar'/'precalificar'/
-  // 'ver_disponibilidad' la IA NO recibe la herramienta -> imposible agendar por error (antes solo lo decia el prompt).
-  // El objetivo del USUARIO IA (agenteConfig.objetivoValor) pisa al de la cuenta; texto libre/desconocido cae al de la
-  // cuenta. Con ia_agenda OFF ya estaba apagada -> esto solo RESTRINGE, nunca habilita de mas.
-  if (_iaAgendaOn) {
+  // GATE OBJETIVO->AGENDA (Diego 2026-07-23, TAREA 1): EL OBJETIVO EFECTIVO MANDA (UNICO gate, sin el flag de cuenta).
+  // La tool agendar_cita se ofrece SOLO si el objetivo efectivo es 'agendar_visita' o 'avanzar_reserva'. Con objetivo
+  // 'informar'/'precalificar'/'ver_disponibilidad' (o desconocido) la IA NO recibe la herramienta -> imposible agendar
+  // por error, y en su lugar deriva. El objetivo del USUARIO IA (agenteConfig.objetivoValor) PISA al de la cuenta
+  // (settings.agent_objetivo); texto libre/desconocido cae al de la cuenta -> 'informar' por default. Asi un usuario IA
+  // nocturno en 'agendar' SI agenda aunque la cuenta este en 'informar' (la IA principal en 'informar' deriva). Solo en
+  // conv REAL (no modoPrueba); en modoPrueba queda false -> flujo de pruebas byte-identico.
+  if (conversation_id && !modoPrueba) {
     const _objGate = (agenteConfig && agenteConfig.objetivoValor) || ((settings && settings.agent_objetivo) || 'informar');
-    if (_objGate !== 'agendar_visita' && _objGate !== 'avanzar_reserva') _iaAgendaOn = false;
+    if (_objGate === 'agendar_visita' || _objGate === 'avanzar_reserva') _iaAgendaOn = true;
   }
   const usaEmojis = (agenteConfig && (agenteConfig.emojis === true || agenteConfig.emojis === false))
     ? agenteConfig.emojis === true
@@ -6614,6 +6627,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // no existe) -> el return es identico al actual. 0 tokens: NO hacemos 2do turno de cortesia; reusamos el texto que
   // el agente ya escribio junto a la tool (o un fallback fijo) como reply.
   let _pidioDerivarV3 = false, _derivarMotivoV3 = null, _derivarDeptoV3 = null;
+  // TAREA 2 (Diego 2026-07-23): true si la tool agendar_cita YA derivo el lead (rotacion o directo) en este turno. El
+  // webhook lo usa para NO reclasificar/re-derivar en el mismo mensaje (evita doble derivacion). Con la tool OFF -> false.
+  let _agendaDerivada = false;
   // RAG DE INVENTARIO (gated ia_rag_v1): marca si la IA uso buscar_inventario / ficha_inventario en ESTA respuesta.
   // Se usa al final para NO cobrar el turno de busqueda como mensaje extra (plan Principio 2 / decision Diego #1:
   // sigue 1 mensaje por respuesta; el RAG es ahorro de Diego, no gasto del cliente). Con el flag OFF queda false =>
@@ -6650,6 +6666,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _leadNombreAg = (datosLead && datosLead.name) ? datosLead.name : null;
         _resAg = await _agendarCitaTentativaAgente(user_id, conversation_id, _toolAgendar.input || {}, _leadNombreAg);
       } catch (eAg) { console.error('flujo tool agendar_cita:', eAg && eAg.message); _resAg = { ok: false }; }
+      // TAREA 2: si la cita derivo el lead, marcarlo para que el webhook NO reclasifique/re-derive este mismo mensaje.
+      _agendaDerivada = !!(_resAg && _resAg.derivada);
       if (_resAg && _resAg.fechaInvalida) {
         // El agente no dio una fecha parseable: pedirle al lead que la aclare (sin crear cita basura).
         reply = _textoPrevioAg || 'Para dejarlo agendado necesito el dia y la hora exactos. ¿Que dia y a que hora te queda bien?';
@@ -7349,7 +7367,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // para el cobro (plan Principio 2 / decision Diego #1: la busqueda no se cobra aparte; sigue 1 msg por respuesta).
   // Con el flag OFF, _ragToolUsado=false => usoTool es BYTE-IDENTICO al actual. Si Diego decide cobrarla, quitar el
   // `&& !_ragToolUsado`.
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3 };
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -8885,6 +8903,10 @@ async function enviarRecordatoriosCitas() {
 // select devuelve error -> early return y el cron NO hace absolutamente nada (comportamiento actual EXACTO).
 // CERO IA / CERO tokens: texto fijo + SQL. Defensivo de punta a punta (nunca tira).
 async function escalarCitasSinTomar() {
+  // TAREA 4 (Diego 2026-07-23): NEUTRALIZADA. La cita ahora viaja pegada a la derivacion del lead (TAREA 2); el
+  // "nadie la tomo" lo maneja el SLA/rotacion del lead, no este sistema paralelo. Inerte, ademas de estar FUERA del
+  // registro de crons. Se deja el cuerpo por si hay que reactivarla, pero NO debe ejecutarse.
+  return;
   try {
     const ahoraMs = Date.now();
     // Solo citas TENTATIVAS de la IA (origen='agente'), aun agendadas y sin dueno, no escaladas todavia.
@@ -10002,6 +10024,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               }
             }
           } catch (eDv3) { console.error('derivacion v3 webhook:', eDv3 && eDv3.message); }
+
+          // TAREA 2 (Diego 2026-07-23): si la tool agendar_cita YA derivo el lead en este turno (rotacion o directo),
+          // NO reclasificar/re-derivar en este mismo mensaje. Reusa el mismo skip que la rotacion v3 (_rotacionV3Iniciada
+          // saltea toda la clasificacion+derivacion+red de seguridad de abajo). El directo ya dejo listo_humano (tambien
+          // saltearia por estadoActual), pero esto cubre ademas la rotacion (queda en 'interesado' con la IA atendiendo).
+          if (resultado && resultado.agendaDerivada) _rotacionV3Iniciada = true;
 
           // Clasificar el estado de la conversacion segun el mensaje del cliente (conservador)
           // Leer el estado actual ANTES de clasificar
@@ -11746,6 +11774,10 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
     // R1 (gated): write APARTE best-effort de recontacto_congelado. Congelar al asignar / descongelar al desasignar.
     // Si la columna no existe, el catch traga el error y la asignacion queda intacta (no rompe nada).
     if (_congelarR1 !== null) { try { await supabase.from('conversations').update({ recontacto_congelado: _congelarR1 }).eq('id', conversation_id); } catch (eCong) {} }
+
+    // TAREA 3 (Diego 2026-07-23): asignacion/reasignacion MANUAL a un asesor -> la cita de la IA (origen='agente') lo
+    // sigue. Solo cuando se asigna a alguien (val no-null; en desasignacion no se toca la cita). 0 tokens, best-effort.
+    if (val) { try { await _sincronizarCitaConLead(ownerId, conversation_id, val); } catch (eSyncCita) {} }
 
     // DERIVACION v3 (gated derivacion_v3): una asignacion/reasignacion/desasignacion MANUAL CANCELA la rotacion (el
     // humano decide quien toma el lead; la rotacion automatica ya no aplica). Limpiamos los marcadores best-effort.
@@ -14744,11 +14776,11 @@ setTimeout(procesarOportunidades, 110 * 1000); // primera corrida ~110s tras arr
 // Recordatorios de citas: revisar cada 30 min (recordatorio al lead + aviso al asesor de citas en las proximas 24h)
 setInterval(enviarRecordatoriosCitas, 30 * 60 * 1000);
 setTimeout(enviarRecordatoriosCitas, 70 * 1000);
-// TAREA A: escalada de citas TENTATIVAS que nadie tomo (avisa al depto Administracion, una sola vez por cita).
-// INERTE hasta correr la migracion (el select filtra por citas.escalada_avisada; sin esa columna hace early-return).
-// Cada 30 min alcanza: el umbral es de HORAS (default 3, configurable por cuenta). 0 IA / 0 tokens.
-setInterval(escalarCitasSinTomar, 30 * 60 * 1000);
-setTimeout(escalarCitasSinTomar, 115 * 1000); // primera corrida ~115s tras arrancar (proceso ya estable)
+// TAREA 4 (Diego 2026-07-23): la escalada de citas de la IA (escalarCitasSinTomar) queda NEUTRALIZADA / FUERA del
+// registro de crons. Ahora la cita viaja PEGADA a la derivacion del lead (TAREA 2), asi que el "nadie la tomo" ya lo
+// maneja el SLA/rotacion del lead, no un sistema paralelo de citas. La funcion sigue definida pero inerte (tiene un
+// early-return propio) por si algo la referenciara. Los settings cita_aviso_canales/cita_escalada_horas quedan sin uso
+// (no hace falta migracion): el backend simplemente ya no los lee para esto.
 // TAREA B: modo 'preguntar_derivar' - deriva sola si el dueno no contesto la consulta de la IA en X minutos.
 // INERTE hasta correr la migracion (el select filtra por aprendizaje_ia.derivada_at) y tambien con el modo
 // default 'preguntar'. Cada 5 min: granularidad suficiente para un umbral en minutos (default 30). 0 IA.
@@ -16750,14 +16782,34 @@ async function _avisoDeptoDeConv(ownerId, conversationId) {
   } catch (e) { return null; }
 }
 
-// ===== FEATURE #15: crear la cita TENTATIVA cuando el agente llama la tool agendar_cita =====
-// Solo se llega aca con el flag ia_agenda ON (la tool no se ofrece con OFF). Deja una cita SIN ASIGNAR
-// (asesor_id=NULL, estado='agendada', origen='agente'), avisa al equipo por el canal "Todos" (0 IA, texto
-// fijo) y — si se pudo resolver el depto — tambien a su canal. DEDUPE: si ya hay una cita futura
-// 'agendada'/'confirmada' para esta conversacion, NO duplica (devuelve la existente). CERO llamada de IA
-// (la tool viaja en el turno actual). Defensivo: ante cualquier fallo devuelve { ok:false } y el agente
-// igual cierra con texto natural (no rompe la respuesta al lead). Duracion default 60 min (fecha_fin).
-// Devuelve { ok, citaId, duplicada, fechaLegible } (fechaLegible para el aviso al equipo).
+// ===== TAREA 3 (Diego 2026-07-23): la cita SIEMPRE refleja el asesor del lead =====
+// Reasigna las citas FUTURAS creadas por la IA (origen='agente', estado agendada/confirmada) de una conversacion al
+// asesor ASIGNADO del lead, para que la cita viaje SIEMPRE pegada al lead. Se llama (best-effort, 0 tokens) en cada
+// punto donde un humano toma o se le asigna el lead: derivacion directa (derivarAHumano), rotacion inicial/rota
+// (iniciarRotacionDerivacionV3 / cron rotate), toma por escribir (_finalizarRotacionV3) y asignacion manual. Si no
+// hay cita, el UPDATE toca 0 filas (barato). Defensivo: cualquier fallo NO rompe el flujo del lead. Aislado por tenant.
+async function _sincronizarCitaConLead(ownerId, conversationId, asesorId) {
+  try {
+    if (!ownerId || !conversationId || !asesorId) return;
+    const _nowISO = new Date().toISOString();
+    await supabase.from('citas')
+      .update({ asesor_id: asesorId })
+      .eq('user_id', ownerId).eq('conversation_id', conversationId).eq('origen', 'agente')
+      .in('estado', ['agendada', 'confirmada']).gte('fecha_hora', _nowISO);
+  } catch (e) { console.error('_sincronizarCitaConLead:', e && e.message); }
+}
+
+// ===== FEATURE #15: crear la cita cuando el agente llama la tool agendar_cita + DERIVAR el lead (TAREA 2) =====
+// Solo se llega aca con la tool agendar_cita ofrecida (objetivo efectivo 'agendar_visita'/'avanzar_reserva', TAREA 1).
+// Crea la cita (estado='agendada', origen='agente', linkeada por conversation_id) y luego DERIVA el lead por el mismo
+// camino que la tool derivar_a_humano: rotacion (derivacion_v3 ON -> iniciarRotacionDerivacionV3, la IA sigue) o directo
+// (derivarAHumano setStatus:true -> listo_humano + IA off + asigna). La cita queda pegada al asesor del lead via
+// _sincronizarCitaConLead (lo llaman por dentro esas funciones, TAREA 3). Ademas postea en la CONVERSACION una linea
+// role='sistema' con la fecha (0 IA). YA NO hay tarjeta tomable ni aviso al chat de departamento (sistema paralelo
+// eliminado, TAREA 4). DEDUPE: si ya hay una cita futura 'agendada'/'confirmada' para esta conv, NO duplica NI re-deriva.
+// CERO llamada de IA (la tool viaja en el turno actual; la derivacion es SQL + plantillas). Defensivo: ante cualquier
+// fallo devuelve { ok:false } y el agente igual cierra con texto natural. Duracion default 60 min (fecha_fin).
+// Devuelve { ok, citaId, duplicada, fechaLegible, derivada } (derivada -> el webhook no reclasifica este mensaje).
 async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadNombre) {
   try {
     if (!ownerId || !conversationId) return { ok: false };
@@ -16792,8 +16844,7 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
     } catch (eDup) {}
     // 4) Resolver departamento (por nombre -> id) si el agente lo paso. Best-effort; null = cualquier depto.
     //    Si el HINT del agente matchea un depto ACTIVO -> ese; si no, cae al depto de la CONVERSACION del lead.
-    //    El aviso (paso 7) va al canal del depto que corresponde via _avisarCitaEquipoCanales (default ['depto'];
-    //    sin depto resuelto, cae a "general"). Diego: "al departamento que corresponde, no a todos". Defensivo.
+    //    Este _deptoId se persiste en la conv (paso 7) para que la DERIVACION del lead routee al area correcta.
     let _deptoId = null;
     try {
       const _hint = (input && input.departamento) ? String(input.departamento).trim().toLowerCase() : '';
@@ -16832,15 +16883,42 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
     } else {
       _citaId = _r.data && _r.data.id;
     }
-    // 7) Aviso al equipo (0 IA, texto fijo) por los CANALES configurados (default depto), con la TARJETA TOMABLE
-    //    adjunta (accion). REFINAMIENTO 2/3. El helper resuelve canales + notif_solo_involucrado + push dirigido.
-    //    `_deptoId` = hint del agente (si matcheo) o depto de la conv (o null -> canal "Todos"). Con default ['depto']
-    //    y sin depto resuelto, el helper cae a "general" (el aviso nunca se pierde).
+    // 7) TAREA 2 (Diego 2026-07-23): la cita viaja PEGADA a la derivacion normal del lead. En vez de postear una
+    //    tarjeta tomable en el chat de departamento (sistema paralelo, ELIMINADO en TAREA 4), DERIVAMOS el lead por el
+    //    MISMO camino que la tool derivar_a_humano: si la cuenta usa rotacion (derivacion_v3 ON) -> iniciarRotacion
+    //    DerivacionV3 (asigna/rota, la IA sigue); si no -> derivarAHumano (directo: asigna + listo_humano + IA off).
+    //    El aviso al equipo lo hace la derivacion (en el chat de la CONVERSACION, no en el de depto). 0 IA / 0 tokens
+    //    (resumen:false para no gastar IA en el directo). El depto resuelto (_deptoId) se persiste en la conv para que
+    //    ambos caminos routeen al area correcta. La cita queda con el asesor asignado via _sincronizarCitaConLead, que
+    //    ya llaman por dentro derivarAHumano / iniciarRotacionDerivacionV3 / _asignarRotacionV3 (TAREA 3).
     const _fechaLegible = _formatearFechaCita(_fhISO);
-    const _txtAviso = '📅 Nueva cita para tomar: ' + _fechaLegible + (_leadNombre ? (' — ' + _leadNombre) : '');
-    const _accionCita = { tipo: 'cita_tomar', cita_id: _citaId, departamento_id: _deptoId || null };
-    try { await _avisarCitaEquipoCanales(ownerId, _deptoId || null, _txtAviso, _accionCita, conversationId); } catch (eAvC) {}
-    return { ok: true, citaId: _citaId, duplicada: false, fechaLegible: _fechaLegible };
+    // Persistir el depto resuelto en la conv (best-effort, solo la columna vieja departamento_id; NO tocamos
+    // departamento_manual). Asi la derivacion (que lee conv.departamento_id) va al area correcta. Defensivo.
+    if (_deptoId) { try { await supabase.from('conversations').update({ departamento_id: _deptoId }).eq('id', conversationId).eq('user_id', ownerId); } catch (eUpDep) {} }
+    let _derivada = false;
+    let _dv3 = false;
+    try { _dv3 = await derivacionV3Activo(ownerId); } catch (eDv) { _dv3 = false; }
+    if (_dv3) {
+      // ROTACION: mismo flujo que la tool derivar_a_humano. anunciarLead:false (default; el agente ya le respondio al
+      // lead con el texto de la tool). Asigna al primero disponible (la IA sigue atendiendo) o queda rotando sin nadie.
+      try {
+        const _rr = await iniciarRotacionDerivacionV3(conversationId, ownerId, { leadRef: _leadNombre || _leadTel || null });
+        if (_rr && _rr.ok) _derivada = true;
+      } catch (eRot) { console.error('_agendarCitaTentativaAgente rotacion:', eRot && eRot.message); }
+    } else {
+      // DIRECTO: derivarAHumano (setStatus:true -> listo_humano + IA off + asigna asesor). resumen:false = 0 tokens IA.
+      try {
+        await derivarAHumano(conversationId, ownerId, 'cita_agendada', { setStatus: true, push: true, pushTitulo: 'Nuevo lead con cita agendada', pushTexto: _leadTel || _leadNombre || '', resumen: false });
+        _derivada = true;
+      } catch (eDir) { console.error('_agendarCitaTentativaAgente directo:', eDir && eDir.message); }
+    }
+    // Registro en la CONVERSACION (messages, role='sistema', texto fijo, 0 IA) con la fecha legible + tipo, para que
+    // quede el rastro del agendamiento en el chat. El front lo linkea a la cita del panel/timeline del lead.
+    try {
+      const _txtCita = 'Cita agendada para ' + _fechaLegible + ' (' + _tipo + ').';
+      await supabase.from('messages').insert({ conversation_id: conversationId, user_id: ownerId, role: 'sistema', content: _txtCita, enviado_por: 'Sistema' });
+    } catch (eMsgCita) {}
+    return { ok: true, citaId: _citaId, duplicada: false, fechaLegible: _fechaLegible, derivada: _derivada };
   } catch (e) { console.error('_agendarCitaTentativaAgente:', e && e.message); return { ok: false }; }
 }
 

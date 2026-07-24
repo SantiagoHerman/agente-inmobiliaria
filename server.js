@@ -4671,7 +4671,9 @@ async function _elegirSiguienteRotacionV3(ownerId, deptoId, actualAsesorId, inte
 }
 
 // ===== TRANSCRIPCION DE AUDIO con Groq Whisper (multilenguaje, autodetect) =====
-async function transcribirAudioGroq(base64, mime) {
+// userId (opcional): si viene, se registra el costo de la transcripcion en ia_uso (observabilidad F4). Sin userId
+// (llamadas viejas) NO se registra nada -> comportamiento identico a antes.
+async function transcribirAudioGroq(base64, mime, userId) {
   try {
     if (!GROQ_KEY || !base64) return null; // fallback: sin key o sin audio
     const buffer = Buffer.from(base64, 'base64');
@@ -4688,12 +4690,24 @@ async function transcribirAudioGroq(base64, mime) {
     });
     if (!resp.ok) { console.error('transcribirAudioGroq fallo:', resp.status); return null; }
     const j = await resp.json();
-    return ((j && j.text) || '').trim() || null;
+    const _texto = ((j && j.text) || '').trim() || null;
+    // F4 OBSERVABILIDAD (Diego 2026-07-24): registrar el costo de la transcripcion Groq (antes era INVISIBLE en el
+    // panel). Whisper-large-v3 en Groq cuesta ~$0.111/hora de audio; NO pedimos verbose_json, asi que NO tenemos la
+    // duracion sin cambiar el request (riesgo 0) -> usamos la estimacion plana de $0.0006 por audio que pidio Diego.
+    // Insert DIRECTO y best-effort (misma forma que la fila base de registrarUsoTokens); el try/catch se traga
+    // cualquier error para NUNCA romper la transcripcion. Solo se registra si hubo texto Y vino userId.
+    if (_texto && userId) {
+      try {
+        await supabase.from('ia_uso').insert({ user_id: userId, input_tokens: 0, output_tokens: 0, cache_read: 0, cache_creation: 0, cost_usd: 0.0006, etiqueta: 'transcripcion_groq' });
+      } catch (eReg) {}
+    }
+    return _texto;
   } catch (e) { console.error('transcribirAudioGroq error:', e && e.message); return null; }
 }
 
 // ===== MULTIMEDIA: baja un archivo de Evolution y lo sube a Supabase Storage =====
-async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia, skipTranscribe) {
+// userId (opcional): se pasa a transcribirAudioGroq para registrar el costo de la transcripcion (F4). Ausente = sin registro.
+async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia, skipTranscribe, userId) {
   try {
     // 1) Pedir el base64 del archivo a Evolution
     const resp = await fetch(EVOLUTION_URL + '/chat/getBase64FromMediaMessage/' + instancia, {
@@ -4724,7 +4738,7 @@ async function subirMediaAStorage(instancia, mensajeCrudo, tipoMedia, skipTransc
     // 5) Si es audio y hay Groq: transcribir REUSANDO el base64 ya bajado (sin segunda descarga)
     let transcripcion = null;
     if (tipoMedia === 'audio' && GROQ_KEY && !skipTranscribe) {
-      transcripcion = await transcribirAudioGroq(base64, mime);
+      transcripcion = await transcribirAudioGroq(base64, mime, userId);
     }
     return url ? { url: url, tipo: tipoMedia, transcripcion: transcripcion } : null;
   } catch (e) { console.error('subirMediaAStorage error:', e && e.message); return null; }
@@ -7993,8 +8007,6 @@ async function enviarWhatsapp(instancia, numero, texto, messageId) {
         let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
         const aceptado = !!(body && body.key && body.key.id); // senal fiable de aceptacion de Evolution/Baileys
         if (aceptado && !primerKeyId) primerKeyId = body.key.id;
-        // LOG TEMPORAL: ver en vivo la forma de la respuesta (key.id / status) de esta instancia de Evolution.
-        console.log('Evolution sendText:', resp.status, 'aceptado=' + aceptado, 'keyId=' + (body && body.key && body.key.id), 'status=' + (body && body.status), (bodyTxt || '').slice(0, 250));
         if (resp.ok || aceptado) {
           // salio, o Evolution lo acepto (key.id presente): NO marcar fallido aunque el HTTP no sea 2xx.
         } else if (resp.status >= 400 && resp.status < 500) {
@@ -8135,31 +8147,13 @@ app.get('/health/deep', async (req, res) => {
   const payload = { status: degradado ? 'degraded' : 'ok', ts: Date.now(), protected: protegido, checks: checks };
   res.status(degradado ? 503 : 200).json(payload);
 });
-// ===== TEMP DIAG PAUTA (read-only, se BORRA) — guard ?k=rz-diag-pauta-9f =====
-// Ring buffer en memoria: graba el SHAPE de mensajes entrantes que mencionen un aviso (externalAdReply/sourceUrl).
-globalThis._diagPautaRB = globalThis._diagPautaRB || [];
+// ===== DIAG (read-only) — guard ?k=rz-diag-pauta-9f — modos utiles: ?costos=1 / ?rag=1 / ?respaldo=1 =====
 app.get('/_diag-pauta2', async (req, res) => {
   try {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
-    // vista rapida del ring buffer (shapes crudos capturados en el webhook)
-    if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
-    // TEMP (verificar usuarios IA): ?iausers=1 -> lista los asesores es_ia=true con su nombre y el objetivo crudo de
-    // su agente_config, mas si ese objetivo habilita agendar (agendar_visita/avanzar_reserva). Solo lectura. REVERTIR.
-    if (req.query.iausers === '1') {
-      try {
-        const { data: ases } = await supabase.from('asesores').select('id, nombre, es_ia, activo, admin_id, agente_config').eq('es_ia', true);
-        const bs = {};
-        try { const { data: b } = await supabase.from('business_settings').select('user_id, company_name, agent_objetivo'); (b || []).forEach(function(x){ bs[x.user_id] = x; }); } catch (eB) {}
-        const out = (ases || []).map(function(a){
-          const c = (a.agente_config && typeof a.agente_config === 'object') ? a.agente_config : {};
-          const obj = (c.objetivo != null ? String(c.objetivo) : '');
-          const habilita = (obj === 'agendar_visita' || obj === 'avanzar_reserva');
-          const cta = bs[a.admin_id] || {};
-          return { usuario_ia: a.nombre, activo: a.activo, cuenta: cta.company_name || a.admin_id, objetivo_del_usuario_ia: obj || '(vacio -> hereda cuenta)', objetivo_cuenta: cta.agent_objetivo || 'informar', PUEDE_AGENDAR: habilita };
-        });
-        return res.json({ total_usuarios_ia: out.length, usuarios: out });
-      } catch (eIU) { return res.status(500).json({ e: eIU && eIU.message }); }
-    }
+    // F6 (Diego 2026-07-24): limpiadas las ramas de diagnostico TEMPORALES (rb/iausers/evo/ragcheck/props/chat y el
+    // default que dumpeaba chats/props/pauta de Anton) que exponian datos crudos de clientes. QUEDAN los chequeos
+    // utiles: ?costos=1 (medidor de gasto), ?rag=1 y ?respaldo=1.
     // VERIFICAR RAG: ?rag=1 -> flag ia_rag_v1 por cuenta + ultimas respuestas de Anton (cache chico = RAG activo).
     if (req.query.rag === '1') {
       const out = {};
@@ -8213,92 +8207,6 @@ app.get('/_diag-pauta2', async (req, res) => {
       out.cuenta_x_operacion = agg(function (f) { return (nom[f.user_id] || f.user_id) + ' | ' + (f.etiqueta || 'respuesta_agente'); }).slice(0, 15);
       return res.json(out);
     }
-    // PREGUNTARLE A EVOLUTION: ?evo=<telefono> -> trae los mensajes CRUDOS de ese chat y busca el dato del anuncio.
-    if (req.query.evo) {
-      const _telE = String(req.query.evo).replace(/[^0-9]/g, '');
-      const { data: bsE } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
-      const uidE = bsE && bsE[0] && bsE[0].user_id;
-      if (!uidE) return res.json({ err: 'no anton' });
-      const _inst = nombreInstancia(uidE);
-      const _jid = _telE + '@s.whatsapp.net';
-      const out = { instancia: _inst, jid: _jid };
-      try {
-        const r = await fetch(EVOLUTION_URL + '/chat/findMessages/' + _inst, {
-          method: 'POST', headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-          body: JSON.stringify({ where: { key: { remoteJid: _jid } } })
-        });
-        out.http = r.status;
-        const j = await r.json().catch(function () { return null; });
-        let recs = [];
-        if (j) { if (Array.isArray(j)) recs = j; else if (j.messages && Array.isArray(j.messages.records)) recs = j.messages.records; else if (Array.isArray(j.messages)) recs = j.messages; else if (Array.isArray(j.records)) recs = j.records; }
-        out.total = recs.length;
-        // ordenar por timestamp ASCENDENTE (el mensaje inicial del lead -donde iria el anuncio- primero)
-        recs.sort(function (a, b) { return (Number(a && a.messageTimestamp) || 0) - (Number(b && b.messageTimestamp) || 0); });
-        // ademas, resumen: ¿ALGUNO de los 36 tiene el dato del anuncio?
-        out.alguno_con_anuncio = recs.some(function (x) { return JSON.stringify(x || {}).indexOf('externalAdReply') >= 0; });
-        out.mensajes = recs.slice(0, 15).map(function (x) {
-          const s = JSON.stringify(x || {});
-          const mm = (x && x.message) || {};
-          const cands = {
-            'extendedTextMessage.contextInfo': mm.extendedTextMessage && mm.extendedTextMessage.contextInfo,
-            'imageMessage.contextInfo': mm.imageMessage && mm.imageMessage.contextInfo,
-            'videoMessage.contextInfo': mm.videoMessage && mm.videoMessage.contextInfo,
-            'msg.contextInfo': mm.contextInfo,
-            'rec.contextInfo': x && x.contextInfo
-          };
-          let ear = null, path = null;
-          for (const k in cands) { if (cands[k] && cands[k].externalAdReply) { ear = cands[k].externalAdReply; path = k; break; } }
-          return {
-            fromMe: !!(x && x.key && x.key.fromMe),
-            ts: x && x.messageTimestamp,
-            msgKeys: Object.keys(mm),
-            txt: String(mm.conversation || (mm.extendedTextMessage && mm.extendedTextMessage.text) || '').slice(0, 90),
-            tieneEAR: s.indexOf('externalAdReply') >= 0,
-            path: path,
-            ear: ear ? { title: ear.title, body: ear.body, sourceUrl: ear.sourceUrl, sourceId: ear.sourceId } : null,
-            raw: (s.indexOf('externalAdReply') >= 0 && !path) ? s.slice(0, 1800) : null
-          };
-        });
-      } catch (e) { out.err = e && e.message; }
-      return res.json(out);
-    }
-    // CHEQUEO A/B RETRIEVAL DEL RAG (Anton): corre el buscador real sobre el inventario real con consultas tipo lead. $0.
-    if (req.query.ragcheck === '1') {
-      const { data: bsR } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
-      const uidR = bsR && bsR[0] && bsR[0].user_id;
-      if (!uidR) return res.json({ err: 'no anton' });
-      const { data: props } = await supabase.from('properties').select('*').eq('user_id', uidR).eq('activa', true);
-      const P = props || [];
-      // calendario temporal REAL (para probar el filtro por fechas)
-      const _perMap = {};
-      try {
-        const _idsT = P.filter(function (p) { return p.temporal_activa; }).map(function (p) { return p.id; });
-        if (_idsT.length) {
-          const { data: _per } = await supabase.from('temporario_periodos').select('property_id, fecha_desde, fecha_hasta, estado').in('property_id', _idsT);
-          (_per || []).forEach(function (x) { (_perMap[x.property_id] = _perMap[x.property_id] || []).push(x); });
-        }
-      } catch (e) {}
-      const _fichas = function (arr) { return (arr || []).map(function (p) { try { return _fichaCompactaProp(p); } catch (e) { return '(err)'; } }); };
-      const _unNum = (P.find(function (p) { return p.numero != null && String(p.numero).trim(); }) || {}).numero;
-      const _unNombre = (function () { var p = P.find(function (x) { return x.title && String(x.title).trim().length > 6; }); return p ? String(p.title).split(/[-|]/)[0].trim() : ''; })();
-      const consultas = [
-        { q: 'departamentos en venta', f: { operacion: 'venta', tipo: 'departamento' } },
-        { q: 'NUEVO por NUMERO exacto (' + _unNum + ')', f: { numero: _unNum } },
-        { q: 'NUEVO por NOMBRE ("' + _unNombre + '")', f: { nombre: _unNombre } },
-        { q: 'NUEVO caracteristica: pileta', f: { caracteristicas: 'pileta' } },
-        { q: 'NUEVO apto credito + cochera', f: { apto_credito: true, cocheras_min: 1 } },
-        { q: 'NUEVO temporal LIBRE 10-20 ene 2027', f: { operacion: 'temporal', fecha_desde: '2027-01-10', fecha_hasta: '2027-01-20' } },
-        { q: 'temporal SIN fechas (control)', f: { operacion: 'temporal' } },
-        { q: '2 dorm hasta 70k (limite nuevo 15)', f: { operacion: 'venta', dormitorios_min: 2, precio_max: 70000 } }
-      ];
-      const salida = { total_activas: P.length, temporales_con_calendario: Object.keys(_perMap).length, busquedas: [] };
-      for (const c of consultas) {
-        let res2 = [];
-        try { res2 = _buscarInventarioProps(P, c.f, _perMap); } catch (e) { res2 = []; salida.error = (e && e.message); }
-        salida.busquedas.push({ consulta: c.q, encontradas: res2.length, resultados: _fichas(res2).slice(0, 4) });
-      }
-      return res.json(salida);
-    }
     // VERIFICAR RESPALDO RELOJ: ?respaldo=1 -> columna existe? cuentas con respaldo_v2 ON? relojes armados?
     if (req.query.respaldo === '1') {
       const salida = {};
@@ -8311,74 +8219,8 @@ app.get('/_diag-pauta2', async (req, res) => {
       try { const { data } = await supabase.from('business_settings').select('company_name, respaldo_v2, respaldo_umbral_min').eq('respaldo_v2', true); salida.cuentas_respaldo_v2_ON = (data || []).map(function(b){ return { cuenta: b.company_name, umbral_min: b.respaldo_umbral_min || '(default 10)' }; }); } catch (e) { salida.cuentas_respaldo_v2_ON = '(no se pudo leer)'; }
       return res.json(salida);
     }
-    // VER IDENTIFICADORES DE PROPIEDADES DE ANTON: ?props=1
-    if (req.query.props === '1') {
-      const { data: bsP } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
-      const uidP = bsP && bsP[0] && bsP[0].user_id;
-      if (!uidP) return res.json({ err: 'no anton' });
-      let pr = null;
-      try { const r = await supabase.from('properties').select('id, numero, ref, referencia, codigo, title, operation, activa').eq('user_id', uidP).limit(12); if (r.error) throw r.error; pr = r.data; }
-      catch (eCols) { const r2 = await supabase.from('properties').select('*').eq('user_id', uidP).limit(12); pr = r2.data; }
-      return res.json({ total_muestra: (pr || []).length, columnas: (pr && pr[0]) ? Object.keys(pr[0]) : [], propiedades: (pr || []).map(function(p){ return { id: p.id, numero: p.numero, ref: p.ref, referencia: p.referencia, codigo: p.codigo, title: String(p.title || '').slice(0, 45), op: p.operation, activa: p.activa }; }) });
-    }
-    // VER UN CHAT: ?chat=<subcadena del nombre> -> trae la conversacion de Anton con ese contacto (mensajes + estado)
-    if (req.query.chat) {
-      const { data: bsC } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
-      const uidC = bsC && bsC[0] && bsC[0].user_id;
-      if (!uidC) return res.json({ err: 'no anton' });
-      const { data: ctsC } = await supabase.from('contacts').select('id, name, phone, created_at').eq('user_id', uidC).ilike('name', '%' + String(req.query.chat) + '%');
-      const salida = { contactos: (ctsC || []).map(function(c){ return { id: c.id, name: c.name, phone: c.phone }; }), chats: [] };
-      for (const c of (ctsC || [])) {
-        const { data: cv } = await supabase.from('conversations').select('id, status, ai_enabled, asesor_id, admin_tomo, last_role, updated_at, derivacion_rotando').eq('user_id', uidC).eq('contact_id', c.id).maybeSingle();
-        if (!cv) continue;
-        let asesorNom = null;
-        if (cv.asesor_id) { try { const { data: a } = await supabase.from('asesores').select('nombre').eq('id', cv.asesor_id).maybeSingle(); asesorNom = a && a.nombre; } catch (e) {} }
-        const { data: msgs } = await supabase.from('messages').select('created_at, role, content, estado_entrega, wa_message_id, pauta_meta, enviado_por, autor_nombre, origen').eq('conversation_id', cv.id).order('created_at', { ascending: true }).limit(200);
-        salida.chats.push({
-          contacto: c.name,
-          conv: { id: cv.id, status: cv.status, ai_enabled: cv.ai_enabled, asesor_id: cv.asesor_id, asesor: asesorNom, admin_tomo: cv.admin_tomo, last_role: cv.last_role, rotando: cv.derivacion_rotando },
-          total: (msgs || []).length,
-          mensajes: (msgs || []).map(function(m){ return { t: m.created_at, role: m.role, quien: m.role === 'ai' ? 'IA' : (m.role === 'human' ? (m.autor_nombre || m.enviado_por || 'humano') + (m.origen ? ('/' + m.origen) : '') : (m.role === 'sistema' ? 'SISTEMA' : 'lead')), txt: String(m.content || '').slice(0, 500), entrega: m.estado_entrega || null, wa: m.wa_message_id ? 'si' : 'no', pauta: m.pauta_meta || null }; })
-        });
-      }
-      return res.json(salida);
-    }
-    const out = {};
-    // 1) user_id de Anton
-    const { data: bs } = await supabase.from('business_settings').select('user_id, company_name, ia_pauta_meta').ilike('company_name', '%anton%');
-    out.anton = (bs || []).map(function(b){ return { user_id: b.user_id, company: b.company_name, flag: b.ia_pauta_meta }; });
-    const uid = bs && bs[0] && bs[0].user_id;
-    if (!uid) { out.err = 'no anton'; return res.json(out); }
-    // 2) contacto Dani Navarro
-    const { data: cts } = await supabase.from('contacts').select('id, name, phone, created_at').eq('user_id', uid).ilike('name', '%dani%');
-    out.contactos = cts || [];
-    // 3) por cada contacto Dani: conversation + primer mensaje humano + total + tiene pauta
-    out.convs = [];
-    for (const c of (cts || [])) {
-      const { data: cv } = await supabase.from('conversations').select('id, created_at, last_message').eq('user_id', uid).eq('contact_id', c.id).maybeSingle();
-      if (!cv) continue;
-      const { data: prim } = await supabase.from('messages').select('created_at, role, content').eq('conversation_id', cv.id).order('created_at', { ascending: true }).limit(1);
-      const { count } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('conversation_id', cv.id);
-      const { data: pta } = await supabase.from('messages').select('created_at, pauta_meta').eq('conversation_id', cv.id).not('pauta_meta', 'is', null).limit(3);
-      out.convs.push({ contacto: c.name, conv_id: cv.id, conv_creada: cv.created_at, primer_msg: prim && prim[0], total_msgs: count, con_pauta: pta || [] });
-    }
-    // 4) TODOS los mensajes de Anton con pauta_meta (para ver desde cuando captura)
-    const { data: convIds } = await supabase.from('conversations').select('id').eq('user_id', uid);
-    const ids = (convIds || []).map(function(x){ return x.id; });
-    let allPauta = [];
-    if (ids.length) {
-      // chunk para no pasar limite de .in()
-      for (let i = 0; i < ids.length; i += 100) {
-        const chunk = ids.slice(i, i + 100);
-        const { data: mp } = await supabase.from('messages').select('created_at, conversation_id, content, pauta_meta').in('conversation_id', chunk).not('pauta_meta', 'is', null);
-        if (mp && mp.length) allPauta = allPauta.concat(mp);
-      }
-    }
-    allPauta.sort(function(a,b){ return String(b.created_at).localeCompare(String(a.created_at)); });
-    out.total_convs_anton = ids.length;
-    out.total_msgs_con_pauta = allPauta.length;
-    out.ejemplos_pauta = allPauta.slice(0, 10).map(function(m){ return { fecha: m.created_at, txt: String(m.content || '').slice(0, 40), pauta: m.pauta_meta }; });
-    return res.json(out);
+    // F6: sin rama que matchee -> respuesta benigna (sin dump de datos de clientes). Modos utiles que quedan.
+    return res.json({ ok: true, modos: ['costos', 'rag', 'respaldo'] });
   } catch (e) { return res.status(500).json({ e: e && e.message }); }
 });
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
@@ -9384,36 +9226,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
     const msg = data.message || {};
     let texto = msg.conversation || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';
-    // ===== TEMP DIAG PAUTA (se BORRA): graba el shape crudo de mensajes que mencionen un aviso =====
-    try {
-      const _rawStr = JSON.stringify(data);
-      // AHORA GRABA TODOS LOS ENTRANTES (antes solo los que YA traian la marca del aviso -> los que fallaban eran
-      // invisibles). Asi, cuando entra un lead de pauta SIN link, vemos exactamente que mando Evolution. Temporal.
-      {
-        globalThis._diagPautaRB = globalThis._diagPautaRB || [];
-        const _cands = {
-          'extendedTextMessage.contextInfo': msg.extendedTextMessage && msg.extendedTextMessage.contextInfo,
-          'imageMessage.contextInfo': msg.imageMessage && msg.imageMessage.contextInfo,
-          'videoMessage.contextInfo': msg.videoMessage && msg.videoMessage.contextInfo,
-          'msg.messageContextInfo': msg.messageContextInfo,
-          'msg.contextInfo': msg.contextInfo,
-          'data.contextInfo': data.contextInfo
-        };
-        let _foundPath = null, _foundEar = null;
-        for (const _k in _cands) { if (_cands[_k] && _cands[_k].externalAdReply) { _foundPath = _k; _foundEar = _cands[_k].externalAdReply; break; } }
-        globalThis._diagPautaRB.unshift({
-          ts: new Date().toISOString(),
-          tel: telefono,
-          txt: String(texto || '').slice(0, 60),
-          msgKeys: Object.keys(msg),
-          rawTieneEAR: _rawStr.indexOf('externalAdReply') >= 0,
-          pathEncontrado: _foundPath,
-          ear: _foundEar ? { title: _foundEar.title, body: _foundEar.body, sourceUrl: _foundEar.sourceUrl, sourceId: _foundEar.sourceId } : null,
-          rawSnippet: _foundPath ? null : _rawStr.slice(0, 1500)
-        });
-        if (globalThis._diagPautaRB.length > 40) globalThis._diagPautaRB.length = 40;
-      }
-    } catch (eDiagRB) {}
+    // F6 (Diego 2026-07-24): eliminado el ring buffer temporal de diagnostico de pauta (globalThis._diagPautaRB) que
+    // grababa el shape crudo de TODOS los mensajes entrantes en memoria (exponia datos de clientes via /_diag-pauta2?rb=1).
     // Detectar multimedia entrante
     let tipoMediaEntrante = null;
     // UBICACION ENTRANTE: lat/lng vienen en locationMessage (Baileys: degreesLatitude/degreesLongitude). Antes esto caia
@@ -9578,7 +9392,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const _esAudioDueno = (tipoMediaEntrante === 'audio');
           if (_esAudioDueno) {
             // Transcribir el audio del dueno (reusa el pipeline Groq de subirMediaAStorage). Sin transcripcion -> avisar y cortar.
-            try { const _msA = await subirMediaAStorage(instanciaNombre, data, 'audio'); if (_msA && _msA.transcripcion) textoAdmin = _msA.transcripcion; } catch (eT) {}
+            try { const _msA = await subirMediaAStorage(instanciaNombre, data, 'audio', false, user_id); if (_msA && _msA.transcripcion) textoAdmin = _msA.transcripcion; } catch (eT) {}
             if (!textoAdmin || textoAdmin === '[audio]') { await enviarWhatsapp(instanciaNombre, telefono, 'No pude transcribir el audio. Proba de nuevo o escribime el mensaje.'); return; }
           }
           if (!textoAdmin) return;
@@ -9706,7 +9520,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     let mediaSubido = null;
     // UBICACION: NO hay archivo que bajar/transcribir; se maneja aparte (link de maps + lat/lng). Solo subimos media real.
     if (tipoMediaEntrante && tipoMediaEntrante !== 'ubicacion') {
-      try { mediaSubido = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante); } catch (eMedia) { console.error('subir media lead:', eMedia && eMedia.message); }
+      try { mediaSubido = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, false, user_id); } catch (eMedia) { console.error('subir media lead:', eMedia && eMedia.message); }
       if (tipoMediaEntrante === 'audio' && mediaSubido && mediaSubido.transcripcion) {
         texto = mediaSubido.transcripcion;
       }
@@ -10286,7 +10100,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // IA por reclasificacion — la unica salida es que un ASESOR escriba (_finalizarRotacionV3 via /api/whatsapp/send).
           if (!_enRotacion && !_rotacionV3Iniciada && estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
             // ETAPA 3: clasificarEstado ahora devuelve { estado, departamentoId, pidioArea, deducido, fueraAlcance }.
-            const _clasif = await clasificarEstado(texto, user_id, _convId, _turnoId); // MEDIDOR: atribucion (no cambia la clasificacion)
+            // F2 (ahorro Haiku, Diego 2026-07-24): saltear la clasificacion en mensajes TRIVIALES (hola/ok/gracias),
+            // el MISMO guard que ya usa el extractor de datos (esMensajeTrivial, ~9808). Un trivial no cambia el estado
+            // del lead -> equivale a 'sin_cambio' (mismos campos que devolveria el clasificador, sin gastar 1 Haiku).
+            // DEFENSIVO: ante CUALQUIER duda (mensaje real, no trivial) SE LLAMA al clasificador -> nunca se rompe la
+            // clasificacion de un mensaje real. DEPLOY-SAFE: esMensajeTrivial es una funcion pura ya existente.
+            const _clasif = esMensajeTrivial(texto)
+              ? { estado: 'sin_cambio', departamentoId: null, pidioArea: false, deducido: false, fueraAlcance: false }
+              : await clasificarEstado(texto, user_id, _convId, _turnoId); // MEDIDOR: atribucion (no cambia la clasificacion)
             const nuevoEstado = _clasif && _clasif.estado;
             const _departamentoId = _clasif && _clasif.departamentoId;
             // FASE 2: senales nuevas (solo se USAN con reparto_v2 ON; con flag OFF se ignoran -> comportamiento ACTUAL).
@@ -19748,27 +19569,9 @@ app.post('/api/scrape/detalle', async function(req, res) {
     return res.json({ ok: true, resultados: resultados, via_wpjson: Object.keys(resueltasWp).length, via_html: pendientes.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
-// ===== TEMPERATURA DE LEADS =====
-// DEPRECADA / SIN USO: la temperatura ahora es DETERMINISTICA y sigue al status del lead via
-// temperaturaPorEstado(status) (CERO IA / CERO tokens). Esta funcion ya NO se invoca desde ningun lado
-// (su unico call site, el retorno de recontacto, fue reemplazado por la regla por-estado). Se deja para
-// no romper nada y por si se necesita referencia historica; NO volver a usarla: gasta Haiku por mensaje.
-async function clasificarTemperatura(textoUsuario, user_id) {
-  try {
-    if (!textoUsuario || !textoUsuario.trim()) return null;
-    const prompt = 'Clasifica el interes de este mensaje de un posible cliente inmobiliario en UNA palabra: ' +
-      'caliente (muestra interes concreto en ver, visitar, precio, o avanzar con una propiedad), ' +
-      'tibio (responde pero sin interes claro), frio (no hay interes). ' +
-      'Responde SOLO con: caliente, tibio o frio. Mensaje: ' + JSON.stringify(textoUsuario);
-    const r = await anthropic.messages.create({ model: MODELO_INTERNO, max_tokens: 10, messages: [{ role: 'user', content: prompt }] });
-    try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'clasificar_temperatura', PRECIO_HAIKU); } catch(e){} // M17: MODELO_INTERNO (Haiku) -> precio Haiku (antes default Sonnet, ~3x inflado)
-    const t = (r && r.content && r.content[0] && r.content[0].text ? r.content[0].text : '').toLowerCase().trim();
-    if (t.indexOf('caliente') >= 0) return 'caliente';
-    if (t.indexOf('tibio') >= 0) return 'tibio';
-    if (t.indexOf('frio') >= 0 || t.indexOf('frío') >= 0) return 'frio';
-    return null;
-  } catch (e) { console.log('clasificarTemperatura error:', e && e.message); return null; }
-}
+// F5 (Diego 2026-07-24): clasificarTemperatura ELIMINADA. Era codigo muerto (sin callers vivos): la temperatura ahora
+// es DETERMINISTICA por status via temperaturaPorEstado(status), CERO IA. Su unico call site historico (retorno de
+// recontacto) ya usaba la regla por-estado. Se borro para no volver a gastar Haiku por mensaje.
 // ===== FASE 3: AUTO-CATALOGO DE FOTOS POR VISION =====
 // Clasifica fotos de propiedades en una categoria (dormitorio, baño, etc) usando vision de Claude.
 // Endpoint nuevo y aislado: NO toca el flujo del agente, webhook, debounce ni memoria.
@@ -29599,7 +29402,12 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
       // Registrar uso (best-effort), igual que el webhook WA.
       // MEDIDOR: etiqueta 'respuesta_agente_meta' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
       try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_meta', PRECIO_IA, { conversation_id: conv.id, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
-      try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
+      // FUGA (Diego 2026-07-24): igual que WhatsApp (~10222), cobrar los EXTRAS con cobrar_todo_v2 ON: +1 si tradujo,
+      // +1 si uso tool. NO se suma audio: este canal (Messenger/IG) NO transcribe audio (transcribirAudioGroq solo lo
+      // llama subirMediaAStorage, exclusivo del webhook de Evolution). DEPLOY-SAFE: si el flag esta OFF/ausente o
+      // huboTraduccion/usoTool son undefined -> _extraMeta=0 -> registra 1 (identico a hoy). Ante CUALQUIER error el
+      // try/catch interno deja _extraMeta=0 => se cobra 1, exactamente como antes.
+      try { if (SUBSCRIPTIONS_ENABLED) { var _extraMeta = 0; try { if (await cobrarTodoV2Activo(tenantUserId)) { _extraMeta = (resultado.huboTraduccion ? 1 : 0) + (resultado.usoTool ? 1 : 0); } } catch (eFlagMeta) {} await registrarUsoIA(tenantUserId, 1 + _extraMeta); } } catch (e) {}
       // DERIVACION v3 (gated derivacion_v3): si la IA uso la tool derivar_a_humano en este canal, arrancar la
       // rotacion igual que en WhatsApp (asigna + notifica; la IA sigue). Con el flag OFF resultado.pidioDerivar es
       // false (la tool no se ofrece) -> no-op. NO anunciamos al lead aca (el reply ya salio por la Send API).
@@ -31982,7 +31790,11 @@ async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil,
           if (!_env.ok) console.error('[cloud-api] no se pudo enviar la respuesta:', _env.error);
           // MEDIDOR: etiqueta 'respuesta_agente_cloud' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
           try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_cloud', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
-          try { if (SUBSCRIPTIONS_ENABLED) await registrarUsoIA(tenantUserId); } catch (e) {}
+          // FUGA (Diego 2026-07-24): igual que WhatsApp (~10222), cobrar los EXTRAS con cobrar_todo_v2 ON: +1 si tradujo,
+          // +1 si uso tool. NO se suma audio: Cloud API NO transcribe audio (transcribirAudioGroq solo lo llama
+          // subirMediaAStorage, exclusivo del webhook de Evolution). DEPLOY-SAFE: flag OFF/ausente o campos undefined
+          // -> _extraCloud=0 -> registra 1 (identico a hoy). Ante CUALQUIER error el try/catch deja _extraCloud=0.
+          try { if (SUBSCRIPTIONS_ENABLED) { var _extraCloud = 0; try { if (await cobrarTodoV2Activo(tenantUserId)) { _extraCloud = (resultado.huboTraduccion ? 1 : 0) + (resultado.usoTool ? 1 : 0); } } catch (eFlagCloud) {} await registrarUsoIA(tenantUserId, 1 + _extraCloud); } } catch (e) {}
           // NOTA: NO se re-inserta la fila role='ai' ni se actualiza last_message: generarRespuestaAgente()
           // YA lo persiste internamente (igual que en el webhook de Meta, ~24560).
         }

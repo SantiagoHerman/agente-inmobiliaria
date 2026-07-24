@@ -2175,6 +2175,97 @@ async function iaAgendaActivo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== TAREA A (cita tentativa que se TOMA): HORAS antes de ESCALAR a Administracion =====
+// Cuantas horas puede quedar una cita TENTATIVA (asesor_id NULL, origen='agente') sin que nadie la tome
+// antes de avisarle al departamento Administracion (business_settings.cita_escalada_horas). DEFAULT 3.
+// Validado 1..168 (fuera de rango / ausente / columna inexistente / cualquier error -> 3). Mismo patron
+// defensivo que derivacionEsperaMin. Solo se consulta desde el cron de escalada (que ya es INERTE sin
+// la columna citas.escalada_avisada), asi que sin migracion esto nunca se llega a usar.
+async function citaEscaladaHoras(user_id, bs) {
+  const _DEF = 3;
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'cita_escalada_horas')) { _raw = bs.cita_escalada_horas; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('cita_escalada_horas').eq('user_id', user_id).maybeSingle();
+      if (!error && data) _raw = data.cita_escalada_horas;
+    }
+    const _n = Number(_raw);
+    if (_n && _n >= 1 && _n <= 168) return _n;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+
+// ===== REFINAMIENTO 2 (citas): CANALES de aviso al equipo (multi, se SUMAN) =====
+// business_settings.cita_aviso_canales: subset de ['privado','depto','whatsapp']. DEFAULT ['depto'] =
+// comportamiento de hoy (aviso al canal del departamento). Se guarda como jsonb array (o texto JSON). NULL /
+// vacio / invalido / columna ausente -> ['depto']. Reusa un bs ya cargado si lo trae. Cada canal es ADITIVO:
+//   'depto'    -> mensaje al canal del departamento (como hoy), con la tarjeta tomable adjunta.
+//   'privado'  -> DM de equipo a cada miembro del departamento.
+//   'whatsapp' -> notificacion por WhatsApp al numero notif (asesores.whatsapp_notif) de cada miembro.
+const _CITA_AVISO_CANALES = ['privado', 'depto', 'whatsapp'];
+async function citaAvisoCanales(user_id, bs) {
+  const _DEF = ['depto'];
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'cita_aviso_canales')) { _raw = bs.cita_aviso_canales; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('cita_aviso_canales').eq('user_id', user_id).maybeSingle();
+      if (error) return _DEF.slice(); // columna ausente u otro error -> comportamiento actual
+      if (data) _raw = data.cita_aviso_canales;
+    }
+    let arr = _raw;
+    if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch (eP) { arr = null; } }
+    if (!Array.isArray(arr)) return _DEF.slice();
+    const out = [];
+    arr.forEach(function (x) { const v = String(x == null ? '' : x).trim().toLowerCase(); if (_CITA_AVISO_CANALES.indexOf(v) >= 0 && out.indexOf(v) < 0) out.push(v); });
+    return out.length ? out : _DEF.slice();
+  } catch (e) { return _DEF.slice(); }
+}
+
+// ===== TAREA B: QUE HACE LA IA CUANDO NO SABE (ia_no_sabe_modo) =====
+// Hasta hoy convivian DOS caminos independientes y la IA elegia sola cual usar cuando no sabia algo:
+// la tool consultar_al_dueno (gated `aprendizaje`/reparto_v2) y la tool derivar_a_humano (gated
+// derivacion_v3). Este setting por-cuenta deja que el DUENO elija:
+//   'preguntar'          -> COMPORTAMIENTO ACTUAL EXACTO (default). No cambia NADA: mismas tools, mismo prompt.
+//   'derivar'            -> NO se le ofrece consultar_al_dueno; la IA deriva con derivar_a_humano al depto.
+//   'preguntar_derivar'  -> igual que hoy (pregunta al dueno) + un cron deriva sola si el dueno no contesto
+//                           en `ia_no_sabe_min` minutos (default 30).
+// FAIL-SAFE TOTAL: columna ausente / null / vacio / valor desconocido / cualquier error -> 'preguntar'
+// (= comportamiento de hoy). Reusa un bs ya cargado si trae la propiedad (0 queries extra por mensaje).
+const _IA_NO_SABE_MODOS = ['preguntar', 'derivar', 'preguntar_derivar'];
+async function iaNoSabeModo(user_id, bs) {
+  const _DEF = 'preguntar';
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_no_sabe_modo')) { _raw = bs.ia_no_sabe_modo; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('ia_no_sabe_modo').eq('user_id', user_id).maybeSingle();
+      if (error) return _DEF; // columna ausente u otro error -> modo actual
+      if (data) _raw = data.ia_no_sabe_modo;
+    }
+    const _v = (_raw == null) ? '' : String(_raw).trim().toLowerCase();
+    if (_IA_NO_SABE_MODOS.indexOf(_v) >= 0) return _v;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+// Minutos de espera del modo 'preguntar_derivar' antes de derivar sola (business_settings.ia_no_sabe_min).
+// DEFAULT 30. Validado 1..1440. Mismo patron defensivo: ausente / fuera de rango / error -> 30.
+async function iaNoSabeMin(user_id, bs) {
+  const _DEF = 30;
+  try {
+    let _raw = null;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_no_sabe_min')) { _raw = bs.ia_no_sabe_min; }
+    else if (user_id) {
+      const { data, error } = await supabase.from('business_settings').select('ia_no_sabe_min').eq('user_id', user_id).maybeSingle();
+      if (!error && data) _raw = data.ia_no_sabe_min;
+    }
+    const _n = Number(_raw);
+    if (_n && _n >= 1 && _n <= 1440) return _n;
+    return _DEF;
+  } catch (e) { return _DEF; }
+}
+
 // ===== UBICACION OSM (Fase 2/3): flag ia_ubicacion por cuenta =====
 // Con ON: la IA recibe la tool buscar_propiedades_cerca + las referencias de zona en el prompt,
 // y el cron geocodificarPendientes procesa el inventario de esa cuenta. Con OFF (default) todo
@@ -5425,6 +5516,18 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
   let _derivacionV3On = false;
   if (conversation_id && !modoPrueba) { try { _derivacionV3On = await derivacionV3Activo(user_id, settings || undefined); } catch (eDv3) { _derivacionV3On = false; } }
+  // TAREA B (ia_no_sabe_modo): el DUENO elige que hace la IA cuando NO sabe. Solo decide QUE TOOL se ofrece y
+  // que dice la instruccion del prompt (NO agrega llamadas de IA). DEFAULT 'preguntar' = comportamiento ACTUAL
+  // EXACTO (no toca nada). Reusa el `settings` ya cargado => 0 queries extra por mensaje.
+  //   'derivar': se APAGA la tool consultar_al_dueno y el prompt le indica derivar con derivar_a_humano.
+  //     FAIL-OPEN: solo se aplica si la tool de derivacion esta realmente disponible (_derivacionV3On); si
+  //     derivacion_v3 esta OFF, dejar el modo actual (si no, la IA se quedaria SIN salida y podria inventar).
+  //   'preguntar_derivar': prompt y tools IDENTICOS a hoy (pregunta al dueno); lo unico nuevo es el cron
+  //     revisarConsultasDuenoSinResponder, que deriva sola si el dueno no contesto en ia_no_sabe_min minutos.
+  let _noSabeModo = 'preguntar';
+  if (conversation_id && !modoPrueba) { try { _noSabeModo = await iaNoSabeModo(user_id, settings || undefined); } catch (eNs) { _noSabeModo = 'preguntar'; } }
+  const _noSabeDerivar = (_noSabeModo === 'derivar' && _derivacionV3On === true);
+  if (_noSabeDerivar) aprendizajeActivo = false; // sin tool consultar_al_dueno: la IA deriva en vez de preguntar
   // FEATURE #15 (gated ia_agenda): ¿ofrecer la tool agendar_cita? SOLO con ia_agenda ON y en conv REAL
   // (no modoPrueba). Con flag OFF -> false => la tool NO se agrega a toolsAgente y el prompt/flujo es
   // BYTE-IDENTICO al actual. Reusa el `settings` ya cargado (0 queries extra). Defensivo: ante error -> false.
@@ -6152,6 +6255,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // preguntarle, y mientras tanto decile al lead con naturalidad que lo averiguas y le confirmas. NO la uses para
     // cosas que ya se derivan a un humano ni para datos puntuales de un solo cliente.
     aprendizajeActivo ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes: usa la herramienta consultar_al_dueno con la pregunta concreta, y decile al lead con naturalidad que lo consultas y le confirmas enseguida.' : '',
+    // TAREA B (ia_no_sabe_modo='derivar'): el dueno eligio que la IA NO consulte a nadie y pase el lead a un
+    // humano cuando no sabe. Esta linea SOLO existe con el modo 'derivar' Y derivacion_v3 ON (_noSabeDerivar);
+    // con el default 'preguntar' queda '' y el .filter(Boolean) la descarta => prompt BYTE-IDENTICO al actual.
+    _noSabeDerivar ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes y NO prometas averiguarlo vos: usa la herramienta derivar_a_humano indicando el departamento/area que corresponde a lo que el lead necesita, para que lo atienda un asesor del equipo.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     (settings && settings.horario_oficina && _horarioLegible(settings.horario_oficina)) ? ('HORARIO DE ATENCION de la oficina (si el lead pregunta cuando pueden atenderlo, visitarlos, llamar, o si estan abiertos, deciselo con naturalidad; NO inventes horarios distintos a estos): ' + _horarioLegible(settings.horario_oficina) + '. (Zona horaria Argentina.)') : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
@@ -8766,6 +8873,112 @@ async function enviarRecordatoriosCitas() {
       } catch (eC) { console.error('recordatorio cita:', eC && eC.message); }
     }
   } catch (e) { console.error('enviarRecordatoriosCitas:', e && e.message); }
+}
+
+// ===== TAREA A (punto 4): CRON DE ESCALADA DE CITAS TENTATIVAS SIN TOMAR =====
+// Si una cita que dejo la IA sigue SIN DUENO (asesor_id NULL) despues de N horas (business_settings.
+// cita_escalada_horas, default 3), se le avisa al departamento ADMINISTRACION (el recibe_fallback de la
+// cuenta) para que alguien la resuelva. UNA SOLA VEZ por cita: claim optimista sobre la columna nueva
+// citas.escalada_avisada (mismo patron EXACTO que enviarRecordatoriosCitas / enviarAvisosTareas: el update
+// condicional .eq('escalada_avisada', false) solo gana si devuelve filas).
+// INERTE SIN MIGRACION: el primer select filtra por `escalada_avisada`; si esa columna todavia NO existe, el
+// select devuelve error -> early return y el cron NO hace absolutamente nada (comportamiento actual EXACTO).
+// CERO IA / CERO tokens: texto fijo + SQL. Defensivo de punta a punta (nunca tira).
+async function escalarCitasSinTomar() {
+  try {
+    const ahoraMs = Date.now();
+    // Solo citas TENTATIVAS de la IA (origen='agente'), aun agendadas y sin dueno, no escaladas todavia.
+    const r = await supabase.from('citas').select('*')
+      .eq('estado', 'agendada').is('asesor_id', null).eq('origen', 'agente').eq('escalada_avisada', false)
+      .limit(200);
+    if (!r || r.error) return;            // columna escalada_avisada ausente u otro error -> INERTE
+    const citas = r.data || [];
+    if (!citas.length) return;
+    const horasCache = {};                // horas de escalada por cuenta (evita 1 query por cita)
+    const agendaCache = {};               // flag ia_agenda por cuenta (no escalar cuentas con la feature apagada)
+    const horarioCache = {};              // REFINAMIENTO 1: horario_oficina por cuenta (arranque del reloj en la apertura)
+    for (const c of citas) {
+      try {
+        if (!c || !c.user_id) continue;
+        // La feature es de la IA-agenda: si la cuenta la tiene apagada, no escalamos nada.
+        if (agendaCache[c.user_id] === undefined) { try { agendaCache[c.user_id] = await iaAgendaActivo(c.user_id); } catch (eFa) { agendaCache[c.user_id] = false; } }
+        if (!agendaCache[c.user_id]) continue;
+        // Momento de creacion de la cita. Si la tabla no tiene columna de creacion (base vieja sin migrar),
+        // NO escalamos (no hay forma de medir el tiempo) -> comportamiento actual.
+        const _baseRaw = c.created_at || c.creado_en || null;
+        if (!_baseRaw) continue;
+        const _baseMs = new Date(_baseRaw).getTime();
+        if (!isFinite(_baseMs)) continue;
+        if (horasCache[c.user_id] === undefined) { try { horasCache[c.user_id] = await citaEscaladaHoras(c.user_id, null); } catch (eHc) { horasCache[c.user_id] = 3; } }
+        const _horas = horasCache[c.user_id] || 3;
+        // REFINAMIENTO 1: el reloj de N horas NO arranca en la creacion sino cuando ABRE la oficina de ese dia.
+        // Efectivo = max(created_at, apertura). Si se creo 3am, arranca a la apertura; si se creo en horario,
+        // arranca en la creacion. FAIL-SAFE: sin horario configurado (o dia cerrado) -> _aperturaOficinaMs da
+        // null y el efectivo queda en created_at (comportamiento de hoy).
+        if (horarioCache[c.user_id] === undefined) {
+          try { const { data: _hbs } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', c.user_id).maybeSingle(); horarioCache[c.user_id] = (_hbs && _hbs.horario_oficina) ? _hbs.horario_oficina : null; }
+          catch (eHo) { horarioCache[c.user_id] = null; }
+        }
+        let _efectivoMs = _baseMs;
+        try { const _ap = _aperturaOficinaMs(horarioCache[c.user_id], _baseMs); if (_ap != null && _ap > _baseMs) _efectivoMs = _ap; } catch (eAp) {}
+        if (ahoraMs - _efectivoMs < _horas * 60 * 60 * 1000) continue; // todavia no vencio (desde la apertura)
+        // CLAIM optimista: marcar ANTES de avisar (si dos corridas se solapan, solo una gana).
+        const claim = await supabase.from('citas').update({ escalada_avisada: true }).eq('id', c.id).eq('escalada_avisada', false).select('id');
+        if (!claim || !claim.data || claim.data.length === 0) continue;
+        // Aviso al depto ADMINISTRACION (recibe_fallback). Sin ese depto -> canal "Todos" (no perder el aviso).
+        let _depAdmin = null;
+        try { _depAdmin = await deptoFallbackDe(c.user_id); } catch (eDa) { _depAdmin = null; }
+        const _quien = (c.lead_nombre && String(c.lead_nombre).trim()) ? (' de ' + String(c.lead_nombre).trim()) : '';
+        const _cuando = c.fecha_hora ? (' para ' + _formatearFechaCita(c.fecha_hora)) : '';
+        const _txt = 'Cita sin tomar hace mas de ' + _horas + 'h: la cita' + _quien + _cuando + ' sigue sin asesor asignado. Alguien de Administracion tiene que resolverla.';
+        // REFINAMIENTO 2/3: avisar por los canales configurados con la tarjeta tomable (la cita sigue tomable).
+        const _accionEsc = { tipo: 'cita_tomar', cita_id: c.id, departamento_id: _depAdmin || null };
+        try { await _avisarCitaEquipoCanales(c.user_id, _depAdmin || null, _txt, _accionEsc, c.conversation_id || null); } catch (eAv) {}
+      } catch (eC) { console.error('escalarCitasSinTomar item:', eC && eC.message); }
+    }
+  } catch (e) { console.error('escalarCitasSinTomar:', e && e.message); }
+}
+
+// ===== TAREA B (modo 'preguntar_derivar'): CRON QUE DERIVA SOLO SI EL DUENO NO CONTESTO =====
+// La IA uso consultar_al_dueno -> quedo una fila 'pendiente' en aprendizaje_ia. Si el dueno NO respondio en
+// `ia_no_sabe_min` minutos (default 30) y la cuenta esta en modo 'preguntar_derivar', el lead se pasa a un
+// humano reusando la maquinaria de derivacion v3 (iniciarRotacionDerivacionV3, que resuelve el departamento
+// de la conversacion). UNA SOLA VEZ por consulta: claim sobre la columna nueva aprendizaje_ia.derivada_at.
+// INERTE SIN MIGRACION: el select filtra por `derivada_at`; si la columna no existe, el select devuelve error
+// -> early return y el cron NO hace NADA. Ademas, con el modo default ('preguntar') tampoco hace nada.
+// CERO IA / CERO tokens (SQL + la rotacion, que es SQL + plantillas fijas).
+async function revisarConsultasDuenoSinResponder() {
+  try {
+    const ahoraMs = Date.now();
+    const r = await supabase.from('aprendizaje_ia').select('id, user_id, conversation_id, created_at, estado, derivada_at')
+      .eq('estado', 'pendiente').is('derivada_at', null)
+      .order('created_at', { ascending: true }).limit(200);
+    if (!r || r.error) return;            // columna derivada_at ausente / tabla ausente -> INERTE
+    const filas = r.data || [];
+    if (!filas.length) return;
+    const modoCache = {};                 // ia_no_sabe_modo por cuenta
+    const minCache = {};                  // ia_no_sabe_min por cuenta
+    const dv3Cache = {};                  // derivacion_v3 por cuenta (la rotacion se apoya en ella)
+    for (const f of filas) {
+      try {
+        if (!f || !f.user_id || !f.conversation_id) continue;
+        if (modoCache[f.user_id] === undefined) { try { modoCache[f.user_id] = await iaNoSabeModo(f.user_id, null); } catch (eM) { modoCache[f.user_id] = 'preguntar'; } }
+        if (modoCache[f.user_id] !== 'preguntar_derivar') continue; // default 'preguntar' -> no derivar nada
+        if (dv3Cache[f.user_id] === undefined) { try { dv3Cache[f.user_id] = await derivacionV3Activo(f.user_id); } catch (eD) { dv3Cache[f.user_id] = false; } }
+        if (!dv3Cache[f.user_id]) continue; // sin derivacion_v3 no hay rotacion: no tocar nada
+        if (minCache[f.user_id] === undefined) { try { minCache[f.user_id] = await iaNoSabeMin(f.user_id, null); } catch (eMi) { minCache[f.user_id] = 30; } }
+        const _nacio = f.created_at ? new Date(f.created_at).getTime() : NaN;
+        if (!isFinite(_nacio)) continue;
+        if (ahoraMs - _nacio < (minCache[f.user_id] || 30) * 60 * 1000) continue; // el dueno todavia esta a tiempo
+        // CLAIM optimista: marcar derivada ANTES de derivar (evita doble derivacion si dos corridas se solapan).
+        const claim = await supabase.from('aprendizaje_ia').update({ derivada_at: new Date().toISOString() }).eq('id', f.id).is('derivada_at', null).select('id');
+        if (!claim || !claim.data || claim.data.length === 0) continue;
+        // Derivar al departamento que corresponde: sin deptoHint, iniciarRotacionDerivacionV3 usa el depto de la
+        // conversacion (o el es_default). Revalida por dentro que no haya humano ya a cargo (no pisa nada).
+        try { await iniciarRotacionDerivacionV3(f.conversation_id, f.user_id, { anunciarLead: false }); } catch (eRot) { console.error('consulta dueno sin responder rotacion:', eRot && eRot.message); }
+      } catch (eF) { console.error('revisarConsultasDuenoSinResponder item:', eF && eF.message); }
+    }
+  } catch (e) { console.error('revisarConsultasDuenoSinResponder:', e && e.message); }
 }
 
 // SECRETO DEL WEBHOOK DE WHATSAPP (A3) — validacion BACKWARD-COMPATIBLE gateada por env var.
@@ -11978,6 +12191,38 @@ function dentroHorarioOficina(horario) {
   return dentroHorarioOficinaEn(horario, Date.now());
 }
 
+// ===== REFINAMIENTO 1 (escalada de citas): momento de APERTURA de oficina del DIA de `tsMs` =====
+// Devuelve el ms UTC de la PRIMERA apertura de oficina del dia (en zona AR, UTC-3) al que pertenece tsMs, o
+// null si ese dia esta cerrado / no hay horario valido. Reusa la MISMA estructura que dentroHorarioOficinaEn
+// (dias con `franjas` [{desde,hasta}] o legacy desde/hasta; `cerrado`/`atiende:false`). Se usa para que el
+// reloj de escalada de una cita tentativa arranque en la apertura y no a las 3am. FAIL-SAFE: ante cualquier
+// dato faltante/raro devuelve null y el caller cae a created_at (comportamiento actual).
+function _aperturaOficinaMs(horario, tsMs) {
+  try {
+    if (!horario || typeof horario !== 'object') return null;
+    var ar = new Date((typeof tsMs === 'number' ? tsMs : Date.now()) - 3 * 60 * 60000); // wall-clock AR via getUTC*
+    var dias = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
+    var cfg = horario[dias[ar.getUTCDay()]];
+    if (!cfg || cfg.cerrado || cfg.atiende === false) return null;
+    var aMin = function (str) {
+      var s = String(str == null ? '' : str).trim(); if (!s) return null;
+      var p = s.split(':'); var h = Number(p[0]); var m = (p.length > 1) ? Number(p[1]) : 0;
+      if (!Number.isFinite(h) || h < 0 || h > 23 || !Number.isFinite(m) || m < 0 || m > 59) return null;
+      return h * 60 + m;
+    };
+    var apertura = null;
+    if (Array.isArray(cfg.franjas)) {
+      for (var k = 0; k < cfg.franjas.length; k++) { var f = cfg.franjas[k]; if (f) { var d = aMin(f.desde); if (d != null && (apertura == null || d < apertura)) apertura = d; } }
+    } else {
+      apertura = aMin(cfg.desde);
+    }
+    if (apertura == null) return null;
+    // Reconstruir el ms UTC de ese dia AR a la hora de apertura: AR wall (year/mon/date de `ar`) a `apertura`;
+    // como `ar` esta corrido -3h, el UTC real de esa hora AR es Date.UTC(...) + 3h.
+    return Date.UTC(ar.getUTCFullYear(), ar.getUTCMonth(), ar.getUTCDate(), Math.floor(apertura / 60), apertura % 60, 0, 0) + 3 * 60 * 60000;
+  } catch (e) { return null; }
+}
+
 // ===== ETAPA 9a: HORARIO POR USUARIO (solo se consulta con reparto_v2 ON) =====
 // Devuelve true si el asesor esta DENTRO de su horario AHORA. DEFENSIVO: ante cualquier dato faltante o raro
 // devuelve true (no bloquear el reparto por un horario mal cargado). Modos (asesores.horario_modo):
@@ -14499,6 +14744,16 @@ setTimeout(procesarOportunidades, 110 * 1000); // primera corrida ~110s tras arr
 // Recordatorios de citas: revisar cada 30 min (recordatorio al lead + aviso al asesor de citas en las proximas 24h)
 setInterval(enviarRecordatoriosCitas, 30 * 60 * 1000);
 setTimeout(enviarRecordatoriosCitas, 70 * 1000);
+// TAREA A: escalada de citas TENTATIVAS que nadie tomo (avisa al depto Administracion, una sola vez por cita).
+// INERTE hasta correr la migracion (el select filtra por citas.escalada_avisada; sin esa columna hace early-return).
+// Cada 30 min alcanza: el umbral es de HORAS (default 3, configurable por cuenta). 0 IA / 0 tokens.
+setInterval(escalarCitasSinTomar, 30 * 60 * 1000);
+setTimeout(escalarCitasSinTomar, 115 * 1000); // primera corrida ~115s tras arrancar (proceso ya estable)
+// TAREA B: modo 'preguntar_derivar' - deriva sola si el dueno no contesto la consulta de la IA en X minutos.
+// INERTE hasta correr la migracion (el select filtra por aprendizaje_ia.derivada_at) y tambien con el modo
+// default 'preguntar'. Cada 5 min: granularidad suficiente para un umbral en minutos (default 30). 0 IA.
+setInterval(revisarConsultasDuenoSinResponder, 5 * 60 * 1000);
+setTimeout(revisarConsultasDuenoSinResponder, 125 * 1000); // primera corrida ~125s tras arrancar
 // Avisos al EQUIPO de tareas de alquiler (limpieza pre/post): MISMO scheduler de 30 min.
 // Cero IA, cero tokens (WhatsApp + push, texto fijo). Defensivo: si la tabla no existe, no rompe.
 setInterval(enviarAvisosTareas, 30 * 60 * 1000);
@@ -16156,11 +16411,25 @@ app.get('/api/equipo/mensajes', async function(req, res) {
     // esquema todavia, reintentar el select sin ellas para que el chat de TEXTO siga funcionando.
     let msgs = null;
     {
+      // FEATURE #15: incluir `accion` (metadata de tarjeta tomable). DEFENSIVO por capas: si la columna aun no
+      // existe, se reintenta sin ella (y luego sin las de media) para no romper el chat de texto.
       const r1 = await supabase.from('team_messages')
-        .select('id, sender_auth_user_id, content, media_url, media_tipo, media_nombre, es_sistema, leido_por, created_at')
+        .select('id, sender_auth_user_id, content, media_url, media_tipo, media_nombre, es_sistema, accion, leido_por, created_at')
         .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
         .order('created_at', { ascending: true }).limit(500);
-      if (r1.error && /column|media_tipo|media_nombre|media_url|es_sistema|schema cache/i.test(r1.error.message || '')) {
+      if (r1.error && /accion/i.test(r1.error.message || '')) {
+        const rA = await supabase.from('team_messages')
+          .select('id, sender_auth_user_id, content, media_url, media_tipo, media_nombre, es_sistema, leido_por, created_at')
+          .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
+          .order('created_at', { ascending: true }).limit(500);
+        if (rA.error && /column|media_tipo|media_nombre|media_url|es_sistema|schema cache/i.test(rA.error.message || '')) {
+          const r2 = await supabase.from('team_messages')
+            .select('id, sender_auth_user_id, content, leido_por, created_at')
+            .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
+            .order('created_at', { ascending: true }).limit(500);
+          msgs = r2.data;
+        } else { msgs = rA.data; }
+      } else if (r1.error && /column|media_tipo|media_nombre|media_url|es_sistema|schema cache/i.test(r1.error.message || '')) {
         const r2 = await supabase.from('team_messages')
           .select('id, sender_auth_user_id, content, leido_por, created_at')
           .eq('thread_id', threadId).eq('admin_id', ident.ownerId)
@@ -16186,12 +16455,16 @@ app.get('/api/equipo/mensajes', async function(req, res) {
       // dueno (cuando el aviso quedo firmado con su propio auth por falta de usuario IA) los ve del lado entrante
       // con la etiqueta "🤖 Sistema" en vez de a su derecha como si los hubiera escrito el.
       const _esSis = (m.es_sistema === true);
+      // FEATURE #15: `accion` (texto JSON) -> objeto parseado para que el front pinte la tarjeta tomable.
+      var _accionObj = null;
+      try { if (m.accion != null) _accionObj = (typeof m.accion === 'string') ? JSON.parse(m.accion) : m.accion; } catch (eAp) { _accionObj = null; }
       return {
         id: m.id,
         content: m.content,
         media_url: m.media_url || null,
         media_tipo: m.media_tipo || null,
         media_nombre: m.media_nombre || null,
+        accion: _accionObj,
         created_at: m.created_at,
         mio: _esSis ? false : (m.sender_auth_user_id === ident.authUserId),
         // LABEL: sistema => "🤖 Sistema"; si no, el nombre del asesor; el dueno es el ADMINISTRADOR inherente.
@@ -16292,10 +16565,25 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto, opts) {
       media_url: null,
       leido_por: [senderId]
     };
+    // FEATURE #15 (tarjeta tomable): metadata `accion` opcional (texto JSON), p.ej. la tarjeta de "tomar cita".
+    // ADITIVO/DEFENSIVO: si el caller no la pasa, no se agrega; si la columna aun no existe (migracion no corrida)
+    // el insert cae al retry que la descarta. Se acepta objeto (se serializa) o string ya serializado.
+    let _accionStr = null;
     try {
-      const _rSis = await supabase.from('team_messages').insert(Object.assign({}, _baseAviso, { es_sistema: true }));
-      if (_rSis && _rSis.error && /column|es_sistema|schema cache/i.test(_rSis.error.message || '')) {
-        await supabase.from('team_messages').insert(_baseAviso);
+      if (opts && opts.accion != null) _accionStr = (typeof opts.accion === 'string') ? opts.accion : JSON.stringify(opts.accion);
+    } catch (eAcc) { _accionStr = null; }
+    // Insert DEFENSIVO por capas: primero con las columnas opcionales (es_sistema + accion), y si el esquema
+    // todavia no las tiene, se reintenta descartandolas progresivamente. El aviso NUNCA se pierde por una columna.
+    try {
+      const _full = Object.assign({}, _baseAviso, { es_sistema: true });
+      if (_accionStr != null) _full.accion = _accionStr;
+      const _r1 = await supabase.from('team_messages').insert(_full);
+      if (_r1 && _r1.error && /column|es_sistema|accion|schema cache/i.test(_r1.error.message || '')) {
+        // Retry SIN accion (por si solo falta esa) pero conservando es_sistema.
+        const _r2 = await supabase.from('team_messages').insert(Object.assign({}, _baseAviso, { es_sistema: true }));
+        if (_r2 && _r2.error && /column|es_sistema|schema cache/i.test(_r2.error.message || '')) {
+          await supabase.from('team_messages').insert(_baseAviso); // ultimo fallback: solo columnas clasicas
+        }
       }
     } catch (eIns) {
       try { await supabase.from('team_messages').insert(_baseAviso); } catch (eIns2) { return; }
@@ -16319,6 +16607,75 @@ async function _postearAvisoInterno(ownerId, departamentoId, texto, opts) {
       try { await enviarPushAsesor(p, 'Asistente', '', 'Aviso interno: ' + cuerpo.slice(0, 120)); } catch (eP) {}
     }
   } catch (e) { console.error('_postearAvisoInterno:', e && e.message); }
+}
+
+// ===== REFINAMIENTO 2/3 (citas): despachar aviso al equipo por los CANALES prendidos =====
+// Envia `texto` (fijo, 0 IA) sobre una cita a los miembros del departamento `deptoId` por los canales
+// configurados (cita_aviso_canales, default ['depto'] = como hoy). Adjunta la metadata `accion` (tarjeta
+// tomable) a los mensajes de equipo (canal depto + DMs privados). DEFENSIVO: cada canal en su try; el que
+// falla no rompe los otros. `convId` (opcional) es para el push dirigido del canal depto (notif_solo_involucrado).
+async function _avisarCitaEquipoCanales(ownerId, deptoId, texto, accion, convId) {
+  try {
+    if (!ownerId || !texto || !String(texto).trim()) return;
+    let canales = ['depto'];
+    try { canales = await citaAvisoCanales(ownerId); } catch (eC) { canales = ['depto']; }
+    // Canal DEPTO (default, = hoy): post al canal del depto (o "general" si no hay depto) con la tarjeta tomable.
+    if (canales.indexOf('depto') >= 0) {
+      let _dirigido = false;
+      try { _dirigido = await notifSoloInvolucrado(ownerId); } catch (eNi) { _dirigido = false; }
+      try { await _postearAvisoInterno(ownerId, deptoId || 'general', texto, Object.assign({}, accion ? { accion: accion } : {}, _dirigido ? { soloRegistro: true } : {})); } catch (eD) {}
+      if (_dirigido) { try { await _pushAsesorLeadMasDuenoAdmins(ownerId, convId || null, texto); } catch (eP) {} }
+    }
+    // Canales EXTRA (aditivos, solo si el dueno los prendio): privado (DM a cada miembro) / whatsapp (WA a su numero).
+    const _quierePriv = canales.indexOf('privado') >= 0;
+    const _quiereWa = canales.indexOf('whatsapp') >= 0;
+    if ((_quierePriv || _quiereWa) && deptoId) {
+      // Resolver miembros HUMANOS del depto (auth_user_id para DM/push; whatsapp_notif para WA). DEFENSIVO ante
+      // columnas ausentes (es_ia / whatsapp_notif / activo): se reintenta con el set clasico.
+      let ases = [];
+      try {
+        const { data: mem } = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', deptoId);
+        const idsAse = (mem || []).map(function (m) { return m.asesor_id; }).filter(Boolean);
+        if (idsAse.length) {
+          let r = null;
+          try { r = await supabase.from('asesores').select('id, auth_user_id, nombre, es_ia, whatsapp_notif, activo').eq('admin_id', ownerId).in('id', idsAse); if (r.error) throw r.error; }
+          catch (eSel) { try { r = await supabase.from('asesores').select('id, auth_user_id, nombre').eq('admin_id', ownerId).in('id', idsAse); } catch (eSel2) { r = null; } }
+          ases = (r && r.data) ? r.data : [];
+        }
+      } catch (eMem) { ases = []; }
+      let _accionStr = null;
+      try { if (accion != null) _accionStr = (typeof accion === 'string') ? accion : JSON.stringify(accion); } catch (eAs) { _accionStr = null; }
+      const _senderId = _quierePriv ? await _avisoRemitente(ownerId) : null;
+      const _inst = _quiereWa ? nombreInstancia(ownerId) : null;
+      for (let i = 0; i < ases.length; i++) {
+        const a = ases[i];
+        if (!a || a.es_ia === true || a.activo === false) continue; // solo humanos activos
+        // PRIVADO: DM de equipo (team_message) del 'Asistente' al miembro + push.
+        if (_quierePriv && a.auth_user_id && _senderId && a.auth_user_id !== _senderId) {
+          try {
+            const _th = await _equipoThreadDm(ownerId, _senderId, a.auth_user_id);
+            if (_th) {
+              const _row = { thread_id: _th.id, admin_id: ownerId, sender_auth_user_id: _senderId, content: String(texto).slice(0, 4000), media_url: null, leido_por: [_senderId] };
+              try {
+                const _full = Object.assign({}, _row, { es_sistema: true });
+                if (_accionStr != null) _full.accion = _accionStr;
+                const _ri = await supabase.from('team_messages').insert(_full);
+                if (_ri && _ri.error && /column|es_sistema|accion|schema cache/i.test(_ri.error.message || '')) {
+                  const _ri2 = await supabase.from('team_messages').insert(Object.assign({}, _row, { es_sistema: true }));
+                  if (_ri2 && _ri2.error && /column|es_sistema|schema cache/i.test(_ri2.error.message || '')) { await supabase.from('team_messages').insert(_row); }
+                }
+              } catch (eIns) { try { await supabase.from('team_messages').insert(_row); } catch (eIns2) {} }
+              try { await enviarPushAsesor(a.auth_user_id, 'Asistente', '', 'Aviso interno: ' + String(texto).slice(0, 120)); } catch (ePu) {}
+            }
+          } catch (ePriv) {}
+        }
+        // WHATSAPP: notificacion al numero notif del miembro (mismo POST sendText que el espejo por WhatsApp).
+        if (_quiereWa && a.whatsapp_notif && String(a.whatsapp_notif).trim() && _inst) {
+          try { await enviarTextoGrupoWA(_inst, String(a.whatsapp_notif).trim(), String(texto).slice(0, 4000)); } catch (eWa) {}
+        }
+      }
+    }
+  } catch (e) { console.error('_avisarCitaEquipoCanales:', e && e.message); }
 }
 
 // ===== FEATURE notif dirigidas: destinatarios DIRIGIDOS (0 IA, texto fijo) =====
@@ -16434,15 +16791,16 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
       if (_dups && _dups.length) return { ok: true, citaId: _dups[0].id, duplicada: true, fechaLegible: _formatearFechaCita(_fhISO) };
     } catch (eDup) {}
     // 4) Resolver departamento (por nombre -> id) si el agente lo paso. Best-effort; null = cualquier depto.
-    //    MEJORA #2: si el agente NO paso un hint, caemos al departamento de la CONVERSACION del lead para que
-    //    el aviso vaya al canal del depto que corresponde (no solo al canal "Todos"). Sigue siendo defensivo.
+    //    Si el HINT del agente matchea un depto ACTIVO -> ese; si no, cae al depto de la CONVERSACION del lead.
+    //    El aviso (paso 7) va al canal del depto que corresponde via _avisarCitaEquipoCanales (default ['depto'];
+    //    sin depto resuelto, cae a "general"). Diego: "al departamento que corresponde, no a todos". Defensivo.
     let _deptoId = null;
     try {
       const _hint = (input && input.departamento) ? String(input.departamento).trim().toLowerCase() : '';
       if (_hint) {
         const { data: _deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true);
         const _m = (_deps || []).find(function(d){ return d.nombre && String(d.nombre).trim().toLowerCase() === _hint; });
-        if (_m) _deptoId = _m.id;
+        if (_m) { _deptoId = _m.id; }
       }
       if (!_deptoId) { try { _deptoId = await _avisoDeptoDeConv(ownerId, conversationId); } catch (eDc) {} }
     } catch (eDep) {}
@@ -16474,15 +16832,14 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
     } else {
       _citaId = _r.data && _r.data.id;
     }
-    // 7) Aviso al canal "Todos" (0 IA, texto fijo). Best-effort. Ademas, si hay depto, a su canal (opcional).
+    // 7) Aviso al equipo (0 IA, texto fijo) por los CANALES configurados (default depto), con la TARJETA TOMABLE
+    //    adjunta (accion). REFINAMIENTO 2/3. El helper resuelve canales + notif_solo_involucrado + push dirigido.
+    //    `_deptoId` = hint del agente (si matcheo) o depto de la conv (o null -> canal "Todos"). Con default ['depto']
+    //    y sin depto resuelto, el helper cae a "general" (el aviso nunca se pierde).
     const _fechaLegible = _formatearFechaCita(_fhISO);
     const _txtAviso = '📅 Nueva cita para tomar: ' + _fechaLegible + (_leadNombre ? (' — ' + _leadNombre) : '');
-    // FEATURE notif dirigidas [gated notif_solo_involucrado]: con el flag ON el push va SOLO al asesor del lead (o al
-    // dueno/admin si el lead no tiene asesor); el/los registro(s) quedan en el hilo SIN push masivo. Flag OFF -> igual que hoy.
-    const _dirigidoCita = await notifSoloInvolucrado(ownerId);
-    try { await _postearAvisoInterno(ownerId, 'general', _txtAviso, _dirigidoCita ? { soloRegistro: true } : undefined); } catch (eAv) {}
-    if (_deptoId) { try { await _postearAvisoInterno(ownerId, _deptoId, _txtAviso, _dirigidoCita ? { soloRegistro: true } : undefined); } catch (eAvD) {} }
-    if (_dirigidoCita) { try { await _pushAsesorLeadMasDuenoAdmins(ownerId, conversationId, _txtAviso); } catch (eAvP) {} }
+    const _accionCita = { tipo: 'cita_tomar', cita_id: _citaId, departamento_id: _deptoId || null };
+    try { await _avisarCitaEquipoCanales(ownerId, _deptoId || null, _txtAviso, _accionCita, conversationId); } catch (eAvC) {}
     return { ok: true, citaId: _citaId, duplicada: false, fechaLegible: _fechaLegible };
   } catch (e) { console.error('_agendarCitaTentativaAgente:', e && e.message); return { ok: false }; }
 }
@@ -24332,6 +24689,32 @@ app.get('/api/citas', async function(req, res) {
     var r = await q;
     if (r.error) return res.status(500).json({ error: r.error.message });
     var citas = r.data || [];
+    // FEATURE #15 (tomar cita): un asesor COMUN solo veia sus propias citas (.eq asesor_id), asi que NUNCA
+    // veia las TENTATIVAS de la IA (asesor_id NULL) para poder tomarlas. Agregamos, de forma ADITIVA y
+    // DEFENSIVA, las citas tentativas (estado='agendada', asesor_id NULL, origen='agente') de SUS departamentos
+    // (o sin depto). DEPLOY-SAFE / byte-identico cuando no hay tentativas: si la feature esta apagada o la IA no
+    // creo ninguna, este set es VACIO y el listado queda EXACTAMENTE igual que hoy. Ante cualquier error, se
+    // ignora (el asesor ve lo mismo que antes). El dueno/admin ya ven todo, no entran aca.
+    var _misDeptos = {};
+    if (soloAsesorId) {
+      try {
+        var _md = await supabase.from('usuario_departamento').select('departamento_id').eq('asesor_id', soloAsesorId);
+        (_md && _md.data ? _md.data : []).forEach(function(x){ if (x && x.departamento_id) _misDeptos[x.departamento_id] = true; });
+      } catch (eMd) { /* sin memberships resueltas: se cae al comportamiento de hoy */ }
+      try {
+        var _rt = await supabase.from('citas').select('*').eq('user_id', ownerId).is('asesor_id', null).eq('estado', 'agendada').eq('origen', 'agente').order('fecha_hora', { ascending: true });
+        if (_rt && !_rt.error && _rt.data && _rt.data.length) {
+          var _yaTengo = {};
+          citas.forEach(function(c){ if (c && c.id) _yaTengo[c.id] = true; });
+          _rt.data.forEach(function(c){
+            if (!c || _yaTengo[c.id]) return;
+            // Solo las tentativas que este asesor PODRIA tomar: sin depto, o de un depto al que pertenece.
+            var _dep = c.departamento_id || null;
+            if (!_dep || _misDeptos[_dep]) citas.push(c);
+          });
+        }
+      } catch (eTent) { /* columna origen ausente u otro error: no agregamos tentativas (comportamiento actual) */ }
+    }
     // MEJORA #4: adjuntar el NOMBRE del asesor DUEÑO (asesor_id) de cada cita para mostrarlo en la agenda.
     // Best-effort: 1 sola query batcheada por los asesor_id distintos. Si falla, las citas van sin nombre
     // (la agenda no rompe). Las citas de la IA sin dueño (asesor_id null) quedan con asesor_nombre null.
@@ -24346,6 +24729,20 @@ app.get('/api/citas', async function(req, res) {
         citas.forEach(function(c){ c.asesor_nombre = (c && c.asesor_id && nombreDe[c.asesor_id]) ? nombreDe[c.asesor_id] : null; });
       }
     } catch (eNom) { /* sin nombres; la agenda funciona igual */ }
+    // FEATURE #15 (contrato con el front): exponer `puede_tomar` (bool) por cita, calculado para el usuario del
+    // token. Una cita es TOMABLE si sigue tentativa (estado='agendada', asesor_id NULL, origen='agente') y quien
+    // pide es admin/dueno, o es un asesor comun que pertenece al depto de la cita (o la cita no tiene depto).
+    // asesor_id y departamento_id ya viajan en la fila (select '*'). Puramente calculado, 0 IA, no rompe nada.
+    try {
+      citas.forEach(function(c){
+        if (!c) return;
+        var _tentativa = (c.estado === 'agendada' && !c.asesor_id && c.origen === 'agente');
+        if (!_tentativa) { c.puede_tomar = false; return; }
+        if (!soloAsesorId) { c.puede_tomar = true; return; } // dueno/admin pueden tomar cualquiera
+        var _dep = c.departamento_id || null;
+        c.puede_tomar = (!_dep || !!_misDeptos[_dep]);
+      });
+    } catch (ePt) { /* si algo falla, el front simplemente no muestra el boton tomar */ }
     // "Recordar a": lista de usuarios (asesores) de la cuenta para el multi-select del form. Best-effort:
     // si falla, el campo queda vacio (la agenda no rompe). Devuelve solo id+nombre (no datos sensibles).
     var asesoresLista = [];
@@ -24498,51 +24895,79 @@ app.post('/api/citas/actualizar', async function(req, res) {
 // ===== FEATURE #15: TOMAR una cita TENTATIVA (claim atomico, CERO IA) =====
 // Un asesor (o el dueno) RECLAMA una cita que dejo el agente sin asignar (asesor_id=NULL, estado='agendada',
 // origen='agente'). Claim ATOMICO (compare-and-set): UPDATE ... WHERE id=cita AND asesor_id IS NULL AND
-// estado='agendada'. El PRIMERO gana; si otro ya la tomo (0 filas afectadas) -> 409. Aislado por tenant
-// (ownerId derivado del JWT). Un asesor comun setea asesor_id=SU id; el dueno (sin fila de asesor) la
-// confirma dejando asesor_id NULL pero estado='confirmada' + creado_por para dejar traza (la doble condicion
-// asesor_id IS NULL + estado='agendada' hace el claim atomico igual en el caso del dueno). 0 IA.
-app.post('/api/citas/tomar', async function(req, res) {
+// estado='agendada'. El PRIMERO gana; si otro ya la tomo (0 filas afectadas) -> ya_tomada. Aislado por tenant
+// (ownerId derivado del JWT). Un asesor comun setea asesor_id=SU id; el dueno (sin fila de asesor) la confirma
+// dejando asesor_id NULL pero estado='confirmada' + creado_por para dejar traza. Quien la toma queda como DUENO
+// de la cita: solo el (o admin/dueno) puede editarla/borrarla despues (guard en /api/citas/actualizar via
+// scoping por asesor_id). GUARDA DE DEPTO (pedido Diego): un asesor comun solo puede tomar una cita de SU
+// departamento; admin/dueno pueden tomar cualquiera. FAIL-OPEN: si no se puede resolver la membresia (query
+// error / sin columnas), se deja pasar (no romper la agenda).
+// CONTRATO acordado con el frontend:
+//   OK        -> { ok:true, asesor_id, asesor_nombre }
+//   ya tomada -> { ok:false, error:'ya_tomada', tomada_por }
+// Se exponen por DOS rutas equivalentes: POST /api/citas/:id/tomar (id en path, la que usa el front nuevo) y
+// POST /api/citas/tomar (id en body cita_id/id, back-compat). Ambas comparten _handlerTomarCita.
+async function _handlerTomarCita(req, res) {
   try {
     var userId = await verificarUsuario(req);
-    if (!userId) return res.status(401).json({ error: 'No autorizado' });
-    var ownerId = userId, claimAsesorId = null;
-    var ase = await supabase.from('asesores').select('id, admin_id').eq('auth_user_id', userId).maybeSingle();
-    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; claimAsesorId = ase.data.id; }
+    if (!userId) return res.status(401).json({ ok: false, error: 'No autorizado' });
+    var ownerId = userId, claimAsesorId = null, esAdmin = true;
+    var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { if (ase.data.admin_id) ownerId = ase.data.admin_id; claimAsesorId = ase.data.id; esAdmin = esAdministrador(ase.data); }
     var b = req.body || {};
-    var citaId = b.cita_id || b.id;
-    if (!citaId) return res.status(400).json({ error: 'Falta cita_id' });
+    var citaId = (req.params && req.params.id) || b.cita_id || b.id;
+    if (!citaId) return res.status(400).json({ ok: false, error: 'Falta cita_id' });
+    // Leer la cita ANTES del claim: para validar el depto y para distinguir "no existe" de "ya tomada".
+    var pre = await supabase.from('citas').select('id, asesor_id, estado, departamento_id, lead_nombre, fecha_hora, conversation_id').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
+    if (!pre || !pre.data) return res.status(404).json({ ok: false, error: 'no_encontrada' });
+    var citaPre = pre.data;
+    // GUARDA DE DEPARTAMENTO: solo aplica a un asesor COMUN (no admin/dueno) y solo si la cita tiene depto.
+    // Si el asesor NO pertenece a ese depto -> 403 no_pertenece. FAIL-OPEN ante cualquier error de resolucion.
+    if (claimAsesorId && !esAdmin && citaPre.departamento_id) {
+      try {
+        var mem = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', citaPre.departamento_id).eq('asesor_id', claimAsesorId).maybeSingle();
+        if (mem && !mem.error && !mem.data) {
+          return res.status(403).json({ ok: false, error: 'no_pertenece' });
+        }
+      } catch (eMem) { /* fail-open: no romper la agenda si no se pudo verificar la membresia */ }
+    }
     // Claim ATOMICO: solo si sigue tentativa (asesor_id IS NULL) Y agendada. .select() devuelve las filas
-    // afectadas: si el UPDATE no toco ninguna, ya la tomo otro (o no existe / no es de este tenant) -> 409.
-    // Traemos tambien departamento_id/lead_nombre/fecha_hora para el AVISO al equipo (MEJORA #2).
+    // afectadas: si el UPDATE no toco ninguna, ya la tomo otro (o cambio de estado) -> ya_tomada.
     var upd = { asesor_id: claimAsesorId, estado: 'confirmada' };
     var q = supabase.from('citas').update(upd)
       .eq('id', citaId).eq('user_id', ownerId)
       .is('asesor_id', null).eq('estado', 'agendada')
-      .select('id, departamento_id, lead_nombre, fecha_hora');
+      .select('id, departamento_id, lead_nombre, fecha_hora, conversation_id');
     var r = await q;
-    if (r.error) return res.status(500).json({ error: r.error.message });
+    if (r.error) return res.status(500).json({ ok: false, error: r.error.message });
     if (!r.data || !r.data.length) {
-      // 0 filas: o la tomo otro, o no existe/otro tenant. Distinguir para el mensaje (best-effort).
-      var chk = await supabase.from('citas').select('id, asesor_id, estado').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
-      if (!chk || !chk.data) return res.status(404).json({ error: 'Cita no encontrada' });
-      return res.status(409).json({ error: 'Ya la tomo otro asesor' });
+      // 0 filas: ya la tomo otro (o dejo de estar tentativa). Resolver quien la tiene para el mensaje.
+      var _tomadaPor = null;
+      try {
+        var chk = await supabase.from('citas').select('asesor_id').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
+        if (chk && chk.data && chk.data.asesor_id) {
+          var _qn = await supabase.from('asesores').select('nombre').eq('id', chk.data.asesor_id).eq('admin_id', ownerId).maybeSingle();
+          if (_qn && _qn.data && _qn.data.nombre) _tomadaPor = String(_qn.data.nombre).trim();
+        }
+      } catch (eChk) {}
+      return res.json({ ok: false, error: 'ya_tomada', tomada_por: _tomadaPor });
     }
     // Traza de quien la tomo (best-effort; si la columna no existe, no-opea y la toma YA quedo firme).
     try { await supabase.from('citas').update({ creado_por: userId }).eq('id', citaId); } catch (eCp) {}
-    // MEJORA #2: ANUNCIAR quien la tomo al canal del DEPARTAMENTO correspondiente (0 IA, texto fijo).
-    // Best-effort, no bloquea la respuesta. Resuelve el nombre del que la tomo (asesor o dueño) y postea
-    // "X tomó la cita ..." al mismo canal donde se aviso la cita tentativa (depto + general de fallback).
+    // Nombre de quien la tomo (para la respuesta del contrato y el aviso al equipo).
+    var _cTomada = r.data[0] || {};
+    var _quien = 'Alguien';
+    var _asesorNombre = null;
     try {
-      var _cTomada = r.data[0] || {};
-      var _quien = 'Alguien';
-      try {
-        if (claimAsesorId) { var _qa = await supabase.from('asesores').select('nombre').eq('id', claimAsesorId).eq('admin_id', ownerId).maybeSingle(); if (_qa && _qa.data && _qa.data.nombre) _quien = String(_qa.data.nombre).trim(); }
-        else { _quien = 'El dueño'; } // quien toma sin fila de asesor = el dueño de la cuenta
-      } catch (eQ) {}
+      if (claimAsesorId) { var _qa = await supabase.from('asesores').select('nombre').eq('id', claimAsesorId).eq('admin_id', ownerId).maybeSingle(); if (_qa && _qa.data && _qa.data.nombre) { _quien = String(_qa.data.nombre).trim(); _asesorNombre = _quien; } }
+      else { _quien = 'El dueño'; _asesorNombre = 'El dueño'; } // quien toma sin fila de asesor = el dueño de la cuenta
+    } catch (eQ) {}
+    // REFINAMIENTO 3: ANUNCIAR "asignado a X" al MISMO canal del departamento (0 IA, texto fijo) asi todos ven
+    // que ya se tomo. Best-effort, no bloquea la respuesta.
+    try {
       var _leadTxt = (_cTomada.lead_nombre && String(_cTomada.lead_nombre).trim()) ? (' de ' + String(_cTomada.lead_nombre).trim()) : '';
       var _fechaTxt = _cTomada.fecha_hora ? (' para ' + _formatearFechaCita(_cTomada.fecha_hora)) : '';
-      var _txtTomada = '✅ ' + _quien + ' tomó la cita' + _leadTxt + _fechaTxt + '.';
+      var _txtTomada = 'La cita' + _leadTxt + _fechaTxt + ' quedo asignada a ' + _quien + '.';
       var _depTomada = _cTomada.departamento_id || null;
       // FEATURE notif dirigidas [gated notif_solo_involucrado]: con el flag ON el push va SOLO al asesor del lead (o al
       // dueno/admin si no tiene asesor); el/los registro(s) quedan en el hilo SIN push masivo. Flag OFF -> igual que hoy.
@@ -24550,15 +24975,90 @@ app.post('/api/citas/tomar', async function(req, res) {
       if (_depTomada) { try { await _postearAvisoInterno(ownerId, _depTomada, _txtTomada, _dirigidoTomada ? { soloRegistro: true } : undefined); } catch (eAvD) {} }
       try { await _postearAvisoInterno(ownerId, 'general', _txtTomada, _dirigidoTomada ? { soloRegistro: true } : undefined); } catch (eAvG) {}
       if (_dirigidoTomada) {
-        var _convTomada = null;
-        try { var _ctc = await supabase.from('citas').select('conversation_id').eq('id', citaId).eq('user_id', ownerId).maybeSingle(); if (_ctc && _ctc.data) _convTomada = _ctc.data.conversation_id || null; } catch (eCtc) {}
+        var _convTomada = _cTomada.conversation_id || citaPre.conversation_id || null;
         try { await _pushAsesorLeadMasDuenoAdmins(ownerId, _convTomada, _txtTomada); } catch (eTP) {}
       }
     } catch (eAviso) { console.error('tomar cita aviso equipo:', eAviso && eAviso.message); }
     // FEATURE #21: reflejar en Google Calendar (best-effort, inerte sin Calendar conectado).
     try { syncCitaACalendar(ownerId, citaId).catch(function(e){ console.error('tomar cita syncCalendar:', e && e.message); }); } catch (eCal) {}
-    return res.json({ ok: true, id: citaId });
-  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+    // CONTRATO: ok + asesor_id (null si la tomo el dueno) + asesor_nombre. `id` se incluye ADITIVO (back-compat).
+    return res.json({ ok: true, asesor_id: claimAsesorId, asesor_nombre: _asesorNombre, id: citaId });
+  } catch (e) { return res.status(500).json({ ok: false, error: e && e.message }); }
+}
+app.post('/api/citas/:id/tomar', _handlerTomarCita);
+app.post('/api/citas/tomar', _handlerTomarCita);
+
+// ===== REFINAMIENTO 4: DERIVAR una cita a OTRO departamento (queda TOMABLE ahi) + HISTORIAL =====
+// POST /api/citas/:id/derivar { departamento_id, motivo? } -> reasigna la cita a otro depto y la deja TOMABLE
+// (asesor_id=NULL, departamento_id=nuevo, estado='agendada', escalada_avisada reset). REGISTRA en el historial de
+// la cita QUIEN derivo a QUE depto (columna citas.historial JSON) y, si la cita tiene conversacion, deja una traza
+// de SISTEMA en el chat del lead (mismo mecanismo que registrarPaseAsesor). Postea el aviso TOMABLE al NUEVO depto
+// (fire-and-forget). AUTORIZACION: admin/dueno o el asesor DUENO de la cita. 0 IA. DEFENSIVO (retry sin columnas
+// nuevas). Contrato: { ok:true } o { ok:false, error }.
+app.post('/api/citas/:id/derivar', async function(req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ ok: false, error: 'No autorizado' });
+    var ownerId = userId, miAsesorId = null, esAdmin = true, esDueno = true;
+    var ase = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', userId).maybeSingle();
+    if (ase && ase.data) { esDueno = false; if (ase.data.admin_id) ownerId = ase.data.admin_id; miAsesorId = ase.data.id; esAdmin = esAdministrador(ase.data); }
+    var citaId = req.params && req.params.id;
+    var b = req.body || {};
+    var nuevoDepto = b.departamento_id ? String(b.departamento_id) : '';
+    var motivo = (b.motivo != null) ? String(b.motivo).slice(0, 300) : '';
+    if (!citaId) return res.status(400).json({ ok: false, error: 'Falta cita_id' });
+    if (!nuevoDepto) return res.status(400).json({ ok: false, error: 'Falta departamento_id' });
+    // Cargar la cita del tenant. `historial` es DEFENSIVO: si la columna no existe, el select('*') no la trae.
+    var pre = await supabase.from('citas').select('*').eq('id', citaId).eq('user_id', ownerId).maybeSingle();
+    if (!pre || !pre.data) return res.status(404).json({ ok: false, error: 'no_encontrada' });
+    var cita = pre.data;
+    // AUTORIZACION: admin/dueno, o el asesor DUENO de la cita (asesor_id === mi id). El resto NO deriva.
+    if (!(esDueno || esAdmin || (miAsesorId && cita.asesor_id && cita.asesor_id === miAsesorId))) {
+      return res.status(403).json({ ok: false, error: 'no_autorizado' });
+    }
+    // Validar el nuevo depto (activo, del owner).
+    var depOk = await supabase.from('departamentos').select('id, nombre').eq('id', nuevoDepto).eq('user_id', ownerId).eq('activo', true).maybeSingle();
+    if (!depOk || !depOk.data) return res.status(400).json({ ok: false, error: 'departamento_invalido' });
+    var nombreNuevoDepto = depOk.data.nombre || '';
+    // Nombre del depto ORIGEN (para el historial). Best-effort.
+    var nombreDeptoOrigen = '';
+    try { if (cita.departamento_id) { var _do = await supabase.from('departamentos').select('nombre').eq('id', cita.departamento_id).maybeSingle(); if (_do && _do.data) nombreDeptoOrigen = _do.data.nombre || ''; } } catch (eDo) {}
+    // Nombre de quien deriva.
+    var _quienDeriva = 'El dueño';
+    try { if (miAsesorId) { var _qd = await supabase.from('asesores').select('nombre').eq('id', miAsesorId).eq('admin_id', ownerId).maybeSingle(); if (_qd && _qd.data && _qd.data.nombre) _quienDeriva = String(_qd.data.nombre).trim(); } } catch (eQd) {}
+    // Reasignar: asesor_id NULL, depto=nuevo, estado agendada (tomable), escalada_avisada reset. DEFENSIVO: si
+    // faltan columnas nuevas (escalada_avisada/actualizado_en), reintentar con el set clasico.
+    var upd = { asesor_id: null, departamento_id: nuevoDepto, estado: 'agendada', escalada_avisada: false, actualizado_en: new Date().toISOString() };
+    var r = await supabase.from('citas').update(upd).eq('id', citaId).eq('user_id', ownerId);
+    if (r.error) {
+      var updSafe = { asesor_id: null, departamento_id: nuevoDepto, estado: 'agendada' };
+      var r2 = await supabase.from('citas').update(updSafe).eq('id', citaId).eq('user_id', ownerId);
+      if (r2.error) return res.status(500).json({ ok: false, error: r2.error.message });
+    }
+    // HISTORIAL: append a citas.historial (JSON). Best-effort (si la columna no existe, el update no-opea).
+    try {
+      var _hist = [];
+      try { if (cita.historial) { var _p = (typeof cita.historial === 'string') ? JSON.parse(cita.historial) : cita.historial; if (Array.isArray(_p)) _hist = _p; } } catch (eHp) {}
+      _hist.push({ at: new Date().toISOString(), por: _quienDeriva, de_depto: nombreDeptoOrigen || null, a_depto: nombreNuevoDepto || null, motivo: motivo || null });
+      await supabase.from('citas').update({ historial: JSON.stringify(_hist).slice(0, 8000) }).eq('id', citaId).eq('user_id', ownerId);
+    } catch (eHist) {}
+    // Traza en el chat del lead (mismo mecanismo que los pases de asesor: message role='sistema'). Best-effort.
+    try {
+      if (cita.conversation_id) {
+        var _txtPase = '🔁 ' + _quienDeriva + ': cita derivada' + (nombreDeptoOrigen ? (' de ' + nombreDeptoOrigen) : '') + ' a ' + nombreNuevoDepto + (motivo ? (' (' + motivo + ')') : '');
+        await supabase.from('messages').insert({ conversation_id: cita.conversation_id, user_id: ownerId, role: 'sistema', content: _txtPase, enviado_por: 'Sistema' });
+      }
+    } catch (ePase) {}
+    // Aviso TOMABLE al NUEVO depto (FIRE-AND-FORGET: no bloquea la respuesta). Tarjeta tomable via `accion`.
+    try {
+      var _fechaTxt2 = cita.fecha_hora ? (' para ' + _formatearFechaCita(cita.fecha_hora)) : '';
+      var _leadTxt2 = (cita.lead_nombre && String(cita.lead_nombre).trim()) ? (' — ' + String(cita.lead_nombre).trim()) : '';
+      var _txtAviso2 = '📅 Cita derivada para tomar:' + _fechaTxt2 + _leadTxt2;
+      var _accion2 = { tipo: 'cita_tomar', cita_id: citaId, departamento_id: nuevoDepto };
+      _avisarCitaEquipoCanales(ownerId, nuevoDepto, _txtAviso2, _accion2, cita.conversation_id || null).catch(function(e){ console.error('derivar cita aviso:', e && e.message); });
+    } catch (eAv2) {}
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, error: e && e.message }); }
 });
 
 // ===== TAREAS DE EVENTO + EQUIPO (motor de tareas, CERO IA) =====
@@ -27650,8 +28150,39 @@ app.get('/api/ui-flags', async function(req, res){
       var _cav = await supabase.from('business_settings').select('cloud_api_v1').eq('user_id', user_id).maybeSingle();
       if (_cav && _cav.data) cloud_api_v1 = _cav.data.cloud_api_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1 });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false }); }
+    // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
+    // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
+    // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
+    // front directo contra business_settings (mismo camino que agent_tone/objetivo, RLS owner-only).
+    var ia_no_sabe_modo = 'preguntar', ia_no_sabe_min = 30;
+    try {
+      var _ns = await supabase.from('business_settings').select('ia_no_sabe_modo, ia_no_sabe_min').eq('user_id', user_id).maybeSingle();
+      if (_ns && _ns.data) {
+        var _m = (_ns.data.ia_no_sabe_modo == null) ? '' : String(_ns.data.ia_no_sabe_modo).trim().toLowerCase();
+        if (['preguntar', 'derivar', 'preguntar_derivar'].indexOf(_m) >= 0) ia_no_sabe_modo = _m;
+        var _mn = Number(_ns.data.ia_no_sabe_min);
+        if (_mn && _mn >= 1 && _mn <= 1440) ia_no_sabe_min = _mn;
+      }
+    } catch (e) { /* columnas ausentes / error -> defaults (comportamiento actual) */ }
+    // REFINAMIENTO 1/2 (citas): exponer canales de aviso + horas de escalada para la config del front. Query
+    // SEPARADA y defensiva: columnas ausentes -> DEFAULTS ['depto'] / 3 = comportamiento ACTUAL EXACTO.
+    var cita_aviso_canales = ['depto'], cita_escalada_horas = 3;
+    try {
+      var _cc = await supabase.from('business_settings').select('cita_aviso_canales, cita_escalada_horas').eq('user_id', user_id).maybeSingle();
+      if (_cc && _cc.data) {
+        var _arr = _cc.data.cita_aviso_canales;
+        if (typeof _arr === 'string') { try { _arr = JSON.parse(_arr); } catch (eJ) { _arr = null; } }
+        if (Array.isArray(_arr)) {
+          var _out = [];
+          _arr.forEach(function (x) { var v = String(x == null ? '' : x).trim().toLowerCase(); if (['privado', 'depto', 'whatsapp'].indexOf(v) >= 0 && _out.indexOf(v) < 0) _out.push(v); });
+          if (_out.length) cita_aviso_canales = _out;
+        }
+        var _ceh = Number(_cc.data.cita_escalada_horas);
+        if (_ceh && _ceh >= 1 && _ceh <= 168) cita_escalada_horas = _ceh;
+      }
+    } catch (e) { /* columnas ausentes / error -> defaults */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================

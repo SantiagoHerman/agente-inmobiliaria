@@ -2961,6 +2961,87 @@ async function procesarRespuestaAprendizaje(user_id, respuestaDueno, instancia, 
   } catch (e) { console.error('procesarRespuestaAprendizaje:', e && e.message); return false; }
 }
 
+// ===== REPARTO POR ORDEN DE ALTA (Diego 2026-07-24): helpers =====
+// El reparto por departamento se decide por el ORDEN en que se agregaron los usuarios al departamento (membresia
+// usuario_departamento), NO por menor-carga ni responsable_fijo. Estos helpers son deploy-safe: se usan SOLO cuando la
+// columna departamentos.modo_asignacion existe y trae valor; sin ella, elegirAsesorParaDepartamento cae al picker de HOY.
+
+// Devuelve los asesor_id de TODOS los miembros del depto en ORDEN DE ALTA (estable). Preferimos created_at; si esa
+// columna no existe, id; si tampoco, el orden que devuelva la query (sin order). PostgREST devuelve error (no throw)
+// cuando la columna de order no existe -> chequeamos r.error y caemos al siguiente intento. 0 tokens de IA.
+async function _ordenMembresiaDepto(deptoId) {
+  try {
+    if (!deptoId) return [];
+    try {
+      const r = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', deptoId).order('created_at', { ascending: true });
+      if (!r.error && Array.isArray(r.data)) return r.data.map(function(m){ return m.asesor_id; });
+    } catch (e1) {}
+    try {
+      const r2 = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', deptoId).order('id', { ascending: true });
+      if (!r2.error && Array.isArray(r2.data)) return r2.data.map(function(m){ return m.asesor_id; });
+    } catch (e2) {}
+    try {
+      const r3 = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', deptoId);
+      if (!r3.error && Array.isArray(r3.data)) return r3.data.map(function(m){ return m.asesor_id; });
+    } catch (e3) {}
+    return [];
+  } catch (e) { return []; }
+}
+
+// Dada la lista de candidatos YA DISPONIBLES (idsDisponibles: activos, reciben, en horario, humano>IA, sin excluidos,
+// que arma elegirAsesorParaDepartamento), devuelve esos MISMOS candidatos reordenados por el ORDEN DE ALTA de la
+// membresia. Los que no aparezcan en el orden de la membresia (raro) quedan al final para no perderlos. 0 tokens.
+async function _asesoresDeptoEnOrden(deptoId, idsDisponibles) {
+  try {
+    if (!Array.isArray(idsDisponibles) || !idsDisponibles.length) return [];
+    const _orden = await _ordenMembresiaDepto(deptoId);
+    const _dispSet = {};
+    for (var i = 0; i < idsDisponibles.length; i++) { _dispSet[idsDisponibles[i]] = true; }
+    const _ordenados = [];
+    for (var j = 0; j < _orden.length; j++) { if (_dispSet[_orden[j]] && _ordenados.indexOf(_orden[j]) < 0) _ordenados.push(_orden[j]); }
+    for (var k = 0; k < idsDisponibles.length; k++) { if (_ordenados.indexOf(idsDisponibles[k]) < 0) _ordenados.push(idsDisponibles[k]); }
+    return _ordenados;
+  } catch (e) { return Array.isArray(idsDisponibles) ? idsDisponibles.slice() : []; }
+}
+
+// Elige por ORDEN. idsCand = candidatos disponibles (ya filtrados por elegirAsesorParaDepartamento; para la rotacion
+// avanzando, ya excluyen a los intentados). Con cursorId (lead NUEVO): round-robin -> el primer disponible DESPUES del
+// cursor en el ORDEN COMPLETO de alta, dando la vuelta. Sin cursor (rotacion avanzando o cursor vacio): el primero
+// disponible en orden. Un solo usuario disponible -> ese. 0 tokens de IA. Defensivo: ante error, null.
+async function _pickPorOrden(deptoId, idsCand, cursorId) {
+  try {
+    if (!Array.isArray(idsCand) || !idsCand.length) return null;
+    const _ordenCompleto = await _ordenMembresiaDepto(deptoId);
+    const _dispSet = {};
+    for (var i = 0; i < idsCand.length; i++) { _dispSet[idsCand[i]] = true; }
+    // Lista de DISPONIBLES en orden de alta (para el fallback "primero disponible").
+    const _ordenados = [];
+    for (var j = 0; j < _ordenCompleto.length; j++) { if (_dispSet[_ordenCompleto[j]] && _ordenados.indexOf(_ordenCompleto[j]) < 0) _ordenados.push(_ordenCompleto[j]); }
+    for (var k = 0; k < idsCand.length; k++) { if (_ordenados.indexOf(idsCand[k]) < 0) _ordenados.push(idsCand[k]); }
+    if (!_ordenados.length) return null;
+    // Sin cursor (rotacion avanzando / cursor vacio): el primero disponible en orden.
+    if (!cursorId) return _ordenados[0];
+    // Con cursor: el primero DESPUES del cursor en el ORDEN COMPLETO, dando la vuelta, que este disponible.
+    var _pos = _ordenCompleto.indexOf(cursorId);
+    if (_pos < 0) return _ordenados[0]; // el cursor ya no es miembro del depto: arrancar del primero disponible
+    for (var s = 1; s <= _ordenCompleto.length; s++) {
+      var _cand = _ordenCompleto[(_pos + s) % _ordenCompleto.length];
+      if (_dispSet[_cand]) return _cand;
+    }
+    return _ordenados[0]; // el unico disponible es el propio cursor (o ninguno tras el): caer al primero disponible
+  } catch (e) { console.error('_pickPorOrden:', e && e.message); return null; }
+}
+
+// Avanza el cursor round-robin del depto (ultimo_asignado_id = a quien le acaba de tocar un lead NUEVO). Best-effort/
+// DEFENSIVO: si la columna no existe (migracion no corrida) el update falla en silencio y el reparto sigue como hoy.
+// Se llama SOLO desde los sitios que ASIGNAN un lead nuevo (arranque de rotacion/fija, derivacion directa, escalado).
+async function _avanzarCursorDepto(deptoId, asesorId) {
+  try {
+    if (!deptoId || !asesorId) return;
+    try { await supabase.from('departamentos').update({ ultimo_asignado_id: asesorId }).eq('id', deptoId); } catch (eCur) {}
+  } catch (e) {}
+}
+
 // ===== ETAPA 7: REPARTO REAL POR DEPARTAMENTO (solo con reparto_v2 ON) =====
 // Picker nuevo, usado DENTRO de derivarAHumano SOLO cuando reparto_v2 esta ON. Elige el asesor del
 // departamento indicado segun el modo_reparto del depto. Candidatos (todos a la vez):
@@ -3053,15 +3134,50 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId, excluirIds)
     if (Array.isArray(excluirIds) && excluirIds.length) {
       idsCand = idsCand.filter(function(id){ return excluirIds.indexOf(id) < 0; });
     }
-    // 3) modo_reparto del depto + (opcional) responsable_id. DEFENSIVO ante columna inexistente.
+    // 3) Config del depto. HOY: modo_reparto + (opcional) responsable_id. NUEVO (Diego 2026-07-24, reparto por ORDEN):
+    //    modo_asignacion ('rotacion'|'fija') + cursor ultimo_asignado_id. DEFENSIVO ante columnas inexistentes: si
+    //    modo_asignacion NO existe (migracion no corrida) -> modoAsignacion queda null -> comportamiento de HOY EXACTO
+    //    (responsable_fijo / asesorMenorCarga). El picker por ORDEN se usa SOLO cuando la columna existe y trae valor.
     let modoReparto = 'equitativo';
     let responsableId = null;
+    let modoAsignacion = null; // 'rotacion' | 'fija' | null (null = columna ausente / valor raro -> orden OFF)
+    let cursorId = null;       // departamentos.ultimo_asignado_id (cursor round-robin de leads NUEVOS)
+    // DEPLOY-SAFE: supabase-js devuelve una columna inexistente como ERROR EN LA RESPUESTA (eDep set), NO como throw.
+    // Por eso NO alcanza con un try/catch: chequeamos eDep explicitamente con _depOk. Si el SELECT con las columnas
+    // NUEVAS falla (migracion no corrida), reintentamos con el set VIEJO (modo_reparto + responsable_id) para NO perder
+    // esos valores (mantiene responsable_fijo pre-migracion). modoAsignacion queda null -> orden OFF (flujo de HOY).
+    let _depOk = false;
     try {
-      const { data: dep, error: eDep } = await supabase.from('departamentos').select('modo_reparto, responsable_id').eq('id', departamentoId).maybeSingle();
-      if (!eDep && dep) { modoReparto = dep.modo_reparto || 'equitativo'; responsableId = dep.responsable_id || null; }
-    } catch (eD1) {
-      // columna responsable_id ausente u otro error: reintentar sin esa columna (solo modo_reparto)
-      try { const { data: dep2 } = await supabase.from('departamentos').select('modo_reparto').eq('id', departamentoId).maybeSingle(); if (dep2) modoReparto = dep2.modo_reparto || 'equitativo'; } catch (eD2) {}
+      const { data: dep, error: eDep } = await supabase.from('departamentos').select('modo_reparto, responsable_id, modo_asignacion, ultimo_asignado_id').eq('id', departamentoId).maybeSingle();
+      if (!eDep) {
+        _depOk = true; // el SELECT funciono (las columnas existen); dep puede ser null si no hay fila
+        if (dep) {
+          modoReparto = dep.modo_reparto || 'equitativo';
+          responsableId = dep.responsable_id || null;
+          if (dep.modo_asignacion === 'rotacion' || dep.modo_asignacion === 'fija') modoAsignacion = dep.modo_asignacion;
+          cursorId = dep.ultimo_asignado_id || null;
+        }
+      }
+    } catch (eD1) { _depOk = false; }
+    if (!_depOk) {
+      try {
+        const { data: dep2, error: eDep2 } = await supabase.from('departamentos').select('modo_reparto, responsable_id').eq('id', departamentoId).maybeSingle();
+        if (!eDep2) { if (dep2) { modoReparto = dep2.modo_reparto || 'equitativo'; responsableId = dep2.responsable_id || null; } }
+        else { try { const { data: dep3 } = await supabase.from('departamentos').select('modo_reparto').eq('id', departamentoId).maybeSingle(); if (dep3) modoReparto = dep3.modo_reparto || 'equitativo'; } catch (eD3) {} }
+      } catch (eD2) {
+        try { const { data: dep3b } = await supabase.from('departamentos').select('modo_reparto').eq('id', departamentoId).maybeSingle(); if (dep3b) modoReparto = dep3b.modo_reparto || 'equitativo'; } catch (eD3b) {}
+      }
+    }
+    // NUEVO (reparto por ORDEN): con modo_asignacion presente, el reparto por depto se decide por el ORDEN de alta de
+    //   las membresias (NO menor-carga, NO responsable_fijo). Dos usos, distinguidos por excluirIds:
+    //   - excluirIds NO vacio (rotacion avanzando, viene del cron via _elegirSiguienteRotacionV3): idsCand YA excluye a
+    //     los intentados -> elegir el PRIMERO disponible EN ORDEN (recorre a TODOS los del depto). Sin cursor round-robin.
+    //   - excluirIds vacio/ausente (lead NUEVO: arranque de rotacion o asignacion fija): round-robin por el cursor -> el
+    //     primer disponible DESPUES de ultimo_asignado_id, dando la vuelta. El cursor lo AVANZA el sitio que asigna.
+    //   Un solo usuario disponible en el depto -> ese. Nadie disponible -> null (igual que hoy). 0 tokens de IA.
+    if (modoAsignacion) {
+      const _rotAvanza = Array.isArray(excluirIds) && excluirIds.length > 0;
+      return await _pickPorOrden(departamentoId, idsCand, (_rotAvanza ? null : cursorId));
     }
     // 4) responsable_fijo: si el responsable es candidato disponible, devolverlo; si no, fallback al equitativo.
     if (modoReparto === 'responsable_fijo' && responsableId && idsCand.indexOf(responsableId) >= 0) {
@@ -3580,6 +3696,9 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     // FASE 2 (puntos 3+4): true cuando la cascada YA resolvio la no-asignacion avisando al gerente
     // (sin_miembros sin fallback / solo_no_recibe) -> NO hay que encolar a la espera ni ofrecer fuera-de-horario.
     let _v2NoEsperar = false;
+    // REPARTO POR ORDEN (Diego 2026-07-24): depto del que salio el asesor (para avanzar el cursor round-robin al
+    // asignar). Solo se setea en el camino por-departamento (v2); pool general / candidatos explicitos -> null (no aplica).
+    let _deptoPickeado = null;
     if (_cv && !_cv.asesor_id && !_cv.admin_tomo) {
       const _ownerId = _cv.user_id || user_id;
       // RESPALDO (Plan B): si el caller pasa una LISTA EXPLICITA de candidatos (opts.candidatos = ids de asesor),
@@ -3626,6 +3745,7 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
           const _estado = _est.estado;
           if (_estado === 'asignable') {
             _asesor = _est.asesor; // reusado: NO se vuelve a llamar al picker (cierra la ventana de carrera)
+            _deptoPickeado = _deptoObjetivo; // REPARTO POR ORDEN: el asesor salio de este depto (avanzar cursor al asignar)
           } else if (_estado === 'sin_miembros') {
             // (4a) Depto SIN miembros -> ir al depto recibe_fallback (Administracion) INMEDIATO (no esperar 30 min).
             const _fbId = await deptoFallbackDe(_ownerId);
@@ -3633,6 +3753,7 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
               const _estFb = await estadoDeptoParaReparto(_ownerId, _fbId);
               if (_estFb.estado === 'asignable') {
                 _asesor = _estFb.asesor; // reusado (sin segunda llamada al picker)
+                _deptoPickeado = _fbId; // REPARTO POR ORDEN: el asesor salio del depto fallback (avanzar su cursor)
                 // R4: este depto lo fija la IA (fallback de reparto) -> departamento_manual=false (clasificacion automatica).
                 // DEFENSIVO: best-effort; si la columna departamento_manual no existe, igual escribimos el depto.
                 if (_asesor) { try { await supabase.from('conversations').update({ departamento_id: _fbId, departamento_manual: false }).eq('id', convId); } catch (eUpD) { try { await supabase.from('conversations').update({ departamento_id: _fbId }).eq('id', convId); } catch (eUpD2) {} } }
@@ -3736,6 +3857,11 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         // TAREA 3 (Diego 2026-07-23): la cita de la IA (origen='agente') sigue al asesor recien asignado en la
         // derivacion DIRECTA. Best-effort, 0 tokens; si no hay cita toca 0 filas. No rompe la derivacion si falla.
         try { await _sincronizarCitaConLead((_cv && _cv.user_id) || user_id, convId, _asesor); } catch (eSyncCita) {}
+        // REPARTO POR ORDEN (Diego 2026-07-24): lead NUEVO asignado por el picker por-depto -> avanzar el cursor
+        // round-robin del depto de donde salio (_deptoPickeado). Best-effort/defensivo: no-op sin la columna nueva o
+        // cuando el asesor salio del pool general (_deptoPickeado null). _asesor puede haberse re-leido por carrera:
+        // avanzamos al que REALMENTE quedo asignado (round-robin correcto).
+        if (_deptoPickeado && _asesor) { try { await _avanzarCursorDepto(_deptoPickeado, _asesor); } catch (eCur) {} }
       }
     }
     // ETAPA 5: si la conv quedo SIN asesor (no habia ninguno disponible y el admin no la tomo), queda EN COLA
@@ -4029,6 +4155,9 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
       // Asignar (condicional: no pisar una toma manual que haya entrado en el interin). IA sigue atendiendo.
       const _ok = await _asignarRotacionV3(convId, _asesor, _deptoId, nowIso, true);
       if (!_ok) return { ok: false, yaTomado: true }; // otro proceso tomo el lead: respetar
+      // REPARTO POR ORDEN (Diego 2026-07-24): este es el arranque (lead NUEVO) tanto de rotacion como de fija -> avanzar
+      // el cursor round-robin del depto a quien le acaba de tocar. Best-effort/defensivo (no-op sin la columna nueva).
+      if (_deptoId) { try { await _avanzarCursorDepto(_deptoId, _asesor); } catch (eCur) {} }
       // TAREA 3 (Diego 2026-07-23): la cita de la IA sigue al asesor asignado por la rotacion inicial. 0 tokens, best-effort.
       try { await _sincronizarCitaConLead(ownerId, convId, _asesor); } catch (eSyncCita) {}
       await _anunciarLead();
@@ -4252,6 +4381,8 @@ async function revisarRotacionDerivacionV3() {
     // TAREA 3 (derivacion-v3-refinements): caches por-tenant para el aviso al dueno cuando NO hay nadie disponible.
     const _avisoDuenoMinCache = {}; // derivacion_aviso_dueno_min (ms) por tenant
     const _horarioCache = {};       // { horario } (horario_oficina) por tenant para saber si estamos EN horario
+    // REPARTO POR ORDEN (Diego 2026-07-24): cache del modo_asignacion por depto (para NO rotar los deptos de asignacion FIJA).
+    const _modoAsigCache = {};      // deptoId -> 'rotacion' | 'fija' | null (null = columna ausente -> comportamiento de hoy)
     for (const conv of rotando) {
       try {
         const ownerId = conv.user_id;
@@ -4298,6 +4429,19 @@ async function revisarRotacionDerivacionV3() {
         let _leadRef = null;
         try { if (conv.contact_id) { const { data: _c } = await supabase.from('contacts').select('name, nombre_manual, phone').eq('id', conv.contact_id).maybeSingle(); _leadRef = (_c && (_c.nombre_manual || _c.name || _c.phone)) || null; } } catch (eLr) {}
         const _deptoId = conv.derivacion_depto_id || conv.departamento_id || null;
+        // REPARTO POR ORDEN (Diego 2026-07-24): si el depto es de ASIGNACION FIJA, el lead NO rota: queda con su asesor y
+        // la IA cubre hasta que ESE humano escriba (lo maneja el guard "humano escribio" de arriba). Solo suprimimos el
+        // AVANCE de rotacion cuando la conv YA tiene asesor; si todavia esta SIN asesor (arranco sin nadie disponible),
+        // dejamos que el flujo de abajo le asigne el PRIMERO por orden y quede. DEFENSIVO: sin la columna modo_asignacion
+        // -> null -> NO se salta -> comportamiento de HOY EXACTO (rota). 0 tokens de IA.
+        if (_deptoId) {
+          if (!(_deptoId in _modoAsigCache)) {
+            let _ma = null;
+            try { const { data: _dMa } = await supabase.from('departamentos').select('modo_asignacion').eq('id', _deptoId).maybeSingle(); _ma = (_dMa && (_dMa.modo_asignacion === 'rotacion' || _dMa.modo_asignacion === 'fija')) ? _dMa.modo_asignacion : null; } catch (eMa) { _ma = null; }
+            _modoAsigCache[_deptoId] = _ma;
+          }
+          if (_modoAsigCache[_deptoId] === 'fija' && conv.asesor_id) continue; // fija ya asignado: NO rotar (la IA cubre)
+        }
         let _siguiente = null;
         let _resetVuelta = false; // el picker reinicio la vuelta (ya se habian intentado TODOS) -> arrancar set nuevo
         if (_deptoId) {
@@ -13110,6 +13254,9 @@ async function escalarLeadsEnColaVencidos() {
               // HISTORIAL DE PASES INMUTABLE: el cron escalo un lead en cola al depto fallback (ej. Administracion).
               // La conv estaba sin asesor (update condicional .is('asesor_id', null)) -> origen = "el sistema". Append-only.
               try { await registrarPaseAsesor(conv.id, ownerId, null, _asignado, 'El sistema'); } catch (ePase) {}
+              // REPARTO POR ORDEN (Diego 2026-07-24): asignacion NUEVA en el depto fallback -> avanzar su cursor
+              // round-robin. Best-effort/defensivo: no-op sin la columna nueva. 0 tokens de IA.
+              try { await _avanzarCursorDepto(depFb.id, _asignado); } catch (eCur) {}
               // FIX (1a): ya hay un humano asignado en la manana -> el pase agendado off-hours dejo de aplicar.
               // Limpiar handoff_pendiente para que una oferta REAL posterior (manejarRespuestaFueraHorario) no se
               // cortocircuite. Write APARTE best-effort/defensivo (columna opcional): no debe romper la asignacion.
@@ -17309,12 +17456,26 @@ app.post('/api/departamentos/crear', async function(req, res) {
       recibe_fallback: b.recibe_fallback === true,
       es_default: b.es_default === true
     };
-    const { data: nuevo, error } = await supabase.from('departamentos').insert(fila).select('id').single();
+    // REPARTO POR ORDEN (Diego 2026-07-24): aceptar modo_asignacion ('rotacion'|'fija'). Solo se agrega al insert si el
+    // front lo manda valido; si no, no se toca (la columna cae a su DEFAULT 'rotacion'). DEFENSIVO: si la columna no
+    // existe (migracion no corrida) el insert de abajo REINTENTA sin el campo -> comportamiento de HOY EXACTO.
+    if (['rotacion', 'fija'].indexOf(b.modo_asignacion) >= 0) fila.modo_asignacion = b.modo_asignacion;
+    let nuevo = null, error = null;
+    {
+      const _r = await supabase.from('departamentos').insert(fila).select('id').single();
+      nuevo = _r.data; error = _r.error;
+      if (error && Object.prototype.hasOwnProperty.call(fila, 'modo_asignacion')) {
+        // columna modo_asignacion ausente: reintentar sin ella (un insert que erro NO dejo fila -> no hay duplicado)
+        const _filaSin = Object.assign({}, fila); delete _filaSin.modo_asignacion;
+        const _r2 = await supabase.from('departamentos').insert(_filaSin).select('id').single();
+        nuevo = _r2.data; error = _r2.error;
+      }
+    }
     if (error) return res.status(500).json({ error: error.message });
     // un solo default y un solo recibe_fallback por cuenta
     if (fila.es_default) await supabase.from('departamentos').update({ es_default: false }).eq('user_id', b.admin_id).neq('id', nuevo.id);
     if (fila.recibe_fallback) await supabase.from('departamentos').update({ recibe_fallback: false }).eq('user_id', b.admin_id).neq('id', nuevo.id);
-    return res.json({ ok: true, id: nuevo && nuevo.id });
+    return res.json({ ok: true, id: nuevo && nuevo.id, modo_asignacion: fila.modo_asignacion || 'rotacion' });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -17330,16 +17491,28 @@ app.post('/api/departamentos/actualizar', async function(req, res) {
     if (typeof b.nombre === 'string' && b.nombre.trim()) cambios.nombre = b.nombre.trim().slice(0, 60);
     if (typeof b.criterio_derivacion === 'string') cambios.criterio_derivacion = b.criterio_derivacion.slice(0, 1000);
     if (['equitativo', 'responsable_fijo'].indexOf(b.modo_reparto) >= 0) cambios.modo_reparto = b.modo_reparto;
+    // REPARTO POR ORDEN (Diego 2026-07-24): aceptar modo_asignacion ('rotacion'|'fija'). DEFENSIVO: si la columna no
+    // existe (migracion no corrida) el update de abajo REINTENTA sin el campo -> comportamiento de HOY EXACTO.
+    if (['rotacion', 'fija'].indexOf(b.modo_asignacion) >= 0) cambios.modo_asignacion = b.modo_asignacion;
     if (['siempre', 'duda', 'nunca'].indexOf(b.preguntar_antes_derivar) >= 0) cambios.preguntar_antes_derivar = b.preguntar_antes_derivar;
     if (typeof b.recibe_fallback === 'boolean') cambios.recibe_fallback = b.recibe_fallback;
     if (typeof b.es_default === 'boolean') cambios.es_default = b.es_default;
     if (typeof b.activo === 'boolean') cambios.activo = b.activo;
     if (Object.keys(cambios).length === 0) return res.status(400).json({ error: 'Nada para actualizar' });
-    const { error } = await supabase.from('departamentos').update(cambios).eq('id', b.departamento_id).eq('user_id', b.admin_id);
+    let { error } = await supabase.from('departamentos').update(cambios).eq('id', b.departamento_id).eq('user_id', b.admin_id);
+    if (error && Object.prototype.hasOwnProperty.call(cambios, 'modo_asignacion')) {
+      // columna modo_asignacion ausente: reintentar sin ella. Si SOLO se pedia modo_asignacion, no queda nada para
+      // actualizar -> tratar como no-op exitoso (no romper: comportamiento seguro previo a la migracion).
+      const _cambiosSin = Object.assign({}, cambios); delete _cambiosSin.modo_asignacion;
+      if (Object.keys(_cambiosSin).length > 0) {
+        const _r2 = await supabase.from('departamentos').update(_cambiosSin).eq('id', b.departamento_id).eq('user_id', b.admin_id);
+        error = _r2.error;
+      } else { error = null; }
+    }
     if (error) return res.status(500).json({ error: error.message });
     if (cambios.es_default === true) await supabase.from('departamentos').update({ es_default: false }).eq('user_id', b.admin_id).neq('id', b.departamento_id);
     if (cambios.recibe_fallback === true) await supabase.from('departamentos').update({ recibe_fallback: false }).eq('user_id', b.admin_id).neq('id', b.departamento_id);
-    return res.json({ ok: true });
+    return res.json({ ok: true, modo_asignacion: cambios.modo_asignacion });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

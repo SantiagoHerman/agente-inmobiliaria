@@ -7918,6 +7918,23 @@ app.get('/_diag-pauta2', async (req, res) => {
     if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
     // vista rapida del ring buffer (shapes crudos capturados en el webhook)
     if (req.query.rb === '1') return res.json({ capturados: (globalThis._diagPautaRB || []).length, items: globalThis._diagPautaRB || [] });
+    // TEMP (verificar usuarios IA): ?iausers=1 -> lista los asesores es_ia=true con su nombre y el objetivo crudo de
+    // su agente_config, mas si ese objetivo habilita agendar (agendar_visita/avanzar_reserva). Solo lectura. REVERTIR.
+    if (req.query.iausers === '1') {
+      try {
+        const { data: ases } = await supabase.from('asesores').select('id, nombre, es_ia, activo, admin_id, agente_config').eq('es_ia', true);
+        const bs = {};
+        try { const { data: b } = await supabase.from('business_settings').select('user_id, company_name, agent_objetivo'); (b || []).forEach(function(x){ bs[x.user_id] = x; }); } catch (eB) {}
+        const out = (ases || []).map(function(a){
+          const c = (a.agente_config && typeof a.agente_config === 'object') ? a.agente_config : {};
+          const obj = (c.objetivo != null ? String(c.objetivo) : '');
+          const habilita = (obj === 'agendar_visita' || obj === 'avanzar_reserva');
+          const cta = bs[a.admin_id] || {};
+          return { usuario_ia: a.nombre, activo: a.activo, cuenta: cta.company_name || a.admin_id, objetivo_del_usuario_ia: obj || '(vacio -> hereda cuenta)', objetivo_cuenta: cta.agent_objetivo || 'informar', PUEDE_AGENDAR: habilita };
+        });
+        return res.json({ total_usuarios_ia: out.length, usuarios: out });
+      } catch (eIU) { return res.status(500).json({ e: eIU && eIU.message }); }
+    }
     // VERIFICAR RAG: ?rag=1 -> flag ia_rag_v1 por cuenta + ultimas respuestas de Anton (cache chico = RAG activo).
     if (req.query.rag === '1') {
       const out = {};

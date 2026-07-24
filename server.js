@@ -26168,6 +26168,21 @@ app.post('/api/probar-agente', async function(req, res) {
         // Si el append fallo (p.ej. falta migrar), NO rompemos: caemos al flujo normal de la IA de abajo.
       }
     } catch (eCmdPrueba) { console.error('comando agregar-instruccion (prueba):', eCmdPrueba && eCmdPrueba.message); }
+    // TOPE ANTI-FUGA (2026-07-24): la ventana de prueba corre el motor Sonnet COMPLETO y NO descuenta cupo del plan
+    // -> el costo lo absorbe el dueno del producto (Diego). Sin tope, una cuenta puede dispararla cientos de veces.
+    // Ponemos un tope DIARIO por cuenta contando las pruebas de HOY en ia_uso (etiqueta 'prueba_agente'). El comando
+    // "agregar instruccion" (0 tokens, arriba) NO cuenta ni se bloquea. DEFENSIVO: si la lectura de ia_uso falla, NO
+    // bloquea (deja pasar) -> nunca rompe la ventana por un problema de la base. Rollback = borrar este bloque.
+    try {
+      var _PRUEBA_TOPE_DIA = 30;
+      var _desdePrueba = new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z'; // desde las 00:00 UTC de hoy
+      var _cntPrueba = await supabase.from('ia_uso').select('id', { count: 'exact', head: true })
+        .eq('user_id', user_id).eq('etiqueta', 'prueba_agente').gte('created_at', _desdePrueba);
+      var _pruebasHoy = (_cntPrueba && typeof _cntPrueba.count === 'number') ? _cntPrueba.count : 0;
+      if (_pruebasHoy >= _PRUEBA_TOPE_DIA) {
+        return res.json({ ok: true, reply: 'Llegaste al límite de ' + _PRUEBA_TOPE_DIA + ' pruebas del agente por hoy. Se reinicia mañana. (No afecta a tus clientes, es solo la ventana de prueba interna.)' });
+      }
+    } catch (eTopePrueba) { console.error('tope prueba-agente (no bloquea):', eTopePrueba && eTopePrueba.message); }
     var r = await generarRespuestaAgente(user_id, null, message, { modoPrueba: true, historialManual: historial });
     // FUGA TAPADA (medidor 2026-07-23): la ventana de prueba gasta Sonnet y no registraba nada en ia_uso.
     // Se registra el COSTO con etiqueta propia. Sin conversation_id (es modo prueba, no hay lead) y SIN

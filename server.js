@@ -26610,7 +26610,22 @@ app.get('/api/suscripcion', async function(req, res) {
     // -> el cliente puede darse de baja durante el trial para no llegar al primer cobro (antes exigia active/past_due
     // y en prueba daba false: no aparecia el boton de cancelar).
     var puede_cancelar = !!(sub && sub.mp_preapproval_id && sub.status !== 'cancelled');
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
+    // ===== periodo_desde: fecha de INICIO del periodo, para mostrar AL LADO del periodo (Diego 2026-07-25) =====
+    // Regla pedida: en CORTESIA va la fecha desde la que se cuenta la renovacion mensual de mensajes (si no hay,
+    // queda VACIO); con SUSCRIPCION va la fecha del ciclo de MercadoPago; y si la cuenta estuvo en cortesia y DESPUES
+    // genero suscripcion, PREDOMINA la de la suscripcion.
+    // COLUMNA USADA: subscriptions.period_start — es la UNICA ancla de periodo que existe en la base, y sirve para
+    // los dos casos porque la escribe quien manda en cada uno:
+    //   * suscripcion MP -> la escribe el webhook al activar el preapproval (trial -> active) y la re-escribe el cron
+    //     cuando MP cierra el periodo y devuelve el proximo next_payment_date (ver revisarSuscripciones).
+    //   * cortesia / sin MP -> la rueda el fallback de 30d del mismo cron (es el ancla del reset mensual de mensajes).
+    // Al suscribirse se re-escribe con la fecha de la suscripcion => la de la suscripcion PREDOMINA sobre la de la
+    // cortesia sin logica extra. NO se usa created_at como fallback: en una cuenta que fue cortesia y despues se
+    // suscribio, created_at es la fecha de la CORTESIA -> mostraria justo la fecha que la regla dice que no debe mandar.
+    // Si no hay period_start -> null (el front deja el campo vacio; no se inventa ninguna fecha).
+    var periodo_desde = (sub && sub.period_start) || null;
+    var periodo_desde_origen = periodo_desde ? ((sub && sub.mp_preapproval_id) ? 'suscripcion' : (esCortesia ? 'cortesia' : 'periodo')) : null;
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, periodo_desde: periodo_desde, periodo_desde_origen: periodo_desde_origen, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
       // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.
       precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync(),
       // Plan Personal (a medida) y Recarga (pago unico): el front calcula el precio = cantidad * usd_por_msg * dolar_ref.

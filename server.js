@@ -26845,7 +26845,9 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
     if (ppId) { Object.keys(PLANES_MP).forEach(function(k){ if (PLANES_MP[k] === ppId) planNivel = k; }); }
     // Leer el estado/plan ANTERIOR para distinguir suscripcion NUEVA vs CAMBIO de plan (best-effort).
     var prevSub = null;
-    try { var ps = await supabase.from('subscriptions').select('status, plan').eq('user_id', user_id).maybeSingle(); prevSub = ps && ps.data ? ps.data : null; } catch (ePrev) {}
+    try { var ps = await supabase.from('subscriptions').select('status, plan, cortesia').eq('user_id', user_id).maybeSingle(); prevSub = ps && ps.data ? ps.data : null; } catch (ePrev) {}
+    // DEFENSIVO: si 'cortesia' no existiera en el select (esquema viejo), reintenta con las 2 columnas de siempre.
+    if (!prevSub) { try { var ps2 = await supabase.from('subscriptions').select('status, plan').eq('user_id', user_id).maybeSingle(); prevSub = ps2 && ps2.data ? ps2.data : null; } catch (ePrev2) {} }
     // M9: el 1er pago real (trial -> active) cierra el periodo de prueba: limpia trial_con_tarjeta (deja de capear a
     // 100 -> rige el cupo del plan) y arranca el periodo del plan en limpio (los mensajes del trial NO se descuentan
     // del 1er mes pago). ANTES esto venia del read de prevSub + upsert -> NO atomico ni idempotente: dos webhooks
@@ -26868,7 +26870,20 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
       if (!afectoReset) {
         var filaAct = { user_id: user_id, status: 'active', mp_preapproval_id: sus.id, current_period_end: sus.next_payment_date || null };
         if (planNivel) filaAct.plan = planNivel;
-        await supabase.from('subscriptions').upsert(filaAct, { onConflict: 'user_id' });
+        // CORTESIA -> SUSCRIPCION (Diego 2026-07-25): si la cuenta venia de CORTESIA y todavia NO estaba 'active',
+        // el ciclo del plan arranca HOY -> manda la fecha de la SUSCRIPCION, no la de la cortesia (regla del dueño).
+        // Sin esto, el "Periodo desde" del panel mostraba el ancla de la cortesia durante todo el primer mes pago,
+        // y recien se acomodaba en la 1ra renovacion de MP.
+        // ACOTADO A ESE CASO: en una renovacion, un 2do webhook o un alta ya activa, prevSub.status ya es 'active'
+        // -> NO se toca el ancla ni el contador (no se regala cupo). Mismo criterio que el reset de trial de arriba.
+        var _veniaDeCortesia = !!(prevSub && prevSub.cortesia === true && prevSub.status !== 'active');
+        if (_veniaDeCortesia) { filaAct.period_start = new Date().toISOString(); filaAct.ai_messages_this_period = 0; }
+        var _upAct = await supabase.from('subscriptions').upsert(filaAct, { onConflict: 'user_id' });
+        if (_upAct && _upAct.error && _veniaDeCortesia) {
+          // DEFENSIVO: si period_start no existe todavia (migracion pendiente), reintenta sin los campos nuevos.
+          delete filaAct.period_start; delete filaAct.ai_messages_this_period;
+          await supabase.from('subscriptions').upsert(filaAct, { onConflict: 'user_id' });
+        }
       }
     } else {
       // Estados no-active (past_due/cancelled/trial): upsert directo del status (sin tocar contador/period_start).

@@ -727,7 +727,7 @@ const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c2
 // auto_recurring.transaction_amount: asi el checkout NO depende del GET del plan en MP (que a veces falla -> MP 500).
 // NOTA: ya NO es la fuente del cobro (eso es precioPlanARS, atado al dolar). Queda como mapa de niveles validos
 // y precio BASE de referencia (lo usa el guard de aceptar-plan). Mantener en sync con BASE_PESOS.
-const PRECIOS_MP = { basico: 55000, pro: 130000, premium: 350000, enterprise: 620000 };
+const PRECIOS_MP = { basico: 65000, pro: 140000, premium: 350000, enterprise: 620000 }; // en sync con BASE_PESOS (Diego 2026-07-25)
 
 // ============ DOLAR BLUE REF (ratchet / high-water-mark) ============
 // Todos los precios nuevos se atan al blue VENTA con un piso que SOLO sube. Se guarda 1 valor GLOBAL en
@@ -762,7 +762,11 @@ async function actualizarDolarRef() {
 }
 
 // Precios BASE en ARS a dolar_ref=1530 (los 4 planes fijos). A 1530 dan EXACTO estos valores; si el blue sube, suben proporcional.
-const BASE_PESOS = { basico: 55000, pro: 130000, premium: 350000, enterprise: 620000 };
+// PRECIOS (Diego 2026-07-25): Basico 55.000 -> 65.000 y Pro 130.000 -> 140.000. Es la BASE (opcion (a) elegida
+// por Diego): el precio que paga el cliente sale de multiplicar esto por el dolar ratchet / DOLAR_REF_BASE, asi
+// que con el dolar por encima de 1530 el importe final queda POR ARRIBA de estos numeros. Premium y Enterprise
+// quedan igual. Mantener en sync con PRECIOS_MP (~730).
+const BASE_PESOS = { basico: 65000, pro: 140000, premium: 350000, enterprise: 620000 };
 // Redondeo "limpio" de precios: al proximo multiplo de 5000 HACIA ARRIBA (Diego 2026-07-22, sin centavos).
 function _redondear5000(x) { return Math.ceil(x / 5000) * 5000; }
 function precioPlanARS(nivel) {

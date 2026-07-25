@@ -2459,6 +2459,22 @@ async function cacheTtl1hActivo(user_id, bs) {
     return !!(data && data.ai_cache_ttl_1h === true);
   } catch (e) { return false; }
 }
+// VENTANA HORARIA DE LA CACHE LARGA (Diego 2026-07-25): el TTL de 1h SOLO conviene de DIA.
+// La cuenta: la escritura con ttl:'1h' cuesta 2x contra 1,25x del default de 5 min (60% mas cara), y la
+// lectura vale IGUAL en ambos casos (ademas cada lectura renueva la hora GRATIS). O sea que el TTL largo
+// solo paga si elimina mas del 37,5% de las escrituras: (1 - X) * 2 = 1,25 -> X = 0,375.
+// De DIA los mensajes entran cada pocos minutos y las elimina casi todas. De NOCHE entran salteados: la
+// cache se vence igual y estarias pagando el doble por una escritura que ibas a hacer lo mismo.
+// Ventana: 07:00 a 23:59 hora Argentina (UTC-3) -> 1h. 00:00 a 06:59 -> el default de 5m de siempre.
+const _CACHE_LARGA_DESDE_H = 7;  // inclusive
+const _CACHE_LARGA_HASTA_H = 24; // exclusive (24 = medianoche)
+function _horarioCacheLarga(ahoraMs) {
+  try {
+    const argMs = (typeof ahoraMs === 'number' ? ahoraMs : Date.now()) + (-3) * 60 * 60 * 1000; // hora local Argentina, leida via getUTC*
+    const h = new Date(argMs).getUTCHours();
+    return h >= _CACHE_LARGA_DESDE_H && h < _CACHE_LARGA_HASTA_H;
+  } catch (e) { return false; } // ante cualquier error -> TTL corto (el comportamiento de siempre)
+}
 
 // ===== 5 FUENTES EXTERNAS PARA LA IA (dolar / clima / feriados / georef / distancia) =====
 // Cada tool nueva se gatea por SU flag propio en business_settings. FAIL-CLOSED, mismo patron EXACTO
@@ -5899,8 +5915,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // default de 5 min. FAIL-CLOSED: ante columna ausente / error / null -> false. Reusa el `settings` ya cargado
   // (0 queries extra). `_cacheTtl` es SOLO para la telemetria (registra que TTL efectivo se uso: '5m' u '1h'); el
   // cache_control real se arma abajo y con el flag OFF queda BYTE-IDENTICO al actual (ephemeral SIN campo ttl).
+  // ADAPTATIVO POR HORARIO (Diego 2026-07-25): ademas del flag, el TTL de 1h se aplica SOLO en la ventana
+  // diurna (07:00-23:59 AR). De noche cae al default de 5m: la cache se vence igual y la escritura larga
+  // costaria 2x en vez de 1,25x. Con el flag OFF nada cambia; con el flag ON de noche el request tambien
+  // queda BYTE-IDENTICO al actual (ephemeral SIN campo ttl). Ver _horarioCacheLarga().
   let _ttl1hOn = false;
-  try { _ttl1hOn = await cacheTtl1hActivo(user_id, settings || undefined); } catch (eTtl) { _ttl1hOn = false; }
+  try { _ttl1hOn = (await cacheTtl1hActivo(user_id, settings || undefined)) && _horarioCacheLarga(); } catch (eTtl) { _ttl1hOn = false; }
   const _cacheTtl = _ttl1hOn ? '1h' : '5m';
   // 5 FUENTES EXTERNAS (gated c/u por su flag): dolar / clima / feriados / georef / distancia. FAIL-CLOSED:
   // con la columna ausente el helper devuelve false -> la tool NO se ofrece y el prompt+flujo son BYTE-IDENTICOS

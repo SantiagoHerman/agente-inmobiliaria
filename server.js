@@ -27601,7 +27601,10 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
         // Si la cuenta NO era ya cortesia, capturamos un SNAPSHOT del plan/estado actual (jsonb snapshot_cortesia)
         // para poder RESTAURARLO al sacar la cortesia (si tenia un plan real). NO pisamos un snapshot ya existente.
         var yaEraCortesia = !!(subC && subC.cortesia === true);
-        var updDar = { user_id: uid, cortesia: true };
+        // CORTESIA (Diego 2026-07-25): al DAR la cortesia arranca su ciclo de 30 dias YA, para que la fecha de
+        // renovacion se vea en el panel desde el dia 1 (antes quedaba null hasta que el cron pasara). Solo se
+        // setea si la cuenta NO era ya cortesia: re-dar cortesia a quien ya la tiene no reinicia su ciclo.
+        var updDar = yaEraCortesia ? { user_id: uid, cortesia: true } : { user_id: uid, cortesia: true, period_start: new Date().toISOString() };
         if (!yaEraCortesia) {
           var snapExistente = (subC && subC.snapshot_cortesia && typeof subC.snapshot_cortesia === 'object') ? subC.snapshot_cortesia : null;
           if (!snapExistente) {
@@ -27745,7 +27748,12 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
     }
     // 3) Cortesia (exento, sin tarjeta)
     if (cortesia === true) {
-      try { await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' }); } catch(eS){}
+      // CORTESIA (Diego 2026-07-25): nace con period_start = ahora para que la fecha de renovacion se vea desde
+      // el dia 1. DEFENSIVO: si la columna no existiera, reintenta sin ella (mismo patron que el resto del archivo).
+      try {
+        var _upCor = await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true, period_start: new Date().toISOString() }, { onConflict: 'user_id' });
+        if (_upCor && _upCor.error) await supabase.from('subscriptions').upsert({ user_id: uid, cortesia: true }, { onConflict: 'user_id' });
+      } catch(eS){}
     }
     // 4) Auditoria (no critico)
     try { await supabase.from('admin_audit').insert({ accion: 'crear_cliente', target_user_id: uid, detalle: JSON.stringify({ email: email, company: company, cortesia: cortesia }) }); } catch(eA){}
@@ -29694,7 +29702,12 @@ async function revisarSuscripciones() {
         if (!ini) updates.period_start = new Date(ahora).toISOString();
         else if (ahora - ini > 30 * 24 * 3600 * 1000) {
           updates.period_start = new Date(ahora).toISOString();
-          if (estVigente === 'active') updates.ai_messages_this_period = 0;
+          // CORTESIA (Diego 2026-07-25): la cortesia tambien RENUEVA el cupo cada 30 dias. Antes solo se reseteaba
+          // con status 'active', y una cuenta de cortesia NO lo esta -> si el Maestro le puso un override de mensajes
+          // (limits_override.ai_messages, el unico caso en que la cortesia TIENE tope, ver topeEfectivoIA ~876), el
+          // contador subia hasta el tope y la cuenta quedaba trabada PARA SIEMPRE, sin renovacion posible.
+          // Sin override la cortesia es ILIMITADA -> resetear el contador no cambia nada (el tope es Infinity).
+          if (estVigente === 'active' || s.cortesia === true) updates.ai_messages_this_period = 0;
         }
       }
       if (Object.keys(updates).length) { try { await supabase.from('subscriptions').update(updates).eq('user_id', s.user_id); } catch (eU) {} }

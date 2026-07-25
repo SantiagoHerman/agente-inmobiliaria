@@ -780,13 +780,16 @@ function precioPlanARS(nivel) {
 }
 
 // ===== PLAN PERSONAL (a medida) + RECARGA de mensajes (pago unico) =====
-// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 9.000 msgs) a USD 0,06 c/u x dolar.
-// Recarga: pago UNICO (Checkout Pro) para sumar mensajes al pool, min 200 a USD 0,08 c/u x dolar (requiere plan activo).
+// Personal: suscripcion mensual con volumen ELEGIDO por el cliente (min 9.000 msgs) a USD 0,08 c/u x dolar.
+// Recarga: pago UNICO (Checkout Pro) para sumar mensajes al pool, min 200 a USD 0,12 c/u x dolar (requiere plan activo).
+// PRECIOS (Diego 2026-07-25): Personal 0,06 -> 0,08 y Recarga 0,08 -> 0,12. Deja la escalera coherente: el volumen
+// (Personal) es lo mas barato y la recarga puntual lo mas caro. Verificado antes de aplicar: 0 recargas pagadas
+// historicas (mensajes_extra_mov origen='recarga_mp'), asi que NO hay links de pago viejos que queden bajo el piso.
 // Ambos precios atados al MISMO dolar ratchet (dolarRefSync) que los planes fijos.
-const PERSONAL_USD_POR_MSG = 0.06;
+const PERSONAL_USD_POR_MSG = 0.08;
 const PERSONAL_MIN_MSGS = 9000;
 const PERSONAL_MAX_MSGS = 2000000; // tope de cordura: evita montos absurdos por typo/manipulacion
-const RECARGA_USD_POR_MSG = 0.08;
+const RECARGA_USD_POR_MSG = 0.12;
 const RECARGA_MIN_MSGS = 200;
 const RECARGA_MAX_MSGS = 1000000;
 // Piso de dolar (mismo guard que precioPlanARS): nunca por debajo del base, ni con un cache corrupto.

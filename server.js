@@ -26625,7 +26625,20 @@ app.get('/api/suscripcion', async function(req, res) {
     // Si no hay period_start -> null (el front deja el campo vacio; no se inventa ninguna fecha).
     var periodo_desde = (sub && sub.period_start) || null;
     var periodo_desde_origen = periodo_desde ? ((sub && sub.mp_preapproval_id) ? 'suscripcion' : (esCortesia ? 'cortesia' : 'periodo')) : null;
-    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, periodo_desde: periodo_desde, periodo_desde_origen: periodo_desde_origen, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
+    // ===== periodo_renueva: CUANDO se renueva el cupo de mensajes (Diego 2026-07-26) =====
+    // Faltaba el otro lado del pedido. `vence` (current_period_end) lo escribe SOLO MercadoPago, asi que una cuenta
+    // de CORTESIA lo tiene en null y el panel nunca mostraba fecha de renovacion. Pero la cortesia SI renueva: el
+    // cron revisarSuscripciones rueda el periodo a los 30 dias de period_start (fallback sin MP) y ahi resetea
+    // ai_messages_this_period. Esa fecha NO existe como columna: se CALCULA period_start + 30d.
+    // Precedencia: si hay fecha de MP manda esa (es el cobro real); si no, la calculada; si no hay ancla -> null.
+    var _MS_30D = 30 * 24 * 3600 * 1000;
+    var periodo_renueva = (sub && sub.current_period_end) || null;
+    var periodo_renueva_origen = periodo_renueva ? 'mercadopago' : null;
+    if (!periodo_renueva && periodo_desde) {
+      var _iniMs = new Date(periodo_desde).getTime();
+      if (isFinite(_iniMs)) { periodo_renueva = new Date(_iniMs + _MS_30D).toISOString(); periodo_renueva_origen = 'calculada'; }
+    }
+    return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, periodo_desde: periodo_desde, periodo_desde_origen: periodo_desde_origen, periodo_renueva: periodo_renueva, periodo_renueva_origen: periodo_renueva_origen, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
       // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.
       precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync(),
       // Plan Personal (a medida) y Recarga (pago unico): el front calcula el precio = cantidad * usd_por_msg * dolar_ref.

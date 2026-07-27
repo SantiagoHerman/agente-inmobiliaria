@@ -9379,7 +9379,11 @@ async function enviarRecordatoriosCitas() {
     // Traemos citas agendadas futuras cuyo recordatorio (clasico) aun no cerro. NOTA: filtramos por
     // recordatorio_enviado=false para NO re-procesar las ya cerradas; el camino multi-offset marca ese flag
     // en true SOLO cuando ya se enviaron TODOS sus offsets (ver abajo), asi no se pierde ningun offset.
-    const { data: citas } = await supabase.from('citas').select('*').eq('estado', 'agendada').eq('recordatorio_enviado', false).gte('fecha_hora', ahoraISO).lte('fecha_hora', enMaxISO);
+    // FIX (Diego 2026-07-27): antes filtraba SOLO estado='agendada'. Pero al apretar "Confirmar"/"Tomar" la cita
+    // pasa a 'confirmada' (ver PUT /api/citas ~25536 y el resto del codigo, que trata los dos como cita viva:
+    // .in('estado',['agendada','confirmada']) en ~17413 y ~17457) -> la cita CONFIRMADA se caia del radar y NUNCA
+    // recibia recordatorio. Efecto perverso: cuanto mas prolijo el asesor, menos recordatorios salian.
+    const { data: citas } = await supabase.from('citas').select('*').in('estado', ['agendada', 'confirmada']).eq('recordatorio_enviado', false).gte('fecha_hora', ahoraISO).lte('fecha_hora', enMaxISO);
     if (!citas || citas.length === 0) return;
     // Cache de offsets por cuenta (evita una query de business_settings por cita).
     const offsetsCache = {};
@@ -17432,7 +17436,18 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
     //    (no crear cita basura). fecha_fin = fecha_hora + 60 min (duracion default).
     const _raw = (input && input.fecha_hora != null) ? String(input.fecha_hora).trim() : '';
     if (!_raw) return { ok: false, fechaInvalida: true };
-    const _fh = new Date(_raw);
+    // HUSO HORARIO (FIX Diego 2026-07-27): el ejemplo que le damos a la IA en el input_schema es "2026-07-10 15:00",
+    // SIN huso. En un servidor UTC (Railway) `new Date('2026-07-10 15:00')` se interpreta como 15:00 UTC = 12:00 en
+    // Argentina -> la cita quedaba 3 HORAS ANTES de lo que acordo el lead, y el recordatorio salia a la hora
+    // equivocada. Verificado con TZ=UTC: '2026-07-10 15:00' -> 12:00 AR; con huso explicito -> 15:00 AR (correcto).
+    // Si el string NO trae huso (ni Z ni ±HH:MM), lo anclamos a -03:00, que es la hora de la que hablo el lead.
+    // Si YA trae huso, no se toca (respeta lo que mando la IA). Si no matchea el patron, queda igual que antes.
+    let _rawTz = _raw;
+    if (!/([zZ]|[+-]\d{2}:?\d{2})$/.test(_raw)) {
+      const _mFh = _raw.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{1,2}):(\d{2})/);
+      if (_mFh) _rawTz = _mFh[1] + '-' + _mFh[2] + '-' + _mFh[3] + 'T' + ('0' + _mFh[4]).slice(-2) + ':' + _mFh[5] + ':00-03:00';
+    }
+    const _fh = new Date(_rawTz);
     if (isNaN(_fh.getTime())) return { ok: false, fechaInvalida: true };
     const _fhISO = _fh.toISOString();
     const _ffISO = new Date(_fh.getTime() + 60 * 60000).toISOString();
@@ -25534,7 +25549,11 @@ app.post('/api/citas/actualizar', async function(req, res) {
     var actual = dueno.data;
     var upd = {};
     if (b.estado && ['agendada','confirmada','cumplida','cancelada'].indexOf(b.estado) >= 0) upd.estado = b.estado;
-    if (b.fecha_hora) { var fh2 = new Date(b.fecha_hora); if (!isNaN(fh2.getTime())) { upd.fecha_hora = fh2.toISOString(); upd.recordatorio_enviado = false; } }
+    // FIX (Diego 2026-07-27): al REPROGRAMAR se limpiaba recordatorio_enviado pero NO la lista de offsets ya
+    // mandados (citas.recordatorios_enviados, ver ~9412). Resultado: si el aviso de 24 h ya habia salido para la
+    // fecha vieja, la fecha NUEVA no lo volvia a mandar (el offset figuraba como enviado). Ahora se limpian los dos:
+    // fecha nueva = recordatorios de cero. DEFENSIVO: si la columna no existe, el UPDATE la ignora sin romper.
+    if (b.fecha_hora) { var fh2 = new Date(b.fecha_hora); if (!isNaN(fh2.getTime())) { upd.fecha_hora = fh2.toISOString(); upd.recordatorio_enviado = false; upd.recordatorios_enviados = null; } }
     if (typeof b.notas === 'string') upd.notas = b.notas.slice(0,500);
     // --- AGENDA NATIVA: campos nuevos editables ---
     // Reasignar asesor: SOLO dueno/admin (un asesor comun no puede pasar su cita a otro).

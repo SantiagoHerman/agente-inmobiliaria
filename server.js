@@ -4461,9 +4461,23 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     let _hintResolvio = false; // el hint matcheo un depto valido (para decidir si pisar el depto viejo de la conv)
     if (opts.deptoHint) {
       try {
-        const _hint = String(opts.deptoHint).trim().toLowerCase();
+        // FIX ACENTOS (Diego 2026-07-27): antes comparaba el nombre TAL CUAL. Si la IA escribia "Administracion"
+        // (sin tilde, que es como se lo mostrabamos en el ejemplo del prompt) y en la base figura "Administración"
+        // (con tilde), NO matcheaba -> la derivacion caia al depto default o a ninguno. Afectaba a Administracion,
+        // Recepcion y Tecnica: 3 de los 4 departamentos de cada rubro. Ahora se normaliza igual que ya lo hace
+        // deducirDepartamentoPorTexto (~4642): minusculas + sin acentos. Mismo criterio en los dos lados.
+        const _normDep = function (s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
+        const _hint = _normDep(opts.deptoHint);
         const { data: _deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true);
-        const _m = (_deps || []).find(function(d){ return d.nombre && String(d.nombre).trim().toLowerCase() === _hint; });
+        // 1) match exacto normalizado. 2) fallback: que uno contenga al otro (cubre "Ventas" vs "Venta",
+        //    "Alquileres" vs "Alquiler"). Solo con hint de 4+ caracteres, para no matchear cualquier cosa.
+        let _m = (_deps || []).find(function (d) { return d.nombre && _normDep(d.nombre) === _hint; });
+        if (!_m && _hint.length >= 4) {
+          _m = (_deps || []).find(function (d) {
+            const _n = _normDep(d.nombre);
+            return _n && (_n.indexOf(_hint) === 0 || _hint.indexOf(_n) === 0);
+          });
+        }
         if (_m) { _deptoId = _m.id; _hintResolvio = true; }
       } catch (eH) { /* si falla la query de departamentos, caemos al depto de la conv abajo */ }
     }
@@ -6900,10 +6914,35 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // esta tool en vez de solo prometerlo por texto. El sistema hace la rotacion (asigna, avisa, y la IA sigue hasta que
   // un humano escriba). NO agrega una llamada de IA extra: la tool viaja en el turno que el agente ya hace hoy.
   if (_derivacionV3On) {
+    // DEPARTAMENTOS REALES DEL CLIENTE (Diego 2026-07-27): antes esta tool traia los nombres HARDCODEADOS
+    // ("Venta, Alquiler, Administracion"), asi que la IA nunca podia derivar a un area que el cliente hubiera
+    // creado — el caso concreto: Anton TIENE un departamento de CAPTACION y la IA no sabia que existia, con lo
+    // cual un lead que ofrece su propiedad para vender nunca llegaba ahi. Ahora la lista sale de la CONFIGURACION
+    // del cliente (tabla departamentos, activos), igual que ya hace el clasificador (~8067). Si manana crea
+    // "Tasaciones", la IA se entera sola sin tocar codigo.
+    // 0 llamadas de IA extra. 1 query chica por turno, del mismo patron que ya usa clasificarEstado.
+    // FAIL-OPEN: si la query falla o el cliente no tiene departamentos cargados, se usa el texto de antes
+    // (byte-identico) -> nunca se rompe la derivacion por no poder leer la tabla.
+    let _deptosTool = [];
+    try {
+      if (user_id) {
+        const { data: _ddT } = await supabase.from('departamentos').select('nombre, criterio_derivacion').eq('user_id', user_id).eq('activo', true);
+        _deptosTool = (_ddT || []).filter(function (d) { return d && d.nombre; });
+      }
+    } catch (eDT) { _deptosTool = []; }
+    // Lista para la IA: "Nombre (cuando corresponde)". El criterio_derivacion es el que el cliente escribio en
+    // Configuracion, asi que la decision de que va a cada area la define EL DUEÑO, no un texto fijo del codigo.
+    const _listaDeptos = _deptosTool.map(function (d) {
+      const _cri = (d.criterio_derivacion && String(d.criterio_derivacion).trim()) ? (' (' + String(d.criterio_derivacion).trim().slice(0, 160) + ')') : '';
+      return String(d.nombre).trim() + _cri;
+    }).join(' · ');
+    const _guiaAreas = _listaDeptos
+      ? ('AREAS DE ESTA EMPRESA (son las unicas validas, pasa el nombre EXACTO tal cual figura aca): ' + _listaDeptos + '. Elegi la que corresponda por lo que el lead necesita. Si NINGUNA encaja del todo, deriva igual a la mas cercana: es preferible que lo atienda un humano del area equivocada a que el lead quede sin atencion.')
+      : 'IMPORTANTE (vos decidis el area): pasa SIEMPRE el departamento correcto segun lo que el lead necesita — Venta si quiere comprar, Alquiler si quiere alquilar, Administracion SOLO si es un cliente que ya opera con la empresa y consulta por un pago/expensa/recibo.';
     toolsAgente.push({
       name: 'derivar_a_humano',
-      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. IMPORTANTE (vos decidis el area): pasa SIEMPRE el departamento correcto segun lo que el lead necesita — Venta si quiere comprar, Alquiler si quiere alquilar, Administracion SOLO si es un cliente que ya opera con la empresa y consulta por un pago/expensa/recibo. NO derives adivinando: si todavia no sabes si es compra o alquiler, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
-      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre EXACTO del area/departamento al que corresponde el lead segun lo que necesita (ej: Venta, Alquiler, Administracion). Pasalo SIEMPRE que sepas la intencion; si no la sabes, primero preguntala al lead antes de derivar.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
+      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. ' + _guiaAreas + ' NO derives adivinando ENTRE COMPRA Y ALQUILER: si todavia no sabes cual de las dos es, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
+      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre EXACTO del area/departamento, tal cual figura en la lista de areas de esta empresa. Pasalo SIEMPRE que sepas la intencion; si no la sabes, primero preguntala al lead antes de derivar.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
     });
   }
 

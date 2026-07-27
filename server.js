@@ -6937,7 +6937,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       return String(d.nombre).trim() + _cri;
     }).join(' · ');
     const _guiaAreas = _listaDeptos
-      ? ('AREAS DE ESTA EMPRESA (son las unicas validas, pasa el nombre EXACTO tal cual figura aca): ' + _listaDeptos + '. Elegi la que corresponda por lo que el lead necesita. Si NINGUNA encaja del todo, deriva igual a la mas cercana: es preferible que lo atienda un humano del area equivocada a que el lead quede sin atencion.')
+      // NOTA (Diego 2026-07-27): aca NO va ninguna regla de comportamiento. Solo el DATO: la lista de areas del
+      // cliente. Si el nombre que manda la IA no matchea, el CODIGO ya lo resuelve (cae al depto de la conversacion
+      // y despues al es_default, ver iniciarRotacionDerivacionV3 ~4462). No hace falta pedirselo a la IA.
+      ? ('AREAS DE ESTA EMPRESA (son las unicas validas, pasa el nombre EXACTO tal cual figura aca): ' + _listaDeptos + '. Elegi la que corresponda por lo que el lead necesita.')
       : 'IMPORTANTE (vos decidis el area): pasa SIEMPRE el departamento correcto segun lo que el lead necesita — Venta si quiere comprar, Alquiler si quiere alquilar, Administracion SOLO si es un cliente que ya opera con la empresa y consulta por un pago/expensa/recibo.';
     toolsAgente.push({
       name: 'derivar_a_humano',

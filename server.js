@@ -720,6 +720,55 @@ const SUBSCRIPTIONS_ENABLED = String(process.env.SUBSCRIPTIONS_ENABLED || '').to
 const TRIAL_DESDE = process.env.TRIAL_DESDE || '';
 const MP_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
 const MP_BASE = 'https://api.mercadopago.com';
+
+// ============ PAYPAL (cobro en USD, en paralelo a MercadoPago en ARS) ============
+// Diego 2026-07-25/27: se cobra tambien en USD por PayPal. Argentina ELIGE moneda (pesos por MP o dolares por
+// PayPal); el resto de los paises va SOLO por PayPal. Todo nace APAGADO: sin PAYPAL_CLIENT_ID + PAYPAL_SECRET
+// en Railway, paypalActivo() es false y NADA de esto se ejecuta (el flujo de MP queda byte-identico).
+// Diferencia clave con MP: MP cobra con un "preapproval directo" mandando el monto suelto en el request. PayPal
+// EXIGE la cadena Producto -> Plan -> Suscripcion: los planes tienen que existir ANTES de poder suscribir a nadie.
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
+// Sandbox para probar sin mover plata real: PAYPAL_ENV=sandbox en Railway. Default LIVE (produccion).
+const PAYPAL_BASE = (String(process.env.PAYPAL_ENV || '').toLowerCase() === 'sandbox')
+  ? 'https://api-m.sandbox.paypal.com'
+  : 'https://api-m.paypal.com';
+function paypalActivo() { return !!(PAYPAL_CLIENT_ID && PAYPAL_SECRET); }
+// Precios USD por nivel (Diego 2026-07-25). Equivalen a los de ARS al dolar base 1530, redondeados.
+const PRECIOS_USD = { basico: 40, pro: 90, premium: 230, enterprise: 405 };
+// Token OAuth de PayPal, cacheado en memoria. PayPal lo emite con vida de ~9 h; lo renovamos con 5 min de
+// colchon. Un fallo NO se cachea (asi el proximo intento reintenta en vez de quedar pegado a un error).
+let _ppTokenCache = { token: null, venceMs: 0 };
+async function paypalToken() {
+  if (!paypalActivo()) throw new Error('PayPal no configurado (faltan PAYPAL_CLIENT_ID / PAYPAL_SECRET)');
+  const ahora = Date.now();
+  if (_ppTokenCache.token && ahora < _ppTokenCache.venceMs) return _ppTokenCache.token;
+  const basic = Buffer.from(PAYPAL_CLIENT_ID + ':' + PAYPAL_SECRET).toString('base64');
+  const r = await fetch(PAYPAL_BASE + '/v1/oauth2/token', {
+    method: 'POST',
+    headers: { 'Authorization': 'Basic ' + basic, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials'
+  });
+  const txt = await r.text();
+  let j = null; try { j = txt ? JSON.parse(txt) : null; } catch (e) {}
+  // NUNCA logueamos el body de esta respuesta: trae el access_token.
+  if (!r.ok || !j || !j.access_token) throw new Error('PayPal auth ' + r.status + ': ' + String((j && j.error_description) || 'sin token').slice(0, 160));
+  _ppTokenCache = { token: j.access_token, venceMs: ahora + Math.max(60, (Number(j.expires_in) || 32400) - 300) * 1000 };
+  return _ppTokenCache.token;
+}
+// Espejo de mpFetch. Tira en no-2xx con el mensaje de PayPal recortado (nunca el token ni el secret).
+async function paypalFetch(path, metodo, cuerpo, extraHeaders) {
+  const token = await paypalToken();
+  const headers = Object.assign({ 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, extraHeaders || {});
+  const r = await fetch(PAYPAL_BASE + path, { method: metodo || 'GET', headers: headers, body: cuerpo ? JSON.stringify(cuerpo) : undefined });
+  const txt = await r.text();
+  let json = null; try { json = txt ? JSON.parse(txt) : null; } catch (e) {}
+  if (!r.ok) {
+    const det = (json && json.details && json.details[0] && json.details[0].description) ? json.details[0].description : ((json && json.message) ? json.message : txt);
+    throw new Error('PayPal ' + r.status + ': ' + String(det).slice(0, 220));
+  }
+  return json;
+}
 // IDs globales de los planes en MercadoPago (creados 2026-06-16). Son del SaaS, compartidos por todos los tenants.
 // enterprise: su id se carga en la env MP_PLAN_ENTERPRISE de Railway (mismo patron; se crea una vez via /api/maestro/mp-crear-plan-enterprise).
 const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7', enterprise: process.env.MP_PLAN_ENTERPRISE || '' };
@@ -8602,6 +8651,18 @@ app.get('/health/deep', async (req, res) => {
 
   // 4) Bedrock: SOLO informativo (nunca afecta el status HTTP). No invoca Bedrock.
   checks.bedrock = { ready: !!_bedrockReady, enabled: process.env.BEDROCK_ENABLED === 'true' };
+
+  // PAYPAL: verifica que las credenciales de Railway sean validas pidiendo un token OAuth. NO expone el
+  // client_id, el secret ni el token: solo dice si configurado/ok y el entorno. NO es critica (si falla, el
+  // cobro por MercadoPago sigue funcionando igual) -> nunca marca el health como degradado.
+  {
+    const t0 = Date.now();
+    if (!paypalActivo()) checks.paypal = { configurado: false, entorno: null };
+    else {
+      try { await paypalToken(); checks.paypal = { configurado: true, ok: true, ms: Date.now() - t0, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live') }; }
+      catch (ePP) { checks.paypal = { configurado: true, ok: false, ms: Date.now() - t0, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live'), detail: String(ePP && ePP.message).slice(0, 180) }; }
+    }
+  }
 
   const criticas = [checks.supabase, checks.anthropic, checks.evolution];
   const degradado = criticas.some(function(c){ return !c || !c.ok; });

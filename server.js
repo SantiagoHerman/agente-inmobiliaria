@@ -181,6 +181,53 @@ const PORT = process.env.PORT || 3001;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_KEY || '', maxRetries: 4 });
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '');
 
+// ============================================================================
+// HORA REAL DEL ULTIMO MENSAJE — conversations.last_message_at (Diego 2026-07-28)
+// ----------------------------------------------------------------------------
+// PROBLEMA: la lista de conversaciones mostraba y ordenaba por updated_at, que se mueve con CUALQUIER cambio de
+// la fila (el reparto asignando asesor, el cron, un flag), no solo cuando entra o sale un mensaje. Medido en una
+// cuenta real: los 3 leads con asesor asignado figuraban a la hora del reparto (01:36) y uno que habia escrito
+// 35 h antes aparecia PRIMERO en "Requieren atencion".
+//
+// SOLUCION: ademas de last_message/last_role, escribimos last_message_at con EL MISMO timestamp que updated_at,
+// pero SOLO en los lugares donde de verdad hubo un mensaje (entrante o saliente). No se toca ningun otro update.
+//
+// COMPATIBLE HACIA ATRAS: mientras la migracion no se corra, la columna no existe y PostgREST rechaza el update
+// ENTERO con PGRST204 (ver "Supabase migraciones/cache": ADD COLUMN sin NOTIFY pgrst tambien rompe). Por eso el
+// campo NUNCA se agrega a mano: se pasa por _updConvMensaje(), que ante CUALQUIER error reintenta el update
+// ORIGINAL (sin la columna) -> el sistema se comporta EXACTAMENTE como hoy. El resultado se cachea en memoria
+// para no pagar un round-trip de mas por mensaje. 0 tokens de IA.
+let _lastMsgAtCol = null; // null = sin probar | true = la columna existe | false = migracion sin correr
+
+function _esErrorColumnaLastMsgAt(err) {
+  if (!err) return false;
+  const _m = String((err.message || err.details || err.hint || '')).toLowerCase();
+  return err.code === 'PGRST204' || err.code === '42703' || _m.indexOf('last_message_at') >= 0 ||
+    (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
+}
+
+// Agrega last_message_at al objeto de update SOLO si ya sabemos que la columna existe (probe hecho por
+// _updConvMensaje). Para los sitios que arman el update aparte y tienen su propia cadena de fallback.
+function _conLastMsgAt(upd) {
+  if (_lastMsgAtCol !== true || !upd) return upd;
+  return Object.assign({}, upd, { last_message_at: upd.updated_at || new Date().toISOString() });
+}
+
+// Ejecuta el update de "entro/salio un mensaje". `filtros` recibe el query builder y le encadena los .eq() que
+// ese sitio ya usaba. Devuelve lo mismo que devolvia el update original (no lanza de mas: si falla con la
+// columna nueva, reintenta sin ella y devuelve ese resultado).
+async function _updConvMensaje(upd, filtros) {
+  const _ts = (upd && upd.updated_at) || new Date().toISOString();
+  if (_lastMsgAtCol !== false) {
+    const _r = await filtros(supabase.from('conversations').update(Object.assign({}, upd, { last_message_at: _ts })));
+    if (!_r || !_r.error) { _lastMsgAtCol = true; return _r; }
+    if (_esErrorColumnaLastMsgAt(_r.error)) _lastMsgAtCol = false;
+    // Cualquier otro error tambien cae al reintento: peor caso escribimos dos veces los MISMOS valores.
+  }
+  return await filtros(supabase.from('conversations').update(upd));
+}
+// ============================================================================
+
 // === Notificaciones push (FCM) via firebase-admin ===
 // Se inicializa SOLO si hay credenciales (env FIREBASE_SERVICE_ACCOUNT = JSON del service account).
 // Si no esta configurado, enviarPushAsesor no hace nada (no rompe el flujo de mensajes).
@@ -1960,7 +2007,8 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
           }
         } catch (eFlipCel) { /* si falla la lectura: al menos guardamos last_message/last_role como siempre */ }
       }
-      await supabase.from('conversations').update(_updCel).eq('id', conv.id);
+      // HORA REAL: es un mensaje saliente REAL (el dueno escribio desde el celular) -> tambien last_message_at.
+      await _updConvMensaje(_updCel, function (q) { return q.eq('id', conv.id); });
       // FIX #3 (Diego 2026-07-23): si este eco marco admin_tomo, guardar QUIEN lo tomo. El que escribe desde
       // el celular es el DUEÑO de la cuenta -> admin_tomo_por = conv.user_id. Write APARTE best-effort: si la
       // migracion (migracion-admin-tomo-por.sql) no corrio, la columna no existe y este update falla SOLO
@@ -4407,13 +4455,23 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
     if (opts.setStatus) {
       const _upd = { status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() };
       if (typeof opts.lastMessage === 'string') { _upd.last_message = opts.lastMessage; _upd.last_role = opts.lastRole || 'ai'; }
+      // HORA REAL: SOLO si vino lastMessage, porque en ese caso los 3 callers ya enviaron el texto por WhatsApp y
+      // lo insertaron en messages (es un mensaje saliente REAL). Sin lastMessage esto es solo un cambio de estado
+      // y NO debe mover la hora de la lista. _conLastMsgAt agrega el campo unicamente si la columna ya existe.
+      const _updD = (typeof opts.lastMessage === 'string') ? _conLastMsgAt(_upd) : _upd;
       // AVISO #2 (LEAD CALIENTE): registrar el momento de la derivacion. DEFENSIVO: si la columna derivado_at no
       // existe, el update falla y reintentamos sin ella (el cron cae a updated_at como anchor). 0 tokens de IA.
       try {
-        const { error: _eDer } = await supabase.from('conversations').update(Object.assign({ derivado_at: new Date().toISOString(), aviso_caliente_enviado: false }, _upd)).eq('id', convId);
+        const { error: _eDer } = await supabase.from('conversations').update(Object.assign({ derivado_at: new Date().toISOString(), aviso_caliente_enviado: false }, _updD)).eq('id', convId);
         if (_eDer) throw _eDer;
       } catch (eDer) {
-        try { await supabase.from('conversations').update(_upd).eq('id', convId); } catch (eDer2) {}
+        try {
+          const { error: _eDer2 } = await supabase.from('conversations').update(_updD).eq('id', convId);
+          if (_eDer2) throw _eDer2;
+        } catch (eDer2) {
+          // Ultimo recurso: sin last_message_at -> exactamente el update de siempre (compatible hacia atras).
+          if (_updD !== _upd) { try { await supabase.from('conversations').update(_upd).eq('id', convId); } catch (eDer3) {} }
+        }
       }
       // PUNTO 5 (historial_estados): registrar el pase a listo_humano. Gated OFF -> no hace nada (BYTE-IDENTICO).
       try { registrarCambioEstadoConv(convId, null, 'listo_humano', 'La IA', motivo || null, user_id).catch(function(){}); } catch (eHE) {}
@@ -4897,7 +4955,7 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
         if (opts.instancia && opts.telefono) {
           try { await enviarWhatsapp(opts.instancia, opts.telefono, _msg); } catch (eWa) {}
           try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'ai', content: _msg, enviado_por: 'Agente IA' }); } catch (eIns) {}
-          try { await supabase.from('conversations').update({ last_message: _msg, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', convId); } catch (eLm) {}
+          try { await _updConvMensaje({ last_message: _msg, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', convId); }); } catch (eLm) {}
         }
       } catch (eAnun) {}
     }
@@ -5026,7 +5084,7 @@ async function _preguntarDeptoDerivacionV4(convId, ownerId, telefono, instancia)
     const _texto = 'Claro, te paso con el equipo. ¿Con que area preferis hablar? Tenemos: ' + _lista + '. Decime cual y te derivo enseguida.';
     if (telefono) { try { await enviarWhatsapp(instancia || nombreInstancia(ownerId), telefono, _texto); } catch (eWa) { console.error('pregunta depto v4 WhatsApp:', eWa && eWa.message); } }
     try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'ai', content: _texto, enviado_por: 'Agente IA' }); } catch (eMsg) {}
-    try { await supabase.from('conversations').update({ last_message: _texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', convId); } catch (eLm) {}
+    try { await _updConvMensaje({ last_message: _texto, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', convId); }); } catch (eLm) {}
     _deptoPreguntaPendiente.set(convId, true);
     try { await supabase.from('conversations').update({ derivacion_pregunta_depto: true }).eq('id', convId); } catch (eMark) { /* columna ausente: solo cuenta el Map */ }
     return { pregunto: true };
@@ -5749,7 +5807,8 @@ app.post('/api/enviar-media', async (req, res) => {
       _autorMedia,
       { select: 'id', single: false }
     );
-    await supabase.from('conversations').update({ last_message: contenidoCartelito, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    // HORA REAL: el "cartelito" es el texto de preview de un mensaje de MEDIA/VOZ que SI se envia -> mensaje real.
+    await _updConvMensaje({ last_message: contenidoCartelito, last_role: 'human', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conversation_id); });
     // RACE #1 (IA-vs-humano) — "Tomar conversacion" AUTOMATICO tambien al enviar MEDIA/VOZ (no solo texto). Si un
     // humano manda una nota de voz / foto con la IA encendida, la IA queda sin posibilidad de responder (igual que el
     // boton "Tomar conversacion" y que /api/whatsapp/send). NO cambia el status, solo apaga ai_enabled. Este endpoint
@@ -8544,7 +8603,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     await supabase.from('messages').insert([
       { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: _enviadoPor }
     ]);
-    await supabase.from('conversations').update({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    await _updConvMensaje({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conversation_id); });
     // E3: marcar la 1a respuesta (IA) para la metrica "tiempo de 1a respuesta". Fire-and-forget, 0 IA, defensivo.
     _marcarPrimeraRespuesta(conversation_id).catch(function(){});
   }
@@ -10622,7 +10681,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       if (tipoMediaEntrante) { try { const _ms = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, true); if (_ms) { _mU = _ms.url; _mT = _ms.tipo; } } catch (e) {} }
       try {
         await supabase.from('messages').insert(Object.assign({ conversation_id: conv.id, user_id: user_id, role: 'contact', content: texto, media_url: _mU, media_tipo: _mT }, _waMsgId ? { wa_message_id: _waMsgId } : {}));
-        await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+        await _updConvMensaje({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
       } catch (e) { console.error('guardar msg (pausa total/papelera):', e && e.message); }
       if (_enPausaTotal) {
         // Pausa total: avisar al asesor humano (FCM, sin tokens) para que atienda en lugar de la IA.
@@ -10763,7 +10822,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     const _idiomaLeadFinal = _idiomaLeadDetectado || idiomaLeadMsg;
     if (_idiomaLeadFinal) { _updConv.idioma_lead = _idiomaLeadFinal; _updConv.traductor_activo = true; }
     else if (_revertirIdiomaBase) { _updConv.idioma_lead = _idiomaBaseEmpresa; _updConv.traductor_activo = false; }
-    await supabase.from('conversations').update(_updConv).eq('id', conv.id);
+    await _updConvMensaje(_updConv, function (q) { return q.eq('id', conv.id); });
     // RESPALDO FALLO IA (reloj por mensaje, Diego 2026-07-23): ARMAMOS/reiniciamos el reloj con CADA mensaje del lead.
     // Va en un update APARTE y DEFENSIVO: si la columna respaldo_reloj todavia no existe (migracion no corrida), falla
     // en silencio y NO afecta el update de arriba (last_message/last_role/idioma) -> comportamiento BYTE-IDENTICO. Se
@@ -11690,7 +11749,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
       _autor,
       { select: 'id', single: true }
     );
-    await supabase.from('conversations').update({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    await _updConvMensaje({ last_message: texto, last_role: 'human', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conversation_id); });
     // E3: marcar la 1a respuesta (humano) para la metrica "tiempo de 1a respuesta". Fire-and-forget, 0 IA, defensivo.
     _marcarPrimeraRespuesta(conversation_id).catch(function(){});
     // FIX #2: RESET de la escalada SLA cuando un HUMANO responde. El escalado (revisarAvisosInternos #4) dedupea por
@@ -11861,7 +11920,7 @@ app.post('/api/whatsapp/ubicacion', async (req, res) => {
     const msgId = msgIns ? msgIns.id : null;
     // lat/lng dedicadas: update DEFENSIVO (si la migracion no corrio, no rompe).
     if (msgId) { try { await supabase.from('messages').update({ latitud: _lat, longitud: _lng }).eq('id', msgId); } catch (eLL) {} }
-    await supabase.from('conversations').update({ last_message: _txtUbic, last_role: 'human', updated_at: new Date().toISOString() }).eq('id', conversation_id);
+    await _updConvMensaje({ last_message: _txtUbic, last_role: 'human', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conversation_id); });
     // 4) Enviar via Evolution.
     const r = await enviarUbicacionWA(instancia, contacto.phone, _lat, _lng, name, address);
     // 5) Registrar estado + wa_message_id (para el ack de tildes). No usamos enviarWhatsapp (es texto), asi que actualizamos aca.
@@ -11970,6 +12029,8 @@ app.post('/api/mensajes/editar', async (req, res) => {
     if (!r.ok) return res.status(502).json({ error: 'No se pudo editar en WhatsApp' + (r.status ? (' [' + r.status + ']') : '') + (r.detail ? (': ' + r.detail) : '') + ' | jid=' + _jidEditar + ' find=' + _foundJid });
     try { await supabase.from('messages').update({ content: String(nuevo_texto) }).eq('id', m.id); } catch (eUpd) { console.error('editar content:', eUpd && eUpd.message); }
     // Si es el ultimo mensaje, reflejar el nuevo texto en la preview de la conversacion.
+    // HORA REAL (Diego 2026-07-28): aca NO se toca last_message_at A PROPOSITO. Editar el texto de un mensaje ya
+    // enviado no es un mensaje nuevo: cambia la preview, pero la hora del ultimo mensaje sigue siendo la del envio.
     try { await supabase.from('conversations').update({ last_message: String(nuevo_texto), updated_at: new Date().toISOString() }).eq('id', m.conversation_id).eq('last_role', 'human'); } catch (eLm) {}
     return res.json({ ok: true });
   } catch (err) {
@@ -15124,7 +15185,7 @@ async function enviarRecontactosPendientes() {
       const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
       // Enviar y registrar estado (enviado/fallido) en ese mensaje
       await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
-      await supabase.from('conversations').update({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      await _updConvMensaje({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
       try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(conv.user_id)) await registrarUsoIA(conv.user_id, 1 + (idiomaRec ? 1 : 0)); } catch (eCobRec) {}
@@ -15290,7 +15351,7 @@ async function procesarOportunidades() {
           // DEDUPE: registrar el envio (una sola vez).
           try { await supabase.from('oportunidad_envios').insert({ oportunidad_id: op.id, contact_id: c.contact_id, conversation_id: c.id, enviado_at: new Date().toISOString() }); } catch (eIns) {}
           // Actualizar last_message de la conv (best-effort, para que el asesor vea que salio algo).
-          try { await supabase.from('conversations').update({ last_message: (textoFinal || '[media]'), last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', c.id); } catch (eLm) {}
+          try { await _updConvMensaje({ last_message: (textoFinal || '[media]'), last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', c.id); }); } catch (eLm) {}
           enviadosTanda++;
           enviadosTotalNuevo++;
           enviadosHoyNuevo++;
@@ -15700,7 +15761,7 @@ async function _enviarRecontactosV2(ahoraMs) {
         // Registrar + enviar (mismo flujo que legacy)
         const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: uid, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
         await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
-        await supabase.from('conversations').update({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', conv.id);
+        await _updConvMensaje({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
         await supabase.from('recontactos').insert({ user_id: uid, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
         await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
         try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(uid)) await registrarUsoIA(uid, 1 + (idiomaRec ? 1 : 0)); } catch (eCob) {}
@@ -25750,7 +25811,7 @@ async function _estadiaProcesarReserva(ownerId, reserva, config, empresa, instan
       try {
         var salio = await enviarWhatsapp(instancia, telefono, texto, msgId);
         if (salio !== false) enviados++;
-        if (reserva.conversation_id) { try { await supabase.from('conversations').update({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }).eq('id', reserva.conversation_id).eq('user_id', ownerId); } catch (eLm) {} }
+        if (reserva.conversation_id) { try { await _updConvMensaje({ last_message: texto, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', reserva.conversation_id).eq('user_id', ownerId); }); } catch (eLm) {} }
         console.log('[estadia] ' + tipo + ' -> reserva ' + reserva.id + ' (cuenta ' + ownerId + ') salio=' + (salio !== false));
       } catch (eSend) { console.error('[estadia] envio ' + tipo + ':', eSend && eSend.message); }
       // Gap suave entre mensajes de la misma reserva (raro que haya >1 el mismo dia).
@@ -30249,7 +30310,7 @@ app.post('/api/public/feed/:token/consulta', async function (req, res) {
     var textoLead = mensaje || ('Consulta desde el catálogo web (' + nombre + ')');
     try {
       await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'contact', content: textoLead });
-      await supabase.from('conversations').update({ last_message: textoLead, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      await _updConvMensaje({ last_message: textoLead, last_role: 'contact', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
     } catch (eM) {}
     try { await supabase.from('messages').insert({ conversation_id: conv.id, user_id: ownerId, role: 'sistema', content: 'Nueva consulta desde el catálogo web público.', enviado_por: 'Sistema' }); } catch (eS) {}
     // 4) Aviso interno al equipo (canal Todos). CERO IA.
@@ -31409,7 +31470,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     // 3) Guardar SIEMPRE el mensaje entrante (role 'contact'), aun en pausa/papelera (no se pierde).
     try {
       await supabase.from('messages').insert({ conversation_id: conv.id, user_id: tenantUserId, role: 'contact', content: texto });
-      await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      await _updConvMensaje({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
     } catch (e) { console.error('meta guardar msg entrante:', e && e.message); }
 
     // Papelera o pausa TOTAL: no responder (cero tokens). El mensaje ya quedo guardado arriba.
@@ -33758,7 +33819,7 @@ async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil,
         console.error('[cloud-api] 🔴 NO se pudo guardar el mensaje entrante -> se corta sin responder (0 tokens):', _errIns.message);
         return;
       }
-      await supabase.from('conversations').update({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }).eq('id', conv.id);
+      await _updConvMensaje({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
     } catch (e) {
       console.error('[cloud-api] 🔴 excepcion guardando el mensaje entrante -> se corta sin responder (0 tokens):', e && e.message);
       return;

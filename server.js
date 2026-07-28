@@ -6021,6 +6021,86 @@ function _buscarUnidadesDev(devs, unitsPorDev, sectorNombrePorId, f) {
   return arr.slice(0, N);
 }
 
+// ===== FOTOS: CATEGORIA CANONICA + MATCH TOLERANTE POR RUBRO (arreglos 1 y 2, Diego 2026-07-28) =====
+// FORMA CANONICA ELEGIDA: 'bano' SIN Ñ. Motivo: es la forma que ya viaja en el prompt y en el enum de la tool
+// (o sea, lo que la IA escribe) y no depende del encoding del archivo ni del transporte. La lista del clasificador
+// Haiku (~20274) sigue guardando 'baño' CON Ñ, y las fotos YA GUARDADAS en la base tienen 'baño': por eso la
+// comparacion NO se hace por texto exacto sino NORMALIZADA (minusculas + sin acentos), donde 'baño' y 'bano'
+// colapsan al MISMO valor. Asi funciona con los datos viejos y con los nuevos SIN migrar nada y sin duplicar logica
+// (el arreglo 1 queda resuelto por esta normalizacion; no hace falta tocar las dos listas).
+// Function declarations => hoisted (se llaman desde generarRespuestaAgente aunque esten declaradas aca).
+function _normCatFoto(s) {
+  try { return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim(); }
+  catch (e) { return ''; }
+}
+// Lista canonica (misma que el enum de la tool: 'bano' sin ñ).
+var _CATEGORIAS_FOTO_CANON = ['dormitorio', 'bano', 'cocina', 'comedor', 'living', 'parque', 'frente', 'pileta', 'cochera', 'exterior', 'otra'];
+// SINONIMOS POR RUBRO: la misma palabra NO significa lo mismo en los 3 mundos, asi que el mapa se elige por rubro.
+// Clave = categoria canonica; valor = como la puede nombrar el lead (o la IA si se sale del enum).
+// - inmobiliaria (default): lo que pidio Diego (caso real "foto de frente y del fondo").
+// - hotel: 'frente' es la ENTRADA/INGRESO del complejo, no la fachada de una casa; se sacan los alias
+//   inmobiliarios ('adelante', 'contrafrente') que no aplican.
+// - desarrolladora: mapa VACIO a proposito. Sus categorias utiles (terreno, plano, avance de obra) todavia NO
+//   existen en la lista del clasificador, asi que inventar sinonimos ahi mandaria fotos equivocadas. Queda solo
+//   la normalizacion (acentos/mayusculas/plural). Cuando se agreguen esas categorias, se carga aca y listo.
+var _SINONIMOS_FOTO_INMOBILIARIA = {
+  frente: ['fachada', 'adelante', 'vista desde la calle', 'entrada', 'exterior frontal'],
+  parque: ['fondo', 'patio', 'jardin', 'contrafrente', 'verde'],
+  exterior: ['afuera', 'terreno', 'vista exterior'],
+  cochera: ['garage', 'garaje', 'estacionamiento'],
+  pileta: ['piscina', 'alberca'],
+  living: ['comedor diario', 'estar', 'sala']
+};
+var _SINONIMOS_FOTO_HOTEL = {
+  frente: ['fachada', 'entrada', 'ingreso', 'vista desde la calle', 'acceso'],
+  parque: ['fondo', 'patio', 'jardin', 'verde'],
+  exterior: ['afuera', 'vista exterior', 'terreno'],
+  cochera: ['garage', 'garaje', 'estacionamiento'],
+  pileta: ['piscina', 'alberca'],
+  living: ['comedor diario', 'estar', 'sala']
+};
+var _SINONIMOS_FOTO_DESARROLLADORA = {};
+function _sinonimosFotoPorRubro(rubro) {
+  try {
+    var r = normalizarRubro(rubro);
+    if (r === 'hotel_cabanas') return _SINONIMOS_FOTO_HOTEL;
+    if (r === 'desarrolladora') return _SINONIMOS_FOTO_DESARROLLADORA;
+    return _SINONIMOS_FOTO_INMOBILIARIA;
+  } catch (e) { return _SINONIMOS_FOTO_INMOBILIARIA; }
+}
+// Devuelve la categoria CANONICA de un texto crudo (lo que pidio la IA o lo que quedo guardado en la foto), o null
+// si no se puede resolver. Orden: exacto canonico -> exacto sinonimo -> plural/contenido canonico -> plural/contenido
+// sinonimo. El orden importa: 'exterior frontal' tiene que caer en 'frente' (sinonimo exacto) y no en 'exterior'
+// (por contenido). FAIL-SAFE: ante cualquier error devuelve null (= no matchea, se comporta como "no hay categoria").
+function _resolverCategoriaFoto(raw, rubro) {
+  try {
+    var n = _normCatFoto(raw);
+    if (!n) return null;
+    var i, k, a;
+    for (i = 0; i < _CATEGORIAS_FOTO_CANON.length; i++) {
+      if (_normCatFoto(_CATEGORIAS_FOTO_CANON[i]) === n) return _CATEGORIAS_FOTO_CANON[i];
+    }
+    var sin = _sinonimosFotoPorRubro(rubro) || {};
+    var keys = Object.keys(sin);
+    for (k = 0; k < keys.length; k++) {
+      var al = sin[keys[k]] || [];
+      for (a = 0; a < al.length; a++) { if (_normCatFoto(al[a]) === n) return keys[k]; }
+    }
+    for (i = 0; i < _CATEGORIAS_FOTO_CANON.length; i++) {
+      var c = _normCatFoto(_CATEGORIAS_FOTO_CANON[i]);
+      if (c && (n === c + 's' || n === c + 'es' || n.indexOf(c) >= 0)) return _CATEGORIAS_FOTO_CANON[i];
+    }
+    for (k = 0; k < keys.length; k++) {
+      var al2 = sin[keys[k]] || [];
+      for (a = 0; a < al2.length; a++) {
+        var s2 = _normCatFoto(al2[a]);
+        if (s2 && (n === s2 + 's' || n === s2 + 'es' || n.indexOf(s2) >= 0)) return keys[k];
+      }
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
 // MEDIDOR (2026-07-23): turnoId es un 5o parametro OPCIONAL (default null) que NO cambia nada del comportamiento:
 // solo viaja hasta las llamadas de IA internas (la traduccion saliente) para que su costo quede atribuido al MISMO
 // turno (mensaje del lead) que la respuesta. Los callers viejos que no lo pasan siguen funcionando igual.
@@ -7957,16 +8037,35 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           try { _contarConsultaPropiedad(user_id, numPedido, (propFoto.title || null)).catch(function(){}); } catch (eCnt) {}
           const imgs = Array.isArray(propFoto.images) ? propFoto.images : [];
           if (imgs.length > 0) {
-            // 1) intentar por categoria exacta
-            let cand = imgs.filter(function(im){ return im && im.categoria === fotoCategoria && im.url; });
-            // 2) fallback: portada / primera foto con url
-            if (cand.length === 0) cand = imgs.filter(function(im){ return im && im.url; });
+            // ARREGLO 2 (Diego 2026-07-28): la comparacion ya NO es texto exacto. Se resuelve la categoria PEDIDA y la
+            // de CADA foto a su forma canonica (minusculas, sin acentos, plural y SINONIMOS POR RUBRO) y se comparan
+            // esas. Asi 'baño' guardado matchea con 'bano' pedido (arreglo 1) y "fondo"/"fachada"/"garage" caen donde
+            // corresponde. Si no se puede resolver -> null (no matchea).
+            const _catPedida = _resolverCategoriaFoto(fotoCategoria, rubro);
+            // Categorias que la propiedad SI tiene (canonicas, sin repetir). Sirve para el aviso del arreglo 3.
+            const _catsDisp = [];
+            imgs.forEach(function(im){
+              if (!im || !im.url) return;
+              const _c = _resolverCategoriaFoto(im.categoria, rubro);
+              if (_c && _catsDisp.indexOf(_c) === -1) _catsDisp.push(_c);
+            });
+            let cand = _catPedida ? imgs.filter(function(im){ return im && im.url && _resolverCategoriaFoto(im.categoria, rubro) === _catPedida; }) : [];
+            // ARREGLO 3 (Diego 2026-07-28): NO mandar una foto que no es la pedida. El fallback "primera foto de la
+            // galeria" se ELIMINA cuando la propiedad TIENE fotos categorizadas: si no hay de la categoria pedida no se
+            // manda ninguna y se le dice a la IA que categorias SI hay para que las ofrezca (el texto al lead lo arma
+            // ella). EXCEPCION deliberada: si la propiedad/unidad no tiene NINGUNA foto categorizada (_catsDisp vacio;
+            // pasa en HOTEL, donde las fotos se guardan con categoria:'' — ver ~21047/21323 — y en galerias importadas
+            // sin clasificar), no hay forma de saber que la foto "no es la pedida": ahi se conserva el comportamiento
+            // de hoy (mandar una foto y pedirle a la IA que aclare) para no dejar al hotel sin fotos.
+            if (cand.length === 0 && _catsDisp.length === 0) cand = imgs.filter(function(im){ return im && im.url; });
             if (cand.length > 0) {
               fotoUrl = cand[0].url;
-              const huboCategoria = cand[0].categoria === fotoCategoria;
+              const huboCategoria = !!(_catPedida && _resolverCategoriaFoto(cand[0].categoria, rubro) === _catPedida);
               toolResultTexto = huboCategoria
                 ? ('OK: foto enviada de la propiedad N' + numPedido + ', categoria ' + fotoCategoria + '. Acompanala con un comentario breve y natural.')
                 : ('No habia foto especifica de la categoria ' + fotoCategoria + ' para la propiedad N' + numPedido + '. Se envio otra foto disponible de la propiedad. Aclara con naturalidad que le mandas una foto de la propiedad aunque no sea exactamente de ' + fotoCategoria + '.');
+            } else if (_catsDisp.length > 0) {
+              toolResultTexto = 'NO se envio ninguna foto: la propiedad N' + numPedido + ' no tiene fotos de la categoria ' + fotoCategoria + '. Categorias de foto que SI tiene esta propiedad: ' + _catsDisp.join(', ') + '. Decile que de esa no tenes y ofrecele las que si hay.';
             } else {
               toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
             }
@@ -20271,6 +20370,11 @@ app.post('/api/scrape/detalle', async function(req, res) {
 // ===== FASE 3: AUTO-CATALOGO DE FOTOS POR VISION =====
 // Clasifica fotos de propiedades en una categoria (dormitorio, baño, etc) usando vision de Claude.
 // Endpoint nuevo y aislado: NO toca el flujo del agente, webhook, debounce ni memoria.
+// ARREGLO 1 (Diego 2026-07-28): esta lista sigue con 'baño' CON Ñ A PROPOSITO. Es la que ETIQUETA las fotos, y las
+// fotos YA guardadas en la base tienen 'baño'; cambiarla dejaria la base con dos valores distintos sin ganar nada.
+// La forma CANONICA para COMPARAR es 'bano' SIN Ñ (ver _CATEGORIAS_FOTO_CANON / _resolverCategoriaFoto, ~6027): el
+// match normaliza acentos, asi que 'baño' (guardado) y 'bano' (lo que pide la IA) colapsan al mismo valor. No hay
+// logica duplicada ni migracion de datos.
 const CATEGORIAS_FOTO = ['dormitorio', 'baño', 'cocina', 'comedor', 'living', 'parque', 'frente', 'pileta', 'cochera', 'exterior', 'otra'];
 // Normaliza acentos y mayusculas para comparar contra la lista de categorias.
 function normalizarTexto(s) {

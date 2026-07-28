@@ -4014,6 +4014,124 @@ async function registrarCambioEstadoConv(conversation_id, estadoPrev, estadoNuev
 }
 // ============================================================================
 
+// ============================================================================
+// ===== REGISTRO DE DECISIONES DE LA IA (Diego 2026-07-28) — "caja negra" =====
+// Deja rastro PERMANENTE y consultable de que decidio la IA en cada turno. Hoy eso vive SOLO en
+// console.log('[CLASIFICADOR] ...') (~8349) que se borra con los logs de Railway.
+// Tabla: ia_decisiones (ver migracion-registro-decisiones-ia.sql). Gateado por
+// business_settings.registro_decisiones_ia (DEFAULT TRUE = ON: no cambia comportamiento, solo registra).
+//
+// CONTRATO DE SEGURIDAD (producto EN VIVO, webhook = camino mas caliente del sistema):
+//   1) NUNCA se hace `await` de esta funcion en el camino del mensaje. SIEMPRE fire-and-forget:
+//      registrarDecisionIA({...}).catch(function(){});
+//      El trabajo sincronico del caller es SOLO armar un objeto literal (microsegundos). Todo el
+//      I/O (flag + select + insert) pasa DESPUES de que la respuesta al lead ya salio.
+//   2) Si la tabla NO existe (migracion no corrida) -> el circuit breaker _regDecOff se prende y NO
+//      se vuelve a intentar NUNCA en este proceso. Cero reintentos en loop, cero ruido en los logs.
+//   3) Cualquier error se traga en silencio. Un fallo del registro JAMAS rompe ni demora la atencion.
+//   4) 0 TOKENS DE IA. Solo registra lo que ya paso.
+//   5) DATOS PERSONALES: se guarda el texto del lead RECORTADO (300 chars) y nada mas. Telefono y
+//      nombre NO se duplican aca: ya estan en `contacts`, se llegan por conversation_id.
+const REG_DEC_MAX_TEXTO = 300;              // recorte del mensaje del lead (no inflar la base)
+const REG_DEC_FLAG_TTL_MS = 5 * 60 * 1000;  // cache del flag en memoria: 1 query cada 5 min por cuenta
+let _regDecOff = false;                     // circuit breaker: tabla ausente -> apagado permanente en este proceso
+const _regDecFlagCache = new Map();         // user_id -> { on: boolean, exp: ms }
+
+// Flag por cuenta. DEFAULT ON (null/true -> ON; solo `false` explicito apaga).
+// Si la COLUMNA no existe (migracion no corrida) el select da error -> devolvemos false (no intentamos
+// escribir en una tabla que tampoco existe todavia). Cacheado 5 min: el webhook no paga esta query.
+async function registroDecisionesActivo(user_id) {
+  try {
+    if (!user_id) return false;
+    const _now = Date.now();
+    const _c = _regDecFlagCache.get(user_id);
+    if (_c && _c.exp > _now) return _c.on;
+    let _on = false;
+    try {
+      const { data, error } = await supabase.from('business_settings').select('registro_decisiones_ia').eq('user_id', user_id).maybeSingle();
+      if (error) _on = false;                                        // columna ausente / error -> OFF
+      else _on = !(data && data.registro_decisiones_ia === false);    // null o true -> ON (default ON)
+    } catch (e) { _on = false; }
+    if (_regDecFlagCache.size > 500) _regDecFlagCache.clear(); // cota dura: la cache no crece sin limite
+    _regDecFlagCache.set(user_id, { on: _on, exp: _now + REG_DEC_FLAG_TTL_MS });
+    return _on;
+  } catch (e) { return false; }
+}
+
+// Recorte defensivo de texto (null-safe, nunca tira).
+function _regDecCorte(s, n) {
+  try {
+    if (s === null || s === undefined) return null;
+    const _s = String(s);
+    return _s.length > n ? _s.slice(0, n) : _s;
+  } catch (e) { return null; }
+}
+
+// Detecta "la tabla/columna no existe" para APAGAR el registro de una y no reintentar en loop.
+function _regDecEsFaltaDeTabla(error) {
+  try {
+    const _m = String((error && (error.message || '')) + ' ' + (error && (error.code || '')) + ' ' + (error && (error.details || ''))).toLowerCase();
+    return _m.indexOf('does not exist') >= 0 || _m.indexOf('could not find') >= 0 ||
+           _m.indexOf('schema cache') >= 0 || _m.indexOf('pgrst205') >= 0 ||
+           _m.indexOf('pgrst204') >= 0 || _m.indexOf('42p01') >= 0 || _m.indexOf('42703') >= 0;
+  } catch (e) { return false; }
+}
+
+// UNICA puerta de escritura. LLAMAR SIEMPRE fire-and-forget (ver contrato arriba).
+// d = { user_id, conversation_id, turno_id, mensaje_lead, clasificador_corrio, estado_previo,
+//       estado_propuesto, estado_aplicado, motivo_no_aplicado, bloqueo_interesado, tools[],
+//       pidio_area, deducido, fuera_alcance, derivo, derivo_camino, derivo_motivo,
+//       departamento_texto, ia_respondio, origen }
+// `estado_despues` y `departamento_id` NO se pasan: se LEEN de la conversacion aca adentro (valor
+// verificado, no deducido). Esa lectura pasa fuera del camino caliente, no demora nada al lead.
+async function registrarDecisionIA(d) {
+  try {
+    if (_regDecOff) return;                                  // migracion no corrida -> apagado
+    if (!d || !d.user_id || !d.conversation_id) return;
+    if (!(await registroDecisionesActivo(d.user_id))) return; // flag OFF / columna ausente -> no-op
+
+    // Estado y departamento REALES despues del turno (1 select, off del camino caliente).
+    let _estadoDespues = null, _deptoDespues = null;
+    try {
+      const { data: _cv } = await supabase.from('conversations').select('status, departamento_id').eq('id', d.conversation_id).maybeSingle();
+      if (_cv) { _estadoDespues = _cv.status || null; _deptoDespues = _cv.departamento_id || null; }
+    } catch (eCv) { /* si falla, quedan null: la fila igual sirve */ }
+
+    const _txt = String(d.mensaje_lead || '');
+    const fila = {
+      user_id: d.user_id,
+      conversation_id: d.conversation_id,
+      turno_id: d.turno_id || null,
+      origen: _regDecCorte(d.origen || 'webhook_whatsapp', 40),
+      mensaje_lead: _regDecCorte(_txt, REG_DEC_MAX_TEXTO),
+      mensaje_truncado: _txt.length > REG_DEC_MAX_TEXTO,
+      clasificador_corrio: d.clasificador_corrio !== false,
+      estado_previo: _regDecCorte(d.estado_previo, 40),
+      estado_propuesto: _regDecCorte(d.estado_propuesto, 40),
+      estado_despues: _regDecCorte(_estadoDespues, 40),
+      estado_aplicado: !!d.estado_aplicado,
+      motivo_no_aplicado: _regDecCorte(d.motivo_no_aplicado, 60),
+      bloqueo_interesado: !!d.bloqueo_interesado,
+      tools: Array.isArray(d.tools) ? d.tools.slice(0, 8).map(function (t) { return _regDecCorte(t, 60); }).filter(Boolean) : [],
+      pidio_area: !!d.pidio_area,
+      deducido: !!d.deducido,
+      fuera_alcance: !!d.fuera_alcance,
+      derivo: !!d.derivo,
+      derivo_camino: _regDecCorte(d.derivo_camino, 60),
+      derivo_motivo: _regDecCorte(d.derivo_motivo, 200),
+      departamento_id: _deptoDespues,
+      departamento_texto: _regDecCorte(d.departamento_texto, 80),
+      ia_respondio: d.ia_respondio !== false
+    };
+    const { error } = await supabase.from('ia_decisiones').insert(fila);
+    if (error && _regDecEsFaltaDeTabla(error)) {
+      _regDecOff = true;
+      console.log('[DECISIONES] tabla ia_decisiones ausente: registro DESACTIVADO en este proceso. Corre migracion-registro-decisiones-ia.sql + NOTIFY pgrst.');
+    }
+  } catch (e) { /* best-effort ABSOLUTO: el registro NUNCA rompe ni demora la atencion */ }
+}
+// ============================================================================
+
 async function derivarAHumano(convId, user_id, motivo, opts) {
   opts = opts || {};
   try {
@@ -8168,7 +8286,17 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // para el cobro (plan Principio 2 / decision Diego #1: la busqueda no se cobra aparte; sigue 1 msg por respuesta).
   // Con el flag OFF, _ragToolUsado=false => usoTool es BYTE-IDENTICO al actual. Si Diego decide cobrarla, quitar el
   // `&& !_ragToolUsado`.
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
+  // REGISTRO DE DECISIONES IA: NOMBRES de las tools que pidio el modelo en este turno (sin argumentos).
+  // Es un filter/map sobre 1-3 bloques del completion (microsegundos, 0 I/O, 0 IA) y es ADITIVO: ningun
+  // consumidor existente lee `toolsUsadas`, asi que no cambia ni un comportamiento. Defensivo: ante
+  // cualquier forma inesperada del completion devuelve [].
+  let _toolsUsadas = [];
+  try {
+    _toolsUsadas = (completion && Array.isArray(completion.content))
+      ? completion.content.filter(function(b){ return b && b.type === 'tool_use' && b.name; }).map(function(b){ return String(b.name); })
+      : [];
+  } catch (eTU) { _toolsUsadas = []; }
+  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada, toolsUsadas: _toolsUsadas, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -10869,6 +10997,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // FIX D: si la conv YA estaba ROTANDO (no recien iniciada), SALTEAR toda la clasificacion+derivacion (incluida
           // la RED DE SEGURIDAD): en rotacion la IA responde pero NADIE debe subir el status a listo_humano ni apagar la
           // IA por reclasificacion — la unica salida es que un ASESOR escriba (_finalizarRotacionV3 via /api/whatsapp/send).
+          // REGISTRO DECISIONES IA: banderas del registro (NADIE mas las lee; no cambian ninguna decision).
+          // _decRegistrada evita registrar dos veces el mismo turno; _yaDerivoRegistro captura la derivacion de la
+          // RED DE SEGURIDAD (que no toca _yaDerivoEnEsteMensaje).
+          let _decRegistrada = false;
+          let _yaDerivoRegistro = false;
           if (!_enRotacion && !_rotacionV3Iniciada && estadoActual !== 'listo_humano' && estadoActual !== 'cerrado') {
             // PUNTO 6 (tildar_depto): leemos el flag ANTES de clasificar y se lo pasamos al clasificador. Con OFF/ausente
             // -> _tildarOn=false -> clasificarEstado usa el prompt de una palabra (20 tokens) y departamentoIdTildar=null
@@ -10904,6 +11037,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             let _repV2Cls = false; try { _repV2Cls = await repartoV2Activo(user_id); } catch (eRG) { _repV2Cls = false; }
             // FASE 2 (punto 6a): evitar que la RED DE SEGURIDAD re-invoque derivarAHumano si ya derivamos en ESTE mensaje.
             let _yaDerivoEnEsteMensaje = false;
+            // REGISTRO DECISIONES IA: por QUE CAMINO derivo (string, solo para el registro). No lo lee nadie mas.
+            let _decCamino = null;
 
             // FASE 2 (punto 1, fallback sin llamada extra): si quedo una CONFIRMACION pendiente y la respuesta del lead
             // no se resolvio por regex arriba, usamos ESTA clasificacion (la que ya corrio) como fallback: si el lead
@@ -10928,6 +11063,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
                   }
                   _yaDerivoEnEsteMensaje = true;
+                  _decCamino = 'confirmacion_fallback'; // REGISTRO DECISIONES IA (solo etiqueta)
                 }
               } catch (ePendFb) { console.error('confirmacion fallback:', ePendFb && ePendFb.message); }
             }
@@ -10984,6 +11120,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                       await derivarAHumano(_convId, user_id, 'cambio_tema_rederivar', { setStatus: true, push: true, pushTitulo: 'Lead cambio de area', pushTexto: (data.pushName || telefono), resumen: true });
                     }
                     _yaDerivoEnEsteMensaje = true;
+                    _decCamino = 'cambio_tema'; // REGISTRO DECISIONES IA (solo etiqueta)
                   }
                   _cambioTemaManejado = true;
                 }
@@ -11040,6 +11177,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 await derivarAHumano(_convId, user_id, 'ia_fuera_alcance', { setStatus: false, push: true, pushTitulo: 'Lead fuera de alcance de la IA', pushTexto: (data.pushName || telefono), resumen: true });
               }
               _yaDerivoEnEsteMensaje = true;
+              _decCamino = 'fuera_alcance'; // REGISTRO DECISIONES IA (solo etiqueta)
             }
 
             // ARREGLO 5 (Diego 2026-07-28): 'interesado' solo si el lead escribio al menos UNA vez DESPUES de la
@@ -11054,9 +11192,17 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 if (_bloqueoInteresado) console.log('Clasificador: se frena "interesado" en conv ' + _convId + ' (el lead todavia no escribio despues de la primera respuesta)');
               } catch (eGI) { _bloqueoInteresado = false; } // fail-open
             }
+            // REGISTRO DECISIONES IA: se aplico el estado propuesto? y si NO, POR QUE. Son SOLO etiquetas para el
+            // registro (ninguna condicion de negocio las lee). Se calculan de las MISMAS variables que ya decidieron.
+            let _decAplicado = false;
+            let _decMotivoNo = (!nuevoEstado || nuevoEstado === 'sin_cambio') ? 'sin_cambio'
+                             : (_yaDerivoEnEsteMensaje ? 'ya_derivo_en_este_mensaje'
+                             : (_bloqueoInteresado ? 'bloqueo_interesado' : null));
             if (nuevoEstado && !_yaDerivoEnEsteMensaje && !_bloqueoInteresado) {
               // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
               const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
+              // REGISTRO DECISIONES IA: lectura pura del mismo mapa `nivel` (0 I/O). No altera el if de abajo.
+              if (!((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0))) _decMotivoNo = 'no_sube_de_nivel';
               if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {
                 // FASE 2 (punto 1): si pasa a listo_humano y hay que CONFIRMAR antes de derivar (perilla del depto +
                 // la IA DEDUJO, no lo pidio explicito), NO asignamos asesor: preguntamos "¿te derivo con [depto]?" y
@@ -11072,6 +11218,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 if (_confirmar) {
                   // Pedir confirmacion: NO subir status ni asignar asesor. La conv sigue en su estado actual con IA ON.
                   await pedirConfirmacionDerivacion(_convId, user_id, _departamentoId, telefono, instanciaNombre);
+                  _decMotivoNo = 'pidio_confirmacion'; _decCamino = 'pidio_confirmacion'; // REGISTRO DECISIONES IA
                 } else if (_v4On && nuevoEstado === 'listo_humano') {
                   // DERIVACION v4 (PUNTO 3): la clasificacion subio a listo_humano, pero con v4 ON NO pasamos a listo_humano/
                   // IA off: entramos en ROTACION en el depto deducido (o conv/default) y la IA SIGUE atendiendo. NO tocamos
@@ -11080,6 +11227,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   try { await _v4RutearARotacion(_convId, user_id, { deptoId: _departamentoId || null, leadRef: (data.pushName || telefono) || null }); }
                   catch (eV4Cl) { console.error('v4 clasificacion listo_humano:', eV4Cl && eV4Cl.message); }
                   _yaDerivoEnEsteMensaje = true;
+                  _decMotivoNo = 'derivo_rotacion_v4'; _decCamino = 'clasificacion_rotacion_v4'; // REGISTRO DECISIONES IA
                   detectarYAgendarCita(user_id, _convId, _turnoId).catch(function(){});
                 } else {
                   // temp-decay (gated): este cambio de estado (p.ej. en_conversacion->interesado, que propondria 'tibio')
@@ -11090,6 +11238,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   // Si pasa a listo_humano, pausar la IA automaticamente para que lo tome un humano
                   if (nuevoEstado === 'listo_humano') { update.ai_enabled = false; }
                   await supabase.from('conversations').update(update).eq('id', _convId);
+                  _decAplicado = true; _decMotivoNo = null; // REGISTRO DECISIONES IA: el estado propuesto SI se escribio
                   // PUNTO 5 (historial_estados): cambio de estado por clasificacion. Gated OFF -> no-op (BYTE-IDENTICO).
                   try { registrarCambioEstadoConv(_convId, estadoActual, nuevoEstado, 'La IA', 'clasificacion automatica', user_id).catch(function(){}); } catch (eHE) {}
                   // Si paso a listo_humano: asignar asesor (si no tiene) + generar resumen.
@@ -11099,6 +11248,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     // (setStatus:false), y este flujo NO avisa por push (igual que antes, push:false).
                     await derivarAHumano(_convId, user_id, 'clasificacion_listo_humano', { setStatus: false, push: false, resumen: true });
                     _yaDerivoEnEsteMensaje = true;
+                    _decCamino = 'clasificacion_listo_humano'; // REGISTRO DECISIONES IA
                     // CITAS: si el lead acordo una cita concreta (fecha+hora) en este handoff, agendarla + avisar al asesor.
                     // Fire-and-forget: no bloquea ni rompe la respuesta. Solo corre en el momento del handoff (raro).
                     detectarYAgendarCita(user_id, _convId, _turnoId).catch(function(){});
@@ -11116,15 +11266,82 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
                   // ETAPA 4: solo asignar asesor (sin tocar status, sin push, sin resumen) — igual que antes.
                   await derivarAHumano(_convId, cvSeg.user_id, 'red_seguridad', { setStatus: false, push: false, resumen: false });
+                  _decCamino = _decCamino || 'red_seguridad'; // REGISTRO DECISIONES IA
+                  _yaDerivoRegistro = true;
                 }
               }
             } catch (eSeg) { console.error('Error red seguridad derivacion:', eSeg); }
+
+            // ===== REGISTRO DE DECISIONES DE LA IA (camino CLASIFICADO) =====
+            // FIRE-AND-FORGET puro: aca solo se arma un objeto literal (microsegundos, 0 I/O, 0 IA) y se suelta la
+            // promesa. NUNCA se hace await: el lead YA recibio su respuesta mas arriba (~10930) y el webhook no se
+            // demora ni un milisegundo. Si la tabla no existe, registrarDecisionIA se apaga solo y no reintenta.
+            _decRegistrada = true;
+            try {
+              registrarDecisionIA({
+                user_id: user_id,
+                conversation_id: _convId,
+                turno_id: _turnoId,
+                mensaje_lead: texto,
+                clasificador_corrio: true,
+                estado_previo: estadoActual,
+                estado_propuesto: nuevoEstado || null,
+                estado_aplicado: _decAplicado,
+                motivo_no_aplicado: _decMotivoNo,
+                bloqueo_interesado: _bloqueoInteresado,
+                tools: (resultado && resultado.toolsUsadas) || [],
+                pidio_area: _pidioArea,
+                deducido: _deducido,
+                fuera_alcance: _fueraAlcance,
+                derivo: (_yaDerivoEnEsteMensaje || _yaDerivoRegistro),
+                derivo_camino: _decCamino,
+                derivo_motivo: (resultado && resultado.derivarMotivo) || null,
+                departamento_texto: (resultado && resultado.derivarDepto) || null,
+                ia_respondio: !!(resultado && resultado.reply),
+                origen: 'webhook_whatsapp'
+              }).catch(function(){});
+            } catch (eDec) { /* jamas rompe el flujo */ }
+
             // MEMORIA VIVA: actualizar el resumen-de-avance (THROTTLED) para que el agente retome sin releer todo
             // y se pueda acortar el historial. Solo charlas con recorrido (>=9 msgs) y cada 3 -> cero costo extra en cortas.
             try {
               const { count: _nMsgs } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('conversation_id', _convId);
               if (typeof _nMsgs === 'number' && _nMsgs >= 9 && (_nMsgs % 3 === 0)) { actualizarMemoriaViva(user_id, _convId, _turnoId).catch(function(){}); }
             } catch (eMem) {}
+          }
+
+          // ===== REGISTRO DE DECISIONES DE LA IA (camino SIN CLASIFICAR) =====
+          // El clasificador se SALTEA cuando la conv esta en rotacion, cuando la tool derivar_a_humano/agendar_cita ya
+          // derivo en este mismo turno, o cuando la conv ya esta en 'listo_humano'/'cerrado'. Esos turnos TAMBIEN tienen
+          // que quedar registrados: si no, la derivacion por tool (el camino mas importante) seria invisible.
+          // FIRE-AND-FORGET igual que arriba: 0 await, 0 I/O sincronico, 0 IA.
+          if (!_decRegistrada) {
+            const _motivoSkip = _enRotacion ? 'en_rotacion'
+                              : (_rotacionV3Iniciada ? 'derivo_por_tool'
+                              : ((estadoActual === 'listo_humano' || estadoActual === 'cerrado') ? 'estado_terminal' : 'sin_clasificar'));
+            const _caminoSkip = (resultado && resultado.agendaDerivada) ? 'agenda_cita'
+                              : (_rotacionV3Iniciada ? 'tool_derivar_v3' : null);
+            try {
+              registrarDecisionIA({
+                user_id: user_id,
+                conversation_id: _convId,
+                turno_id: _turnoId,
+                mensaje_lead: texto,
+                clasificador_corrio: false,
+                estado_previo: estadoActual,
+                estado_propuesto: null,
+                estado_aplicado: false,
+                motivo_no_aplicado: _motivoSkip,
+                bloqueo_interesado: false,
+                tools: (resultado && resultado.toolsUsadas) || [],
+                derivo: !!_rotacionV3Iniciada,
+                derivo_camino: _caminoSkip,
+                derivo_motivo: (resultado && resultado.derivarMotivo) || null,
+                departamento_texto: (resultado && resultado.derivarDepto) || null,
+                ia_respondio: !!(resultado && resultado.reply),
+                origen: 'webhook_whatsapp'
+              }).catch(function(){});
+            } catch (eDec2) { /* jamas rompe el flujo */ }
           }
         }
       } catch (eGen) {
@@ -21827,6 +22044,188 @@ async function _ownerDe(req) {
   try { var ase = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle(); if (ase && ase.data && ase.data.admin_id) return ase.data.admin_id; } catch (e) {}
   return user_id;
 }
+
+// ============================================================================
+// ===== REGISTRO DE DECISIONES DE LA IA — LECTURA (Diego 2026-07-28) =====
+// Endpoints de SOLO LECTURA sobre la tabla ia_decisiones (ver migracion-registro-decisiones-ia.sql).
+// AUTH: _ownerDe(req) -> resuelve el TENANT (un asesor consulta la cuenta de su dueno). TODA query va
+// filtrada por user_id = ownerId, asi que NUNCA se puede leer la cuenta de otro. 0 IA, 0 escrituras.
+// Si la migracion no se corrio todavia, devuelven 200 con { pendiente_migracion: true } y lista vacia
+// (no rompen el front ni tiran 500).
+// ============================================================================
+
+// Rango de fechas comun a los dos endpoints. Default: ultimos 7 dias (la ventana que mira el dueno).
+function _decRango(q) {
+  var _hasta = (q && q.hasta) ? new Date(String(q.hasta)) : new Date();
+  if (isNaN(_hasta.getTime())) _hasta = new Date();
+  var _desde = (q && q.desde) ? new Date(String(q.desde)) : new Date(_hasta.getTime() - 7 * 24 * 60 * 60 * 1000);
+  if (isNaN(_desde.getTime())) _desde = new Date(_hasta.getTime() - 7 * 24 * 60 * 60 * 1000);
+  return { desde: _desde.toISOString(), hasta: _hasta.toISOString() };
+}
+function _decErrFaltaTabla(error) { return _regDecEsFaltaDeTabla(error); }
+
+// GET /api/decisiones
+//   Filtros (todos opcionales, se combinan con AND):
+//     conversation_id=<uuid>   -> todas las decisiones de ESE lead (ignora el rango de fechas por default)
+//     desde=/hasta=            -> ISO date/datetime (default: ultimos 7 dias)
+//     derivo=si|no             -> solo las que derivaron / solo las que NO
+//     frenado=si               -> solo donde el guard freno un 'interesado' (bloqueo_interesado)
+//     sin_derivar=si           -> quedo en 'interesado' y NO derivo (el caso Marcela)
+//     tool=<nombre>            -> el turno uso esa herramienta (ej: enviar_foto_propiedad)
+//     limit=1..200             -> default 50
+//   Enriquecido (sin tocar la tabla): nombre del departamento + `atendido_despues` (si un HUMANO
+//   escribio en esa conversacion DESPUES de la decision). Ese ultimo campo es el que responde
+//   "quedo sin atencion?" sin salir a mirar el chat a mano.
+app.get('/api/decisiones', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var q = req.query || {};
+    var limite = Math.min(Math.max(parseInt(q.limit, 10) || 50, 1), 200);
+    var convId = q.conversation_id ? String(q.conversation_id) : null;
+
+    var sel = supabase.from('ia_decisiones').select('*').eq('user_id', ownerId);
+    if (convId) {
+      sel = sel.eq('conversation_id', convId);
+    } else {
+      var r = _decRango(q);
+      sel = sel.gte('created_at', r.desde).lte('created_at', r.hasta);
+    }
+    if (q.derivo === 'si') sel = sel.eq('derivo', true);
+    if (q.derivo === 'no') sel = sel.eq('derivo', false);
+    if (q.frenado === 'si') sel = sel.eq('bloqueo_interesado', true);
+    if (q.sin_derivar === 'si') sel = sel.eq('derivo', false).eq('estado_despues', 'interesado');
+    if (q.tool) sel = sel.contains('tools', [String(q.tool)]);
+    sel = sel.order('created_at', { ascending: false }).limit(limite);
+
+    var out = await sel;
+    if (out.error) {
+      if (_decErrFaltaTabla(out.error)) return res.json({ pendiente_migracion: true, total: 0, decisiones: [] });
+      return res.status(500).json({ error: out.error.message });
+    }
+    var filas = out.data || [];
+
+    // --- Enriquecido 1: nombre del departamento (1 query chica al catalogo del tenant) ---
+    var mapaDeptos = {};
+    try {
+      var dq = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId);
+      (dq && dq.data ? dq.data : []).forEach(function (d) { if (d && d.id) mapaDeptos[d.id] = d.nombre || null; });
+    } catch (eD) { /* sin nombres: se devuelve solo el id */ }
+
+    // --- Enriquecido 2: atendido_despues (hubo mensaje role='human' posterior en esa conversacion?) ---
+    // UNA sola query batcheada para TODAS las conversaciones de la pagina (nunca N+1).
+    var porConv = {};
+    try {
+      var ids = [];
+      var minTs = null;
+      filas.forEach(function (f) {
+        if (f.conversation_id && ids.indexOf(f.conversation_id) < 0) ids.push(f.conversation_id);
+        if (f.created_at && (!minTs || f.created_at < minTs)) minTs = f.created_at;
+      });
+      if (ids.length && minTs) {
+        var mq = await supabase.from('messages').select('conversation_id, created_at')
+          .in('conversation_id', ids).eq('role', 'human').gte('created_at', minTs)
+          .order('created_at', { ascending: true }).limit(2000);
+        (mq && mq.data ? mq.data : []).forEach(function (m) {
+          if (!m || !m.conversation_id) return;
+          if (!porConv[m.conversation_id]) porConv[m.conversation_id] = m.created_at; // el PRIMER humano posterior alcanza
+        });
+      }
+    } catch (eH) { porConv = {}; }
+
+    var decisiones = filas.map(function (f) {
+      var _primerHumano = porConv[f.conversation_id] || null;
+      return Object.assign({}, f, {
+        departamento_nombre: (f.departamento_id && mapaDeptos[f.departamento_id]) || null,
+        // true = un humano escribio en el chat DESPUES de esta decision. false = nadie lo atendio (todavia).
+        atendido_despues: !!(_primerHumano && f.created_at && _primerHumano > f.created_at)
+      });
+    });
+    return res.json({ total: decisiones.length, limite: limite, decisiones: decisiones });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/decisiones/resumen?desde=&hasta=
+// Los numeros que el dueno mira TODAS LAS SEMANAS. Default: ultimos 7 dias.
+//   turnos_registrados         -> mensajes de lead que dejaron rastro
+//   clasificados               -> turnos donde REALMENTE corrio el clasificador
+//   derivados                  -> turnos que derivaron a un humano/departamento
+//   interesado_sin_derivar     -> quedaron en 'interesado' y NADIE los tomo  (el caso MARCELA)
+//   frenados_por_guard         -> el guard freno un 'interesado'             (el caso VERONICA)
+//   fuera_de_alcance           -> la IA declaro que no podia avanzar
+//   leads_*                    -> lo mismo pero contando LEADS distintos (no turnos)
+//   por_camino                 -> desglose de POR DONDE derivo
+// Los 6 contadores de arriba salen de count-queries EXACTAS (head:true, no traen filas).
+// Los `leads_*` y `por_camino` salen de una muestra acotada (max 20.000 filas); si se llega al tope
+// viene `muestra_truncada: true` y hay que achicar el rango (nunca se devuelve un numero inventado).
+app.get('/api/decisiones/resumen', async function (req, res) {
+  try {
+    var ownerId = await _ownerDe(req);
+    if (!ownerId) return res.status(401).json({ error: 'No autorizado' });
+    var r = _decRango(req.query || {});
+    var TOPE_MUESTRA = 20000;
+
+    function _base() {
+      return supabase.from('ia_decisiones').select('id', { count: 'exact', head: true })
+        .eq('user_id', ownerId).gte('created_at', r.desde).lte('created_at', r.hasta);
+    }
+    var qs = await Promise.all([
+      _base(),                                                                  // 0 total
+      _base().eq('clasificador_corrio', true),                                  // 1 clasificados
+      _base().eq('derivo', true),                                               // 2 derivados
+      _base().eq('derivo', false).eq('estado_despues', 'interesado'),           // 3 interesado sin derivar (MARCELA)
+      _base().eq('bloqueo_interesado', true),                                   // 4 frenados por guard (VERONICA)
+      _base().eq('fuera_alcance', true)                                         // 5 fuera de alcance
+    ]);
+    var primerErr = qs.find(function (x) { return x && x.error; });
+    if (primerErr) {
+      if (_decErrFaltaTabla(primerErr.error)) {
+        return res.json({ pendiente_migracion: true, desde: r.desde, hasta: r.hasta, turnos_registrados: 0 });
+      }
+      return res.status(500).json({ error: primerErr.error.message });
+    }
+    var n = function (i) { return (qs[i] && typeof qs[i].count === 'number') ? qs[i].count : 0; };
+
+    // Muestra acotada para lo que PostgREST no sabe agrupar (leads distintos + desglose por camino).
+    var leadsTodos = {}, leadsDerivados = {}, leadsSinDerivar = {}, leadsFrenados = {}, porCamino = {};
+    var muestraTruncada = false;
+    try {
+      var mq = await supabase.from('ia_decisiones')
+        .select('conversation_id, derivo, derivo_camino, estado_despues, bloqueo_interesado')
+        .eq('user_id', ownerId).gte('created_at', r.desde).lte('created_at', r.hasta)
+        .order('created_at', { ascending: false }).limit(TOPE_MUESTRA);
+      var filas = (mq && mq.data) ? mq.data : [];
+      muestraTruncada = filas.length >= TOPE_MUESTRA;
+      filas.forEach(function (f) {
+        var c = f && f.conversation_id;
+        if (c) leadsTodos[c] = 1;
+        if (f && f.derivo === true) { if (c) leadsDerivados[c] = 1; var k = f.derivo_camino || 'sin_etiqueta'; porCamino[k] = (porCamino[k] || 0) + 1; }
+        if (f && f.derivo === false && f.estado_despues === 'interesado' && c) leadsSinDerivar[c] = 1;
+        if (f && f.bloqueo_interesado === true && c) leadsFrenados[c] = 1;
+      });
+    } catch (eM) { muestraTruncada = true; }
+
+    return res.json({
+      desde: r.desde, hasta: r.hasta,
+      // EXACTOS (count queries)
+      turnos_registrados: n(0),
+      clasificados: n(1),
+      derivados: n(2),
+      interesado_sin_derivar: n(3),
+      frenados_por_guard: n(4),
+      fuera_de_alcance: n(5),
+      // POR LEAD (muestra acotada)
+      leads_con_registro: Object.keys(leadsTodos).length,
+      leads_derivados: Object.keys(leadsDerivados).length,
+      leads_interesado_sin_derivar: Object.keys(leadsSinDerivar).length,
+      leads_frenados_por_guard: Object.keys(leadsFrenados).length,
+      por_camino: porCamino,
+      muestra_truncada: muestraTruncada,
+      nota: muestraTruncada ? 'Los conteos por LEAD y por_camino salen de una muestra de ' + TOPE_MUESTRA + ' filas: achica el rango para que sean exactos. Los contadores por TURNO son exactos siempre.' : null
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+// ============================================================================
 
 // Editar UNA unidad de alojamiento (edicion manual desde /alojamiento). Owner-scoped. Solo toca los campos enviados.
 app.post('/api/inventario/hotel/unidad/actualizar', async function (req, res) {

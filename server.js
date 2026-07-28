@@ -769,6 +769,274 @@ async function paypalFetch(path, metodo, cuerpo, extraHeaders) {
   }
   return json;
 }
+
+// ---- PayPal: PRODUCTO -> PLANES -> SUSCRIPCION ----------------------------------------------------
+// MISMO PATRON QUE PLANES_MP: los ids son GLOBALES del SaaS (uno por nivel, compartidos por todos los
+// tenants) y viven en envs de Railway. Se crean UNA vez con POST /api/maestro/paypal-crear-planes y el
+// dueno pega los ids devueltos en Railway. Sin esas envs, paypalPlanesListos() es false y el checkout
+// USD contesta un 503 claro: NADA del flujo de MercadoPago se entera.
+const PAYPAL_PRODUCT_ID = process.env.PAYPAL_PRODUCT_ID || '';
+const PLANES_PAYPAL = {
+  basico: process.env.PAYPAL_PLAN_BASICO || '',
+  pro: process.env.PAYPAL_PLAN_PRO || '',
+  premium: process.env.PAYPAL_PLAN_PREMIUM || '',
+  enterprise: process.env.PAYPAL_PLAN_ENTERPRISE || ''
+};
+// Id del webhook que el dueno da de alta en el panel de PayPal (Apps & Credentials -> app -> Webhooks).
+// Es OBLIGATORIO para verificar la firma: SIN el, el webhook se descarta entero (fail-CLOSED, ver
+// paypalVerificarFirma). Aca se cobra plata: preferimos no acreditar nada antes que acreditar algo falso.
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || '';
+// Nombre canonico del producto en el catalogo de PayPal. Es el ancla idempotente: el endpoint de creacion
+// LISTA el catalogo y busca ESTE nombre antes de crear nada -> correrlo dos veces no duplica el producto.
+// OJO (verificado en el OpenAPI oficial de PayPal, catalogs_products_v1 + billing_subscriptions_v1): NO
+// conviene usar un id propio. Al crear el PRODUCTO, un id propio tiene PROHIBIDO empezar con 'PROD-'
+// (400 INVALID_PARAMETER_SYNTAX: "Input identifier must not use system prefix(PROD-)"), pero al crear el
+// PLAN el campo product_id exige el patron ^PROD-[A-Z0-9]*$ con largo 22. O sea: un id propio deja al
+// producto inservible para crear planes. Por eso dejamos que PayPal genere el id (PROD-...) y lo
+// buscamos/guardamos nosotros. NO cambiar este string: es la clave de deduplicacion.
+const PAYPAL_PRODUCT_NOMBRE = 'Raices CRM';
+// Nombre canonico de cada plan en PayPal. Es la clave con la que el endpoint idempotente RECONOCE un plan
+// ya creado (lista los planes del producto y matchea por nombre exacto) -> NO cambiar estos strings.
+const PAYPAL_PLAN_NOMBRES = {
+  basico: 'Raices CRM - Plan Basico (USD)',
+  pro: 'Raices CRM - Plan Pro (USD)',
+  premium: 'Raices CRM - Plan Premium (USD)',
+  enterprise: 'Raices CRM - Plan Enterprise (USD)'
+};
+// True solo si estan los 4 ids de plan en las envs. Los 4 niveles fijos se venden juntos o no se venden.
+function paypalPlanesListos() {
+  return !!(PLANES_PAYPAL.basico && PLANES_PAYPAL.pro && PLANES_PAYPAL.premium && PLANES_PAYPAL.enterprise);
+}
+// paypalActivo() (credenciales) + planes cargados + webhook id (sin el no podriamos activar a nadie).
+function paypalCobroListo() { return paypalActivo() && paypalPlanesListos() && !!PAYPAL_WEBHOOK_ID; }
+// Nivel (basico/pro/...) a partir del plan_id que devuelve PayPal. Espejo del lookup de PLANES_MP del webhook de MP.
+function paypalNivelDePlanId(planId) {
+  if (!planId) return null;
+  var nivel = null;
+  Object.keys(PLANES_PAYPAL).forEach(function(k) { if (PLANES_PAYPAL[k] && PLANES_PAYPAL[k] === planId) nivel = k; });
+  return nivel;
+}
+
+// ADMINISTRACION (se corre UNA vez, a mano): crea el producto y los 4 planes mensuales en USD.
+// IDEMPOTENTE: antes de crear, LISTA lo que ya existe en la cuenta de PayPal y reusa lo que encuentra
+// (producto por NOMBRE exacto, planes por NOMBRE exacto). Correrlo dos veces NO duplica nada.
+// Devuelve los ids para que el dueno los pegue en las envs de Railway (mismo patron que MP_PLAN_ENTERPRISE).
+async function paypalCrearProductoYPlanes() {
+  if (!paypalActivo()) throw new Error('PayPal no configurado (faltan PAYPAL_CLIENT_ID / PAYPAL_SECRET)');
+  var creado = { producto: null, producto_creado: false, planes: {}, planes_creados: [], planes_reusados: [] };
+
+  // ---- 1) PRODUCTO ----
+  // (a) Si ya esta en la env, se usa ese y no se toca nada.
+  var productId = PAYPAL_PRODUCT_ID || '';
+  // (b) Si no, lo buscamos POR NOMBRE en el catalogo. GET /v1/catalogs/products NO admite filtro por nombre
+  //     (solo paginacion, page_size max 20 segun el spec) -> paginamos hasta 5 paginas y matcheamos exacto.
+  if (!productId) {
+    try {
+      for (var pg = 1; pg <= 5 && !productId; pg++) {
+        var lista = await paypalFetch('/v1/catalogs/products?page_size=20&page=' + pg + '&total_required=true', 'GET', null);
+        var prods = (lista && lista.products) || [];
+        for (var i = 0; i < prods.length; i++) {
+          if (prods[i] && String(prods[i].name) === PAYPAL_PRODUCT_NOMBRE) { productId = prods[i].id; break; }
+        }
+        if (prods.length < 20) break; // ultima pagina
+      }
+    } catch (eL) { console.error('paypal listar productos:', eL && eL.message); }
+  }
+  // (c) Si sigue sin aparecer, lo creamos SIN id propio (lo genera PayPal como PROD-..., que es el unico
+  //     formato que despues acepta el campo product_id del plan). PayPal-Request-Id da idempotencia del lado
+  //     de PayPal ante un reintento de red (PayPal guarda esa clave 72 h: dos POST iguales no crean dos).
+  //     'Prefer: return=representation' para que la respuesta traiga el body completo (por default es minimal).
+  if (!productId) {
+    var prod = await paypalFetch('/v1/catalogs/products', 'POST', {
+      name: PAYPAL_PRODUCT_NOMBRE,
+      description: 'CRM con agente de IA para inmobiliarias, hoteles y desarrolladoras',
+      type: 'SERVICE',
+      category: 'SOFTWARE',
+      home_url: FRONTEND_URL
+    }, { 'PayPal-Request-Id': 'raicescrm-producto-v1', 'Prefer': 'return=representation' });
+    productId = prod && prod.id;
+    creado.producto_creado = true;
+  }
+  if (!productId) throw new Error('No se pudo obtener/crear el producto de PayPal');
+  creado.producto = productId;
+
+  // ---- 2) PLANES ya existentes de ese producto (para no duplicar) ----
+  var yaPorNombre = {};
+  try {
+    for (var pg2 = 1; pg2 <= 5; pg2++) {
+      var lp = await paypalFetch('/v1/billing/plans?product_id=' + encodeURIComponent(productId) + '&page_size=20&page=' + pg2 + '&total_required=true', 'GET', null);
+      var pls = (lp && lp.plans) || [];
+      for (var j = 0; j < pls.length; j++) { if (pls[j] && pls[j].name) yaPorNombre[String(pls[j].name)] = pls[j].id; }
+      if (pls.length < 20) break;
+    }
+  } catch (eLP) { console.error('paypal listar planes:', eLP && eLP.message); }
+
+  // ---- 3) CREAR (o reusar) los 4 planes mensuales USD con los precios de PRECIOS_USD ----
+  var niveles = ['basico', 'pro', 'premium', 'enterprise'];
+  for (var n = 0; n < niveles.length; n++) {
+    var nivel = niveles[n];
+    var nombre = PAYPAL_PLAN_NOMBRES[nivel];
+    var precio = PRECIOS_USD[nivel];
+    if (!precio) continue; // nivel sin precio USD definido -> no se crea (hoy no pasa: los 4 estan en PRECIOS_USD)
+    if (yaPorNombre[nombre]) { creado.planes[nivel] = yaPorNombre[nombre]; creado.planes_reusados.push(nivel); continue; }
+    var body = {
+      product_id: productId,
+      name: nombre,
+      description: 'Suscripcion mensual Raices CRM - ' + nivel + ' (USD ' + precio + '/mes)',
+      status: 'ACTIVE',
+      billing_cycles: [{
+        // Un unico ciclo REGULAR mensual, sin trial y sin fin. total_cycles: 0 = INFINITO (confirmado en el
+        // spec: "Regular billing cycles can be executed infinite times (value of 0 for total_cycles)").
+        // Mismo criterio que MercadoPago hoy: SIN periodo de prueba, se cobra al aprobar (Diego 2026-07-20).
+        frequency: { interval_unit: 'MONTH', interval_count: 1 },
+        tenure_type: 'REGULAR',
+        sequence: 1,
+        total_cycles: 0,
+        pricing_scheme: { fixed_price: { value: String(precio), currency_code: 'USD' } }
+      }],
+      payment_preferences: {
+        auto_bill_outstanding: true,     // si un cobro queda impago, lo reintenta en el siguiente
+        setup_fee_failure_action: 'CONTINUE',
+        payment_failure_threshold: 3     // tras 3 cobros fallidos PayPal suspende -> nos llega SUSPENDED
+      }
+      // SIN `setup_fee` (no cobramos alta) y SIN `taxes` (ambos son opcionales; el default es 0 / sin
+      // impuesto). Se omiten a proposito: menos campos = menos superficie para un 422 en el unico
+      // request de creacion, que ademas todavia NO se pudo probar contra la API real.
+    };
+    var pl = await paypalFetch('/v1/billing/plans', 'POST', body, { 'PayPal-Request-Id': 'raicescrm-plan-v1-' + nivel, 'Prefer': 'return=representation' });
+    if (pl && pl.id) { creado.planes[nivel] = pl.id; creado.planes_creados.push(nivel); }
+  }
+  return creado;
+}
+
+// Crea una SUSCRIPCION de PayPal y devuelve el objeto (con .id y .links[rel=approve]).
+// Espejo de mpCrearSuscripcion: custom_id lleva NUESTRO user_id (es el equivalente del external_reference
+// de MP). El webhook lo recupera del GET de la suscripcion (donde el schema oficial de PayPal lo documenta),
+// NO del body de la notificacion: que custom_id venga dentro del `resource` del webhook NO esta confirmado
+// en la doc de PayPal, asi que no dependemos de eso.
+async function paypalCrearSuscripcion(nivel, email, userId, returnUrl, cancelUrl) {
+  var planId = PLANES_PAYPAL[nivel];
+  if (!planId) throw new Error('Plan de PayPal no configurado para el nivel: ' + nivel);
+  var body = {
+    plan_id: planId,
+    custom_id: String(userId),           // = external_reference de MP
+    subscriber: { email_address: String(email) },
+    application_context: {
+      brand_name: 'Raices CRM',
+      locale: 'es-AR',
+      shipping_preference: 'NO_SHIPPING',
+      user_action: 'SUBSCRIBE_NOW',      // el boton final dice "Suscribirse" y cobra al aprobar
+      payment_method: { payer_selected: 'PAYPAL', payee_preferred: 'IMMEDIATE_PAYMENT_REQUIRED' },
+      return_url: returnUrl,
+      cancel_url: cancelUrl
+    }
+  };
+  return await paypalFetch('/v1/billing/subscriptions', 'POST', body, { 'Prefer': 'return=representation' });
+}
+// Link al que hay que mandar al cliente para que apruebe (equivalente al init_point de MP).
+function paypalLinkAprobacion(sus) {
+  var links = (sus && Array.isArray(sus.links)) ? sus.links : [];
+  for (var i = 0; i < links.length; i++) {
+    if (links[i] && String(links[i].rel).toLowerCase() === 'approve' && links[i].href) return links[i].href;
+  }
+  return null;
+}
+// Espejo de mpConsultarSuscripcion. Es la fuente de verdad del webhook (NO confiamos en el body recibido).
+async function paypalConsultarSuscripcion(subId) {
+  return await paypalFetch('/v1/billing/subscriptions/' + encodeURIComponent(subId), 'GET', null);
+}
+// Espejo de mpCancelarSuscripcion: corta el cobro recurrente. Tira en no-2xx (el caller envuelve en try/catch).
+async function paypalCancelarSuscripcion(subId, motivo) {
+  return await paypalFetch('/v1/billing/subscriptions/' + encodeURIComponent(subId) + '/cancel', 'POST', { reason: String(motivo || 'Cancelada por el cliente desde Raices CRM').slice(0, 127) });
+}
+
+// ===== VERIFICACION DE FIRMA DEL WEBHOOK DE PAYPAL (aca se activa plata: fail-CLOSED) =====
+// El endpoint del webhook es PUBLICO: cualquiera puede POSTearnos un JSON diciendo "esta suscripcion se
+// activo". Si le creyeramos, se regalaria el servicio. PayPal firma cada notificacion y expone
+// POST /v1/notifications/verify-webhook-signature para validarla contra el certificado de PayPal.
+//
+// Se le mandan los 5 headers de transmision + el WEBHOOK_ID (el de NUESTRO webhook, que el dueno da de
+// alta en el panel de PayPal) + el evento. Responde { verification_status: 'SUCCESS' | 'FAILURE' }.
+//
+// DETALLE FINO QUE ROMPE LA VERIFICACION SI SE HACE MAL: la firma se calculo sobre los BYTES EXACTOS del
+// body que PayPal envio. Advertencia LITERAL de la doc de PayPal: "It is essential that the webhook_event
+// data be posted back exactly as it was received, with no deviations in formatting or content of any kind.
+// Parsing to an array/object followed by re-serializing back to a JSON string can fail verification."
+// O sea: si parseamos con express.json() y re-serializamos con JSON.stringify(), el JSON puede quedar
+// distinto (espacios, orden, escapes, notacion de numeros) y da FAILURE aunque el evento sea legitimo.
+// Por eso armamos el body a mano y METEMOS EL RAW TAL CUAL como valor de webhook_event (req.rawBody ya lo
+// captura el express.json({ verify }) del arranque, linea ~20).
+//
+// LIMITACION CONOCIDA (doc oficial): el SIMULADOR de webhooks del panel de PayPal NO se puede validar por
+// este metodo ("Postback verification to the verify-webhook-signature endpoint is not supported for mock
+// events"). Un evento del simulador va a dar FAILURE y se va a descartar: NO es un bug. Para probar de
+// verdad hay que generar un evento real en sandbox (PAYPAL_ENV=sandbox).
+//
+// NOTA: PayPal prefiere la verificacion OFFLINE (armar transmissionId|time|webhookId|crc32(raw), bajar el
+// cert de paypal-cert-url y verificar la firma con SHA256) porque evita una llamada extra. Elegimos el
+// postback igual: es la via documentada, no depende de implementar CRC32 ni de cachear certificados, y
+// una llamada mas por webhook de cobro es irrelevante al volumen de este producto.
+//
+// FAIL-CLOSED: sin PAYPAL_WEBHOOK_ID, sin raw body, con cert_url que no sea de paypal.com, si la API
+// contesta cualquier cosa distinta de SUCCESS, o si la llamada de verificacion falla -> devuelve false y
+// el evento se DESCARTA. Nunca "ante la duda, acredito".
+async function paypalVerificarFirmaWebhook(req) {
+  try {
+    if (!paypalActivo()) return false;
+    if (!PAYPAL_WEBHOOK_ID) { console.error('[paypal] webhook recibido pero falta PAYPAL_WEBHOOK_ID -> descartado'); return false; }
+    var h = req.headers || {};
+    var transmissionId = h['paypal-transmission-id'];
+    var transmissionTime = h['paypal-transmission-time'];
+    var transmissionSig = h['paypal-transmission-sig'];
+    var certUrl = h['paypal-cert-url'];
+    // paypal-auth-algo: el spec de la API lo referencia como PAYPAL-AUTH-ALGO, pero la guia de integracion de
+    // PayPal NO lo lista en su tabla de headers. Si por eso llegara vacio, usamos 'SHA256withRSA', que es el
+    // valor del ejemplo oficial (y el unico algoritmo que PayPal usa hoy). Si el algoritmo real fuera otro,
+    // la verificacion da FAILURE y el evento se descarta igual: el fallback NO afloja la seguridad.
+    var authAlgo = h['paypal-auth-algo'] || 'SHA256withRSA';
+    if (!transmissionId || !transmissionTime || !transmissionSig || !certUrl) {
+      console.error('[paypal] webhook sin headers de firma completos -> descartado');
+      return false;
+    }
+    // El cert lo descarga PayPal de su lado, pero validamos igual que la URL sea de un host de PayPal:
+    // barato, y evita que un atacante intente apuntar la verificacion a un certificado propio.
+    var hostCert = '';
+    try { hostCert = new URL(String(certUrl)).hostname.toLowerCase(); } catch (eU) { hostCert = ''; }
+    if (!(hostCert === 'paypal.com' || hostCert.endsWith('.paypal.com'))) {
+      console.error('[paypal] cert_url con host no-PayPal (' + hostCert + ') -> descartado');
+      return false;
+    }
+    // RAW EXACTO del body. Sin el no podemos verificar de forma confiable -> descartamos.
+    var raw = (req.rawBody && req.rawBody.length) ? req.rawBody.toString('utf8') : '';
+    if (!raw) { console.error('[paypal] webhook sin rawBody -> no se puede verificar la firma -> descartado'); return false; }
+    // Body armado a mano: los campos escalares con JSON.stringify (escapa comillas) y webhook_event con el RAW literal.
+    var cuerpo = '{'
+      + '"auth_algo":' + JSON.stringify(String(authAlgo)) + ','
+      + '"cert_url":' + JSON.stringify(String(certUrl)) + ','
+      + '"transmission_id":' + JSON.stringify(String(transmissionId)) + ','
+      + '"transmission_sig":' + JSON.stringify(String(transmissionSig)) + ','
+      + '"transmission_time":' + JSON.stringify(String(transmissionTime)) + ','
+      + '"webhook_id":' + JSON.stringify(String(PAYPAL_WEBHOOK_ID)) + ','
+      + '"webhook_event":' + raw
+      + '}';
+    var token = await paypalToken();
+    var r = await fetch(PAYPAL_BASE + '/v1/notifications/verify-webhook-signature', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: cuerpo
+    });
+    var txt = await r.text();
+    var j = null; try { j = txt ? JSON.parse(txt) : null; } catch (eJ) {}
+    if (!r.ok) { console.error('[paypal] verify-webhook-signature HTTP ' + r.status + ' -> descartado'); return false; }
+    var ok = !!(j && String(j.verification_status).toUpperCase() === 'SUCCESS');
+    if (!ok) console.error('[paypal] firma INVALIDA (verification_status=' + String(j && j.verification_status) + ') -> descartado');
+    return ok;
+  } catch (e) {
+    console.error('[paypal] error verificando firma -> descartado:', e && e.message);
+    return false; // FAIL-CLOSED
+  }
+}
+
 // IDs globales de los planes en MercadoPago (creados 2026-06-16). Son del SaaS, compartidos por todos los tenants.
 // enterprise: su id se carga en la env MP_PLAN_ENTERPRISE de Railway (mismo patron; se crea una vez via /api/maestro/mp-crear-plan-enterprise).
 const PLANES_MP = { basico: 'a1792acbe2b14721885c3d1b9cb2a867', pro: 'a91c0a95c26f499fb55d9b71ac888b39', premium: 'a320490c4aca402c92e8fa4d12347af7', enterprise: process.env.MP_PLAN_ENTERPRISE || '' };
@@ -8839,10 +9107,13 @@ app.get('/health/deep', async (req, res) => {
   // cobro por MercadoPago sigue funcionando igual) -> nunca marca el health como degradado.
   {
     const t0 = Date.now();
-    if (!paypalActivo()) checks.paypal = { configurado: false, entorno: null };
+    if (!paypalActivo()) checks.paypal = { configurado: false, entorno: null, planes_listos: false, webhook_id: false, cobro_listo: false };
     else {
-      try { await paypalToken(); checks.paypal = { configurado: true, ok: true, ms: Date.now() - t0, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live') }; }
-      catch (ePP) { checks.paypal = { configurado: true, ok: false, ms: Date.now() - t0, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live'), detail: String(ePP && ePP.message).slice(0, 180) }; }
+      // planes_listos / webhook_id / cobro_listo: booleanos para ver de un vistazo si el cobro en USD ya
+      // esta habilitado o que falta cargar en Railway. NO exponen ningun id ni credencial.
+      var _ppExtra = { planes_listos: paypalPlanesListos(), webhook_id: !!PAYPAL_WEBHOOK_ID, cobro_listo: paypalCobroListo() };
+      try { await paypalToken(); checks.paypal = Object.assign({ configurado: true, ok: true, ms: Date.now() - t0, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live') }, _ppExtra); }
+      catch (ePP) { checks.paypal = Object.assign({ configurado: true, ok: false, ms: Date.now() - t0, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live'), detail: String(ePP && ePP.message).slice(0, 180) }, _ppExtra); }
     }
   }
 
@@ -26959,15 +27230,22 @@ app.get('/api/suscripcion', async function(req, res) {
     // ya devuelve la fila sin esa key -> snap = null y no rompe.
     var snap = (sub && sub.snapshot_cortesia && typeof sub.snapshot_cortesia === 'object') ? sub.snapshot_cortesia : null;
     var tieneMPactivo = !!(sub && sub.mp_preapproval_id && (sub.status === 'active' || sub.status === 'past_due'));
-    // sin_suscripcion: la cuenta esta bloqueada, NO es cortesia y NO tiene MP activo -> el front muestra "elegi un plan".
-    var sin_suscripcion = !!(bloqueado === true && !esCortesia && !tieneMPactivo);
+    // PAYPAL (agregado 2026-07-28): el equivalente exacto para el cobro en USD. Sin esto, un cliente que paga
+    // por PayPal (mp_preapproval_id = NULL) veia `sin_suscripcion: true` y el panel le decia "elegi un plan"
+    // aunque estuviera pagando => el GET MENTIA. INERTE HOY: la columna es nueva y esta en NULL en todas las
+    // filas -> tienePayPalActivo es false siempre y todo lo de abajo se comporta EXACTAMENTE como antes.
+    var tienePayPalActivo = !!(sub && sub.paypal_subscription_id && (sub.status === 'active' || sub.status === 'past_due'));
+    // "Tiene una pasarela cobrando", sin importar CUAL. Es lo que de verdad quieren saber los campos de abajo.
+    var tienePasarelaActiva = (tieneMPactivo || tienePayPalActivo);
+    // sin_suscripcion: la cuenta esta bloqueada, NO es cortesia y NO tiene NINGUNA pasarela activa -> "elegi un plan".
+    var sin_suscripcion = !!(bloqueado === true && !esCortesia && !tienePasarelaActiva);
     // plan_label: que mostrar como "Plan actual".
     var plan_label = null;
-    var snapPlanReal = !!(snap && (snap.mp_preapproval_id || snap.status === 'active'));
+    var snapPlanReal = !!(snap && (snap.mp_preapproval_id || snap.paypal_subscription_id || snap.status === 'active'));
     if (esCortesia) {
       plan_label = (snapPlanReal && snap.plan) ? snap.plan : 'Cortesia'; // cortesia con plan previo real -> ese plan; si no -> "Cortesia"
-    } else if (tieneMPactivo) {
-      plan_label = (sub && sub.plan) ? sub.plan : null; // MP activo -> nombre del plan
+    } else if (tienePasarelaActiva) {
+      plan_label = (sub && sub.plan) ? sub.plan : null; // pasarela activa (MP o PayPal) -> nombre del plan
     } else if (sin_suscripcion) {
       plan_label = null; // sin suscripcion -> el front muestra "elegi un plan"
     } else {
@@ -26976,7 +27254,9 @@ app.get('/api/suscripcion', async function(req, res) {
     // puede_cancelar: hay un preapproval (tarjeta cargada) y NO esta ya cancelada. Incluye la PRUEBA con tarjeta
     // -> el cliente puede darse de baja durante el trial para no llegar al primer cobro (antes exigia active/past_due
     // y en prueba daba false: no aparecia el boton de cancelar).
-    var puede_cancelar = !!(sub && sub.mp_preapproval_id && sub.status !== 'cancelled');
+    // PAYPAL: el boton de dar de baja tambien tiene que aparecer para quien paga en dolares (la baja la
+    // resuelve el MISMO endpoint /api/suscripcion/cancelar, que ahora corta las dos pasarelas).
+    var puede_cancelar = !!(sub && (sub.mp_preapproval_id || sub.paypal_subscription_id) && sub.status !== 'cancelled');
     // ===== periodo_desde: fecha de INICIO del periodo, para mostrar AL LADO del periodo (Diego 2026-07-25) =====
     // Regla pedida: en CORTESIA va la fecha desde la que se cuenta la renovacion mensual de mensajes (si no hay,
     // queda VACIO); con SUSCRIPCION va la fecha del ciclo de MercadoPago; y si la cuenta estuvo en cortesia y DESPUES
@@ -26991,7 +27271,9 @@ app.get('/api/suscripcion', async function(req, res) {
     // suscribio, created_at es la fecha de la CORTESIA -> mostraria justo la fecha que la regla dice que no debe mandar.
     // Si no hay period_start -> null (el front deja el campo vacio; no se inventa ninguna fecha).
     var periodo_desde = (sub && sub.period_start) || null;
-    var periodo_desde_origen = periodo_desde ? ((sub && sub.mp_preapproval_id) ? 'suscripcion' : (esCortesia ? 'cortesia' : 'periodo')) : null;
+    // PAYPAL: una suscripcion en dolares tambien es 'suscripcion' (antes, sin mp_preapproval_id, el origen
+    // caia a 'cortesia'/'periodo' y el panel mostraba un rotulo equivocado).
+    var periodo_desde_origen = periodo_desde ? ((sub && (sub.mp_preapproval_id || sub.paypal_subscription_id)) ? 'suscripcion' : (esCortesia ? 'cortesia' : 'periodo')) : null;
     // ===== periodo_renueva: CUANDO se renueva el cupo de mensajes (Diego 2026-07-26) =====
     // Faltaba el otro lado del pedido. `vence` (current_period_end) lo escribe SOLO MercadoPago, asi que una cuenta
     // de CORTESIA lo tiene en null y el panel nunca mostraba fecha de renovacion. Pero la cortesia SI renueva: el
@@ -27010,7 +27292,8 @@ app.get('/api/suscripcion', async function(req, res) {
     if (esCortesia) {
       if (isFinite(_iniMs)) { periodo_renueva = new Date(_iniMs + _MS_30D).toISOString(); periodo_renueva_origen = 'cortesia'; }
     } else if (sub && sub.current_period_end) {
-      periodo_renueva = sub.current_period_end; periodo_renueva_origen = 'mercadopago';
+      // El origen depende de QUIEN escribio esa fecha: el webhook de MP o el de PayPal (next_billing_time).
+      periodo_renueva = sub.current_period_end; periodo_renueva_origen = (sub.paypal_subscription_id && !sub.mp_preapproval_id) ? 'paypal' : 'mercadopago';
     } else if (isFinite(_iniMs)) {
       periodo_renueva = new Date(_iniMs + _MS_30D).toISOString(); periodo_renueva_origen = 'calculada';
     }
@@ -27018,7 +27301,16 @@ app.get('/api/suscripcion', async function(req, res) {
       // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.
       precios: { basico: precioPlanARS('basico'), pro: precioPlanARS('pro'), premium: precioPlanARS('premium'), enterprise: precioPlanARS('enterprise') }, dolar_ref: dolarRefSync(),
       // Plan Personal (a medida) y Recarga (pago unico): el front calcula el precio = cantidad * usd_por_msg * dolar_ref.
-      personal: { usd_por_msg: PERSONAL_USD_POR_MSG, min: PERSONAL_MIN_MSGS }, recarga: { usd_por_msg: RECARGA_USD_POR_MSG, min: RECARGA_MIN_MSGS } });
+      personal: { usd_por_msg: PERSONAL_USD_POR_MSG, min: PERSONAL_MIN_MSGS }, recarga: { usd_por_msg: RECARGA_USD_POR_MSG, min: RECARGA_MIN_MSGS },
+      // ===== PAGO EN USD POR PAYPAL (campos ADITIVOS: el front viejo los ignora y funciona igual) =====
+      // paypal_disponible: si es false, el front NO debe ofrecer la opcion en dolares (falta configurar algo
+      // en Railway: credenciales, ids de plan o webhook id). Arranca en false hasta que el dueno lo prenda.
+      // precios_usd: los 4 planes fijos. 'personal' y 'recarga' NO estan: su precio en USD todavia no lo
+      // definio el dueno, y no se inventa.
+      paypal_disponible: paypalCobroListo(),
+      precios_usd: { basico: PRECIOS_USD.basico, pro: PRECIOS_USD.pro, premium: PRECIOS_USD.premium, enterprise: PRECIOS_USD.enterprise },
+      // Por donde paga HOY esta cuenta (para que el panel muestre "USD 90/mes por PayPal" y no pesos).
+      pasarela: tienePayPalActivo ? 'paypal' : (tieneMPactivo ? 'mercadopago' : null) });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -27051,6 +27343,13 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     // tarjeta y el cliente arranca con el cupo COMPLETO del plan. No hay cobro diferido ni cap de 100. El primer mes
     // sirve para ajustar/dar asistencia con el cliente ya adentro. startDateISO = null -> MP cobra al autorizar.
     var subPrev = await getSubscription(user_id);
+    // PRECEDENCIA MP <-> PAYPAL (agregado 2026-07-28): una cuenta NO puede tener las dos pasarelas cobrando
+    // a la vez (serian dos cobros mensuales). Si ya paga en dolares por PayPal y esta al dia, no abrimos el
+    // checkout en pesos: primero da de baja el de dolares. INERTE HOY: `paypal_subscription_id` es una columna
+    // NUEVA y esta en NULL en TODAS las filas existentes -> esta condicion nunca se cumple y el flujo de
+    // MercadoPago se comporta EXACTAMENTE igual que antes.
+    var tienePayPalActivoPrev = !!(subPrev && subPrev.paypal_subscription_id && (subPrev.status === 'active' || subPrev.status === 'past_due'));
+    if (tienePayPalActivoPrev) return res.status(409).json({ error: 'Ya tenes una suscripcion activa en dolares por PayPal. Dala de baja antes de pasarte a pesos.', pasarela_actual: 'paypal' });
     var yaActivo = !!(subPrev && (subPrev.status === 'active' || subPrev.status === 'past_due' || subPrev.cortesia === true));
     var startDateISO = null;
     var sus = await mpCrearSuscripcion(planId, email, user_id, backUrl, nivel, startDateISO, montoOverride);
@@ -27070,6 +27369,72 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
       await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
     } catch (eP) { console.error('checkout guardar plan:', eP && eP.message); }
     return res.json({ ok: true, init_point: sus && (sus.init_point || sus.sandbox_init_point), id: sus && sus.id });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== CHECKOUT EN USD POR PAYPAL (espejo del de arriba) =====
+// Diego 2026-07-25: Argentina ELIGE moneda (pesos por MercadoPago o dolares por PayPal); el resto del mundo
+// va SOLO por PayPal. El front elige llamando a ESTE endpoint en vez del de arriba; devuelve `init_point`
+// con el MISMO nombre de campo para que el front reuse su `window.location.href = j.init_point`.
+//
+// APAGADO POR DEFECTO: sin credenciales, sin los 4 ids de plan o sin PAYPAL_WEBHOOK_ID -> 503 con un
+// mensaje claro. El endpoint de MercadoPago de arriba no se toca ni se entera.
+//
+// NO incluye 'personal' ni la recarga: sus precios en USD todavia NO estan definidos por el dueno
+// (PERSONAL_USD_POR_MSG / RECARGA_USD_POR_MSG son valores en dolares POR MENSAJE que hoy se convierten a
+// pesos; no hay decision de que se cobra en USD). No se inventa: quedan fuera de esta etapa.
+app.post('/api/suscripcion/checkout-paypal', async function(req, res) {
+  try {
+    var user_id = await verificarUsuario(req);
+    if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    if (!paypalActivo()) return res.status(503).json({ error: 'El pago en dolares todavia no esta habilitado' });
+    if (!paypalPlanesListos()) return res.status(503).json({ error: 'Los planes en dolares todavia no estan publicados' });
+    // Sin webhook id no podriamos verificar la firma => nunca activariamos la cuenta => el cliente pagaria
+    // y quedaria bloqueado. Preferimos NO cobrarle antes que cobrarle sin poder activarlo.
+    if (!PAYPAL_WEBHOOK_ID) return res.status(503).json({ error: 'El pago en dolares todavia no esta habilitado' });
+    var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
+    var email = (req.body && req.body.email) ? String(req.body.email) : '';
+    if (['basico','pro','premium','enterprise'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
+    if (!PRECIOS_USD[nivel]) return res.status(503).json({ error: 'Ese plan todavia no tiene precio en dolares' });
+    if (!email) return res.status(400).json({ error: 'Falta email del pagador' });
+
+    // ===== PRECEDENCIA: una cuenta NO puede tener MercadoPago y PayPal cobrando a la vez =====
+    // Si ya hay un preapproval de MP cobrable, NO abrimos un checkout de PayPal: seria un doble cobro
+    // mensual. Primero se da de baja el de pesos (boton "Dar de baja" del panel) y despues se suscribe en
+    // dolares. Mismo criterio al reves: ver el guard de PayPal agregado en /api/suscripcion/checkout.
+    var subPrev = await getSubscription(user_id);
+    var tieneMPactivo = !!(subPrev && subPrev.mp_preapproval_id && (subPrev.status === 'active' || subPrev.status === 'past_due'));
+    if (tieneMPactivo) return res.status(409).json({ error: 'Ya tenes una suscripcion activa en pesos por MercadoPago. Dala de baja antes de pasarte a dolares.', pasarela_actual: 'mercadopago' });
+    // Ya suscripto por PayPal y al dia -> no crear una segunda suscripcion en PayPal (doble cobro).
+    var tienePPactivo = !!(subPrev && subPrev.paypal_subscription_id && (subPrev.status === 'active' || subPrev.status === 'past_due'));
+    if (tienePPactivo) return res.status(409).json({ error: 'Ya tenes una suscripcion activa en dolares por PayPal.', pasarela_actual: 'paypal' });
+
+    var backUrl = FRONTEND_URL + '/suscripcion/listo';
+    var sus = await paypalCrearSuscripcion(nivel, email, user_id, backUrl, backUrl);
+    var aprobar = paypalLinkAprobacion(sus);
+    if (!sus || !sus.id || !aprobar) return res.status(502).json({ error: 'PayPal no devolvio el link de aprobacion. Proba de nuevo.' });
+
+    // MISMO criterio que el checkout de MP: guardamos el plan ELEGIDO para que al activarse rijan SUS limites,
+    // y si la cuenta no estaba ya activa/cortesia la dejamos PENDIENTE (status 'trial' sin trial_con_tarjeta ->
+    // debeBloquearAcceso la bloquea) hasta que el webhook firmado confirme el pago.
+    // NO guardamos todavia paypal_subscription_id como "cobrable": la suscripcion nace en APPROVAL_PENDING
+    // (el cliente aun no aprobo). Igual la persistimos para poder reconciliar/cancelar si abandona.
+    var yaActivo = !!(subPrev && (subPrev.status === 'active' || subPrev.status === 'past_due' || subPrev.cortesia === true));
+    try {
+      var filaPlan = { user_id: user_id, plan: nivel, paypal_subscription_id: sus.id, pasarela: 'paypal' };
+      if (!yaActivo) filaPlan.status = 'trial';
+      var upPP = await supabase.from('subscriptions').upsert(filaPlan, { onConflict: 'user_id' });
+      if (upPP && upPP.error) {
+        // DEFENSIVO: si las columnas nuevas todavia no existen (migracion pendiente), guardamos al menos el plan.
+        console.error('checkout-paypal guardar plan (columnas nuevas):', upPP.error.message);
+        var filaCompat = { user_id: user_id, plan: nivel };
+        if (!yaActivo) filaCompat.status = 'trial';
+        await supabase.from('subscriptions').upsert(filaCompat, { onConflict: 'user_id' });
+      }
+    } catch (eP) { console.error('checkout-paypal guardar plan:', eP && eP.message); }
+    // `init_point` = mismo nombre que devuelve el checkout de MP (el front lo reusa tal cual).
+    // `approve_url` es un alias explicito por si el front prefiere un nombre propio para el flujo USD.
+    return res.json({ ok: true, init_point: aprobar, approve_url: aprobar, id: sus.id, moneda: 'USD', precio: PRECIOS_USD[nivel], pasarela: 'paypal' });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -27300,6 +27665,180 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
   } catch (e) { console.error('webhook mercadopago:', e && e.message); }
 });
 
+// ============================================================================================
+// WEBHOOK DE PAYPAL — suscripciones en USD. Espejo del de MercadoPago de arriba.
+// ============================================================================================
+// URL a dar de alta en el panel de PayPal (Apps & Credentials -> tu app -> Webhooks):
+//     https://<backend>/api/webhook/paypal
+// Eventos a suscribir: BILLING.SUBSCRIPTION.ACTIVATED / .CANCELLED / .SUSPENDED / .EXPIRED /
+//                      .PAYMENT.FAILED / .UPDATED  +  PAYMENT.SALE.COMPLETED
+// El id que PayPal asigna a ESE webhook va a la env PAYPAL_WEBHOOK_ID (sin el no se verifica nada).
+//
+// TRES CANDADOS (aca se activa plata):
+//  1) FIRMA: se valida contra PayPal (paypalVerificarFirmaWebhook). Sin firma valida -> se descarta.
+//     FAIL-CLOSED: sin PAYPAL_WEBHOOK_ID no se procesa NADA.
+//  2) NO CONFIAMOS EN EL BODY: como hace el de MP, re-consultamos la suscripcion real en la API de
+//     PayPal (paypalConsultarSuscripcion) y el estado/plan salen de ESA respuesta, no del JSON recibido.
+//  3) IDEMPOTENCIA: marca-primero en paypal_webhook_eventos (PK = id del evento). PayPal REINTENTA hasta
+//     recibir un 200 y puede repetir el mismo evento -> sin esto, un ACTIVATED repetido podria resetear
+//     el contador de mensajes dos veces (= regalar cupo). Mismo patron que la recarga de MP.
+//
+// INERTE si PayPal no esta configurado o la funcion de suscripciones esta apagada.
+app.post('/api/webhook/paypal', async function(req, res) {
+  res.sendStatus(200); // responder rapido siempre (PayPal reintenta si no)
+  try {
+    if (!paypalActivo() || !SUBSCRIPTIONS_ENABLED) return;
+
+    // ---- CANDADO 1: FIRMA ----
+    var firmaOk = await paypalVerificarFirmaWebhook(req);
+    if (!firmaOk) return; // ya se logueo el motivo adentro; NO se acredita nada
+
+    var ev = req.body || {};
+    var eventId = ev.id ? String(ev.id) : '';
+    var tipo = String(ev.event_type || '').toUpperCase();
+    var recurso = ev.resource || {};
+    if (!eventId) { console.error('[paypal] evento sin id -> descartado'); return; }
+
+    // Solo eventos de suscripcion / cobro recurrente. El resto se ignora (pero se responde 200).
+    var esSub = tipo.indexOf('BILLING.SUBSCRIPTION.') === 0;
+    var esVenta = (tipo === 'PAYMENT.SALE.COMPLETED');
+    if (!esSub && !esVenta) return;
+
+    // Id de la suscripcion. En los BILLING.SUBSCRIPTION.* es resource.id; en PAYMENT.SALE.COMPLETED
+    // (el cobro de cada mes) la suscripcion viene en resource.billing_agreement_id.
+    //
+    // NO VERIFICADO EN LA DOC OFICIAL DE PAYPAL: que `billing_agreement_id` del sale traiga el id de la
+    // suscripcion (I-...). El campo EXISTE en el objeto sale ("The PayPal billing agreement ID. References
+    // an approved recurring payment...") y encaja, pero PayPal no publica un payload de ejemplo que lo
+    // confirme. Por eso esto es BEST-EFFORT: si no viene o no tiene forma de suscripcion, se descarta el
+    // evento y listo. NO se pierde plata: la ACTIVACION la hace BILLING.SUBSCRIPTION.ACTIVATED (que si usa
+    // resource.id) y la renovacion del periodo la reconcilia el cron revisarSuscripciones, que re-consulta
+    // la fecha real de cobro en PayPal. Este evento solo ADELANTA esa reconciliacion.
+    var subId = esVenta ? (recurso.billing_agreement_id || null) : (recurso.id || null);
+    if (!subId) return;
+    // GUARD DE FORMA: los ids de suscripcion de PayPal son 'I-XXXXXXXX'. Esto ademas descarta los eventos
+    // DEPRECADOS de "Billing Agreements", que reusan los MISMOS event_type (BILLING.SUBSCRIPTION.CANCELLED,
+    // etc.) pero con otro recurso y con ids 'B-...': sin este guard, iriamos a pedirle a la API de
+    // suscripciones un id que no es de una suscripcion.
+    if (!/^I-[A-Za-z0-9]+$/.test(String(subId))) { console.error('[paypal] id de recurso sin forma de suscripcion (' + String(subId).slice(0, 20) + ') -> descartado'); return; }
+
+    // ---- CANDADO 3: IDEMPOTENCIA (marca-primero) ----
+    // Insertamos la marca ANTES de tocar nada. Si el evento ya se proceso, el PK choca (23505) y salimos.
+    // Si la tabla no existe todavia (migracion pendiente), NO procesamos: preferimos que PayPal reintente
+    // antes que arriesgar un doble reset de cupo sin proteccion.
+    var marca = await supabase.from('paypal_webhook_eventos').insert({
+      event_id: eventId, event_type: tipo, resource_id: String(subId)
+    });
+    if (marca && marca.error) {
+      var ec = String((marca.error.code || '') + ' ' + (marca.error.message || ''));
+      if (ec.indexOf('23505') >= 0 || /duplicate|unique/i.test(ec)) return; // ya procesado -> no repetir
+      console.error('[paypal] no se pudo marcar el evento (falta la migracion?) -> no se procesa:', marca.error.message);
+      return;
+    }
+
+    // BORRAR LA MARCA si el evento NO se llego a aplicar. Sin esto, un fallo TRANSITORIO despues de marcar
+    // (se cayo la red al consultar PayPal, la base contesto error) dejaria el evento marcado como "procesado"
+    // para siempre: los 25 reintentos que hace PayPal en 3 dias chocarian todos contra el 23505 y la cuenta
+    // de un cliente que YA PAGO nunca se activaria. Al borrar la marca, el proximo reintento lo procesa.
+    var _ppSoltarMarca = async function() {
+      try { await supabase.from('paypal_webhook_eventos').delete().eq('event_id', eventId); }
+      catch (eD) { console.error('[paypal] no se pudo soltar la marca del evento ' + eventId + ':', eD && eD.message); }
+    };
+
+    // ---- CANDADO 2: la verdad la da la API, no el body ----
+    var sus = null;
+    try { sus = await paypalConsultarSuscripcion(subId); }
+    catch (eC) { console.error('[paypal] no se pudo consultar la suscripcion ' + subId + ':', eC && eC.message); await _ppSoltarMarca(); return; }
+    if (!sus) { await _ppSoltarMarca(); return; }
+
+    // user_id: custom_id de la suscripcion (equivalente del external_reference de MP). Lo leemos de la
+    // RESPUESTA DE LA API (donde el schema oficial lo documenta), NO del body del webhook: que custom_id
+    // venga dentro del `resource` de la notificacion no esta confirmado en la doc de PayPal.
+    var user_id = sus.custom_id ? String(sus.custom_id) : null;
+    // Sin custom_id valido no sabemos a que cuenta acreditar. NO soltamos la marca: reintentar no lo arregla
+    // (la suscripcion se creo mal) y no queremos 25 reintentos golpeando la API por lo mismo.
+    if (!user_id || !/^[0-9a-fA-F-]{32,40}$/.test(user_id)) { console.error('[paypal] suscripcion sin custom_id valido -> descartada'); return; }
+
+    // Mapeo de estados PayPal -> los MISMOS estados que ya usa el sistema (mismo criterio que el de MP).
+    //   ACTIVE            -> 'active'
+    //   SUSPENDED         -> 'past_due'  (equivale al 'paused' de MP: gracia; el cron lo pasa a suspended)
+    //   CANCELLED/EXPIRED -> 'cancelled'
+    //   APPROVAL_PENDING / APPROVED (aun sin cobrar) -> 'trial' (pendiente = bloqueado, igual que en MP)
+    var st = String(sus.status || '').toUpperCase();
+    var estado = (st === 'ACTIVE') ? 'active'
+      : (st === 'SUSPENDED') ? 'past_due'
+      : ((st === 'CANCELLED' || st === 'EXPIRED') ? 'cancelled' : 'trial');
+
+    // Nivel del plan a partir del plan_id (espejo del lookup de PLANES_MP).
+    var planNivel = paypalNivelDePlanId(sus.plan_id);
+    // Proxima fecha de cobro real (equivalente del next_payment_date de MP).
+    var proxCobro = (sus.billing_info && sus.billing_info.next_billing_time) ? sus.billing_info.next_billing_time : null;
+
+    // Estado/plan ANTERIOR (para distinguir alta nueva vs cambio, igual que el webhook de MP).
+    var prevSub = null;
+    try { var ps = await supabase.from('subscriptions').select('status, plan, cortesia').eq('user_id', user_id).maybeSingle(); prevSub = ps && ps.data ? ps.data : null; } catch (ePrev) {}
+
+    if (estado === 'active') {
+      // MISMO patron ATOMICO que el webhook de MP: el reset del contador SOLO lo hace el primer evento que
+      // encuentra la fila todavia en 'trial' (UPDATE condicional .eq('status','trial')). Un segundo evento ya
+      // no matchea -> no resetea -> no regala cupo. (La marca de idempotencia de arriba ya cubre el reintento
+      // del MISMO evento; esto cubre ademas eventos DISTINTOS que llegan casi juntos, ej. ACTIVATED + SALE.)
+      var filaReset = {
+        status: 'active', paypal_subscription_id: sus.id, pasarela: 'paypal',
+        current_period_end: proxCobro, trial_con_tarjeta: false,
+        ai_messages_this_period: 0, period_start: new Date().toISOString()
+      };
+      if (planNivel) filaReset.plan = planNivel;
+      var upReset = await supabase.from('subscriptions').update(filaReset).eq('user_id', user_id).eq('status', 'trial').select('user_id');
+      if (upReset && upReset.error) {
+        // Falta la migracion o la base fallo. NO activamos a medias: soltamos la marca para que el reintento
+        // de PayPal (hasta 25 en 3 dias) lo aplique una vez que la migracion este corrida.
+        console.error('[paypal] update reset fallo:', upReset.error.message);
+        await _ppSoltarMarca();
+        return;
+      }
+      var afectoReset = !!(Array.isArray(upReset.data) && upReset.data.length > 0);
+      if (!afectoReset) {
+        // No estaba en 'trial': alta ya activa, renovacion mensual (PAYMENT.SALE.COMPLETED) o 2do evento.
+        // Se actualiza el estado y la proxima fecha de cobro SIN tocar el contador ni el ancla del periodo.
+        var filaAct = { user_id: user_id, status: 'active', paypal_subscription_id: sus.id, pasarela: 'paypal', current_period_end: proxCobro };
+        if (planNivel) filaAct.plan = planNivel;
+        // CORTESIA -> SUSCRIPCION: mismo criterio que el webhook de MP (el ciclo del plan arranca HOY).
+        var _veniaDeCortesia = !!(prevSub && prevSub.cortesia === true && prevSub.status !== 'active');
+        if (_veniaDeCortesia) { filaAct.period_start = new Date().toISOString(); filaAct.ai_messages_this_period = 0; }
+        var _upAct = await supabase.from('subscriptions').upsert(filaAct, { onConflict: 'user_id' });
+        if (_upAct && _upAct.error) { console.error('[paypal] upsert active fallo:', _upAct.error.message); await _ppSoltarMarca(); return; }
+      }
+    } else {
+      // No-active (past_due / cancelled / trial): solo el estado, sin tocar contador ni period_start.
+      var fila = { user_id: user_id, status: estado, paypal_subscription_id: sus.id, pasarela: 'paypal', current_period_end: proxCobro };
+      if (planNivel) fila.plan = planNivel;
+      var _upNo = await supabase.from('subscriptions').upsert(fila, { onConflict: 'user_id' });
+      if (_upNo && _upNo.error) { console.error('[paypal] upsert no-active fallo:', _upNo.error.message); await _ppSoltarMarca(); return; }
+    }
+
+    // Marcar a que tenant se aplico (best-effort, solo para auditoria).
+    try { await supabase.from('paypal_webhook_eventos').update({ user_id: user_id }).eq('event_id', eventId); } catch (eMk) {}
+
+    // NOTIF MAESTRO (best-effort, nunca rompe el webhook). Mismo criterio que el de MP.
+    try {
+      var prevEstado = prevSub && prevSub.status ? prevSub.status : null;
+      var prevPlan = prevSub && prevSub.plan ? prevSub.plan : null;
+      if (estado === 'cancelled' && prevEstado !== 'cancelled') {
+        crearNotifMaestro('suscripcion_cancelada', 'Suscripcion cancelada (PayPal)', 'Un cliente cancelo su suscripcion en dolares' + (prevPlan ? ' (plan ' + prevPlan + ')' : '') + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'warning' }).catch(function(){});
+      } else if (estado === 'past_due' && prevEstado !== 'past_due') {
+        crearNotifMaestro('suscripcion_cancelada', 'Suscripcion suspendida (PayPal)', 'PayPal suspendio la suscripcion de un cliente (pago fallido o suspension manual)' + (prevPlan ? ' (plan ' + prevPlan + ')' : '') + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'warning' }).catch(function(){});
+      } else if (estado === 'active') {
+        if (prevEstado !== 'active') {
+          crearNotifMaestro('suscripcion_nueva', 'Suscripcion nueva (PayPal, USD)', 'Un cliente activo su suscripcion en dolares' + (planNivel ? ' (plan ' + planNivel + ', USD ' + (PRECIOS_USD[planNivel] || '?') + '/mes)' : '') + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'info' }).catch(function(){});
+        } else if (planNivel && prevPlan && planNivel !== prevPlan) {
+          crearNotifMaestro('suscripcion_cambio', 'Cambio de plan (PayPal)', 'Un cliente cambio de plan: ' + prevPlan + ' -> ' + planNivel + '.', { ref_user_id: user_id, ref_id: sus.id, severidad: 'info' }).catch(function(){});
+        }
+      }
+    } catch (eNotif) {}
+  } catch (e) { console.error('webhook paypal:', e && e.message); }
+});
+
 // (endpoint temporal /api/mp-setup-planes eliminado: los 3 planes base ya estan creados y sus IDs viven en PLANES_MP)
 
 // RECARGA: procesa un pago UNICO aprobado y acredita los mensajes al pool mensajes_extra (mismo que cargar_extra del Maestro).
@@ -27399,6 +27938,87 @@ app.post('/api/maestro/mp-crear-plan-enterprise', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     return res.status(410).json({ ok: false, error: 'Deshabilitado: ya no se usan plantillas de plan en MercadoPago (el cobro es directo, con el monto del codigo atado al dolar).' });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// ===== PAYPAL (ADMIN): crear el producto + los 4 planes mensuales en USD =====
+// A diferencia de MercadoPago (preapproval DIRECTO con el monto suelto), PayPal EXIGE la cadena
+// Producto -> Plan -> Suscripcion: los planes tienen que existir ANTES de poder suscribir a nadie.
+// Este endpoint los crea UNA vez. NO se dispara solo: lo corre el dueno cuando quiera.
+//
+//   curl -X POST https://<backend>/api/maestro/paypal-crear-planes -H "Authorization: Bearer <token maestro>"
+//
+// IDEMPOTENTE: antes de crear, lista lo que ya hay en la cuenta de PayPal y reusa lo que encuentra
+// (producto y planes se matchean por NOMBRE exacto). Correrlo dos veces NO duplica.
+// Devuelve los ids para pegar en las envs de Railway (mismo patron que MP_PLAN_ENTERPRISE):
+//   PAYPAL_PRODUCT_ID, PAYPAL_PLAN_BASICO, PAYPAL_PLAN_PRO, PAYPAL_PLAN_PREMIUM, PAYPAL_PLAN_ENTERPRISE
+// Solo SUPER-ADMIN (el dueno del SaaS): un empleado del Maestro NO puede crear planes de cobro.
+app.post('/api/maestro/paypal-crear-planes', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (req._maestroTipo !== 'admin') return res.status(403).json({ error: 'Solo el super-admin puede crear los planes de cobro' });
+    if (!paypalActivo()) return res.status(503).json({ ok: false, error: 'PayPal no configurado (faltan PAYPAL_CLIENT_ID / PAYPAL_SECRET en Railway)' });
+    var r = await paypalCrearProductoYPlanes();
+    // Bloque listo para copiar/pegar en las envs de Railway.
+    var envs = {
+      PAYPAL_PRODUCT_ID: r.producto || '',
+      PAYPAL_PLAN_BASICO: r.planes.basico || '',
+      PAYPAL_PLAN_PRO: r.planes.pro || '',
+      PAYPAL_PLAN_PREMIUM: r.planes.premium || '',
+      PAYPAL_PLAN_ENTERPRISE: r.planes.enterprise || ''
+    };
+    try { await supabase.from('admin_audit').insert({ accion: 'paypal_crear_planes', detalle: JSON.stringify({ producto: r.producto, creados: r.planes_creados, reusados: r.planes_reusados, entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live') }) }); } catch(eA){}
+    return res.json({
+      ok: true,
+      entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live'),
+      precios_usd: PRECIOS_USD,
+      producto: r.producto,
+      producto_creado: r.producto_creado,
+      planes: r.planes,
+      planes_creados: r.planes_creados,
+      planes_reusados: r.planes_reusados,
+      envs_para_railway: envs,
+      siguiente_paso: '1) Pega estas 5 envs en Railway y reinicia el servicio. 2) En el panel de PayPal da de alta el webhook apuntando a <URL-DEL-BACKEND>/api/webhook/paypal con los eventos BILLING.SUBSCRIPTION.* y PAYMENT.SALE.COMPLETED. 3) Carga el id de ese webhook en la env PAYPAL_WEBHOOK_ID (lo podes ver con GET /api/maestro/paypal-estado). Recien con las 6 envs cargadas el checkout en dolares se habilita.'
+    });
+  }catch(e){ return res.status(500).json({ ok: false, error: e && e.message }); }
+});
+
+// ===== PAYPAL (ADMIN, read-only): estado de la configuracion, para chequear sin tocar nada =====
+// NO expone credenciales: solo dice que falta para poder cobrar en USD.
+app.get('/api/maestro/paypal-estado', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    if (req._maestroTipo !== 'admin') return res.status(403).json({ error: 'Solo el super-admin' });
+    var falta = [];
+    if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) falta.push('PAYPAL_CLIENT_ID / PAYPAL_SECRET');
+    if (!PLANES_PAYPAL.basico) falta.push('PAYPAL_PLAN_BASICO');
+    if (!PLANES_PAYPAL.pro) falta.push('PAYPAL_PLAN_PRO');
+    if (!PLANES_PAYPAL.premium) falta.push('PAYPAL_PLAN_PREMIUM');
+    if (!PLANES_PAYPAL.enterprise) falta.push('PAYPAL_PLAN_ENTERPRISE');
+    if (!PAYPAL_WEBHOOK_ID) falta.push('PAYPAL_WEBHOOK_ID');
+    // AYUDA: lista los webhooks ya dados de alta en la app de PayPal (GET /v1/notifications/webhooks) para
+    // que el dueno saque de aca el id que va en PAYPAL_WEBHOOK_ID, sin tener que buscarlo en el panel.
+    // Read-only y best-effort: si falla, no rompe el estado.
+    var webhooks = null;
+    if (paypalActivo()) {
+      try {
+        var wl = await paypalFetch('/v1/notifications/webhooks', 'GET', null);
+        webhooks = ((wl && wl.webhooks) || []).map(function(w){ return { id: w.id, url: w.url, eventos: ((w.event_types || []).map(function(t){ return t.name; })) }; });
+      } catch (eW) { webhooks = { error: String(eW && eW.message).slice(0, 180) }; }
+    }
+    return res.json({
+      ok: true,
+      webhooks_dados_de_alta: webhooks,
+      entorno: (PAYPAL_BASE.indexOf('sandbox') >= 0 ? 'sandbox' : 'live'),
+      credenciales: paypalActivo(),
+      planes_listos: paypalPlanesListos(),
+      webhook_id_cargado: !!PAYPAL_WEBHOOK_ID,
+      cobro_listo: paypalCobroListo(),
+      producto_id: PAYPAL_PRODUCT_ID || null,
+      planes: PLANES_PAYPAL,
+      precios_usd: PRECIOS_USD,
+      falta: falta
+    });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -29829,9 +30449,22 @@ app.post('/api/suscripcion/cancelar', async function(req, res){
       try { await mpCancelarSuscripcion(sub.mp_preapproval_id); cancelado = true; }
       catch(eM){ console.error('cancelar MP:', eM && eM.message); }
     }
+    // ESPEJO PAYPAL (agregado 2026-07-28): si la cuenta paga en dolares, cortamos el cobro recurrente en
+    // PayPal con el mismo criterio best-effort. INERTE HOY: `paypal_subscription_id` es una columna NUEVA,
+    // esta en NULL en TODAS las filas existentes -> esta rama nunca corre y el flujo de MP queda igual.
+    var canceladoPaypal = false;
+    if (paypalActivo() && sub.paypal_subscription_id) {
+      try { await paypalCancelarSuscripcion(sub.paypal_subscription_id, 'Baja pedida por el cliente desde Raices CRM'); canceladoPaypal = true; }
+      catch(ePP){ console.error('cancelar PayPal:', ePP && ePP.message); }
+    }
     // La cuenta cae al paywall (cancelled -> bloqueado). Limpiamos el preapproval para no reusarlo.
-    await supabase.from('subscriptions').update({ status: 'cancelled', mp_preapproval_id: null }).eq('user_id', user_id);
-    return res.json({ ok: true, cancelado: cancelado });
+    // Se limpian LOS DOS ids (el de PayPal solo si la columna existe; si no, se reintenta como antes).
+    var upCan = await supabase.from('subscriptions').update({ status: 'cancelled', mp_preapproval_id: null, paypal_subscription_id: null, pasarela: null }).eq('user_id', user_id);
+    if (upCan && upCan.error) {
+      // DEFENSIVO: sin la migracion de PayPal aplicada, el update de siempre (BYTE-IDENTICO al de antes).
+      await supabase.from('subscriptions').update({ status: 'cancelled', mp_preapproval_id: null }).eq('user_id', user_id);
+    }
+    return res.json({ ok: true, cancelado: (cancelado || canceladoPaypal), cancelado_paypal: canceladoPaypal });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -30085,6 +30718,26 @@ async function revisarSuscripciones() {
           // si MP aun no adelanto la fecha (cobro pendiente/fallido), NO reseteamos -> no se regala cupo
         }
         // ahora < fin: todavia dentro del periodo pago, no se toca el contador
+      } else if (estVigente === 'active' && fin && s.paypal_subscription_id && paypalActivo()) {
+        // ESPEJO EXACTO del bloque de MP, para las cuentas que pagan en USD por PayPal: al llegar la fecha de
+        // cobro re-consultamos la suscripcion real y anclamos el periodo nuevo en su next_billing_time. Asi el
+        // reset del cupo queda pegado al cobro REAL y no a un rollover de 30 dias.
+        // INERTE HOY: `paypal_subscription_id` es una columna nueva, NULL en todas las filas -> esta rama nunca
+        // corre y cada fila cae al fallback de siempre (el `else` de abajo), igual que antes.
+        if (ahora >= fin) {
+          var freshPP = null;
+          try {
+            var susPP = await paypalConsultarSuscripcion(s.paypal_subscription_id);
+            var nb = susPP && susPP.billing_info && susPP.billing_info.next_billing_time;
+            if (nb) freshPP = new Date(nb).getTime();
+          } catch (ePP) { /* si PayPal falla, NO reseteamos este ciclo; reintenta el proximo cron */ }
+          if (freshPP && freshPP > ahora) {
+            updates.current_period_end = new Date(freshPP).toISOString();
+            updates.ai_messages_this_period = 0;
+            updates.period_start = new Date(ahora).toISOString();
+          }
+          // si PayPal aun no adelanto la fecha (cobro pendiente/fallido), NO reseteamos -> no se regala cupo
+        }
       } else {
         // FALLBACK: sin current_period_end conocido (o no-active) mantenemos el rollover de 30d de antes.
         // Solo se resetea el contador si esta 'active'; para past_due/suspended/trial la ventana rueda sin regalar cupo.

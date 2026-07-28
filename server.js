@@ -1994,9 +1994,12 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
           if (_gap >= 0 && _gap < 20000) _esAutoRespuesta = true;
         }
       } catch (eAuto) { _esAutoRespuesta = false; }
+      // HISTORIAL DE ESTADOS: estado del que venia la conv (para registrar el cambio despues del write). Solo lectura.
+      let _estadoPrevCel = null;
       if (!_esAutoRespuesta) {
         try {
           const { data: _cvE } = await supabase.from('conversations').select('status, ai_enabled, asesor_id, admin_tomo, departamento_id').eq('id', conv.id).maybeSingle();
+          _estadoPrevCel = (_cvE && _cvE.status) ? _cvE.status : null;
           if (_cvE && _cvE.status !== 'listo_humano' && _cvE.status !== 'cerrado') { _updCel.status = 'listo_humano'; _updCel.ai_enabled = false; }
           else if (_cvE && _cvE.ai_enabled === true) { _updCel.ai_enabled = false; }
           if (_cvE && !_cvE.asesor_id) {
@@ -2009,6 +2012,12 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
       }
       // HORA REAL: es un mensaje saliente REAL (el dueno escribio desde el celular) -> tambien last_message_at.
       await _updConvMensaje(_updCel, function (q) { return q.eq('id', conv.id); });
+      // HISTORIAL DE ESTADOS (lead_estados_historial): el DUEÑO escribio desde el celular -> el lead pasa a
+      // 'listo_humano'. Solo si el update efectivamente llevaba status (no fue un saludo automatico ni ya estaba
+      // en listo_humano/cerrado). Fire-and-forget; con la tabla ausente es un no-op.
+      if (_updCel.status) {
+        try { registrarCambioEstado({ conversation_id: conv.id, user_id: conv.user_id, estado_anterior: _estadoPrevCel, estado_nuevo: _updCel.status, origen: 'humano', motivo: 'el dueno respondio desde el celular' }).catch(function(){}); } catch (eLEH) {}
+      }
       // FIX #3 (Diego 2026-07-23): si este eco marco admin_tomo, guardar QUIEN lo tomo. El que escribe desde
       // el celular es el DUEÑO de la cuenta -> admin_tomo_por = conv.user_id. Write APARTE best-effort: si la
       // migracion (migracion-admin-tomo-por.sql) no corrio, la columna no existe y este update falla SOLO
@@ -4448,6 +4457,81 @@ async function registrarDecisionIA(d) {
 }
 // ============================================================================
 
+// ============================================================================
+// ===== HISTORIAL DE CAMBIOS DE ESTADO DEL LEAD (Diego 2026-07-28) ===========
+// Tabla: lead_estados_historial (ver migracion-historial-estados.sql).
+// Deja rastro ESTRUCTURADO de CADA cambio de conversations.status: de que estado a cual, quien lo
+// movio (ia / humano / sistema / cron), que asesor fue (si aplica) y con que motivo. Hoy en la base
+// solo queda el estado FINAL, asi que "quien lo paso a listo_humano" era imposible de responder.
+//
+// CONTRATO DE SEGURIDAD (producto EN VIVO; varios call sites estan en el webhook, camino caliente):
+//   1) NUNCA se hace `await` de esta funcion. SIEMPRE fire-and-forget:
+//        try { registrarCambioEstado({...}).catch(function(){}); } catch (eLEH) {}
+//      El trabajo sincronico del caller es SOLO armar un objeto literal (microsegundos).
+//   2) CIRCUIT BREAKER: si la tabla NO existe (migracion no corrida) se prende _leadEstHistOff y NO
+//      se vuelve a intentar NUNCA en este proceso. Cero reintentos en loop, cero ruido en los logs.
+//      MISMO patron exacto que registrarDecisionIA (reusa _regDecEsFaltaDeTabla / _regDecCorte).
+//   3) Cualquier error se traga en silencio. Un fallo del registro JAMAS rompe el cambio de estado.
+//   4) 0 TOKENS DE IA. Solo registra lo que ya paso.
+//   5) NO gateado por flag: no cambia NINGUN comportamiento, solo agrega una fila. Con la tabla
+//      ausente es un no-op absoluto (breaker) => desplegar antes o despues de la migracion da igual.
+//
+// d = { conversation_id, estado_anterior, estado_nuevo, origen, actor_asesor_id, actor_auth_uid,
+//       motivo, user_id }
+//   - user_id (tenant): opcional; si no viene se resuelve de la conversacion (best-effort).
+//   - actor_auth_uid: opcional; si no vino actor_asesor_id, se resuelve el id en `asesores` aca
+//     adentro (fuera del camino del request, no demora nada al lead ni al panel).
+const LEAD_EST_HIST_ORIGENES = ['ia', 'humano', 'sistema', 'cron'];
+let _leadEstHistOff = false; // circuit breaker: tabla ausente -> apagado permanente en este proceso
+
+async function registrarCambioEstado(d) {
+  try {
+    if (_leadEstHistOff) return;                                  // migracion no corrida -> apagado
+    if (!d || !d.conversation_id || !d.estado_nuevo) return;
+    // No hubo cambio real de estado: no registrar (evita ruido cuando el caller no filtra).
+    if (d.estado_anterior && String(d.estado_anterior) === String(d.estado_nuevo)) return;
+
+    // Tenant: si no vino, resolverlo de la conversacion (aislamiento por cuenta + RLS del front).
+    let _owner = d.user_id || null;
+    if (!_owner) {
+      try {
+        const { data: _cv } = await supabase.from('conversations').select('user_id').eq('id', d.conversation_id).maybeSingle();
+        _owner = (_cv && _cv.user_id) ? _cv.user_id : null;
+      } catch (eO) { _owner = null; }
+    }
+    if (!_owner) return;
+
+    // Origen normalizado al check de la tabla (cualquier cosa rara cae a 'sistema', nunca rompe el insert).
+    let _origen = String(d.origen || 'sistema').trim().toLowerCase();
+    if (LEAD_EST_HIST_ORIGENES.indexOf(_origen) < 0) _origen = 'sistema';
+
+    // Actor: id en `asesores`. Si el caller solo tiene el uid de auth, lo resolvemos aca (best-effort).
+    let _actor = d.actor_asesor_id || null;
+    if (!_actor && d.actor_auth_uid) {
+      try {
+        const { data: _ase } = await supabase.from('asesores').select('id').eq('auth_user_id', d.actor_auth_uid).eq('admin_id', _owner).maybeSingle();
+        if (_ase && _ase.id) _actor = _ase.id;   // el DUEÑO no tiene fila en asesores -> queda null (correcto)
+      } catch (eA) { _actor = null; }
+    }
+
+    const fila = {
+      user_id: _owner,
+      conversation_id: d.conversation_id,
+      estado_anterior: _regDecCorte(d.estado_anterior, 40),
+      estado_nuevo: _regDecCorte(d.estado_nuevo, 40),
+      origen: _origen,
+      actor_asesor_id: _actor,
+      motivo: _regDecCorte(d.motivo, 200)
+    };
+    const { error } = await supabase.from('lead_estados_historial').insert(fila);
+    if (error && _regDecEsFaltaDeTabla(error)) {
+      _leadEstHistOff = true;
+      console.log('[HISTORIAL ESTADOS] tabla lead_estados_historial ausente: registro DESACTIVADO en este proceso. Corre migracion-historial-estados.sql + NOTIFY pgrst.');
+    }
+  } catch (e) { /* best-effort ABSOLUTO: el registro NUNCA rompe el cambio de estado */ }
+}
+// ============================================================================
+
 async function derivarAHumano(convId, user_id, motivo, opts) {
   opts = opts || {};
   try {
@@ -4475,6 +4559,8 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
       }
       // PUNTO 5 (historial_estados): registrar el pase a listo_humano. Gated OFF -> no hace nada (BYTE-IDENTICO).
       try { registrarCambioEstadoConv(convId, null, 'listo_humano', 'La IA', motivo || null, user_id).catch(function(){}); } catch (eHE) {}
+      // HISTORIAL DE ESTADOS (lead_estados_historial): derivacion a humano. Fire-and-forget, tabla ausente -> no-op.
+      try { registrarCambioEstado({ conversation_id: convId, user_id: user_id, estado_anterior: null, estado_nuevo: 'listo_humano', origen: 'ia', motivo: motivo || 'derivacion a humano' }).catch(function(){}); } catch (eLEH) {}
     }
     // 2) Elegir/asignar asesor (solo si no tiene y no lo tomo el admin) — criterio identico al actual.
     // ETAPA 7: con reparto_v2 ON tambien necesitamos departamento_id para el picker por departamento.
@@ -4625,6 +4711,12 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
               if (_reOff && _reOff.asesor_id) { _asesor = _reOff.asesor_id; }
             } catch (eReOff) {}
           }
+        }
+        // HISTORIAL DE ESTADOS (lead_estados_historial): la cobertura fue un USUARIO IA -> la conv BAJA de
+        // 'listo_humano' a 'en_conversacion' (la IA la sigue atendiendo). Solo se registra si el update de arriba
+        // efectivamente llevaba status (reparto_v2 ON + asesor es_ia). Fire-and-forget, tabla ausente -> no-op.
+        if (_updAsesor.status) {
+          try { registrarCambioEstado({ conversation_id: convId, user_id: _ownerId || user_id, estado_anterior: 'listo_humano', estado_nuevo: _updAsesor.status, origen: 'ia', actor_asesor_id: _asesor || null, motivo: 'cobertura por usuario IA: la IA sigue atendiendo' }).catch(function(){}); } catch (eLEH) {}
         }
         // EXTRA: registrar un MENSAJE DE SISTEMA en el historial cuando se DERIVA a un asesor (solo reparto_v2,
         // solo si quien quedo es un HUMANO, no usuario IA). Texto "Derivado a {Depto} · {Nombre}". DEFENSIVO: 0 tokens.
@@ -5154,6 +5246,8 @@ async function _finalizarRotacionV3(convId, ownerId, writerAsesorId) {
       try { await supabase.from('messages').insert({ conversation_id: convId, user_id: ownerId, role: 'sistema', content: 'Un asesor tomo la conversacion. La IA deja de responder.', enviado_por: 'Sistema' }); } catch (eIns) {}
       // PUNTO 5 (historial_estados): registrar el pase a listo_humano por asesor que escribio. Gated OFF -> no-op.
       try { registrarCambioEstadoConv(convId, null, 'listo_humano', 'Un asesor', 'tomo la conversacion', ownerId).catch(function(){}); } catch (eHE) {}
+      // HISTORIAL DE ESTADOS (lead_estados_historial): un HUMANO escribio y finalizo la rotacion v3.
+      try { registrarCambioEstado({ conversation_id: convId, user_id: ownerId, estado_anterior: null, estado_nuevo: 'listo_humano', origen: 'humano', actor_asesor_id: writerAsesorId || null, motivo: 'un asesor escribio y tomo la conversacion' }).catch(function(){}); } catch (eLEH) {}
       console.log('Derivacion v3: lead ' + convId + ' finalizado (un humano escribio) -> listo_humano, IA off');
     }
   } catch (e) { console.error('_finalizarRotacionV3:', e && e.message); }
@@ -10971,6 +11065,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       }).eq('id', conv.id);
       // PUNTO 5 (historial_estados): el lead volvio a escribir desde recontacto -> restaura estado previo. Gated OFF -> no-op.
       try { registrarCambioEstadoConv(conv.id, 'recontacto', volverA, 'El lead', 'volvio a escribir', user_id).catch(function(){}); } catch (eHE) {}
+      // HISTORIAL DE ESTADOS (lead_estados_historial): el lead contesto un recontacto -> vuelve a su estado previo.
+      try { registrarCambioEstado({ conversation_id: conv.id, user_id: user_id, estado_anterior: 'recontacto', estado_nuevo: volverA, origen: 'sistema', motivo: 'el lead volvio a escribir' }).catch(function(){}); } catch (eLEH) {}
     }
 
     // ===== PARTE A (REGLA 22): RETORNO DEL LEAD A UN CASO CERRADO =====
@@ -10998,6 +11094,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             updated_at: new Date().toISOString()
           }).eq('id', conv.id);
           conv.status = 'en_conversacion'; // sincronizar el objeto en memoria: el ciclo de abajo lo trata como conv viva
+          // HISTORIAL DE ESTADOS (lead_estados_historial): un lead CERRADO volvio a escribir y "revive" (REGLA 22).
+          try { registrarCambioEstado({ conversation_id: conv.id, user_id: user_id, estado_anterior: 'cerrado', estado_nuevo: 'en_conversacion', origen: 'sistema', motivo: 'el lead escribio a un caso cerrado (revive)' }).catch(function(){}); } catch (eLEH) {}
         }
       } catch (eRev) { console.error('retorno lead cerrado:', eRev && eRev.message); }
     }
@@ -11390,6 +11488,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                     try { await supabase.from('conversations').update({ departamento_manual: false }).eq('id', _convId); } catch (eDm) {}
                     // PUNTO 5 (historial_estados): gated OFF -> no-op (BYTE-IDENTICO).
                     try { registrarCambioEstadoConv(_convId, estadoActual, 'listo_humano', 'La IA', 'confirmacion de derivacion', user_id).catch(function(){}); } catch (eHE) {}
+                    // HISTORIAL DE ESTADOS (lead_estados_historial): el lead confirmo la derivacion (fallback v3 OFF).
+                    try { registrarCambioEstado({ conversation_id: _convId, user_id: user_id, estado_anterior: estadoActual, estado_nuevo: 'listo_humano', origen: 'ia', motivo: 'confirmacion de derivacion' }).catch(function(){}); } catch (eLEH) {}
                     await derivarAHumano(_convId, user_id, 'confirmacion_derivar_fallback', { setStatus: false, push: true, pushTitulo: 'Lead confirmado para derivar', pushTexto: (data.pushName || telefono), resumen: true });
                   }
                   _yaDerivoEnEsteMensaje = true;
@@ -11504,6 +11604,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, temperatura: temperaturaPorEstado('listo_humano'), updated_at: new Date().toISOString() }).eq('id', _convId);
                 // PUNTO 5 (historial_estados): gated OFF -> no-op (BYTE-IDENTICO).
                 try { registrarCambioEstadoConv(_convId, estadoActual, 'listo_humano', 'La IA', 'fuera de alcance', user_id).catch(function(){}); } catch (eHE) {}
+                // HISTORIAL DE ESTADOS (lead_estados_historial): pedido fuera del alcance de la IA -> a humano.
+                try { registrarCambioEstado({ conversation_id: _convId, user_id: user_id, estado_anterior: estadoActual, estado_nuevo: 'listo_humano', origen: 'ia', motivo: 'pedido fuera de alcance de la IA' }).catch(function(){}); } catch (eLEH) {}
                 await derivarAHumano(_convId, user_id, 'ia_fuera_alcance', { setStatus: false, push: true, pushTitulo: 'Lead fuera de alcance de la IA', pushTexto: (data.pushName || telefono), resumen: true });
               }
               _yaDerivoEnEsteMensaje = true;
@@ -11571,6 +11673,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   _decAplicado = true; _decMotivoNo = null; // REGISTRO DECISIONES IA: el estado propuesto SI se escribio
                   // PUNTO 5 (historial_estados): cambio de estado por clasificacion. Gated OFF -> no-op (BYTE-IDENTICO).
                   try { registrarCambioEstadoConv(_convId, estadoActual, nuevoEstado, 'La IA', 'clasificacion automatica', user_id).catch(function(){}); } catch (eHE) {}
+                  // HISTORIAL DE ESTADOS (lead_estados_historial): EL CLASIFICADOR de la IA movio el estado.
+                  try { registrarCambioEstado({ conversation_id: _convId, user_id: user_id, estado_anterior: estadoActual, estado_nuevo: nuevoEstado, origen: 'ia', motivo: 'clasificacion automatica' }).catch(function(){}); } catch (eLEH) {}
                   // Si paso a listo_humano: asignar asesor (si no tiene) + generar resumen.
                   if (nuevoEstado === 'listo_humano') {
                     // ETAPA 4: la asignacion de asesor y el resumen al transicionar a listo_humano ahora viven
@@ -11779,6 +11883,8 @@ app.post('/api/whatsapp/send', async (req, res) => {
         await supabase.from('conversations').update({ status: 'listo_humano', ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
         // PUNTO 5 (historial_estados): un humano respondio -> listo_humano. Gated OFF -> no-op (BYTE-IDENTICO).
         try { registrarCambioEstadoConv(conversation_id, convEstado.status, 'listo_humano', 'Un asesor', 'respondio el asesor', conv.user_id).catch(function(){}); } catch (eHE) {}
+        // HISTORIAL DE ESTADOS (lead_estados_historial): un HUMANO respondio desde el panel. _autor ya resuelto arriba.
+        try { registrarCambioEstado({ conversation_id: conversation_id, user_id: conv.user_id, estado_anterior: convEstado.status, estado_nuevo: 'listo_humano', origen: 'humano', actor_asesor_id: (_autor && _autor.asesorId) || null, actor_auth_uid: _uidToken || null, motivo: 'respondio un humano desde el panel' }).catch(function(){}); } catch (eLEH) {}
       } else if (convEstado && convEstado.ai_enabled === true) {
         // Ya es listo_humano/cerrado pero la IA quedó encendida -> apagarla igual (no pisar la respuesta humana).
         await supabase.from('conversations').update({ ai_enabled: false, updated_at: new Date().toISOString() }).eq('id', conversation_id);
@@ -12656,7 +12762,46 @@ app.get('/api/conversaciones/timeline', async function (req, res) {
         .order('created_at', { ascending: true }).limit(200);
       if (!(rp && rp.error)) pases = (rp.data || []).filter(function (m) { return m && typeof m.content === 'string' && m.content.indexOf('🔁') >= 0; });
     } catch (eP) { pases = []; }
-    return res.json({ ok: true, conversation_id: convId, nota_asesor: conv.nota_asesor || null, citas: citas, pases: pases });
+    // ========================================================================================
+    // AMPLIACION ADITIVA (Diego 2026-07-28): 3 bloques NUEVOS. Los campos que ya devolvia este
+    // endpoint (ok / conversation_id / nota_asesor / citas / pases) NO CAMBIAN -> el front actual
+    // sigue funcionando igual. Cada bloque va en SU PROPIO try/catch y ante CUALQUIER error
+    // (tabla ausente, migracion no corrida, PostgREST sin refrescar) devuelve [] en vez de romper:
+    // este endpoint NUNCA tira 500 por una tabla que todavia no existe. CERO IA.
+    // ========================================================================================
+    // ---- DECISIONES de la IA (ia_decisiones, migracion-registro-decisiones-ia.sql). ----
+    var decisiones = [];
+    try {
+      var rd = await supabase.from('ia_decisiones')
+        .select('id, created_at, origen, mensaje_lead, mensaje_truncado, clasificador_corrio, estado_previo, estado_propuesto, estado_despues, estado_aplicado, motivo_no_aplicado, bloqueo_interesado, tools, pidio_area, deducido, fuera_alcance, derivo, derivo_camino, derivo_motivo, departamento_id, departamento_texto, ia_respondio')
+        .eq('user_id', ownerId).eq('conversation_id', convId)
+        .order('created_at', { ascending: true }).limit(200);
+      if (!(rd && rd.error)) decisiones = (rd.data || []);
+    } catch (eDec) { decisiones = []; }
+    // ---- HISTORIAL DE ESTADOS (lead_estados_historial, migracion-historial-estados.sql). ----
+    var estados = [];
+    try {
+      var re = await supabase.from('lead_estados_historial')
+        .select('id, created_at, estado_anterior, estado_nuevo, origen, actor_asesor_id, motivo')
+        .eq('user_id', ownerId).eq('conversation_id', convId)
+        .order('created_at', { ascending: true }).limit(200);
+      if (!(re && re.error)) estados = (re.data || []);
+    } catch (eEst) { estados = []; }
+    // ---- RESERVAS de desarrollo (dev_reservas). Aplica al rubro DESARROLLADORA: en los otros
+    //      mundos simplemente no hay filas -> [] (no hace falta chequear el rubro ni el gate).
+    //      Se buscan por conversacion Y por contacto (la reserva puede haberse creado desde la
+    //      ficha del contacto, sin conversation_id). ----
+    var reservas = [];
+    try {
+      var orRes = ['conversation_id.eq.' + convId];
+      if (contactId) orRes.push('contact_id.eq.' + contactId);
+      var rr = await supabase.from('dev_reservas')
+        .select('id, created_at, updated_at, development_id, unit_id, contact_id, conversation_id, estado, monto_sena, moneda, comprobante_url, motivo_caida, notas')
+        .eq('user_id', ownerId).or(orRes.join(','))
+        .order('created_at', { ascending: true }).limit(200);
+      if (!(rr && rr.error)) reservas = (rr.data || []);
+    } catch (eRes) { reservas = []; }
+    return res.json({ ok: true, conversation_id: convId, nota_asesor: conv.nota_asesor || null, citas: citas, pases: pases, decisiones: decisiones, estados: estados, reservas: reservas });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -13135,7 +13280,9 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
     // 1) Leer la conversacion (tenant dueño REAL + estado actual para concurrencia/historial).
     const { data: conv } = await supabase
       .from('conversations')
-      .select('id, user_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual')
+      // `status` es ADITIVO al select (columna vieja, siempre existe): lo necesita el HISTORIAL DE ESTADOS
+      // de mas abajo para saber de que estado venia. No cambia ninguna decision del endpoint.
+      .select('id, user_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status')
       .eq('id', conversation_id)
       .maybeSingle();
     if (!conv) return res.status(404).json({ error: 'Conversacion no encontrada' });
@@ -13205,6 +13352,13 @@ app.post('/api/conversaciones/asignar', async (req, res) => {
         message: 'La asignacion de este lead cambio mientras lo reasignabas. Reintenta.',
         actual: fresh || null
       });
+    }
+
+    // HISTORIAL DE ESTADOS (lead_estados_historial): CAMBIO MANUAL DESDE EL PANEL. Asignar/derivar a un humano pasa
+    // el lead a 'listo_humano' (upd.status, ver arriba). Solo se registra si el update efectivamente llevaba status
+    // y si el estado REALMENTE cambio (la propia funcion descarta anterior===nuevo). Fire-and-forget, nunca rompe.
+    if (upd.status) {
+      try { registrarCambioEstado({ conversation_id: conversation_id, user_id: ownerId, estado_anterior: conv.status || null, estado_nuevo: upd.status, origen: 'humano', actor_auth_uid: _uidToken || null, motivo: quienAsigna + ' asigno/derivo el lead a mano' }).catch(function(){}); } catch (eLEH) {}
     }
 
     // Write APARTE best-effort del flag departamento_manual=true (no romper la asignacion si la columna no existe).
@@ -14240,6 +14394,8 @@ async function revisarInactividad() {
       }
       // PUNTO 5 (historial_estados): paso a recontacto por inactividad. Gated OFF -> no-op (BYTE-IDENTICO).
       try { registrarCambioEstadoConv(conv.id, conv.status, 'recontacto', 'El sistema', 'inactividad 72hs', conv.user_id).catch(function(){}); } catch (eHE) {}
+      // HISTORIAL DE ESTADOS (lead_estados_historial): CRON de inactividad.
+      try { registrarCambioEstado({ conversation_id: conv.id, user_id: conv.user_id, estado_anterior: conv.status, estado_nuevo: 'recontacto', origen: 'cron', motivo: 'inactividad 72hs (cron de recontacto)' }).catch(function(){}); } catch (eLEH) {}
     }
   } catch (e) { console.error('Error en revisarInactividad:', e && e.message); }
   finally { _inactividadEnCurso = false; } // RACE #6: liberar el guard siempre (nunca queda trabado)
@@ -15673,6 +15829,8 @@ async function _enviarRecontactosV2(ahoraMs) {
               .eq('status', 'recontacto'); // condicional: solo si sigue en recontacto (no pisa un cambio concurrente)
             // PUNTO 5 (historial_estados): cierre por agotar recontacto_max. Gated OFF -> no-op (BYTE-IDENTICO).
             try { registrarCambioEstadoConv(conv.id, 'recontacto', 'cerrado', 'El sistema', 'agoto recontactos', uid).catch(function(){}); } catch (eHE) {}
+            // HISTORIAL DE ESTADOS (lead_estados_historial): CRON de recontacto v2, cierre por agotar el tope.
+            try { registrarCambioEstado({ conversation_id: conv.id, user_id: uid, estado_anterior: 'recontacto', estado_nuevo: 'cerrado', origen: 'cron', motivo: 'agoto el maximo de recontactos (' + maxRec + ')' }).catch(function(){}); } catch (eLEH) {}
             console.log('Recontacto v2: conv ' + conv.id + ' AGOTO recontacto_max (' + maxRec + ') -> status=cerrado (cuenta ' + uid + ')');
           } catch (eClose) { console.error('recontacto v2 cerrar agotado conv ' + conv.id + ':', eClose && eClose.message); }
           continue;
@@ -16036,7 +16194,11 @@ async function rescatarRecontactosRespondidos() {
           status: volverA, temperatura: _temp, estado_previo: null, recontacto_count: 0, updated_at: new Date().toISOString()
         }).eq('id', c.id).eq('status', 'recontacto').eq('last_role', 'contact').select('id'); // condicional: solo si sigue pegado (anti-carrera)
         // PUNTO 5 (historial_estados): solo si el write gano (evita ruido si otro lo movio). Gated OFF -> no-op.
-        if (_uResc && _uResc.length) { try { registrarCambioEstadoConv(c.id, 'recontacto', volverA, 'El sistema', 'rescate: el lead respondio', c.user_id).catch(function(){}); } catch (eHE) {} }
+        if (_uResc && _uResc.length) {
+          try { registrarCambioEstadoConv(c.id, 'recontacto', volverA, 'El sistema', 'rescate: el lead respondio', c.user_id).catch(function(){}); } catch (eHE) {}
+          // HISTORIAL DE ESTADOS (lead_estados_historial): CRON de rescate (lead pegado en recontacto que ya contesto).
+          try { registrarCambioEstado({ conversation_id: c.id, user_id: c.user_id, estado_anterior: 'recontacto', estado_nuevo: volverA, origen: 'cron', motivo: 'rescate: el lead ya habia respondido' }).catch(function(){}); } catch (eLEH) {}
+        }
       } catch (eOne) { /* seguir con el resto */ }
     }
     if (pegados && pegados.length) console.log('rescatarRecontactosRespondidos: ' + pegados.length + ' lead(s) devuelto(s) de recontacto a conversacion');
@@ -31012,6 +31174,9 @@ app.post('/api/conversations/cerrar', async function(req, res){
     if (upd && upd.error) return res.status(409).json({ ok: false, error: 'No se pudo cerrar: ' + (upd.error.message || 'error de esquema') });
     // PUNTO 5 (historial_estados): cierre manual del caso por un usuario. Gated OFF -> no-op (BYTE-IDENTICO).
     try { registrarCambioEstadoConv(conversation_id, null, 'cerrado', 'Un usuario', 'cerro el caso', c.data.user_id).catch(function(){}); } catch (eHE) {}
+    // HISTORIAL DE ESTADOS (lead_estados_historial): cierre MANUAL desde el panel. El actor se resuelve adentro
+    // desde el uid de auth (el dueno no tiene fila en `asesores` -> actor_asesor_id queda null, correcto).
+    try { registrarCambioEstado({ conversation_id: conversation_id, user_id: c.data.user_id, estado_anterior: null, estado_nuevo: 'cerrado', origen: 'humano', actor_auth_uid: uid || null, motivo: 'cerro el caso desde el panel' }).catch(function(){}); } catch (eLEH) {}
     // E3: MOTIVO DE PERDIDA (opcional, para la tarjeta "Motivos de perdida"). Se escribe en un update SEPARADO y
     // best-effort: si la columna motivo_perdida aun no existe (migracion sin correr), el cierre NO se rompe.
     var _MOTIVOS_PERDIDA = ['precio', 'zona', 'dejo_de_responder', 'comprado_otro', 'otro'];

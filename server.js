@@ -8193,6 +8193,40 @@ function _pideHumano(texto) {
 // Clasifica el estado de la conversacion segun el ultimo mensaje del cliente.
 // Conservador: solo devuelve un estado nuevo cuando la senal es clara; si no, devuelve null.
 //
+// ===== ARREGLO 5 (Diego 2026-07-28): preguntar UNA sola vez NO es "interesado" =====
+// VERIFICADO: clasificarEstado recibe SOLO el texto del ultimo mensaje (no ve historial) y su prompt dice
+// "Basta con que pregunte por algo concreto" + "ante la duda elegi interesado". Por eso un lead que pregunto UNA vez
+// y nunca mas contesto quedaba marcado 'interesado' (caso real: Veronica, tel 5491161959955).
+// FIX POR CODIGO (el prompt del clasificador NO se toca): antes de ACEPTAR 'interesado' se exige que el lead haya
+// escrito al menos UNA vez DESPUES de la primera respuesta del negocio. 2 queries chicas a `messages`, 0 IA, 0 tokens.
+//   - Solo puede frenar 'interesado'. 'listo_humano' NUNCA pasa por este guard (si el lead acepta una visita en su
+//     primer mensaje, deriva igual). 'en_conversacion' tampoco.
+//   - FAIL-OPEN: cualquier error de consulta -> true (se acepta el estado = comportamiento de HOY).
+//   - "primera respuesta" = primer mensaje con role 'ai' O 'human'. Se incluye 'human' porque si el que contesto
+//     primero fue un ASESOR, el lead que vuelve a escribir SI se engancho; exigir un 'ai' ahi bloquearia de mas.
+//     role 'sistema' NO cuenta (no es atencion; mismo criterio que el fix de Respaldo/SLA del 2026-07-20).
+//   - Si todavia NO hay ninguna respuesta -> false (no puede haber escrito "despues"): es exactamente el caso que
+//     se quiere frenar. En el webhook este guard corre SIEMPRE despues de generarRespuestaAgente, que ya inserto
+//     su mensaje role='ai', asi que el "sin respuestas" solo se da en flujos sin respuesta previa.
+// NO ESTA GATEADO por flag: no existe columna en business_settings para esto y crearla exige una migracion SQL
+// (fuera de alcance). Queda ACTIVO para todas las cuentas.
+async function _leadEscribioDespuesDeLaPrimeraRespuesta(conversation_id) {
+  try {
+    if (!conversation_id) return true; // fail-open
+    const { data: _resp, error: _eR } = await supabase.from('messages')
+      .select('created_at').eq('conversation_id', conversation_id)
+      .in('role', ['ai', 'human']).order('created_at', { ascending: true }).limit(1);
+    if (_eR) return true; // fail-open
+    if (!_resp || _resp.length === 0 || !_resp[0].created_at) return false; // nadie le respondio todavia
+    const { count, error: _eC } = await supabase.from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('conversation_id', conversation_id).eq('role', 'contact')
+      .gt('created_at', _resp[0].created_at);
+    if (_eC) return true; // fail-open
+    return (count || 0) >= 1;
+  } catch (e) { console.error('guard interesado:', e && e.message); return true; } // fail-open
+}
+
 // FASE 2 / ETAPA 3 (departamento INERTE): ademas del estado, esta MISMA llamada a Haiku deduce
 // el DEPARTAMENTO del lead (D8=C hibrido: lo deduce de la charla; D3=A: lo mapea a uno de los
 // departamentos del tenant). NO se agrega ninguna llamada extra a Claude: se reusa la unica
@@ -11008,7 +11042,19 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               _yaDerivoEnEsteMensaje = true;
             }
 
-            if (nuevoEstado && !_yaDerivoEnEsteMensaje) {
+            // ARREGLO 5 (Diego 2026-07-28): 'interesado' solo si el lead escribio al menos UNA vez DESPUES de la
+            // primera respuesta del negocio (ver _leadEscribioDespuesDeLaPrimeraRespuesta, ~8196). Preguntar una sola
+            // vez y desaparecer NO es un interesado. SOLO frena 'interesado': 'listo_humano' pasa siempre (si acepta
+            // una visita en el primer mensaje, deriva igual). FAIL-OPEN: si la consulta falla se acepta el estado.
+            // Solo se consulta cuando el estado REALMENTE cambiaria (evita queries al pedo).
+            let _bloqueoInteresado = false;
+            if (nuevoEstado === 'interesado' && !_yaDerivoEnEsteMensaje && estadoActual !== 'interesado') {
+              try {
+                _bloqueoInteresado = !(await _leadEscribioDespuesDeLaPrimeraRespuesta(_convId));
+                if (_bloqueoInteresado) console.log('Clasificador: se frena "interesado" en conv ' + _convId + ' (el lead todavia no escribio despues de la primera respuesta)');
+              } catch (eGI) { _bloqueoInteresado = false; } // fail-open
+            }
+            if (nuevoEstado && !_yaDerivoEnEsteMensaje && !_bloqueoInteresado) {
               // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
               const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
               if ((nivel[nuevoEstado] || 0) > (nivel[estadoActual] || 0)) {

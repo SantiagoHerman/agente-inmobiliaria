@@ -26842,11 +26842,20 @@ app.get('/api/suscripcion', async function(req, res) {
     // ai_messages_this_period. Esa fecha NO existe como columna: se CALCULA period_start + 30d.
     // Precedencia: si hay fecha de MP manda esa (es el cobro real); si no, la calculada; si no hay ancla -> null.
     var _MS_30D = 30 * 24 * 3600 * 1000;
-    var periodo_renueva = (sub && sub.current_period_end) || null;
-    var periodo_renueva_origen = periodo_renueva ? 'mercadopago' : null;
-    if (!periodo_renueva && periodo_desde) {
-      var _iniMs = new Date(periodo_desde).getTime();
-      if (isFinite(_iniMs)) { periodo_renueva = new Date(_iniMs + _MS_30D).toISOString(); periodo_renueva_origen = 'calculada'; }
+    // PRECEDENCIA (FIX Diego 2026-07-28): en CORTESIA manda SIEMPRE el calculo propio (inicio + 30d), NUNCA
+    // current_period_end. Motivo: esa columna la escribe MercadoPago y una cuenta que ANTES tuvo suscripcion
+    // conserva la fecha vieja -> el panel mostraba "desde 22/07 · renueva 14/07", o sea renovando 8 dias ANTES
+    // de empezar. Regla del dueño: en cortesia la fecha sale del inicio de la cortesia y NO se mueve si le
+    // cargas mas mensajes; solo cambia si se le saca la cortesia y el cliente se suscribe con tarjeta.
+    // Fuera de cortesia se mantiene el orden de antes: manda la fecha real de cobro de MP.
+    var periodo_renueva = null, periodo_renueva_origen = null;
+    var _iniMs = periodo_desde ? new Date(periodo_desde).getTime() : NaN;
+    if (esCortesia) {
+      if (isFinite(_iniMs)) { periodo_renueva = new Date(_iniMs + _MS_30D).toISOString(); periodo_renueva_origen = 'cortesia'; }
+    } else if (sub && sub.current_period_end) {
+      periodo_renueva = sub.current_period_end; periodo_renueva_origen = 'mercadopago';
+    } else if (isFinite(_iniMs)) {
+      periodo_renueva = new Date(_iniMs + _MS_30D).toISOString(); periodo_renueva_origen = 'calculada';
     }
     return res.json({ ok: true, habilitado: SUBSCRIPTIONS_ENABLED, plan: plan, estado: (sub && sub.status) || null, cortesia: esCortesia, es_prueba: esPrueba, limites: lim, uso: { ai_messages: usado, extra: (sub && sub.mensajes_extra) || 0 }, vence: (sub && sub.current_period_end) || null, periodo_desde: periodo_desde, periodo_desde_origen: periodo_desde_origen, periodo_renueva: periodo_renueva, periodo_renueva_origen: periodo_renueva_origen, bloqueado: bloqueado, sin_suscripcion: sin_suscripcion, plan_label: plan_label, puede_cancelar: puede_cancelar,
       // Precios ACTUALES atados al dolar (cache, sin red). El front los muestra en vez de hardcode.

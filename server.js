@@ -12805,6 +12805,109 @@ app.get('/api/conversaciones/timeline', async function (req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// POST /api/conversaciones/registrar-estado  (Diego 2026-07-28) — RUTA LITERAL (Express 5).
+//
+// POR QUE EXISTE: el FRONT cambia el estado del lead escribiendo DIRECTO a Supabase por
+// PostgREST (el desplegable del panel, el toggle de IA que saca de 'listo_humano', y los dos
+// caminos de Recontactos). Esos updates NO pasan por el backend, asi que registrarCambioEstado()
+// nunca se entera y el historial quedaba con agujeros justo en el caso MAS comun: el cambio
+// manual de una persona.
+//
+// QUE HACE / QUE NO HACE:
+//   * SOLO REGISTRA historial. NO toca conversations.status (eso lo sigue haciendo el front,
+//     exactamente igual que hoy). Si este endpoint falla, el cambio de estado ya ocurrio igual.
+//   * El front lo llama FIRE-AND-FORGET: nunca demora la UI ni muestra errores.
+//   * CERO IA: no llama a ningun modelo. $0.
+//   * Aplica a los 3 mundos (inmobiliaria / hotel_cabanas / desarrolladora): es del CRM.
+//
+// SEGURIDAD: verificarUsuario + scoping de tenant IDENTICO a GET /api/conversaciones/timeline
+// (ownerId por asesores.admin_id). Solo se registran las conversaciones que SON de ese tenant;
+// las ajenas se descartan en silencio. Si ninguna es del tenant -> 404.
+//
+// NUNCA 500: cualquier problema inesperado responde 200 { ok:true, registrado:false }. Igual
+// para la tabla ausente (circuit breaker de registrarCambioEstado). El panel no se entera.
+// ============================================================================
+const REG_EST_MAX_IDS = 500;   // tope de ids por request (caso masivo de Recontactos)
+const REG_EST_CHUNK_SEL = 50;  // ids por SELECT de validacion: `in(...)` viaja en la URL de PostgREST
+                               // y con cientos de uuids la URL se pasa de largo y el select falla ENTERO
+const REG_EST_LOTE = 25;       // inserts en paralelo por tanda: no cuelga ni satura PostgREST
+
+app.post('/api/conversaciones/registrar-estado', async function (req, res) {
+  try {
+    var userId = await verificarUsuario(req);
+    if (!userId) return res.status(401).json({ error: 'No autorizado' });
+
+    // Tenant + actor. MISMO criterio que registrarCambioEstado: el DUEÑO no tiene fila en
+    // `asesores` -> actor_asesor_id queda null (correcto, no es un bug).
+    var ownerId = userId, actorAsesorId = null;
+    try {
+      var _ase = await supabase.from('asesores').select('id, admin_id').eq('auth_user_id', userId).maybeSingle();
+      if (_ase && _ase.data) {
+        if (_ase.data.admin_id) ownerId = _ase.data.admin_id;
+        if (_ase.data.id) actorAsesorId = _ase.data.id;
+      }
+    } catch (eAse) { /* sin fila en asesores -> es el dueño: ownerId = userId, actor = null */ }
+
+    var b = (req && req.body) ? req.body : {};
+
+    var estadoNuevo = String(b.estado_nuevo == null ? '' : b.estado_nuevo).trim();
+    if (!estadoNuevo) return res.status(400).json({ error: 'Falta estado_nuevo' });
+    var estadoAnterior = (b.estado_anterior == null) ? null : (String(b.estado_anterior).trim() || null);
+    var motivo = (typeof b.motivo === 'string' && b.motivo.trim()) ? b.motivo.trim() : 'cambio de estado a mano desde el panel';
+
+    // Uno o varios ids (el masivo de Recontactos manda UN solo POST con todos). Dedupe + tope.
+    var ids = [];
+    if (Array.isArray(b.conversation_ids)) ids = b.conversation_ids;
+    else if (b.conversation_id) ids = [b.conversation_id];
+    ids = ids.map(function (x) { return String(x == null ? '' : x).trim(); }).filter(function (x) { return !!x; });
+    ids = ids.filter(function (x, i, arr) { return arr.indexOf(x) === i; });
+    if (!ids.length) return res.status(400).json({ error: 'Falta conversation_id' });
+    var recortado = false;
+    if (ids.length > REG_EST_MAX_IDS) { ids = ids.slice(0, REG_EST_MAX_IDS); recortado = true; }
+
+    // AISLAMIENTO DE TENANT: nos quedamos SOLO con las conversaciones de este dueño. Por CHUNKS
+    // (ver REG_EST_CHUNK_SEL). Si un chunk falla (p.ej. un id que no es uuid) se descarta ese chunk
+    // y se siguen los demas: fail-closed por id, no se registra NADA que no sea del tenant.
+    var propias = [];
+    for (var s = 0; s < ids.length; s += REG_EST_CHUNK_SEL) {
+      var chunk = ids.slice(s, s + REG_EST_CHUNK_SEL);
+      try {
+        var rc = await supabase.from('conversations').select('id').eq('user_id', ownerId).in('id', chunk);
+        if (!(rc && rc.error) && Array.isArray(rc.data)) {
+          rc.data.forEach(function (c) { if (c && c.id) propias.push(c.id); });
+        }
+      } catch (eC) { /* chunk descartado */ }
+    }
+    if (!propias.length) return res.status(404).json({ error: 'Conversacion no encontrada' });
+
+    // Registro en tandas paralelas. registrarCambioEstado es best-effort ABSOLUTO (nunca tira),
+    // asi que esto no puede romper aunque falte la tabla o la migracion.
+    for (var i = 0; i < propias.length; i += REG_EST_LOTE) {
+      var tanda = propias.slice(i, i + REG_EST_LOTE);
+      await Promise.all(tanda.map(function (cid) {
+        return registrarCambioEstado({
+          conversation_id: cid,
+          user_id: ownerId,
+          estado_anterior: estadoAnterior,
+          estado_nuevo: estadoNuevo,
+          origen: 'humano',
+          actor_asesor_id: actorAsesorId,
+          motivo: motivo
+        });
+      }));
+    }
+
+    // registrado:false = la migracion todavia no se corrio (circuit breaker). No es un error.
+    // recortado:true = venian mas de REG_EST_MAX_IDS ids y se registraron los primeros (honesto,
+    // no se finge que se registro todo).
+    return res.json({ ok: true, registrado: !_leadEstHistOff, total: propias.length, recortado: recortado });
+  } catch (e) {
+    // Un fallo aca NUNCA debe ser ruidoso: el estado del lead YA cambio (lo hizo el front).
+    return res.json({ ok: true, registrado: false });
+  }
+});
+
 // Gate matching_v1 (mirror de _reservasV1Activo): ausente/error -> false (comportamiento actual). NUNCA rompe.
 async function _matchingV1Activo(ownerId) {
   try {

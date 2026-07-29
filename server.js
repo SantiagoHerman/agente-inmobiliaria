@@ -6899,6 +6899,26 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   } catch (e) { console.error('Error trayendo periodos:', e && e.message); }
 
+  // ===== TEMPORADA VENCIDA (Diego 2026-07-28) =====
+  // Los precios por noche vienen con marca de temporada ("(DIC)"). Si la temporada de ese precio YA
+  // TERMINO, no se le puede mostrar a la IA como si fuera el precio de hoy (era el caso de los 32
+  // precios de verano 2026 que seguian publicados en julio). No se toca la base: se neutraliza el precio
+  // SOLO en memoria y todos los armados (indice del RAG, ficha compacta, ficha completa y el listado
+  // clasico) pasan solos a decir "consultar", que es un camino que ya existe y NO oculta la propiedad.
+  // Corre ANTES de armar el inventario y ANTES del indice del RAG, asi vale para los dos caminos.
+  // Si una propiedad no tiene temporada derivada (precio sin marca), no se toca NADA: igual que hoy.
+  let _hayTemporadaVencida = false;
+  try {
+    const _hoyISO = new Date().toISOString().slice(0, 10);
+    (properties || []).forEach(function (p) {
+      if (!p || !p.temporal_activa || p.temporal_precio_dia == null) return;
+      const _temps = (periodosPorProp[p.id] || []).filter(function (per) { return per && per.estado === 'temporada'; });
+      if (!_temps.length) return;
+      const _vigente = _temps.some(function (per) { return String(per.fecha_hasta || '') >= _hoyISO; });
+      if (!_vigente) { p.temporal_precio_dia = null; _hayTemporadaVencida = true; }
+    });
+  } catch (eTempVenc) { console.error('temporada vencida:', eTempVenc && eTempVenc.message); }
+
   let inventario = 'No hay propiedades cargadas todavia.';
   if (properties && properties.length > 0) {
     inventario = properties.map(function(p){
@@ -7516,6 +7536,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // una regla que no puede cumplir (Diego: "no quiero agregar cosas al prompt al pedo si no las cumple").
     // El resto ya esta cubierto por reglas vigentes: "usa SOLO estas propiedades" y la REGLA CLAVE de arriba.
     _derivacionV3On ? 'Si el lead pregunta por una propiedad puntual que NO figura en tu listado, o de la que no tenes el precio o la condicion confirmada: NO digas "no disponible" ni inventes nada. Deci que no contas con esa informacion y derivá con derivar_a_humano al departamento que corresponda.' : '',
+    // TEMPORADA VENCIDA: esta linea SOLO aparece si de verdad hay alguna propiedad cuyo precio por noche
+    // quedo de una temporada ya terminada (_hayTemporadaVencida). En las cuentas donde no pasa, el prompt
+    // queda BYTE-IDENTICO. Es la salida que aprobo Diego: no citar el precio viejo, avisar que todavia no
+    // salieron los de la temporada que viene, ofrecer avisarle y tomarle los datos.
+    _hayTemporadaVencida ? 'ALQUILER TEMPORAL: los precios por noche de la proxima temporada TODAVIA NO estan publicados (los que figuran como "consultar" son justamente esos). Si te preguntan por fechas de esa temporada, deci con naturalidad que todavia no salieron, ofrecele avisarle apenas se publiquen y tomale los datos y las fechas que busca. NUNCA cites como vigente un precio de una temporada que ya paso.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     (settings && settings.horario_oficina && _horarioLegible(settings.horario_oficina)) ? ('HORARIO DE ATENCION de la oficina (si el lead pregunta cuando pueden atenderlo, visitarlos, llamar, o si estan abiertos, deciselo con naturalidad; NO inventes horarios distintos a estos): ' + _horarioLegible(settings.horario_oficina) + '. (Zona horaria Argentina.)') : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
@@ -26416,24 +26441,124 @@ function _ppFlagsEstado(estadoTxt) {
     reservada: /reservad[ao]s?/.test(t)
   };
 }
-// Marca de TEMPORADA del precio temporal: "(DIC)", "(ENE)", "verano 2026", "temporada 2026".
-// OJO: "(DIC)" NO trae año -> solo se informa, NUNCA se escribe en la base (ver cambio 7/vigencia).
-function _ppTemporada(txt) {
-  var t = _ppNorm(txt);
-  var mMes = t.match(/\((ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\)/);
-  var mes = mMes ? mMes[1] : null;
-  var anio = null;
-  var mAnio = t.match(/(?:verano|temporada|temp\.?)\s*(20\d{2})/) || t.match(/\((20\d{2})\)/);
-  if (mAnio) anio = mAnio[1];
-  if (!mes && !anio) return null;
-  return (mes || '') + (anio || '');
+// ============================================================================
+// TEMPORADAS (Diego 2026-07-28: "ojo que existen temporadas de invierno y verano, hay que saber distinguir")
+// ----------------------------------------------------------------------------
+// Costa argentina (Villa Gesell). Dos temporadas reales, con RANGOS DE FECHAS distintos:
+//   VERANO   : 1-dic (año Y-1) -> 31-mar (año Y).  Se NOMBRA por el año en que TERMINA:
+//              "verano 2026" = dic-2025 a mar-2026 (misma convencion que uso Diego).
+//   INVIERNO : todo julio (vacaciones de invierno). "invierno 2026" = jul-2026.
+//   OTRO MES : cualquier otra marca ((SEP), (OCT)...) se resuelve como ESE MES del año que
+//              corresponda. No se fuerza a una de las dos temporadas: se informa como esta.
+// Sin esto, el año que viene un precio de julio se ofreceria en enero.
+//
+// 🔑 REGLA DEL AÑO (la marca "(DIC)" NO trae año) — DOCUMENTADA A PROPOSITO:
+//   1) Si el texto trae año explicito ("(DIC 2026)", "verano 2027") se usa ESE. No se infiere nada.
+//   2) Si no lo trae, se toma la ULTIMA temporada de ese tipo que YA HABIA EMPEZADO en la fecha de
+//      referencia (`fechaRef` = la fecha en la que se vio el precio publicado por primera vez).
+//      Fundamento: la web NO publica precios de una temporada que todavia no arranco (Diego confirmo
+//      que a julio-2026 la temporada 2027 seguia sin publicarse). Por eso una marca sin año es SIEMPRE
+//      de una temporada ya iniciada, nunca de una futura.
+//   3) El sesgo del error es DELIBERADO. Equivocarse hacia "temporada vieja" hace que la IA diga que
+//      todavia no hay precios publicados (no miente, a lo sumo pierde una consulta). Equivocarse hacia
+//      "temporada nueva" haria que la IA cotice un precio VIEJO como vigente: eso es exactamente el bug
+//      que estamos arreglando. Siempre se elige el error seguro.
+//   4) CASO AMBIGUO -> DUDA: si la temporada inferida ya estaba vencida en `fechaRef` PERO la proxima
+//      arranca dentro de los 90 dias, no se puede distinguir "precio viejo" de "precio adelantado" ->
+//      se resuelve igual (a la vieja, por el punto 3) y ADEMAS se genera una duda para que lo mire un
+//      humano. Ejemplo real: un "(JUL)" visto el 26-jun.
+//   5) La VIGENCIA no se congela: se guarda el RANGO DE FECHAS, asi que la temporada vence sola cuando
+//      pasa su fecha de fin. No hay ningun campo de texto que quede desactualizado.
+// ============================================================================
+var _PP_MESES = { ene: 1, feb: 2, mar: 3, abr: 4, may: 5, jun: 6, jul: 7, ago: 8, sep: 9, set: 9, oct: 10, nov: 11, dic: 12 };
+var _PP_MES_NOMBRE = { 1: 'enero', 2: 'febrero', 3: 'marzo', 4: 'abril', 5: 'mayo', 6: 'junio', 7: 'julio', 8: 'agosto', 9: 'septiembre', 10: 'octubre', 11: 'noviembre', 12: 'diciembre' };
+var _PP_MS_DIA = 24 * 60 * 60 * 1000;
+function _ppISO(y, m, d) { return String(y) + '-' + (m < 10 ? '0' : '') + m + '-' + (d < 10 ? '0' : '') + d; }
+function _ppUltimoDia(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
+function _ppFechaRef(f) {
+  var d = null;
+  try { d = (f instanceof Date) ? f : (f ? new Date(f) : new Date()); } catch (e) { d = new Date(); }
+  if (!d || isNaN(d.getTime())) d = new Date();
+  return d;
 }
-function parsearPrecioFicha(precioTxt, estadoTxt) {
+// Devuelve el rango de una temporada concreta. tipo: 'verano' | 'invierno' | 'mes'.
+function _ppRangoTemporada(tipo, anio, mes) {
+  if (tipo === 'verano') return { tipo: 'verano', etiqueta: 'verano ' + anio, desde: _ppISO(anio - 1, 12, 1), hasta: _ppISO(anio, 3, 31) };
+  if (tipo === 'invierno') return { tipo: 'invierno', etiqueta: 'invierno ' + anio, desde: _ppISO(anio, 7, 1), hasta: _ppISO(anio, 7, 31) };
+  return { tipo: 'mes', etiqueta: (_PP_MES_NOMBRE[mes] || 'temporada') + ' ' + anio, desde: _ppISO(anio, mes, 1), hasta: _ppISO(anio, mes, _ppUltimoDia(anio, mes)) };
+}
+// Lee la marca de temporada del texto del precio. Devuelve null si no hay ninguna.
+function _ppMarcaTemporada(txt) {
+  var t = _ppNorm(txt);
+  // 1) Marca de temporada con nombre: "verano 2027", "invierno 2026", "temporada 2026".
+  var mNombre = t.match(/\b(verano|invierno|temporada)\s*(?:20)?(\d{2})\b/);
+  // 2) Marcas de MES entre parentesis: "(DIC)", "(ENE 2027)", "(dic.)". Puede haber varias.
+  var meses = [], mm, reMes = /\((ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\.?\s*(20\d{2})?\)/g;
+  while ((mm = reMes.exec(t)) !== null) meses.push({ mes: _PP_MESES[mm[1]], anio: mm[2] ? Number(mm[2]) : null });
+  var distintos = {};
+  meses.forEach(function (x) { distintos[x.mes] = 1; });
+  if (Object.keys(distintos).length > 1) return { ambigua: true, motivo: 'el precio tiene marcas de mas de una temporada distinta' };
+  if (!meses.length && !mNombre) return null;
+  var out = { ambigua: false, mes: meses.length ? meses[0].mes : null, anio: meses.length ? meses[0].anio : null, tipoNombrado: null };
+  if (mNombre) {
+    var anioN = Number(mNombre[2] < 100 ? ('20' + mNombre[2]) : mNombre[2]);
+    if (mNombre[1] === 'verano' || mNombre[1] === 'invierno') out.tipoNombrado = mNombre[1];
+    if (!out.anio) out.anio = anioN;
+    else if (out.anio !== anioN && out.tipoNombrado !== 'verano') return { ambigua: true, motivo: 'el precio nombra dos años de temporada distintos' };
+  }
+  return out;
+}
+// Resuelve la marca a una temporada CONCRETA (con rango de fechas), usando fechaRef para inferir el año.
+// Devuelve { tipo, etiqueta, desde, hasta, anio_inferido:bool, duda:{motivo}|null } o null.
+function _ppResolverTemporada(txt, fechaRef) {
+  var marca = _ppMarcaTemporada(txt);
+  if (!marca) return null;
+  if (marca.ambigua) return { ambigua: true, duda: { motivo: marca.motivo } };
+  var R = _ppFechaRef(fechaRef);
+  var Ry = R.getUTCFullYear(), Rm = R.getUTCMonth() + 1;
+  var mes = marca.mes;
+  var tipo = marca.tipoNombrado || (mes == null ? null : ((mes === 12 || mes === 1 || mes === 2 || mes === 3) ? 'verano' : (mes === 7 ? 'invierno' : 'mes')));
+  if (!tipo) return null;
+  var anio = null, inferido = false;
+  if (marca.anio != null) {
+    // Año EXPLICITO. Para verano se convierte el año CALENDARIO del mes al año que NOMBRA la temporada
+    // (dic-2026 -> "verano 2027"); si vino como "verano 2027" ya es el año de la temporada.
+    if (tipo === 'verano') anio = (mes === 12) ? (marca.anio + 1) : marca.anio;
+    else anio = marca.anio;
+  } else {
+    inferido = true;
+    if (tipo === 'verano') anio = ((Rm === 12) ? Ry : (Ry - 1)) + 1;      // ultima que arranco un 1-dic
+    else if (tipo === 'invierno') anio = (Rm >= 7) ? Ry : (Ry - 1);       // ultima que arranco un 1-jul
+    else anio = (Rm >= mes) ? Ry : (Ry - 1);                              // ultimo 1 de ese mes
+  }
+  var r = _ppRangoTemporada(tipo, anio, mes);
+  r.anio_inferido = inferido;
+  r.duda = null;
+  // Año explicito imposible (mas de un año en el futuro): la web no puede estar publicando eso.
+  if (!inferido && (anio - Ry) > 1) r.duda = { motivo: 'la temporada que dice el precio (' + r.etiqueta + ') esta demasiado adelante para estar publicada' };
+  // Ambiguedad del punto 4: ya vencida al verla, pero la proxima arranca en menos de 90 dias.
+  if (inferido && r.duda === null) {
+    var finR = new Date(r.hasta + 'T00:00:00Z');
+    if (finR.getTime() < R.getTime()) {
+      var prox = _ppRangoTemporada(tipo, anio + 1, mes);
+      var iniProx = new Date(prox.desde + 'T00:00:00Z');
+      if ((iniProx.getTime() - R.getTime()) <= 90 * _PP_MS_DIA) {
+        r.duda = { motivo: 'la marca de temporada no trae año y la proxima (' + prox.etiqueta + ') arranca enseguida: no se sabe si el precio es viejo o adelantado' };
+      }
+    }
+  }
+  return r;
+}
+// `fechaRef` (3er parametro, OPCIONAL y ADITIVO — no cambia el contrato de 2 argumentos): fecha en la
+// que se vio publicado este precio. Solo se usa para inferir el AÑO de una marca de temporada sin año
+// (ver REGLA DEL AÑO arriba). Si no se pasa, se usa la fecha de hoy.
+function parsearPrecioFicha(precioTxt, estadoTxt, fechaRef) {
   var out = {
     venta: null, anual: null, temporal: null,
     no_disponible: { venta: false, anual: false },
     dudas: [],
-    temporal_temporada: null
+    temporal_temporada: null,   // etiqueta legible ('verano 2026'); null si el precio no trae marca
+    temporada: null             // { tipo, etiqueta, desde, hasta, anio_inferido } con el RANGO de fechas
   };
   function duda(campo, motivo, valor) {
     out.dudas.push({ campo: campo, motivo: motivo, valor_visto: String(valor == null ? '' : valor).slice(0, 200) });
@@ -26442,8 +26567,21 @@ function parsearPrecioFicha(precioTxt, estadoTxt) {
     var pTxt = String(precioTxt == null ? '' : precioTxt);
     var eTxt = String(estadoTxt == null ? '' : estadoTxt);
     // "RETASADO"/"OPORTUNIDAD"/"DESDE" son ruido comercial: no cambian ni el numero ni la operacion.
-    var pNorm = _ppNorm(pTxt).replace(/retasado|oportunidad|oferta|rebajado|precio|desde|hasta/g, ' ');
-    out.temporal_temporada = _ppTemporada(pTxt);
+    // Las MARCAS DE TEMPORADA tambien se sacan ANTES de buscar numeros: si no, el año de "(DIC 2026)"
+    // entraba como un segundo precio y el parser lo mandaba a duda por "mas de un valor distinto".
+    var pNorm = _ppNorm(pTxt)
+      .replace(/\((?:ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\.?\s*(?:20\d{2})?\)/g, ' ')
+      .replace(/\b(?:verano|invierno|temporada)\s*(?:20)?\d{2}\b/g, ' ')
+      .replace(/retasado|oportunidad|oferta|rebajado|precio|desde|hasta/g, ' ');
+    // TEMPORADA: tipo (verano/invierno/mes) + RANGO DE FECHAS. Ver REGLA DEL AÑO arriba.
+    var _temp = _ppResolverTemporada(pTxt, fechaRef);
+    if (_temp && _temp.ambigua) {
+      duda('temporal', _temp.duda.motivo, pTxt);
+    } else if (_temp) {
+      out.temporada = { tipo: _temp.tipo, etiqueta: _temp.etiqueta, desde: _temp.desde, hasta: _temp.hasta, anio_inferido: _temp.anio_inferido };
+      out.temporal_temporada = _temp.etiqueta;
+      if (_temp.duda) duda('temporal', _temp.duda.motivo, pTxt);
+    }
 
     var moneda = _ppMoneda(pTxt);
     var ops = _ppOpsEstado(eTxt);
@@ -27975,6 +28113,77 @@ function _scrapCamposDeParse(parse, ex, tieneCols) {
   return { fila: fila, dudas: dudas };
 }
 
+// ===== TEMPORADAS -> `temporario_periodos` (tabla que YA existe; no se crea nada nuevo) =====
+// El rango de la temporada se guarda como una fila con estado='temporada'. Es un estado NUEVO, y eso es
+// deliberado: los DOS consumidores actuales de esa tabla miran solo estado='ocupado' (el prompt lista las
+// lineas "OCUPADA del X al Y" y el filtro de fechas del RAG descarta por solape), asi que estas filas les
+// son INVISIBLES. Aditivo puro: no bloquean disponibilidad ni cambian nada de lo que ya funciona.
+// `nota` guarda la etiqueta + el TEXTO del precio con el que se derivo: es lo que permite detectar despues
+// si la web republico el precio (texto distinto = publicacion nueva) sin re-fechar lo que no cambio.
+async function _scrapEscribirTemporada(userId, propertyId, temp, precioDia, textoPrecio) {
+  try {
+    if (!userId || !propertyId || !temp || !temp.desde || !temp.hasta || precioDia == null) return 0;
+    await supabase.from('temporario_periodos').delete().eq('property_id', propertyId).eq('estado', 'temporada');
+    var ins = await supabase.from('temporario_periodos').insert({
+      property_id: propertyId, user_id: userId,
+      fecha_desde: temp.desde, fecha_hasta: temp.hasta,
+      estado: 'temporada', precio_dia: precioDia,
+      nota: 'temporada ' + (temp.etiqueta || '') + ' :: ' + String(textoPrecio == null ? '' : textoPrecio).trim().slice(0, 240)
+    });
+    if (ins && ins.error) {
+      // NO se traga el error en silencio: si `temporario_periodos.estado` tuviera un CHECK que no acepte
+      // el valor 'temporada', esta feature quedaria muerta sin que se entere nadie. Queda en el log.
+      console.error('[scraper temporada] no se pudo guardar el periodo de temporada (property ' + propertyId + '):', ins.error.message || ins.error,
+        '-> revisar si `temporario_periodos.estado` admite el valor "temporada".');
+      return 0;
+    }
+    return 1;
+  } catch (e) { console.error('[scraper temporada] excepcion guardando el periodo:', e && e.message); return 0; }
+}
+// Trae de una las temporadas ya derivadas del tenant (1 query por corrida, no una por propiedad).
+async function _scrapTemporadasPrevias(userId) {
+  var mapa = {};
+  try {
+    var r = await supabase.from('temporario_periodos').select('property_id, fecha_desde, fecha_hasta, precio_dia, nota').eq('user_id', userId).eq('estado', 'temporada');
+    if (r && r.error) return mapa;
+    (r.data || []).forEach(function (x) {
+      if (!x || !x.property_id) return;
+      var nota = String(x.nota || ''), i = nota.indexOf(' :: ');
+      mapa[x.property_id] = { desde: x.fecha_desde, hasta: x.fecha_hasta, precio_dia: x.precio_dia, texto: (i >= 0 ? nota.slice(i + 4) : '') };
+    });
+  } catch (e) {}
+  return mapa;
+}
+// ANCLA DE FECHA para inferir el año de una marca sin año (ver REGLA DEL AÑO en el parser):
+//  - ya hay temporada derivada y el texto del precio NO cambio -> se ancla en el inicio de ESA temporada,
+//    con lo que se re-deriva exactamente la misma (la temporada NO se re-fecha sola en cada corrida);
+//  - hay temporada derivada pero el texto CAMBIO -> es una publicacion nueva -> se ancla en HOY (null);
+//  - no hay nada derivado -> se ancla en el alta de la propiedad (la fecha mas temprana en la que podemos
+//    probar que ese precio ya estaba publicado). Ojo: el alta es cuando se scrapeo, no cuando la web lo
+//    publico, pero como ancla EMPUJA HACIA ATRAS, que es el lado seguro del error.
+function _scrapAnclaTemporada(prev, precioTxt, createdAt) {
+  var texto = String(precioTxt == null ? '' : precioTxt).trim().slice(0, 240);
+  if (prev && prev.texto === texto) return prev.desde;
+  if (prev) return null;
+  return createdAt || null;
+}
+// Sincroniza la temporada de UNA propiedad. Devuelve 1 si escribio, 0 si no habia nada que cambiar.
+async function _scrapSincronizarTemporada(userId, propertyId, parse, precioTxt, prev) {
+  try {
+    if (!propertyId) return 0;
+    var t = (parse && parse.temporada) ? parse.temporada : null;
+    var precio = (parse && parse.temporal) ? parse.temporal.precio_dia : null;
+    if (!t || precio == null) {
+      // El precio publicado ya no trae marca de temporada (o no se pudo confirmar): la fila vieja quedo
+      // sin respaldo -> se borra. Nunca se deja una temporada colgada de un precio que ya no existe.
+      if (prev) { try { await supabase.from('temporario_periodos').delete().eq('property_id', propertyId).eq('estado', 'temporada'); } catch (eD) {} }
+      return 0;
+    }
+    if (prev && prev.desde === t.desde && prev.hasta === t.hasta && Number(prev.precio_dia) === Number(precio)) return 0; // nada cambio
+    return await _scrapEscribirTemporada(userId, propertyId, t, precio, precioTxt);
+  } catch (e) { return 0; }
+}
+
 // Guarda UNA duda en la cola de revision (`scraping_pendientes`, tipo_cambio='duda').
 // NO se usa `scrape_jobs`: esa es la cola de DESARROLLADORA y su runner toma el pendiente mas viejo
 // SIN filtrar por tipo -> una duda ahi la mata como error y bloquea la cola de emprendimientos.
@@ -28082,6 +28291,14 @@ async function correrScrapingDeUsuario(cfg) {
     // "pendiente"). Solo borra las de tipo 'duda': no toca cambios 'nueva'/'modificada' en revision.
     var _dudasRun = 0;
     if (_parserOn) { try { await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id).eq('tipo_cambio', 'duda'); } catch (eDel) {} }
+    // TEMPORADAS: se traen TODAS las ya derivadas de una sola vez (1 query por corrida) y se usa
+    // `created_at` como ancla para inferir el año de las marcas sin año. Ambas cosas con sonda propia:
+    // si `created_at` no estuviera, se ancla en hoy y el resto sigue funcionando igual.
+    var _tieneCreated = true;
+    try { var _cb = await supabase.from('properties').select('created_at').limit(1); if (_cb.error) _tieneCreated = false; } catch (eCb) { _tieneCreated = false; }
+    if (_parserOn && _tieneCreated) _selCols += ', created_at';
+    var _tempPrev = _parserOn ? await _scrapTemporadasPrevias(cfg.user_id) : {};
+    var _tempRun = 0;
     var _pinsRun = [];
     // Entero limpio de un valor de la tabla de detalles ("3", "3 ambientes"). null si no es un numero sano.
     function _intProp(v) {
@@ -28112,7 +28329,9 @@ async function correrScrapingDeUsuario(cfg) {
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
         var ex = await supabase.from('properties').select(_selCols).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         // CAMBIO 6: parser central. Lo que el texto CONFIRMA se escribe; lo que no, va a DUDAS y NO se escribe.
-        var _pf = _parserOn ? parsearPrecioFicha(p.precio, p.estado) : null;
+        var _tmpPrev = (_parserOn && ex.data && ex.data.id) ? (_tempPrev[ex.data.id] || null) : null;
+        var _anclaTemp = _parserOn ? _scrapAnclaTemporada(_tmpPrev, p.precio, (ex.data && ex.data.created_at) || null) : null;
+        var _pf = _parserOn ? parsearPrecioFicha(p.precio, p.estado, _anclaTemp) : null;
         var _res = _pf ? _scrapCamposDeParse(_pf, (ex && ex.data) ? ex.data : null, _tieneCols) : { fila: {}, dudas: [] };
         var _dudasProp = (_pf ? (_pf.dudas || []) : []).concat(_res.dudas || []);
         if (ex.data && ex.data.id) {
@@ -28136,6 +28355,7 @@ async function correrScrapingDeUsuario(cfg) {
           Object.assign(fila, _res.fila);
           var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
           if (up.error) errores++; else actualizados++;
+          if (_parserOn) _tempRun += await _scrapSincronizarTemporada(cfg.user_id, ex.data.id, _pf, p.precio, _tmpPrev);
           if (_dudasProp.length) _dudasRun += await _scrapRegistrarDuda(cfg.user_id, p, ex.data.id, _dudasProp);
         } else {
           fila.activa = true;
@@ -28145,8 +28365,10 @@ async function correrScrapingDeUsuario(cfg) {
           var _rmN = _intProp(p.ambientes), _bnN = _intProp(p.banos);
           if (_rmN != null) fila.rooms = _rmN;
           if (_bnN != null) fila.banos = _bnN;
-          var ins = await supabase.from('properties').insert(fila);
+          var ins = await supabase.from('properties').insert(fila).select('id').maybeSingle();
           if (ins.error) errores++; else creados++;
+          // Temporada de una propiedad NUEVA: se necesita el id recien creado (por eso el .select('id')).
+          if (_parserOn && ins.data && ins.data.id) _tempRun += await _scrapSincronizarTemporada(cfg.user_id, ins.data.id, _pf, p.precio, null);
           // Una propiedad NUEVA con dudas es justamente donde mas importa avisar (entra sin precio o sin
           // operacion confirmada). Se registra igual que en el update, pero sin property_id (recien creada).
           if (_dudasProp.length) _dudasRun += await _scrapRegistrarDuda(cfg.user_id, p, null, _dudasProp);
@@ -28207,7 +28429,7 @@ async function correrScrapingDeUsuario(cfg) {
     }
     // CORRECCION D3: UN solo aviso por corrida con el total ("12 precios a confirmar"), nunca uno por propiedad.
     if (_dudasRun > 0) { try { await _scrapAvisarDudas(cfg.user_id, _dudasRun); } catch (eAv) {} }
-    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, dudas: _dudasRun, total: lista.length };
+    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, dudas: _dudasRun, temporadas: _tempRun, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 
@@ -28268,7 +28490,10 @@ async function correrScrapingPendiente(cfg) {
       + (_tieneColsP ? ', venta_moneda, anual_moneda, temporal_moneda, no_disponible_web' : '');
     var _parserOnP = true;
     try { var _obP = await supabase.from('properties').select(_colsOpsP).limit(1); if (_obP.error) _parserOnP = false; } catch (eObP) { _parserOnP = false; }
-    var _selPend = 'id,title,price,zone,description,images' + (_parserOnP ? (', ' + _colsOpsP) : '');
+    var _tieneCreatedP = true;
+    try { var _cbP = await supabase.from('properties').select('created_at').limit(1); if (_cbP.error) _tieneCreatedP = false; } catch (eCbP) { _tieneCreatedP = false; }
+    var _selPend = 'id,title,price,zone,description,images' + (_parserOnP ? (', ' + _colsOpsP) : '') + ((_parserOnP && _tieneCreatedP) ? ', created_at' : '');
+    var _tempPrevP = _parserOnP ? await _scrapTemporadasPrevias(cfg.user_id) : {};
     var _dudasRunP = 0;
     var nuevas = 0, modificadas = 0;
     for (var i = 0; i < lista.length; i++) {
@@ -28294,10 +28519,17 @@ async function correrScrapingPendiente(cfg) {
         var ex = await supabase.from('properties').select(_selPend).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
         // CAMBIO 8: el parser corre TAMBIEN en el modo "me deja revisar antes". Lo confirmado viaja en
         // `nuevo.ops` (lo aplica /aceptar); lo dudoso va a una fila APARTE con tipo_cambio='duda'.
-        var _pfP = _parserOnP ? parsearPrecioFicha(p.precio, p.estado) : null;
+        var _tmpPrevP = (_parserOnP && ex && ex.data && ex.data.id) ? (_tempPrevP[ex.data.id] || null) : null;
+        var _anclaTempP = _parserOnP ? _scrapAnclaTemporada(_tmpPrevP, p.precio, (ex && ex.data && ex.data.created_at) || null) : null;
+        var _pfP = _parserOnP ? parsearPrecioFicha(p.precio, p.estado, _anclaTempP) : null;
         var _resP = _pfP ? _scrapCamposDeParse(_pfP, (ex && ex.data) ? ex.data : null, _tieneColsP) : { fila: {}, dudas: [] };
         var _dudasPropP = (_pfP ? (_pfP.dudas || []) : []).concat(_resP.dudas || []);
         if (_resP.fila && Object.keys(_resP.fila).length) nuevo.ops = _resP.fila;
+        // TEMPORADA en modo "me deja revisar antes": NO se escribe ahora. Viaja en el pendiente y se aplica
+        // recien cuando el dueno acepta el cambio (el switch directo/pendiente sigue mandando).
+        if (_pfP && _pfP.temporada && _pfP.temporal && _pfP.temporal.precio_dia != null) {
+          nuevo.temporada = { tipo: _pfP.temporada.tipo, etiqueta: _pfP.temporada.etiqueta, desde: _pfP.temporada.desde, hasta: _pfP.temporada.hasta, precio_dia: _pfP.temporal.precio_dia, texto: String(p.precio || '').slice(0, 240) };
+        }
         if (ex.data && ex.data.id) {
           // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion) o si la web tiene MAS fotos que las guardadas
           var v = ex.data;
@@ -28452,6 +28684,7 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
         // traiga una reactivacion explicita del parser (auto-curacion: la web la volvio a publicar).
         if (_tienePausaAcc && _cur.data && _cur.data.pausa_manual === true && !(d.ops && d.ops.pausa_manual === false)) delete fila.activa;
         await supabase.from('properties').update(fila).eq('id', it.property_id);
+        if (d.temporada && d.temporada.desde) { try { await _scrapEscribirTemporada(user_id, it.property_id, d.temporada, d.temporada.precio_dia, d.temporada.texto); } catch (eT) {} }
       } else {
         var ex = await supabase.from('properties').select(_tienePausaAcc ? 'id, images, pausa_manual' : 'id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
@@ -28459,8 +28692,13 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
           if (_exN < 2 && _fotosAcc.length > _exN) fila.images = _fotosAcc;
           if (_tienePausaAcc && ex.data.pausa_manual === true && !(d.ops && d.ops.pausa_manual === false)) delete fila.activa;
           await supabase.from('properties').update(fila).eq('id', ex.data.id);
+          if (d.temporada && d.temporada.desde) { try { await _scrapEscribirTemporada(user_id, ex.data.id, d.temporada, d.temporada.precio_dia, d.temporada.texto); } catch (eT2) {} }
         }
-        else { if (_fotosAcc.length) fila.images = _fotosAcc; await supabase.from('properties').insert(fila); }
+        else {
+          if (_fotosAcc.length) fila.images = _fotosAcc;
+          var _insAcc = await supabase.from('properties').insert(fila).select('id').maybeSingle();
+          if (d.temporada && d.temporada.desde && _insAcc && _insAcc.data && _insAcc.data.id) { try { await _scrapEscribirTemporada(user_id, _insAcc.data.id, d.temporada, d.temporada.precio_dia, d.temporada.texto); } catch (eT3) {} }
+        }
       }
       await supabase.from('scraping_pendientes').delete().eq('id', it.id);
       aplicados++;

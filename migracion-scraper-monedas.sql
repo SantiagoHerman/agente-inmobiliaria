@@ -26,7 +26,18 @@
 -- VIGENCIA DE TEMPORADA: NO se agrega ninguna columna de texto. La vigencia del precio
 -- temporal va por FECHAS en la tabla que YA existe: `temporario_periodos`
 -- (property_id, user_id, fecha_desde, fecha_hasta, estado, precio_dia, nota).
--- Es la misma tabla que ya leen el prompt y el filtro del RAG.
+-- Es la misma tabla que ya leen el prompt y el filtro del RAG. Verano e invierno se
+-- distinguen por el RANGO: verano = 1-dic a 31-mar; invierno = todo julio.
+--
+-- ⚠ VERIFICAR ANTES DE DEPLOYAR (no se pudo comprobar sin acceso a la base):
+-- las temporadas se guardan con estado='temporada' (valor NUEVO; los consumidores actuales
+-- solo miran estado='ocupado', asi que les resulta invisible y no bloquean disponibilidad).
+-- Si `estado` tuviera un CHECK que no admita ese valor, el insert falla y la feature queda
+-- muerta (queda en el log como "[scraper temporada] no se pudo guardar..."). Chequeo:
+--   select con.conname, pg_get_constraintdef(con.oid)
+--     from pg_constraint con join pg_class rel on rel.oid = con.conrelid
+--    where rel.relname = 'temporario_periodos' and con.contype = 'c';
+-- Si aparece un CHECK sobre `estado`, hay que ampliarlo para incluir 'temporada'.
 --
 -- DUDAS DEL SCRAPER: tampoco necesitan tabla nueva. Van a `scraping_pendientes` con
 -- tipo_cambio='duda' y el motivo dentro de datos_nuevos (jsonb). OJO: NO usar

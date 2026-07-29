@@ -5958,13 +5958,28 @@ function _ragMiles(n) {
 function _ragNorm(s) {
   return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
 }
+// MONEDA REAL DE LA OPERACION (cambio 13). Antes la moneda estaba HARDCODEADA en el prompt
+// (venta=USD, anual=$/mes, temporal=$/dia): cualquier numero que cayera en anual_precio se le
+// pintaba a la IA como pesos por mes. Por eso la IA le juro DOS VECES al lead que "U$S 30.000"
+// eran pesos. Ahora sale de la columna *_moneda.
+// FALLBACK EXACTO al comportamiento de hoy: columna null / vacia / migracion sin correr -> el
+// default de siempre. Devuelve el PREFIJO listo para concatenar ('USD ' con espacio, '$' sin espacio),
+// que es como se arman hoy los dos bloques del prompt.
+// Cache del sondeo de esquema de las columnas *_moneda (null = sin sondear, true/false = resultado).
+// Evita un query fallido por cada mensaje del agente mientras la migracion no este corrida.
+let _monColsOk = null, _monColsTs = 0;
+function _monPrefijo(col, defCodigo) {
+  var m = String(col == null ? '' : col).trim().toUpperCase();
+  if (m !== 'USD' && m !== 'ARS') m = String(defCodigo || 'USD').toUpperCase();
+  return (m === 'USD') ? 'USD ' : '$';
+}
 // Operaciones ACTIVAS de una propiedad (MISMA logica que el armado del inventario del prompt: venta no vendida,
 // anual no alquilada, temporal). Devuelve [{op,label,precio(Number),moneda,raw,sufijo}].
 function _ragOpsProp(p) {
   var ops = [];
-  if (p.venta_activa && p.venta_estado !== 'vendida') ops.push({ op: 'venta', label: 'VENTA', precio: Number(p.venta_precio), moneda: 'USD', raw: p.venta_precio, sufijo: '' });
-  if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push({ op: 'alquiler_anual', label: 'ALQUILER ANUAL', precio: Number(p.anual_precio), moneda: '$', raw: p.anual_precio, sufijo: '/mes' });
-  if (p.temporal_activa) ops.push({ op: 'alquiler_temporal', label: 'ALQUILER TEMPORAL', precio: Number(p.temporal_precio_dia), moneda: '$', raw: p.temporal_precio_dia, sufijo: '/dia' });
+  if (p.venta_activa && p.venta_estado !== 'vendida') ops.push({ op: 'venta', label: 'VENTA', precio: Number(p.venta_precio), moneda: _monPrefijo(p.venta_moneda, 'USD').trim(), raw: p.venta_precio, sufijo: '' });
+  if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push({ op: 'alquiler_anual', label: 'ALQUILER ANUAL', precio: Number(p.anual_precio), moneda: _monPrefijo(p.anual_moneda, 'ARS').trim(), raw: p.anual_precio, sufijo: '/mes' });
+  if (p.temporal_activa) ops.push({ op: 'alquiler_temporal', label: 'ALQUILER TEMPORAL', precio: Number(p.temporal_precio_dia), moneda: _monPrefijo(p.temporal_moneda, 'ARS').trim(), raw: p.temporal_precio_dia, sufijo: '/dia' });
   return ops;
 }
 // INDICE MINIMO del inventario (~el panorama, no el catalogo): total + operaciones con rango de precio + tipos +
@@ -5977,10 +5992,11 @@ function _construirIndiceInventario(properties) {
   var nOp = { venta: 0, alquiler_anual: 0, alquiler_temporal: 0 };
   var precios = { venta: [], alquiler_anual: [], alquiler_temporal: [] };
   var porTipo = {}, porZona = {}, dorms = [];
+  var monedasOp = { venta: {}, alquiler_anual: {}, alquiler_temporal: {} };
   props.forEach(function (p) {
     _ragOpsProp(p).forEach(function (o) {
       nOp[o.op] = (nOp[o.op] || 0) + 1;
-      if (o.raw && isFinite(o.precio)) precios[o.op].push(o.precio);
+      if (o.raw && isFinite(o.precio)) { precios[o.op].push(o.precio); monedasOp[o.op][o.moneda] = 1; }
     });
     var t = (String(p.type || '').trim()) || 'sin tipo';
     porTipo[t] = (porTipo[t] || 0) + 1;
@@ -5990,12 +6006,21 @@ function _construirIndiceInventario(properties) {
     if (p.dormitorios && isFinite(d)) dorms.push(d);
   });
   function rango(arr) { if (!arr.length) return null; return { min: Math.min.apply(null, arr), max: Math.max.apply(null, arr) }; }
+  // CAMBIO 13 (indice del RAG): el rango de precios llevaba la moneda HARDCODEADA igual que el prompt. Ahora
+  // usa la moneda REAL; si una misma operacion tiene propiedades en MONEDAS DISTINTAS, el rango no significa
+  // nada -> se informa solo la cantidad (mejor no decir nada que decir un rango mezclado).
+  function simbolo(op, porDefecto) {
+    var ms = Object.keys(monedasOp[op] || {});
+    if (ms.length === 1) return ms[0];
+    if (ms.length === 0) return porDefecto;
+    return null; // mezcla de monedas -> sin rango
+  }
   var lineas = [];
   lineas.push('Total de propiedades activas: ' + props.length + '.');
   var opsTxt = [];
-  if (nOp.venta) { var rv = rango(precios.venta); opsTxt.push('venta: ' + nOp.venta + (rv ? ' (USD ' + _ragMiles(rv.min) + (rv.min !== rv.max ? ' a USD ' + _ragMiles(rv.max) : '') + ')' : '')); }
-  if (nOp.alquiler_anual) { var ra = rango(precios.alquiler_anual); opsTxt.push('alquiler anual: ' + nOp.alquiler_anual + (ra ? ' ($' + _ragMiles(ra.min) + (ra.min !== ra.max ? ' a $' + _ragMiles(ra.max) : '') + '/mes)' : '')); }
-  if (nOp.alquiler_temporal) { var rt = rango(precios.alquiler_temporal); opsTxt.push('alquiler temporal: ' + nOp.alquiler_temporal + (rt ? ' ($' + _ragMiles(rt.min) + (rt.min !== rt.max ? ' a $' + _ragMiles(rt.max) : '') + '/dia)' : '')); }
+  if (nOp.venta) { var rv = rango(precios.venta); var sv = simbolo('venta', 'USD'); opsTxt.push('venta: ' + nOp.venta + ((rv && sv) ? ' (' + sv + ' ' + _ragMiles(rv.min) + (rv.min !== rv.max ? ' a ' + sv + ' ' + _ragMiles(rv.max) : '') + ')' : '')); }
+  if (nOp.alquiler_anual) { var ra = rango(precios.alquiler_anual); var sa = simbolo('alquiler_anual', '$'); opsTxt.push('alquiler anual: ' + nOp.alquiler_anual + ((ra && sa) ? ' (' + sa + ' ' + _ragMiles(ra.min) + (ra.min !== ra.max ? ' a ' + sa + ' ' + _ragMiles(ra.max) : '') + '/mes)' : '')); }
+  if (nOp.alquiler_temporal) { var rt = rango(precios.alquiler_temporal); var st = simbolo('alquiler_temporal', '$'); opsTxt.push('alquiler temporal: ' + nOp.alquiler_temporal + ((rt && st) ? ' (' + st + ' ' + _ragMiles(rt.min) + (rt.min !== rt.max ? ' a ' + st + ' ' + _ragMiles(rt.max) : '') + '/dia)' : '')); }
   if (opsTxt.length) lineas.push('Operaciones disponibles (cantidad y rango de precio): ' + opsTxt.join(' | ') + '.');
   var tipos = Object.keys(porTipo).sort(function (a, b) { return porTipo[b] - porTipo[a]; });
   if (tipos.length) lineas.push('Tipos de propiedad: ' + tipos.map(function (t) { return t + ' (' + porTipo[t] + ')'; }).join(', ') + '.');
@@ -6763,8 +6788,23 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   let properties = null;
   {
     const _colsProp = 'id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images';
-    try {
-      const _rp = await supabase.from('properties').select(_colsProp + ', direccion, entre_calles, ciudad, lat, lng, referencias_zona').eq('user_id', user_id).eq('activa', true);
+    const _colsDir = ', direccion, entre_calles, ciudad, lat, lng, referencias_zona';
+    // CAMBIO 13: monedas por operacion. Se piden PRIMERO; si la migracion todavia no corrio, el select
+    // falla y se cae al de siempre (prompt byte-identico al actual). El resultado del sondeo se CACHEA
+    // 10 minutos para no pagar un query fallido por cada mensaje del agente; pasados los 10 min se
+    // reintenta solo, asi despues de correr la migracion se cura sin redeploy.
+    if (_monColsOk === false && (Date.now() - _monColsTs) > 600000) _monColsOk = null;
+    const _colsMon = (_monColsOk === false) ? '' : ', venta_moneda, anual_moneda, temporal_moneda';
+    let _listo = false;
+    if (_colsMon) {
+      try {
+        const _rpM = await supabase.from('properties').select(_colsProp + _colsMon + _colsDir).eq('user_id', user_id).eq('activa', true);
+        if (_rpM.error) throw _rpM.error;
+        properties = _rpM.data; _listo = true; _monColsOk = true;
+      } catch (eMon) { _monColsOk = false; _monColsTs = Date.now(); }
+    }
+    if (!_listo) try {
+      const _rp = await supabase.from('properties').select(_colsProp + _colsDir).eq('user_id', user_id).eq('activa', true);
       if (_rp.error) throw _rp.error;
       properties = _rp.data;
     } catch (eDirProp) {
@@ -6863,8 +6903,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (properties && properties.length > 0) {
     inventario = properties.map(function(p){
     var ops = [];
-    if (p.venta_activa && p.venta_estado !== 'vendida') ops.push('VENTA (' + (p.venta_estado||'disponible') + '): ' + (p.venta_precio ? 'USD ' + p.venta_precio : 'consultar'));
-    if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push('ALQUILER ANUAL (' + (p.anual_estado||'disponible') + '): ' + (p.anual_precio ? '$' + p.anual_precio + '/mes' : 'consultar'));
+    // CAMBIO 13 (segundo lugar, el que corre con el flag ia_rag_v1 OFF): moneda REAL de la columna,
+    // con fallback EXACTO al default de hoy si viene null. Tocar solo _ragOpsProp dejaba a la mitad
+    // de las cuentas (las que no tienen el flag RAG) con el bug intacto.
+    if (p.venta_activa && p.venta_estado !== 'vendida') ops.push('VENTA (' + (p.venta_estado||'disponible') + '): ' + (p.venta_precio ? _monPrefijo(p.venta_moneda, 'USD') + p.venta_precio : 'consultar'));
+    if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push('ALQUILER ANUAL (' + (p.anual_estado||'disponible') + '): ' + (p.anual_precio ? _monPrefijo(p.anual_moneda, 'ARS') + p.anual_precio + '/mes' : 'consultar'));
     if (p.temporal_activa) {
       var ocup = (periodosPorProp[p.id] || []).filter(function(per){ return per.estado === 'ocupado'; });
       var fechasTxt;
@@ -6874,7 +6917,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       } else {
         fechasTxt = ' (sin reservas cargadas: disponible para consultar fechas)';
       }
-      ops.push('ALQUILER TEMPORAL: ' + (p.temporal_precio_dia ? '$' + p.temporal_precio_dia + '/dia (base)' : 'consultar') + fechasTxt);
+      ops.push('ALQUILER TEMPORAL: ' + (p.temporal_precio_dia ? _monPrefijo(p.temporal_moneda, 'ARS') + p.temporal_precio_dia + '/dia (base)' : 'consultar') + fechasTxt);
     }
     if (ops.length === 0 && p.operation) ops.push(p.operation + (p.price ? ': ' + p.price : ''));
     var enc = (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title||'');
@@ -7468,6 +7511,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // que CADA turno cierre el loop. La DERIVACION es la red: puede COMBINAR resolver+derivar o consultar+derivar en el
     // mismo turno (la IA puede llamar dos herramientas a la vez) para que el lead SIEMPRE quede con una persona.
     _derivacionV3On ? 'REGLA CLAVE (nunca dejes al lead esperando): NO cierres tu mensaje prometiendo una accion futura tuya que no estas ejecutando en ESTE mismo turno. Frases como "ya busco", "ya te averiguo", "te confirmo enseguida", "dejame ver/consultar", "en un ratito te paso" SOLO valen si en este turno realmente usas una herramienta. Tu respuesta tiene que CERRAR el loop, y podes COMBINAR herramientas en el mismo turno: (1) RESOLVER lo que puedas ahora (buscar y entregar info/opciones) y, si el lead necesita avanzar (visita, reserva, seguimiento), DERIVAR ademas a un asesor del area (resolver + derivar); (2) si te falta un dato o una POLITICA del negocio (por ejemplo "alquiler con opcion a compra", planes o condiciones especiales que el inventario no distingue), CONSULTAR al dueno con la herramienta Y DERIVAR a un asesor del area en el MISMO turno, para que una persona siga con el lead mientras llega la respuesta (consultar + derivar); (3) si no podes resolverlo, DERIVAR directo. La derivacion es tu red de seguridad: ante la duda, resolve lo que puedas y deriva. NUNCA dejes al lead con una promesa tuya sin una herramienta atras.' : '',
+    // CORRECCION D1 (Diego 2026-07-28): la IA NUNCA dice "no disponible" (suena tosco y deja al lead sin salida).
+    // UNA sola linea, y SOLO con derivacion_v3 ON: si la tool derivar_a_humano no existe, pedirle que derive seria
+    // una regla que no puede cumplir (Diego: "no quiero agregar cosas al prompt al pedo si no las cumple").
+    // El resto ya esta cubierto por reglas vigentes: "usa SOLO estas propiedades" y la REGLA CLAVE de arriba.
+    _derivacionV3On ? 'Si el lead pregunta por una propiedad puntual que NO figura en tu listado, o de la que no tenes el precio o la condicion confirmada: NO digas "no disponible" ni inventes nada. Deci que no contas con esa informacion y derivá con derivar_a_humano al departamento que corresponda.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     (settings && settings.horario_oficina && _horarioLegible(settings.horario_oficina)) ? ('HORARIO DE ATENCION de la oficina (si el lead pregunta cuando pueden atenderlo, visitarlos, llamar, o si estan abiertos, deciselo con naturalidad; NO inventes horarios distintos a estos): ' + _horarioLegible(settings.horario_oficina) + '. (Zona horaria Argentina.)') : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
@@ -21235,6 +21283,25 @@ app.post('/api/scrape/detalle', async function(req, res) {
       const procesados = await _mapConcurrente(pendientes, 6, procesarUnaUrlHtml);
       for (var ip = 0; ip < procesados.length; ip++) resultados[idxPendiente[ip]] = procesados[ip];
     }
+    // ===== CAMBIO 10: `operaciones` — UNA SOLA FUENTE DE REGLAS PARA EL FRONT =====
+    // Este endpoint es SOLO LECTURA (no escribe nada) y sigue devolviendo TODO lo de antes: `operaciones`
+    // se AGREGA a cada resultado. El importador del front deja de derivar operacion/precio/moneda por su
+    // cuenta (era el origen del envenenamiento: copiaba el MISMO numero a todas las operaciones y tiraba
+    // la moneda) y muestra lo que dice el parser, incluidas las `dudas` para que el humano decida ahi.
+    // Contrato: { venta|null, anual|null, temporal|null, no_disponible:{venta,anual}, dudas:[] }.
+    // DEFENSIVO: si algo falla, ese resultado va sin `operaciones` y el front cae a su camino de siempre.
+    try {
+      for (var io = 0; io < resultados.length; io++) {
+        var _r = resultados[io];
+        if (!_r || typeof _r !== 'object' || _r.error) continue;
+        var _c = _r.campos || {};
+        // estado_crudo (wp-json) trae la taxonomia TAL CUAL ("Alquiler anual, En Venta"); campos['Estado']
+        // viene ya colapsado a una sola operacion, por eso el crudo tiene prioridad.
+        var _estadoTxt = _r.estado_crudo || _c['Estado'] || _c['Estado de la propiedad'] || '';
+        var _precioTxt = _c['Precio'] || _c['precio'] || '';
+        _r.operaciones = parsearPrecioFicha(_precioTxt, _estadoTxt);
+      }
+    } catch (eOps) { console.error('[scrape/detalle] operaciones:', eOps && eOps.message); }
     return res.json({ ok: true, resultados: resultados, via_wpjson: Object.keys(resueltasWp).length, via_html: pendientes.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

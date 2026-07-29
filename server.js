@@ -9894,7 +9894,10 @@ async function responderConsultaAdmin(user_id, pregunta) {
       const matches = [];
       props.forEach(function (p) {
         const zonaP = norm(p.zone), tipoP = norm(p.type), tokP = tokensZona(p.zone);
-        const precioP = typeof p.price === 'number' ? p.price : Number(String(p.price || '').replace(/[^0-9]/g, '')) || 0;
+        // CAMBIO 20 (mismo bug que el matcher de oportunidades): el precio se leia tirando la moneda,
+        // asi que una propiedad de U$S 30.000 matcheaba con un presupuesto de $30.000.
+        const _pmR = _mtchPrecioMoneda(p);
+        const precioP = _pmR.precio || 0, monedaP = _pmR.moneda;
         const candidatos = [];
         leads.forEach(function (l) {
           const est = estadoContacto[l.id];
@@ -9906,7 +9909,7 @@ async function responderConsultaAdmin(user_id, pregunta) {
           if (zonaP && (texto.indexOf(zonaP) >= 0)) { score += 2; motivos.push('zona'); }
           else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
           if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
-          if (precioP > 0) {
+          if (precioP > 0 && _mtchMonedaCompatible(monedaP, (l.budget || '') + ' ' + (l.interest || ''))) {
             const presup = numPresupuesto((l.budget || '') + ' ' + (l.interest || ''));
             if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
           }
@@ -12971,6 +12974,43 @@ function _mtchNorm(s) { return String(s == null ? '' : s).toLowerCase().normaliz
 function _mtchTokensZona(s) { return _mtchNorm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(function (w) { return w.length >= 4; }); }
 function _mtchNums(s) { var m = _mtchNorm(s).replace(/\./g, '').match(/\d{4,}/g); return m ? m.map(Number) : []; }
 
+// ===== CAMBIO 20: el matcher tambien tiraba la moneda =====
+// Antes: Number(String(p.price).replace(/[^0-9]/g,'')) -> "U$S 30.000" quedaba en 30000 y se comparaba
+// contra un presupuesto en PESOS (y "Desde $80.000 hasta $120.000" se pegaba en 80000120000).
+// Ahora: se prefieren las columnas estructuradas con su moneda y, si no hay, se lee el texto con el
+// parser central (numero + moneda). Devuelve { precio, moneda }.
+function _mtchPrecioMoneda(p) {
+  var vacio = { precio: 0, moneda: null };
+  try {
+    if (!p) return vacio;
+    var cands = [
+      { v: p.venta_precio, m: p.venta_moneda, on: p.venta_activa !== false },
+      { v: p.anual_precio, m: p.anual_moneda, on: p.anual_activa === true },
+      { v: p.temporal_precio_dia, m: p.temporal_moneda, on: p.temporal_activa === true }
+    ];
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (!c.on || c.v == null || c.v === '') continue;
+      var n = Number(c.v);
+      if (isFinite(n) && n > 0) return { precio: n, moneda: (c.m === 'USD' || c.m === 'ARS') ? c.m : null };
+    }
+    if (typeof p.price === 'number' && isFinite(p.price)) return { precio: p.price, moneda: null };
+    var nums = _ppNumeros(String(p.price == null ? '' : p.price));
+    var uniq = nums.filter(function (v, ix, a) { return a.indexOf(v) === ix; });
+    if (uniq.length !== 1) return { precio: 0, moneda: _ppMoneda(p.price) }; // ambiguo -> no se compara precio
+    return { precio: uniq[0], moneda: _ppMoneda(p.price) };
+  } catch (e) { return vacio; }
+}
+// El presupuesto del lead es texto libre. Solo se DESCARTA el punto de "presupuesto" cuando hay un
+// CONFLICTO EXPLICITO de moneda (propiedad en USD vs lead que habla en pesos, o al reves). Si alguno
+// de los dos no dice la moneda, se puntua como hasta hoy (fail-open: no perdemos matches).
+function _mtchMonedaCompatible(monedaProp, textoLead) {
+  if (!monedaProp) return true;
+  var monLead = _ppMoneda(textoLead);
+  if (!monLead) return true;
+  return monLead === monedaProp;
+}
+
 // Umbral del matching. score: zona exacta=+2, zona~(token)=+1, tipo=+1, presupuesto en rango=+1.
 // MIN=2 => zona exacta sola, o (zona~ + tipo), o (zona~ + presupuesto), o (tipo + presupuesto).
 // Conservador para reducir falsos positivos (la salida es un BORRADOR que el dueno filtra). CERO IA.
@@ -12983,7 +13023,8 @@ async function _matchLeadsParaPropiedad(ownerId, prop) {
   var out = [];
   try {
     var zonaP = _mtchNorm(prop && prop.zone), tipoP = _mtchNorm(prop && prop.type), tokP = _mtchTokensZona(prop && prop.zone);
-    var precioP = (prop && typeof prop.price === 'number') ? prop.price : (Number(String((prop && prop.price) || '').replace(/[^0-9]/g, '')) || 0);
+    var _pm = _mtchPrecioMoneda(prop);
+    var precioP = _pm.precio || 0, monedaP = _pm.moneda;
     if (!zonaP && !tipoP && !(precioP > 0) && !(tokP && tokP.length)) return []; // sin ninguna senal util -> no matchear
     // 1) conversations del tenant (id, contact_id, status) PAGINADAS. Nos quedamos con la 1a conv NO cerrada por contacto.
     var convByContact = {};
@@ -13012,7 +13053,7 @@ async function _matchLeadsParaPropiedad(ownerId, prop) {
         if (zonaP && texto.indexOf(zonaP) >= 0) { score += 2; motivos.push('zona'); }
         else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
         if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
-        if (precioP > 0) {
+        if (precioP > 0 && _mtchMonedaCompatible(monedaP, (l.budget || '') + ' ' + (l.interest || ''))) {
           var presup = _mtchNums((l.budget || '') + ' ' + (l.interest || ''));
           if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
         }
@@ -13033,7 +13074,15 @@ async function _propMatchDesdeProperty(ownerId, propertyId) {
     if (!pq || pq.error || !pq.data) return null;
     var p = pq.data;
     var precio = p.price || p.venta_precio || p.anual_precio || p.temporal_precio_dia || null;
-    return { prop: { zone: p.zone, type: p.type, price: precio }, label: (p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : '') };
+    // CAMBIO 20: se pasan tambien las columnas ESTRUCTURADAS (precio + moneda por operacion) para que el
+    // matcher compare peras con peras. Si la migracion de monedas no corrio, esos campos vienen undefined
+    // y _mtchPrecioMoneda cae al texto de `price` -> mismo comportamiento que hoy pero con la moneda leida.
+    return { prop: {
+      zone: p.zone, type: p.type, price: precio,
+      venta_activa: p.venta_activa, venta_precio: p.venta_precio, venta_moneda: p.venta_moneda,
+      anual_activa: p.anual_activa, anual_precio: p.anual_precio, anual_moneda: p.anual_moneda,
+      temporal_activa: p.temporal_activa, temporal_precio_dia: p.temporal_precio_dia, temporal_moneda: p.temporal_moneda
+    }, label: (p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : '') };
   } catch (e) { return null; }
 }
 async function _propMatchDesdeUnidad(ownerId, developmentId, unitId) {
@@ -21753,7 +21802,18 @@ app.post('/api/scrape/universal', async function(req, res) {
     }
 
     // modo reset: borrar el inventario actual del usuario antes de cargar
+    // ⚠ CAMINO DESTRUCTIVO (hueco H1, 2026-07-28): este delete BORRA EL INVENTARIO ENTERO DEL TENANT
+    // (todas las propiedades, incluidas las cargadas A MANO y las que no vienen de esta web) y reinserta
+    // SIN `numero`, asi que se pierde la trazabilidad contra la fuente. No hay backup automatico.
+    // Queda REGISTRADO: se cuenta y se loguea que se va a borrar, y la respuesta lo devuelve para que el
+    // front pueda avisarlo. NO se cambia el comportamiento (el front ya lo usa) — solo deja de ser silencioso.
+    var _borradasReset = null;
     if (modo === 'reset') {
+      try {
+        var _cnt = await supabase.from('properties').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
+        _borradasReset = (_cnt && typeof _cnt.count === 'number') ? _cnt.count : null;
+      } catch (eCnt) {}
+      console.warn('[scrape/universal RESET] BORRANDO el inventario COMPLETO del tenant', user_id, '->', (_borradasReset == null ? '?' : _borradasReset), 'propiedad(es). Es un camino destructivo y sin backup automatico.');
       await supabase.from('properties').delete().eq('user_id', user_id);
     }
 
@@ -21793,7 +21853,9 @@ app.post('/api/scrape/universal', async function(req, res) {
         }
       } catch (e) { errores++; }
     }
-    return res.json({ ok: true, modo: modo, total: props.length, creados: creados, actualizados: actualizados, errores: errores });
+    var _outUni = { ok: true, modo: modo, total: props.length, creados: creados, actualizados: actualizados, errores: errores };
+    if (modo === 'reset') { _outUni.borradas_antes = _borradasReset; _outUni.advertencia = 'El modo "reset" borro TODO el inventario del negocio antes de cargar (incluidas las propiedades cargadas a mano). Si no era lo que querias, hay que recargarlas.'; }
+    return res.json(_outUni);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -27759,11 +27821,18 @@ app.post('/api/scraping-config', async function(req, res) {
       frecuencia: ['dos_por_dia','dias_semana','semanal','mensual'].indexOf(b.frecuencia) >= 0 ? b.frecuencia : 'semanal',
       horarios: Array.isArray(b.horarios) ? b.horarios : [],
       dias_semana: Array.isArray(b.dias_semana) ? b.dias_semana : [],
-      modo: (b.modo === 'directo') ? 'directo' : 'pendiente'
+      // BUG PREEXISTENTE H3 (arreglo aprobado por Diego 2026-07-28): `modo` esta SOBRECARGADO.
+      // Inmobiliaria manda 'directo'|'pendiente'; el HOTEL manda 'ia'|'directo' (app/alojamiento).
+      // Este coercion mandaba TODO lo que no fuera 'directo' a 'pendiente' -> el 'ia' del hotel se
+      // perdia y el switch "usar IA" NO PERSISTIA (se veia apagado siempre al recargar).
+      // Ahora 'ia' se acepta tal cual (el hotel lo lee de vuelta en el GET) y, sobre todo, la
+      // AUTORIDAD pasa a ser la columna ia_habilitada, que ya existe.
+      modo: (b.modo === 'directo') ? 'directo' : ((b.modo === 'ia') ? 'ia' : 'pendiente')
     };
     // SWITCH DE IA para la actualizacion automatica. Solo `true` explicito prende (opt-in);
     // cualquier otra cosa (undefined incluido) apaga -> nunca se prende sola.
-    fila.ia_habilitada = (b.ia_habilitada === true);
+    // El hotel expresa el mismo permiso con modo='ia': se espeja aca para que haya UNA sola autoridad.
+    fila.ia_habilitada = (b.ia_habilitada === true) || (b.modo === 'ia');
     var up = await supabase.from('scraping_config').upsert(fila, { onConflict: 'user_id' }).select().maybeSingle();
     // DEPLOY-SAFE: si migracion-scraper-ia-cron.sql todavia NO corrio, la columna ia_habilitada
     // no existe y PostgREST tira PGRST204 -> el guardado ENTERO fallaria (regresion). Reintentamos
@@ -28059,6 +28128,9 @@ async function correrScrapingDeUsuario(cfg) {
           if (_bnN != null) fila.banos = _bnN;
           var ins = await supabase.from('properties').insert(fila);
           if (ins.error) errores++; else creados++;
+          // Una propiedad NUEVA con dudas es justamente donde mas importa avisar (entra sin precio o sin
+          // operacion confirmada). Se registra igual que en el update, pero sin property_id (recien creada).
+          if (_dudasProp.length) _dudasRun += await _scrapRegistrarDuda(cfg.user_id, p, null, _dudasProp);
         }
       } catch (e) { errores++; }
     }
@@ -28289,7 +28361,9 @@ async function revisarScrapingsAutomaticos() {
       // correr el scraping segun el rubro. Hotel: siempre directo; usa IA (Sonnet) segun la preferencia del
       // cliente (modo='ia'). Si usa IA, el costo se descuenta de SUS mensajes (como el scraper de inventario).
       if (_esHotelCfg) {
-        var _iaHotel = (String(cfg.modo || '').indexOf('ia') >= 0);
+        // H3: la autoridad es la columna ia_habilitada. Se deja el chequeo de modo='ia' como fallback
+        // para las filas viejas guardadas antes de este arreglo (y por si la columna no existiera).
+        var _iaHotel = (cfg.ia_habilitada === true) || (String(cfg.modo || '').indexOf('ia') >= 0);
         // P1 (CRON): freno de gasto IA por tope de plan. El gate HTTP (_PREFIJOS_TOPE_IA) NO cubre los cron:
         // sin esto, el auto-update seguia gastando IA (y cobrando 3 msgs) POR ENCIMA del tope, solo y sin que
         // nadie mire. Si la corrida usa IA y la cuenta paso su tope -> saltear SIN marcar ultimo_scraping,
@@ -30776,9 +30850,50 @@ app.post('/api/inventario/api-key/regenerar', async function(req, res){
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== CAMBIO 18: PUERTA TRASERA DEL INVENTARIO =====
+// Esta API (auth por api-key) escribia los 3 precios SIN NINGUNA validacion: por aca se puede volver a
+// envenenar el inventario aunque el scraper ya este blindado. Se le aplican los MISMOS chequeos de
+// sensatez que al parser central y se acepta la MONEDA explicita por operacion (o una `moneda` global).
+// No rompe integraciones existentes: solo se DESCARTA el campo que no pasa el chequeo (el resto del item
+// se guarda igual) y se devuelven los descartes en la respuesta para que el integrador los vea.
+function _sInvMoneda(v){
+  var m = String(v == null ? '' : v).trim().toUpperCase();
+  if (m === 'USD' || m === 'U$S' || m === 'US$' || m === 'U$D' || m === 'DOLAR' || m === 'DOLARES') return 'USD';
+  if (m === 'ARS' || m === '$' || m === 'PESO' || m === 'PESOS') return 'ARS';
+  return null;
+}
+function _sInvChequearPrecios(fila, it, tieneCols){
+  var rechazos = [];
+  var mGlobal = _sInvMoneda(it.moneda);
+  var mv = _sInvMoneda(it.venta_moneda) || mGlobal;
+  var ma = _sInvMoneda(it.anual_moneda) || mGlobal;
+  var mt = _sInvMoneda(it.temporal_moneda) || mGlobal;
+  function tirar(campo, motivo){ if (fila[campo] === undefined) return; delete fila[campo]; rechazos.push({ campo: campo, motivo: motivo }); }
+  ['venta_precio', 'anual_precio', 'temporal_precio_dia'].forEach(function(k){
+    if (fila[k] != null && !(Number(fila[k]) > 0)) tirar(k, 'precio 0 o invalido');
+  });
+  if (fila.anual_precio != null && ma === 'USD') tirar('anual_precio', 'alquiler anual en dolares: casi siempre es un precio de venta mal asignado');
+  if (fila.venta_precio != null && fila.anual_precio != null && Number(fila.venta_precio) === Number(fila.anual_precio)) {
+    tirar('venta_precio', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal');
+    tirar('anual_precio', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal');
+  }
+  if (fila.temporal_precio_dia != null) {
+    var pd = Number(fila.temporal_precio_dia);
+    if ((mt === 'USD') ? (pd > 5000 || pd < 5) : (pd > 2000000 || pd < 5000)) tirar('temporal_precio_dia', 'tarifa por noche fuera de un rango razonable');
+  }
+  if (tieneCols) {
+    if (fila.venta_precio != null && mv) fila.venta_moneda = mv;
+    if (fila.anual_precio != null && ma) fila.anual_moneda = ma;
+    if (fila.temporal_precio_dia != null && mt) fila.temporal_moneda = mt;
+  }
+  return rechazos;
+}
+
 // UPSERT inmobiliaria (properties) por 'numero'.
 async function _syncInvInmobiliaria(user_id, items){
   var creadas = 0, actualizadas = 0, errores = 0;
+  var descartes = [];
+  var _tieneColsSync = await _scrapTieneColsMoneda();
   for (var i = 0; i < items.length; i++){
     var it = items[i] || {};
     try {
@@ -30800,12 +30915,15 @@ async function _syncInvInmobiliaria(user_id, items){
       };
       if (Array.isArray(it.images)) fila.images = it.images;
       Object.keys(fila).forEach(function(k){ if (fila[k] === undefined) delete fila[k]; });
+      // CAMBIO 18: chequeos de sensatez + moneda explicita ANTES de escribir.
+      var _rech = _sInvChequearPrecios(fila, it, _tieneColsSync);
+      if (_rech.length && descartes.length < 100) descartes.push({ numero: numero, campos: _rech });
       var ex = await supabase.from('properties').select('id').eq('user_id', user_id).eq('numero', numero).maybeSingle();
       if (ex.data && ex.data.id) { var u = await supabase.from('properties').update(fila).eq('id', ex.data.id); if (u.error) errores++; else actualizadas++; }
       else { var ins = await supabase.from('properties').insert(fila); if (ins.error) errores++; else creadas++; }
     } catch (e) { errores++; }
   }
-  return { creadas: creadas, actualizadas: actualizadas, errores: errores, total: items.length };
+  return { creadas: creadas, actualizadas: actualizadas, errores: errores, total: items.length, descartados: descartes };
 }
 
 // UPSERT hotel (hotel_unidades) por 'numero' (o title si no hay numero).

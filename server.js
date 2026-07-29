@@ -5958,13 +5958,28 @@ function _ragMiles(n) {
 function _ragNorm(s) {
   return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
 }
+// MONEDA REAL DE LA OPERACION (cambio 13). Antes la moneda estaba HARDCODEADA en el prompt
+// (venta=USD, anual=$/mes, temporal=$/dia): cualquier numero que cayera en anual_precio se le
+// pintaba a la IA como pesos por mes. Por eso la IA le juro DOS VECES al lead que "U$S 30.000"
+// eran pesos. Ahora sale de la columna *_moneda.
+// FALLBACK EXACTO al comportamiento de hoy: columna null / vacia / migracion sin correr -> el
+// default de siempre. Devuelve el PREFIJO listo para concatenar ('USD ' con espacio, '$' sin espacio),
+// que es como se arman hoy los dos bloques del prompt.
+// Cache del sondeo de esquema de las columnas *_moneda (null = sin sondear, true/false = resultado).
+// Evita un query fallido por cada mensaje del agente mientras la migracion no este corrida.
+let _monColsOk = null, _monColsTs = 0;
+function _monPrefijo(col, defCodigo) {
+  var m = String(col == null ? '' : col).trim().toUpperCase();
+  if (m !== 'USD' && m !== 'ARS') m = String(defCodigo || 'USD').toUpperCase();
+  return (m === 'USD') ? 'USD ' : '$';
+}
 // Operaciones ACTIVAS de una propiedad (MISMA logica que el armado del inventario del prompt: venta no vendida,
 // anual no alquilada, temporal). Devuelve [{op,label,precio(Number),moneda,raw,sufijo}].
 function _ragOpsProp(p) {
   var ops = [];
-  if (p.venta_activa && p.venta_estado !== 'vendida') ops.push({ op: 'venta', label: 'VENTA', precio: Number(p.venta_precio), moneda: 'USD', raw: p.venta_precio, sufijo: '' });
-  if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push({ op: 'alquiler_anual', label: 'ALQUILER ANUAL', precio: Number(p.anual_precio), moneda: '$', raw: p.anual_precio, sufijo: '/mes' });
-  if (p.temporal_activa) ops.push({ op: 'alquiler_temporal', label: 'ALQUILER TEMPORAL', precio: Number(p.temporal_precio_dia), moneda: '$', raw: p.temporal_precio_dia, sufijo: '/dia' });
+  if (p.venta_activa && p.venta_estado !== 'vendida') ops.push({ op: 'venta', label: 'VENTA', precio: Number(p.venta_precio), moneda: _monPrefijo(p.venta_moneda, 'USD').trim(), raw: p.venta_precio, sufijo: '' });
+  if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push({ op: 'alquiler_anual', label: 'ALQUILER ANUAL', precio: Number(p.anual_precio), moneda: _monPrefijo(p.anual_moneda, 'ARS').trim(), raw: p.anual_precio, sufijo: '/mes' });
+  if (p.temporal_activa) ops.push({ op: 'alquiler_temporal', label: 'ALQUILER TEMPORAL', precio: Number(p.temporal_precio_dia), moneda: _monPrefijo(p.temporal_moneda, 'ARS').trim(), raw: p.temporal_precio_dia, sufijo: '/dia' });
   return ops;
 }
 // INDICE MINIMO del inventario (~el panorama, no el catalogo): total + operaciones con rango de precio + tipos +
@@ -5977,10 +5992,11 @@ function _construirIndiceInventario(properties) {
   var nOp = { venta: 0, alquiler_anual: 0, alquiler_temporal: 0 };
   var precios = { venta: [], alquiler_anual: [], alquiler_temporal: [] };
   var porTipo = {}, porZona = {}, dorms = [];
+  var monedasOp = { venta: {}, alquiler_anual: {}, alquiler_temporal: {} };
   props.forEach(function (p) {
     _ragOpsProp(p).forEach(function (o) {
       nOp[o.op] = (nOp[o.op] || 0) + 1;
-      if (o.raw && isFinite(o.precio)) precios[o.op].push(o.precio);
+      if (o.raw && isFinite(o.precio)) { precios[o.op].push(o.precio); monedasOp[o.op][o.moneda] = 1; }
     });
     var t = (String(p.type || '').trim()) || 'sin tipo';
     porTipo[t] = (porTipo[t] || 0) + 1;
@@ -5990,12 +6006,21 @@ function _construirIndiceInventario(properties) {
     if (p.dormitorios && isFinite(d)) dorms.push(d);
   });
   function rango(arr) { if (!arr.length) return null; return { min: Math.min.apply(null, arr), max: Math.max.apply(null, arr) }; }
+  // CAMBIO 13 (indice del RAG): el rango de precios llevaba la moneda HARDCODEADA igual que el prompt. Ahora
+  // usa la moneda REAL; si una misma operacion tiene propiedades en MONEDAS DISTINTAS, el rango no significa
+  // nada -> se informa solo la cantidad (mejor no decir nada que decir un rango mezclado).
+  function simbolo(op, porDefecto) {
+    var ms = Object.keys(monedasOp[op] || {});
+    if (ms.length === 1) return ms[0];
+    if (ms.length === 0) return porDefecto;
+    return null; // mezcla de monedas -> sin rango
+  }
   var lineas = [];
   lineas.push('Total de propiedades activas: ' + props.length + '.');
   var opsTxt = [];
-  if (nOp.venta) { var rv = rango(precios.venta); opsTxt.push('venta: ' + nOp.venta + (rv ? ' (USD ' + _ragMiles(rv.min) + (rv.min !== rv.max ? ' a USD ' + _ragMiles(rv.max) : '') + ')' : '')); }
-  if (nOp.alquiler_anual) { var ra = rango(precios.alquiler_anual); opsTxt.push('alquiler anual: ' + nOp.alquiler_anual + (ra ? ' ($' + _ragMiles(ra.min) + (ra.min !== ra.max ? ' a $' + _ragMiles(ra.max) : '') + '/mes)' : '')); }
-  if (nOp.alquiler_temporal) { var rt = rango(precios.alquiler_temporal); opsTxt.push('alquiler temporal: ' + nOp.alquiler_temporal + (rt ? ' ($' + _ragMiles(rt.min) + (rt.min !== rt.max ? ' a $' + _ragMiles(rt.max) : '') + '/dia)' : '')); }
+  if (nOp.venta) { var rv = rango(precios.venta); var sv = simbolo('venta', 'USD'); opsTxt.push('venta: ' + nOp.venta + ((rv && sv) ? ' (' + sv + ' ' + _ragMiles(rv.min) + (rv.min !== rv.max ? ' a ' + sv + ' ' + _ragMiles(rv.max) : '') + ')' : '')); }
+  if (nOp.alquiler_anual) { var ra = rango(precios.alquiler_anual); var sa = simbolo('alquiler_anual', '$'); opsTxt.push('alquiler anual: ' + nOp.alquiler_anual + ((ra && sa) ? ' (' + sa + ' ' + _ragMiles(ra.min) + (ra.min !== ra.max ? ' a ' + sa + ' ' + _ragMiles(ra.max) : '') + '/mes)' : '')); }
+  if (nOp.alquiler_temporal) { var rt = rango(precios.alquiler_temporal); var st = simbolo('alquiler_temporal', '$'); opsTxt.push('alquiler temporal: ' + nOp.alquiler_temporal + ((rt && st) ? ' (' + st + ' ' + _ragMiles(rt.min) + (rt.min !== rt.max ? ' a ' + st + ' ' + _ragMiles(rt.max) : '') + '/dia)' : '')); }
   if (opsTxt.length) lineas.push('Operaciones disponibles (cantidad y rango de precio): ' + opsTxt.join(' | ') + '.');
   var tipos = Object.keys(porTipo).sort(function (a, b) { return porTipo[b] - porTipo[a]; });
   if (tipos.length) lineas.push('Tipos de propiedad: ' + tipos.map(function (t) { return t + ' (' + porTipo[t] + ')'; }).join(', ') + '.');
@@ -6763,8 +6788,23 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   let properties = null;
   {
     const _colsProp = 'id, numero, title, type, zone, caracteristicas, price, rooms, capacity, amenities, link, operation, status, venta_activa, venta_estado, venta_precio, anual_activa, anual_estado, anual_precio, temporal_activa, temporal_precio_dia, dormitorios, banos, cocheras, superficie_cubierta, superficie_total, expensas, apto_credito, antiguedad, orientacion, images';
-    try {
-      const _rp = await supabase.from('properties').select(_colsProp + ', direccion, entre_calles, ciudad, lat, lng, referencias_zona').eq('user_id', user_id).eq('activa', true);
+    const _colsDir = ', direccion, entre_calles, ciudad, lat, lng, referencias_zona';
+    // CAMBIO 13: monedas por operacion. Se piden PRIMERO; si la migracion todavia no corrio, el select
+    // falla y se cae al de siempre (prompt byte-identico al actual). El resultado del sondeo se CACHEA
+    // 10 minutos para no pagar un query fallido por cada mensaje del agente; pasados los 10 min se
+    // reintenta solo, asi despues de correr la migracion se cura sin redeploy.
+    if (_monColsOk === false && (Date.now() - _monColsTs) > 600000) _monColsOk = null;
+    const _colsMon = (_monColsOk === false) ? '' : ', venta_moneda, anual_moneda, temporal_moneda';
+    let _listo = false;
+    if (_colsMon) {
+      try {
+        const _rpM = await supabase.from('properties').select(_colsProp + _colsMon + _colsDir).eq('user_id', user_id).eq('activa', true);
+        if (_rpM.error) throw _rpM.error;
+        properties = _rpM.data; _listo = true; _monColsOk = true;
+      } catch (eMon) { _monColsOk = false; _monColsTs = Date.now(); }
+    }
+    if (!_listo) try {
+      const _rp = await supabase.from('properties').select(_colsProp + _colsDir).eq('user_id', user_id).eq('activa', true);
       if (_rp.error) throw _rp.error;
       properties = _rp.data;
     } catch (eDirProp) {
@@ -6859,12 +6899,35 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     }
   } catch (e) { console.error('Error trayendo periodos:', e && e.message); }
 
+  // ===== TEMPORADA VENCIDA (Diego 2026-07-28) =====
+  // Los precios por noche vienen con marca de temporada ("(DIC)"). Si la temporada de ese precio YA
+  // TERMINO, no se le puede mostrar a la IA como si fuera el precio de hoy (era el caso de los 32
+  // precios de verano 2026 que seguian publicados en julio). No se toca la base: se neutraliza el precio
+  // SOLO en memoria y todos los armados (indice del RAG, ficha compacta, ficha completa y el listado
+  // clasico) pasan solos a decir "consultar", que es un camino que ya existe y NO oculta la propiedad.
+  // Corre ANTES de armar el inventario y ANTES del indice del RAG, asi vale para los dos caminos.
+  // Si una propiedad no tiene temporada derivada (precio sin marca), no se toca NADA: igual que hoy.
+  let _hayTemporadaVencida = false;
+  try {
+    const _hoyISO = new Date().toISOString().slice(0, 10);
+    (properties || []).forEach(function (p) {
+      if (!p || !p.temporal_activa || p.temporal_precio_dia == null) return;
+      const _temps = (periodosPorProp[p.id] || []).filter(function (per) { return per && per.estado === 'temporada'; });
+      if (!_temps.length) return;
+      const _vigente = _temps.some(function (per) { return String(per.fecha_hasta || '') >= _hoyISO; });
+      if (!_vigente) { p.temporal_precio_dia = null; _hayTemporadaVencida = true; }
+    });
+  } catch (eTempVenc) { console.error('temporada vencida:', eTempVenc && eTempVenc.message); }
+
   let inventario = 'No hay propiedades cargadas todavia.';
   if (properties && properties.length > 0) {
     inventario = properties.map(function(p){
     var ops = [];
-    if (p.venta_activa && p.venta_estado !== 'vendida') ops.push('VENTA (' + (p.venta_estado||'disponible') + '): ' + (p.venta_precio ? 'USD ' + p.venta_precio : 'consultar'));
-    if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push('ALQUILER ANUAL (' + (p.anual_estado||'disponible') + '): ' + (p.anual_precio ? '$' + p.anual_precio + '/mes' : 'consultar'));
+    // CAMBIO 13 (segundo lugar, el que corre con el flag ia_rag_v1 OFF): moneda REAL de la columna,
+    // con fallback EXACTO al default de hoy si viene null. Tocar solo _ragOpsProp dejaba a la mitad
+    // de las cuentas (las que no tienen el flag RAG) con el bug intacto.
+    if (p.venta_activa && p.venta_estado !== 'vendida') ops.push('VENTA (' + (p.venta_estado||'disponible') + '): ' + (p.venta_precio ? _monPrefijo(p.venta_moneda, 'USD') + p.venta_precio : 'consultar'));
+    if (p.anual_activa && p.anual_estado !== 'alquilada') ops.push('ALQUILER ANUAL (' + (p.anual_estado||'disponible') + '): ' + (p.anual_precio ? _monPrefijo(p.anual_moneda, 'ARS') + p.anual_precio + '/mes' : 'consultar'));
     if (p.temporal_activa) {
       var ocup = (periodosPorProp[p.id] || []).filter(function(per){ return per.estado === 'ocupado'; });
       var fechasTxt;
@@ -6874,7 +6937,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       } else {
         fechasTxt = ' (sin reservas cargadas: disponible para consultar fechas)';
       }
-      ops.push('ALQUILER TEMPORAL: ' + (p.temporal_precio_dia ? '$' + p.temporal_precio_dia + '/dia (base)' : 'consultar') + fechasTxt);
+      ops.push('ALQUILER TEMPORAL: ' + (p.temporal_precio_dia ? _monPrefijo(p.temporal_moneda, 'ARS') + p.temporal_precio_dia + '/dia (base)' : 'consultar') + fechasTxt);
     }
     if (ops.length === 0 && p.operation) ops.push(p.operation + (p.price ? ': ' + p.price : ''));
     var enc = (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title||'');
@@ -7468,6 +7531,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // que CADA turno cierre el loop. La DERIVACION es la red: puede COMBINAR resolver+derivar o consultar+derivar en el
     // mismo turno (la IA puede llamar dos herramientas a la vez) para que el lead SIEMPRE quede con una persona.
     _derivacionV3On ? 'REGLA CLAVE (nunca dejes al lead esperando): NO cierres tu mensaje prometiendo una accion futura tuya que no estas ejecutando en ESTE mismo turno. Frases como "ya busco", "ya te averiguo", "te confirmo enseguida", "dejame ver/consultar", "en un ratito te paso" SOLO valen si en este turno realmente usas una herramienta. Tu respuesta tiene que CERRAR el loop, y podes COMBINAR herramientas en el mismo turno: (1) RESOLVER lo que puedas ahora (buscar y entregar info/opciones) y, si el lead necesita avanzar (visita, reserva, seguimiento), DERIVAR ademas a un asesor del area (resolver + derivar); (2) si te falta un dato o una POLITICA del negocio (por ejemplo "alquiler con opcion a compra", planes o condiciones especiales que el inventario no distingue), CONSULTAR al dueno con la herramienta Y DERIVAR a un asesor del area en el MISMO turno, para que una persona siga con el lead mientras llega la respuesta (consultar + derivar); (3) si no podes resolverlo, DERIVAR directo. La derivacion es tu red de seguridad: ante la duda, resolve lo que puedas y deriva. NUNCA dejes al lead con una promesa tuya sin una herramienta atras.' : '',
+    // CORRECCION D1 (Diego 2026-07-28): la IA NUNCA dice "no disponible" (suena tosco y deja al lead sin salida).
+    // UNA sola linea, y SOLO con derivacion_v3 ON: si la tool derivar_a_humano no existe, pedirle que derive seria
+    // una regla que no puede cumplir (Diego: "no quiero agregar cosas al prompt al pedo si no las cumple").
+    // El resto ya esta cubierto por reglas vigentes: "usa SOLO estas propiedades" y la REGLA CLAVE de arriba.
+    _derivacionV3On ? 'Si el lead pregunta por una propiedad puntual que NO figura en tu listado, o de la que no tenes el precio o la condicion confirmada: NO digas "no disponible" ni inventes nada. Deci que no contas con esa informacion y derivá con derivar_a_humano al departamento que corresponda.' : '',
+    // TEMPORADA VENCIDA: esta linea SOLO aparece si de verdad hay alguna propiedad cuyo precio por noche
+    // quedo de una temporada ya terminada (_hayTemporadaVencida). En las cuentas donde no pasa, el prompt
+    // queda BYTE-IDENTICO. Es la salida que aprobo Diego: no citar el precio viejo, avisar que todavia no
+    // salieron los de la temporada que viene, ofrecer avisarle y tomarle los datos.
+    _hayTemporadaVencida ? 'ALQUILER TEMPORAL: los precios por noche de la proxima temporada TODAVIA NO estan publicados (los que figuran como "consultar" son justamente esos). Si te preguntan por fechas de esa temporada, deci con naturalidad que todavia no salieron, ofrecele avisarle apenas se publiquen y tomale los datos y las fechas que busca. NUNCA cites como vigente un precio de una temporada que ya paso.' : '',
     (settings && settings.negocio_descripcion) ? ('SOBRE EL NEGOCIO (lo que el dueno te conto; usalo para hablar con criterio del negocio y recomendar lo que de verdad le conviene a cada cliente): ' + settings.negocio_descripcion) : '',
     (settings && settings.horario_oficina && _horarioLegible(settings.horario_oficina)) ? ('HORARIO DE ATENCION de la oficina (si el lead pregunta cuando pueden atenderlo, visitarlos, llamar, o si estan abiertos, deciselo con naturalidad; NO inventes horarios distintos a estos): ' + _horarioLegible(settings.horario_oficina) + '. (Zona horaria Argentina.)') : '',
     '', 'Base de conocimiento de la empresa:', kb, '',
@@ -9846,7 +9919,10 @@ async function responderConsultaAdmin(user_id, pregunta) {
       const matches = [];
       props.forEach(function (p) {
         const zonaP = norm(p.zone), tipoP = norm(p.type), tokP = tokensZona(p.zone);
-        const precioP = typeof p.price === 'number' ? p.price : Number(String(p.price || '').replace(/[^0-9]/g, '')) || 0;
+        // CAMBIO 20 (mismo bug que el matcher de oportunidades): el precio se leia tirando la moneda,
+        // asi que una propiedad de U$S 30.000 matcheaba con un presupuesto de $30.000.
+        const _pmR = _mtchPrecioMoneda(p);
+        const precioP = _pmR.precio || 0, monedaP = _pmR.moneda;
         const candidatos = [];
         leads.forEach(function (l) {
           const est = estadoContacto[l.id];
@@ -9858,7 +9934,7 @@ async function responderConsultaAdmin(user_id, pregunta) {
           if (zonaP && (texto.indexOf(zonaP) >= 0)) { score += 2; motivos.push('zona'); }
           else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
           if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
-          if (precioP > 0) {
+          if (precioP > 0 && _mtchMonedaCompatible(monedaP, (l.budget || '') + ' ' + (l.interest || ''))) {
             const presup = numPresupuesto((l.budget || '') + ' ' + (l.interest || ''));
             if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
           }
@@ -12923,6 +12999,43 @@ function _mtchNorm(s) { return String(s == null ? '' : s).toLowerCase().normaliz
 function _mtchTokensZona(s) { return _mtchNorm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(function (w) { return w.length >= 4; }); }
 function _mtchNums(s) { var m = _mtchNorm(s).replace(/\./g, '').match(/\d{4,}/g); return m ? m.map(Number) : []; }
 
+// ===== CAMBIO 20: el matcher tambien tiraba la moneda =====
+// Antes: Number(String(p.price).replace(/[^0-9]/g,'')) -> "U$S 30.000" quedaba en 30000 y se comparaba
+// contra un presupuesto en PESOS (y "Desde $80.000 hasta $120.000" se pegaba en 80000120000).
+// Ahora: se prefieren las columnas estructuradas con su moneda y, si no hay, se lee el texto con el
+// parser central (numero + moneda). Devuelve { precio, moneda }.
+function _mtchPrecioMoneda(p) {
+  var vacio = { precio: 0, moneda: null };
+  try {
+    if (!p) return vacio;
+    var cands = [
+      { v: p.venta_precio, m: p.venta_moneda, on: p.venta_activa !== false },
+      { v: p.anual_precio, m: p.anual_moneda, on: p.anual_activa === true },
+      { v: p.temporal_precio_dia, m: p.temporal_moneda, on: p.temporal_activa === true }
+    ];
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (!c.on || c.v == null || c.v === '') continue;
+      var n = Number(c.v);
+      if (isFinite(n) && n > 0) return { precio: n, moneda: (c.m === 'USD' || c.m === 'ARS') ? c.m : null };
+    }
+    if (typeof p.price === 'number' && isFinite(p.price)) return { precio: p.price, moneda: null };
+    var nums = _ppNumeros(String(p.price == null ? '' : p.price));
+    var uniq = nums.filter(function (v, ix, a) { return a.indexOf(v) === ix; });
+    if (uniq.length !== 1) return { precio: 0, moneda: _ppMoneda(p.price) }; // ambiguo -> no se compara precio
+    return { precio: uniq[0], moneda: _ppMoneda(p.price) };
+  } catch (e) { return vacio; }
+}
+// El presupuesto del lead es texto libre. Solo se DESCARTA el punto de "presupuesto" cuando hay un
+// CONFLICTO EXPLICITO de moneda (propiedad en USD vs lead que habla en pesos, o al reves). Si alguno
+// de los dos no dice la moneda, se puntua como hasta hoy (fail-open: no perdemos matches).
+function _mtchMonedaCompatible(monedaProp, textoLead) {
+  if (!monedaProp) return true;
+  var monLead = _ppMoneda(textoLead);
+  if (!monLead) return true;
+  return monLead === monedaProp;
+}
+
 // Umbral del matching. score: zona exacta=+2, zona~(token)=+1, tipo=+1, presupuesto en rango=+1.
 // MIN=2 => zona exacta sola, o (zona~ + tipo), o (zona~ + presupuesto), o (tipo + presupuesto).
 // Conservador para reducir falsos positivos (la salida es un BORRADOR que el dueno filtra). CERO IA.
@@ -12935,7 +13048,8 @@ async function _matchLeadsParaPropiedad(ownerId, prop) {
   var out = [];
   try {
     var zonaP = _mtchNorm(prop && prop.zone), tipoP = _mtchNorm(prop && prop.type), tokP = _mtchTokensZona(prop && prop.zone);
-    var precioP = (prop && typeof prop.price === 'number') ? prop.price : (Number(String((prop && prop.price) || '').replace(/[^0-9]/g, '')) || 0);
+    var _pm = _mtchPrecioMoneda(prop);
+    var precioP = _pm.precio || 0, monedaP = _pm.moneda;
     if (!zonaP && !tipoP && !(precioP > 0) && !(tokP && tokP.length)) return []; // sin ninguna senal util -> no matchear
     // 1) conversations del tenant (id, contact_id, status) PAGINADAS. Nos quedamos con la 1a conv NO cerrada por contacto.
     var convByContact = {};
@@ -12964,7 +13078,7 @@ async function _matchLeadsParaPropiedad(ownerId, prop) {
         if (zonaP && texto.indexOf(zonaP) >= 0) { score += 2; motivos.push('zona'); }
         else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
         if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
-        if (precioP > 0) {
+        if (precioP > 0 && _mtchMonedaCompatible(monedaP, (l.budget || '') + ' ' + (l.interest || ''))) {
           var presup = _mtchNums((l.budget || '') + ' ' + (l.interest || ''));
           if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
         }
@@ -12985,7 +13099,15 @@ async function _propMatchDesdeProperty(ownerId, propertyId) {
     if (!pq || pq.error || !pq.data) return null;
     var p = pq.data;
     var precio = p.price || p.venta_precio || p.anual_precio || p.temporal_precio_dia || null;
-    return { prop: { zone: p.zone, type: p.type, price: precio }, label: (p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : '') };
+    // CAMBIO 20: se pasan tambien las columnas ESTRUCTURADAS (precio + moneda por operacion) para que el
+    // matcher compare peras con peras. Si la migracion de monedas no corrio, esos campos vienen undefined
+    // y _mtchPrecioMoneda cae al texto de `price` -> mismo comportamiento que hoy pero con la moneda leida.
+    return { prop: {
+      zone: p.zone, type: p.type, price: precio,
+      venta_activa: p.venta_activa, venta_precio: p.venta_precio, venta_moneda: p.venta_moneda,
+      anual_activa: p.anual_activa, anual_precio: p.anual_precio, anual_moneda: p.anual_moneda,
+      temporal_activa: p.temporal_activa, temporal_precio_dia: p.temporal_precio_dia, temporal_moneda: p.temporal_moneda
+    }, label: (p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : '') };
   } catch (e) { return null; }
 }
 async function _propMatchDesdeUnidad(ownerId, developmentId, unitId) {
@@ -20509,7 +20631,10 @@ function _mapearPropWpJsonADetalle(p, urlOriginal, mediaMap) {
   var estadoTax = _taxNombre(emb, 'property_status') || '';
   // normalizar a lo que entiende el front: Venta / Alquiler anual / Alquiler temporario
   var op = detectarOperacion(estadoTax, titulo + ' ' + descripcion.substring(0, 200));
-  campos['Estado'] = (op === 'temporal') ? 'Alquiler temporario' : (op === 'anual') ? 'Alquiler anual' : 'Venta';
+  // CAMBIO 5: si NO se reconoce la operacion Y la taxonomia no dice nada, ya NO se inventa 'Venta'.
+  // Se deja la clave AUSENTE: el que consume decide (el parser central lo manda a dudas). Cuando la
+  // taxonomia SI dice algo, el valor normalizado queda EXACTAMENTE como hoy (cero cambio para el front).
+  if (op || estadoTax) campos['Estado'] = (op === 'temporal') ? 'Alquiler temporario' : (op === 'anual') ? 'Alquiler anual' : 'Venta';
 
   // --- Ambientes / habitaciones / banos / cochera ---
   var ambientes = _metaVal(meta, 'fave_property_rooms');
@@ -20574,7 +20699,11 @@ function _mapearPropWpJsonADetalle(p, urlOriginal, mediaMap) {
   // si por algun motivo no hay galeria pero si portada, dejar al menos la portada en fotos
   if (fotos.length === 0 && foto) fotos.push(foto);
 
-  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, foto: foto, fotos: fotos, _idsGaleria: idsGaleria, wpjson: true };
+  // `estado_crudo`: la taxonomia property_status TAL CUAL ("Alquiler anual, En Venta"). ADITIVO y aparte de
+  // campos['Estado'] (que sigue colapsado a UNA operacion por compatibilidad con el front de hoy). Sin esto,
+  // el parser central veria una sola operacion en las fichas resueltas por wp-json y perderia el caso que
+  // origino todo el problema (un precio + varias operaciones en el mismo Estado).
+  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, estado_crudo: estadoTax || null, foto: foto, fotos: fotos, _idsGaleria: idsGaleria, wpjson: true };
 }
 
 // Resuelve EN BLOQUE un set de IDs de adjuntos WordPress a sus source_url.
@@ -21228,6 +21357,25 @@ app.post('/api/scrape/detalle', async function(req, res) {
       const procesados = await _mapConcurrente(pendientes, 6, procesarUnaUrlHtml);
       for (var ip = 0; ip < procesados.length; ip++) resultados[idxPendiente[ip]] = procesados[ip];
     }
+    // ===== CAMBIO 10: `operaciones` — UNA SOLA FUENTE DE REGLAS PARA EL FRONT =====
+    // Este endpoint es SOLO LECTURA (no escribe nada) y sigue devolviendo TODO lo de antes: `operaciones`
+    // se AGREGA a cada resultado. El importador del front deja de derivar operacion/precio/moneda por su
+    // cuenta (era el origen del envenenamiento: copiaba el MISMO numero a todas las operaciones y tiraba
+    // la moneda) y muestra lo que dice el parser, incluidas las `dudas` para que el humano decida ahi.
+    // Contrato: { venta|null, anual|null, temporal|null, no_disponible:{venta,anual}, dudas:[] }.
+    // DEFENSIVO: si algo falla, ese resultado va sin `operaciones` y el front cae a su camino de siempre.
+    try {
+      for (var io = 0; io < resultados.length; io++) {
+        var _r = resultados[io];
+        if (!_r || typeof _r !== 'object' || _r.error) continue;
+        var _c = _r.campos || {};
+        // estado_crudo (wp-json) trae la taxonomia TAL CUAL ("Alquiler anual, En Venta"); campos['Estado']
+        // viene ya colapsado a una sola operacion, por eso el crudo tiene prioridad.
+        var _estadoTxt = _r.estado_crudo || _c['Estado'] || _c['Estado de la propiedad'] || '';
+        var _precioTxt = _c['Precio'] || _c['precio'] || '';
+        _r.operaciones = parsearPrecioFicha(_precioTxt, _estadoTxt);
+      }
+    } catch (eOps) { console.error('[scrape/detalle] operaciones:', eOps && eOps.message); }
     return res.json({ ok: true, resultados: resultados, via_wpjson: Object.keys(resueltasWp).length, via_html: pendientes.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -21679,7 +21827,18 @@ app.post('/api/scrape/universal', async function(req, res) {
     }
 
     // modo reset: borrar el inventario actual del usuario antes de cargar
+    // ⚠ CAMINO DESTRUCTIVO (hueco H1, 2026-07-28): este delete BORRA EL INVENTARIO ENTERO DEL TENANT
+    // (todas las propiedades, incluidas las cargadas A MANO y las que no vienen de esta web) y reinserta
+    // SIN `numero`, asi que se pierde la trazabilidad contra la fuente. No hay backup automatico.
+    // Queda REGISTRADO: se cuenta y se loguea que se va a borrar, y la respuesta lo devuelve para que el
+    // front pueda avisarlo. NO se cambia el comportamiento (el front ya lo usa) — solo deja de ser silencioso.
+    var _borradasReset = null;
     if (modo === 'reset') {
+      try {
+        var _cnt = await supabase.from('properties').select('id', { count: 'exact', head: true }).eq('user_id', user_id);
+        _borradasReset = (_cnt && typeof _cnt.count === 'number') ? _cnt.count : null;
+      } catch (eCnt) {}
+      console.warn('[scrape/universal RESET] BORRANDO el inventario COMPLETO del tenant', user_id, '->', (_borradasReset == null ? '?' : _borradasReset), 'propiedad(es). Es un camino destructivo y sin backup automatico.');
       await supabase.from('properties').delete().eq('user_id', user_id);
     }
 
@@ -21719,7 +21878,9 @@ app.post('/api/scrape/universal', async function(req, res) {
         }
       } catch (e) { errores++; }
     }
-    return res.json({ ok: true, modo: modo, total: props.length, creados: creados, actualizados: actualizados, errores: errores });
+    var _outUni = { ok: true, modo: modo, total: props.length, creados: creados, actualizados: actualizados, errores: errores };
+    if (modo === 'reset') { _outUni.borradas_antes = _borradasReset; _outUni.advertencia = 'El modo "reset" borro TODO el inventario del negocio antes de cargar (incluidas las propiedades cargadas a mano). Si no era lo que querias, hay que recargarlas.'; }
+    return res.json(_outUni);
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -26183,13 +26344,348 @@ function detectarNumeroProp(pares, titulo, plataformaId) {
   return null;
 }
 // Detecta operacion y devuelve flags
+// CAMBIO 5 (Diego 2026-07-28): SE SACA EL DEFAULT SILENCIOSO A VENTA. Antes esta funcion terminaba en
+// `return 'venta'`: una ficha sin operacion reconocible se guardaba como VENTA (caso Omar) y la IA la ofrecia
+// como tal. Ahora devuelve null = "no se sabe" y el que llama decide (el parser central lo manda a DUDAS).
+// Los 3 call sites toleran null: /api/scrape/universal escribe `operation: p.operacion || null` (columna
+// nullable, el prompt solo la usa como fallback si no hay operaciones activas) y el mapeo wp-json ya no
+// inventa un Estado (ver _mapearPropWpJsonADetalle).
 function detectarOperacion(estado, textoExtra) {
   var t = ((estado || '') + ' ' + (textoExtra || '')).toLowerCase();
   if (/tempora|por noche|por dia|por d.a|alquiler temporal|temporario|veraneo|diaria/.test(t)) return 'temporal';
   if (/anual|alquiler anual|alquiler permanente|todo el a.o/.test(t)) return 'anual';
   if (/alquiler|renta|rent/.test(t)) return 'anual';
   if (/venta|vende|compra|sale/.test(t)) return 'venta';
-  return 'venta';
+  return null;
+}
+
+// ============================================================================
+// PARSER CENTRAL DE PRECIO + OPERACION DE UNA FICHA  —  parsearPrecioFicha()
+// ----------------------------------------------------------------------------
+// CERO IA: parsing 100% determinista (regex + reglas). NO llama a ningun modelo.
+//
+// POR QUE EXISTE (incidente 2026-07-28, lead Alejandro Cabrera / cuenta Anton): la ficha de la web trae UN
+// solo precio ("U$S 30.000") y un Estado con VARIAS operaciones ("Alquiler anual, En Venta"). El importador
+// copiaba el MISMO numero a TODAS las operaciones y tiraba la moneda -> la IA ofrecio locales EN VENTA en
+// dolares como "alquiler mensual en pesos" y le juro al lead dos veces que eran pesos.
+//
+// REGLA DE ORO (Diego): "si esta el campo claro de valores, bien; si hay discrepancia, que consulte antes."
+//   -> Solo se devuelve un numero para una operacion cuando el TEXTO lo confirma. Todo lo demas va a `dudas`
+//      (y el que llama NO lo escribe: lo manda a la cola de revision humana).
+//
+// CONTRATO DE SALIDA (fijado con el agente del front — respetarlo EXACTO):
+//   {
+//     venta:    { precio: <number|null>, moneda: 'USD'|'ARS'|null } | null,
+//     anual:    { precio: <number|null>, moneda: 'USD'|'ARS'|null } | null,
+//     temporal: { precio_dia: <number|null>, moneda: 'USD'|'ARS'|null } | null,
+//     no_disponible: { venta: <bool>, anual: <bool> },
+//     dudas: [ { campo, motivo, valor_visto } ]
+//   }
+//   null en una operacion = esa operacion NO se ofrece.
+//   precio null con la operacion presente = "a consultar" (la ofrece pero el precio no esta confirmado).
+//   `temporal_temporada` es un EXTRA informativo (no rompe el contrato): la marca de temporada del precio
+//   ("(DIC)", "verano 2026"). NO se escribe en la base (ver nota de temporada mas abajo).
+// ============================================================================
+function _ppNorm(s) {
+  return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+}
+// "30.000" -> 30000 | "1.234.567,89" -> 1234567.89 | "45,000" -> 45000. null si no hay numero sano.
+function _ppANumero(s) {
+  var t = String(s == null ? '' : s).trim();
+  if (!/\d/.test(t)) return null;
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(t)) t = t.replace(/\./g, '').replace(',', '.');        // es-AR
+  else if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(t)) t = t.replace(/,/g, '');                       // en-US
+  else if (/^\d+,\d{1,2}$/.test(t)) t = t.replace(',', '.');                                    // decimal con coma
+  else if (/^\d+[.,]\d{3}$/.test(t)) t = t.replace(/[.,]/g, '');                                // miles suelto
+  else t = t.replace(/[.,]/g, '');
+  var n = Number(t);
+  return isFinite(n) ? n : null;
+}
+function _ppNumeros(txt) {
+  var out = [], m, re = /\d[\d.,]*/g, s = String(txt == null ? '' : txt);
+  while ((m = re.exec(s)) !== null) {
+    var crudo = m[0].replace(/[.,]+$/, '');
+    var n = _ppANumero(crudo);
+    if (n != null) out.push(n);
+  }
+  return out;
+}
+// Moneda EXPLICITA del texto. USD gana siempre (U$S contiene un '$', si no todo seria ARS). null = no se sabe.
+function _ppMoneda(txt) {
+  var t = _ppNorm(txt);
+  if (/u\$s|us\$|u\$d|\busd\b|dolar|dolares/.test(t)) return 'USD';
+  if (/\bars\b|\bpesos?\b|\$/.test(t)) return 'ARS';
+  return null;
+}
+// Marcas de OPERACION dentro del TEXTO DEL PRECIO (lo unico que CONFIRMA la semantica del numero).
+var _PP_RE_TEMPORAL = /por noche|x noche|\/ ?noche|por dia|x dia|\/ ?dia\b|diaria|la noche|el dia\b/;
+var _PP_RE_ANUAL = /\/ ?mes\b|por mes|mensual|x mes|al mes/;
+// Operaciones NOMBRADAS en el Estado de la ficha (puede nombrar varias: "Alquiler anual, En Venta").
+function _ppOpsEstado(estadoTxt) {
+  var t = _ppNorm(estadoTxt);
+  var ops = { venta: false, anual: false, temporal: false };
+  if (/tempora|veraneo|verano|por noche|por dia|diaria/.test(t)) ops.temporal = true;
+  if (/alquiler anual|alquiler permanente|\banual\b|todo el ano|alquiler mensual/.test(t)) ops.anual = true;
+  if (/en venta|\bventa\b|\bvende\b|\bvendo\b|vendid[ao]s?/.test(t)) ops.venta = true;
+  if (/alquilad[ao]s?/.test(t) && !ops.temporal) ops.anual = true;
+  // "Alquiler" a secas (sin anual ni temporal): se mantiene el criterio historico de detectarOperacion (anual).
+  if (!ops.anual && !ops.temporal && /\balquiler\b|\balquila\b|\brenta\b/.test(t)) ops.anual = true;
+  return ops;
+}
+function _ppFlagsEstado(estadoTxt) {
+  var t = _ppNorm(estadoTxt);
+  return {
+    noDisp: /no disponible|no-disponible|nodisponible|no esta disponible|dado de baja/.test(t),
+    vendida: /vendid[ao]s?/.test(t),
+    alquilada: /alquilad[ao]s?/.test(t),
+    reservada: /reservad[ao]s?/.test(t)
+  };
+}
+// ============================================================================
+// TEMPORADAS (Diego 2026-07-28: "ojo que existen temporadas de invierno y verano, hay que saber distinguir")
+// ----------------------------------------------------------------------------
+// Costa argentina (Villa Gesell). Dos temporadas reales, con RANGOS DE FECHAS distintos:
+//   VERANO   : 1-dic (año Y-1) -> 31-mar (año Y).  Se NOMBRA por el año en que TERMINA:
+//              "verano 2026" = dic-2025 a mar-2026 (misma convencion que uso Diego).
+//   INVIERNO : todo julio (vacaciones de invierno). "invierno 2026" = jul-2026.
+//   OTRO MES : cualquier otra marca ((SEP), (OCT)...) se resuelve como ESE MES del año que
+//              corresponda. No se fuerza a una de las dos temporadas: se informa como esta.
+// Sin esto, el año que viene un precio de julio se ofreceria en enero.
+//
+// 🔑 REGLA DEL AÑO (la marca "(DIC)" NO trae año) — DOCUMENTADA A PROPOSITO:
+//   1) Si el texto trae año explicito ("(DIC 2026)", "verano 2027") se usa ESE. No se infiere nada.
+//   2) Si no lo trae, se toma la ULTIMA temporada de ese tipo que YA HABIA EMPEZADO en la fecha de
+//      referencia (`fechaRef` = la fecha en la que se vio el precio publicado por primera vez).
+//      Fundamento: la web NO publica precios de una temporada que todavia no arranco (Diego confirmo
+//      que a julio-2026 la temporada 2027 seguia sin publicarse). Por eso una marca sin año es SIEMPRE
+//      de una temporada ya iniciada, nunca de una futura.
+//   3) El sesgo del error es DELIBERADO. Equivocarse hacia "temporada vieja" hace que la IA diga que
+//      todavia no hay precios publicados (no miente, a lo sumo pierde una consulta). Equivocarse hacia
+//      "temporada nueva" haria que la IA cotice un precio VIEJO como vigente: eso es exactamente el bug
+//      que estamos arreglando. Siempre se elige el error seguro.
+//   4) CASO AMBIGUO -> DUDA: si la temporada inferida ya estaba vencida en `fechaRef` PERO la proxima
+//      arranca dentro de los 90 dias, no se puede distinguir "precio viejo" de "precio adelantado" ->
+//      se resuelve igual (a la vieja, por el punto 3) y ADEMAS se genera una duda para que lo mire un
+//      humano. Ejemplo real: un "(JUL)" visto el 26-jun.
+//   5) La VIGENCIA no se congela: se guarda el RANGO DE FECHAS, asi que la temporada vence sola cuando
+//      pasa su fecha de fin. No hay ningun campo de texto que quede desactualizado.
+// ============================================================================
+var _PP_MESES = { ene: 1, feb: 2, mar: 3, abr: 4, may: 5, jun: 6, jul: 7, ago: 8, sep: 9, set: 9, oct: 10, nov: 11, dic: 12 };
+var _PP_MES_NOMBRE = { 1: 'enero', 2: 'febrero', 3: 'marzo', 4: 'abril', 5: 'mayo', 6: 'junio', 7: 'julio', 8: 'agosto', 9: 'septiembre', 10: 'octubre', 11: 'noviembre', 12: 'diciembre' };
+var _PP_MS_DIA = 24 * 60 * 60 * 1000;
+function _ppISO(y, m, d) { return String(y) + '-' + (m < 10 ? '0' : '') + m + '-' + (d < 10 ? '0' : '') + d; }
+function _ppUltimoDia(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
+function _ppFechaRef(f) {
+  var d = null;
+  try { d = (f instanceof Date) ? f : (f ? new Date(f) : new Date()); } catch (e) { d = new Date(); }
+  if (!d || isNaN(d.getTime())) d = new Date();
+  return d;
+}
+// Devuelve el rango de una temporada concreta. tipo: 'verano' | 'invierno' | 'mes'.
+function _ppRangoTemporada(tipo, anio, mes) {
+  if (tipo === 'verano') return { tipo: 'verano', etiqueta: 'verano ' + anio, desde: _ppISO(anio - 1, 12, 1), hasta: _ppISO(anio, 3, 31) };
+  if (tipo === 'invierno') return { tipo: 'invierno', etiqueta: 'invierno ' + anio, desde: _ppISO(anio, 7, 1), hasta: _ppISO(anio, 7, 31) };
+  return { tipo: 'mes', etiqueta: (_PP_MES_NOMBRE[mes] || 'temporada') + ' ' + anio, desde: _ppISO(anio, mes, 1), hasta: _ppISO(anio, mes, _ppUltimoDia(anio, mes)) };
+}
+// Lee la marca de temporada del texto del precio. Devuelve null si no hay ninguna.
+function _ppMarcaTemporada(txt) {
+  var t = _ppNorm(txt);
+  // 1) Marca de temporada con nombre: "verano 2027", "invierno 2026", "temporada 2026".
+  var mNombre = t.match(/\b(verano|invierno|temporada)\s*(?:20)?(\d{2})\b/);
+  // 2) Marcas de MES entre parentesis: "(DIC)", "(ENE 2027)", "(dic.)". Puede haber varias.
+  var meses = [], mm, reMes = /\((ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\.?\s*(20\d{2})?\)/g;
+  while ((mm = reMes.exec(t)) !== null) meses.push({ mes: _PP_MESES[mm[1]], anio: mm[2] ? Number(mm[2]) : null });
+  var distintos = {};
+  meses.forEach(function (x) { distintos[x.mes] = 1; });
+  if (Object.keys(distintos).length > 1) return { ambigua: true, motivo: 'el precio tiene marcas de mas de una temporada distinta' };
+  if (!meses.length && !mNombre) return null;
+  var out = { ambigua: false, mes: meses.length ? meses[0].mes : null, anio: meses.length ? meses[0].anio : null, tipoNombrado: null };
+  if (mNombre) {
+    var anioN = Number(mNombre[2] < 100 ? ('20' + mNombre[2]) : mNombre[2]);
+    if (mNombre[1] === 'verano' || mNombre[1] === 'invierno') out.tipoNombrado = mNombre[1];
+    if (!out.anio) out.anio = anioN;
+    else if (out.anio !== anioN && out.tipoNombrado !== 'verano') return { ambigua: true, motivo: 'el precio nombra dos años de temporada distintos' };
+  }
+  return out;
+}
+// Resuelve la marca a una temporada CONCRETA (con rango de fechas), usando fechaRef para inferir el año.
+// Devuelve { tipo, etiqueta, desde, hasta, anio_inferido:bool, duda:{motivo}|null } o null.
+function _ppResolverTemporada(txt, fechaRef) {
+  var marca = _ppMarcaTemporada(txt);
+  if (!marca) return null;
+  if (marca.ambigua) return { ambigua: true, duda: { motivo: marca.motivo } };
+  var R = _ppFechaRef(fechaRef);
+  var Ry = R.getUTCFullYear(), Rm = R.getUTCMonth() + 1;
+  var mes = marca.mes;
+  var tipo = marca.tipoNombrado || (mes == null ? null : ((mes === 12 || mes === 1 || mes === 2 || mes === 3) ? 'verano' : (mes === 7 ? 'invierno' : 'mes')));
+  if (!tipo) return null;
+  var anio = null, inferido = false;
+  if (marca.anio != null) {
+    // Año EXPLICITO. Para verano se convierte el año CALENDARIO del mes al año que NOMBRA la temporada
+    // (dic-2026 -> "verano 2027"); si vino como "verano 2027" ya es el año de la temporada.
+    if (tipo === 'verano') anio = (mes === 12) ? (marca.anio + 1) : marca.anio;
+    else anio = marca.anio;
+  } else {
+    inferido = true;
+    if (tipo === 'verano') anio = ((Rm === 12) ? Ry : (Ry - 1)) + 1;      // ultima que arranco un 1-dic
+    else if (tipo === 'invierno') anio = (Rm >= 7) ? Ry : (Ry - 1);       // ultima que arranco un 1-jul
+    else anio = (Rm >= mes) ? Ry : (Ry - 1);                              // ultimo 1 de ese mes
+  }
+  var r = _ppRangoTemporada(tipo, anio, mes);
+  r.anio_inferido = inferido;
+  r.duda = null;
+  // Año explicito imposible (mas de un año en el futuro): la web no puede estar publicando eso.
+  if (!inferido && (anio - Ry) > 1) r.duda = { motivo: 'la temporada que dice el precio (' + r.etiqueta + ') esta demasiado adelante para estar publicada' };
+  // Ambiguedad del punto 4: ya vencida al verla, pero la proxima arranca en menos de 90 dias.
+  if (inferido && r.duda === null) {
+    var finR = new Date(r.hasta + 'T00:00:00Z');
+    if (finR.getTime() < R.getTime()) {
+      var prox = _ppRangoTemporada(tipo, anio + 1, mes);
+      var iniProx = new Date(prox.desde + 'T00:00:00Z');
+      if ((iniProx.getTime() - R.getTime()) <= 90 * _PP_MS_DIA) {
+        r.duda = { motivo: 'la marca de temporada no trae año y la proxima (' + prox.etiqueta + ') arranca enseguida: no se sabe si el precio es viejo o adelantado' };
+      }
+    }
+  }
+  return r;
+}
+// `fechaRef` (3er parametro, OPCIONAL y ADITIVO — no cambia el contrato de 2 argumentos): fecha en la
+// que se vio publicado este precio. Solo se usa para inferir el AÑO de una marca de temporada sin año
+// (ver REGLA DEL AÑO arriba). Si no se pasa, se usa la fecha de hoy.
+function parsearPrecioFicha(precioTxt, estadoTxt, fechaRef) {
+  var out = {
+    venta: null, anual: null, temporal: null,
+    no_disponible: { venta: false, anual: false },
+    dudas: [],
+    temporal_temporada: null,   // etiqueta legible ('verano 2026'); null si el precio no trae marca
+    temporada: null             // { tipo, etiqueta, desde, hasta, anio_inferido } con el RANGO de fechas
+  };
+  function duda(campo, motivo, valor) {
+    out.dudas.push({ campo: campo, motivo: motivo, valor_visto: String(valor == null ? '' : valor).slice(0, 200) });
+  }
+  try {
+    var pTxt = String(precioTxt == null ? '' : precioTxt);
+    var eTxt = String(estadoTxt == null ? '' : estadoTxt);
+    // "RETASADO"/"OPORTUNIDAD"/"DESDE" son ruido comercial: no cambian ni el numero ni la operacion.
+    // Las MARCAS DE TEMPORADA tambien se sacan ANTES de buscar numeros: si no, el año de "(DIC 2026)"
+    // entraba como un segundo precio y el parser lo mandaba a duda por "mas de un valor distinto".
+    var pNorm = _ppNorm(pTxt)
+      .replace(/\((?:ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\.?\s*(?:20\d{2})?\)/g, ' ')
+      .replace(/\b(?:verano|invierno|temporada)\s*(?:20)?\d{2}\b/g, ' ')
+      .replace(/retasado|oportunidad|oferta|rebajado|precio|desde|hasta/g, ' ');
+    // TEMPORADA: tipo (verano/invierno/mes) + RANGO DE FECHAS. Ver REGLA DEL AÑO arriba.
+    var _temp = _ppResolverTemporada(pTxt, fechaRef);
+    if (_temp && _temp.ambigua) {
+      duda('temporal', _temp.duda.motivo, pTxt);
+    } else if (_temp) {
+      out.temporada = { tipo: _temp.tipo, etiqueta: _temp.etiqueta, desde: _temp.desde, hasta: _temp.hasta, anio_inferido: _temp.anio_inferido };
+      out.temporal_temporada = _temp.etiqueta;
+      if (_temp.duda) duda('temporal', _temp.duda.motivo, pTxt);
+    }
+
+    var moneda = _ppMoneda(pTxt);
+    var ops = _ppOpsEstado(eTxt);
+    var flags = _ppFlagsEstado(eTxt);
+
+    // ---- (1) EL NUMERO ----
+    var nums = _ppNumeros(pNorm);
+    var monto = null;
+    if (nums.length === 1) monto = nums[0];
+    else if (nums.length > 1) {
+      var unicos = nums.filter(function (v, i, a) { return a.indexOf(v) === i; });
+      if (unicos.length === 1) monto = unicos[0];
+      else duda('operacion', 'el texto del precio tiene mas de un valor distinto y no se sabe cual va en cada operacion', pTxt);
+    }
+    if (monto === 0) { duda('operacion', 'el precio publicado es 0', pTxt); monto = null; }
+
+    // ---- (2) QUE OPERACION CONFIRMA EL TEXTO DEL PRECIO ----
+    var opPrecio = null;
+    if (_PP_RE_TEMPORAL.test(pNorm)) opPrecio = 'temporal';
+    else if (_PP_RE_ANUAL.test(pNorm)) opPrecio = 'anual';
+    if (opPrecio === 'temporal') ops.temporal = true;
+    if (opPrecio === 'anual') ops.anual = true;
+
+    // ---- (3) SIN OPERACION RECONOCIBLE -> DUDA, y NADA se escribe (regla 3.7: sin default a Venta) ----
+    if (!ops.venta && !ops.anual && !ops.temporal) {
+      duda('operacion', 'la ficha no dice que operacion es (venta / alquiler anual / alquiler temporal)', (eTxt || pTxt));
+      return out;
+    }
+
+    // Operaciones PRESENTES (ofrecidas) pero todavia sin precio confirmado.
+    if (ops.venta) out.venta = { precio: null, moneda: null };
+    if (ops.anual) out.anual = { precio: null, moneda: null };
+    if (ops.temporal) out.temporal = { precio_dia: null, moneda: null };
+
+    // ---- (4) A QUE OPERACION LE CORRESPONDE EL NUMERO ----
+    var nOps = (ops.venta ? 1 : 0) + (ops.anual ? 1 : 0) + (ops.temporal ? 1 : 0);
+    var destino = null, dudaTemporalYa = false;
+    if (monto != null) {
+      if (opPrecio) destino = opPrecio;                                   // "POR NOCHE"/"/mes": el texto lo confirma
+      else if (nOps === 1) destino = ops.venta ? 'venta' : (ops.anual ? 'anual' : 'temporal');
+      else if (ops.venta && moneda === 'USD') destino = 'venta';          // regla 1: USD sin marca de alquiler = venta
+      // varias operaciones y sin senal clara -> destino null: NADA se escribe, todo a dudas (abajo).
+    }
+    // TEMPORAL ESTRICTO: la tarifa por noche SOLO se acepta si el texto del precio dice "por noche"/"por dia".
+    // Es el caso "U$S 52.000" en una propiedad temporal (Edificio San Jorge): 52.000 de VENTA terminaba
+    // guardado como 52.000 POR NOCHE.
+    if (destino === 'temporal' && opPrecio !== 'temporal') {
+      duda('temporal', 'el precio no dice "por noche" ni "por dia": no se puede confirmar que sea la tarifa diaria', pTxt);
+      dudaTemporalYa = true;
+      destino = null;
+    }
+    if (destino === 'venta') out.venta = { precio: monto, moneda: moneda };
+    else if (destino === 'anual') out.anual = { precio: monto, moneda: moneda };
+    else if (destino === 'temporal') out.temporal = { precio_dia: monto, moneda: moneda };
+
+    // Operaciones ofrecidas que quedaron SIN precio confirmado habiendo un numero en la ficha -> DUDA.
+    if (monto != null) {
+      if (ops.venta && destino !== 'venta') duda('venta', 'la ficha ofrece venta pero el precio publicado no se puede confirmar como precio de venta', pTxt);
+      if (ops.anual && destino !== 'anual') duda('anual', 'la ficha ofrece alquiler anual pero el precio publicado no se puede confirmar como alquiler mensual', pTxt);
+      if (ops.temporal && destino !== 'temporal' && !dudaTemporalYa) duda('temporal', 'la ficha ofrece alquiler temporal pero el precio publicado no se puede confirmar como tarifa por noche', pTxt);
+    }
+
+    // ---- (5) DISPONIBILIDAD — CORRECCION D2: la baja es POR OPERACION, y el TEMPORAL nunca se apaga ----
+    if (flags.vendida && ops.venta) out.no_disponible.venta = true;
+    if (flags.alquilada) {
+      if (ops.temporal) duda('disponibilidad', 'dice alquilada y ademas es alquiler temporal: la baja del temporal va por FECHAS, no se apaga la propiedad', eTxt);
+      else if (ops.anual) out.no_disponible.anual = true;
+    }
+    if (flags.noDisp) {
+      var nNoTemp = (ops.venta ? 1 : 0) + (ops.anual ? 1 : 0);
+      if (nNoTemp === 0) {
+        duda('disponibilidad', 'dice no disponible pero la unica operacion es alquiler temporal: la baja va por FECHAS, no se apaga la propiedad', eTxt);
+      } else if (nNoTemp === 1) {
+        if (ops.venta) out.no_disponible.venta = true; else out.no_disponible.anual = true;
+        if (ops.temporal) duda('disponibilidad', 'dice no disponible y ademas ofrece alquiler temporal: el temporal NO se da de baja (va por fechas)', eTxt);
+      } else {
+        duda('disponibilidad', 'dice no disponible pero ofrece mas de una operacion: no se sabe cual se dio de baja', eTxt);
+      }
+    }
+
+    // ---- (6) CHEQUEOS DE SENSATEZ (cambio 11): cualquiera -> DUDA y NO se escribe el numero ----
+    if (out.anual && out.anual.precio != null && out.anual.moneda === 'USD') {
+      duda('anual', 'alquiler anual en dolares: casi siempre es un precio de VENTA mal asignado', pTxt);
+      out.anual = { precio: null, moneda: null };
+    }
+    if (out.venta && out.anual && out.venta.precio != null && out.venta.precio === out.anual.precio) {
+      duda('venta', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal', pTxt);
+      duda('anual', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal', pTxt);
+      out.venta = { precio: null, moneda: null };
+      out.anual = { precio: null, moneda: null };
+    }
+    if (out.temporal && out.temporal.precio_dia != null) {
+      var pd = out.temporal.precio_dia;
+      var fuera = (out.temporal.moneda === 'USD') ? (pd > 5000 || pd < 5) : (pd > 2000000 || pd < 5000);
+      if (fuera) {
+        duda('temporal', 'la tarifa por noche queda fuera de un rango razonable', pTxt);
+        out.temporal = { precio_dia: null, moneda: null };
+      }
+    }
+  } catch (e) {
+    // Un parser que explota NO puede romper una corrida de scraping: se devuelve "no se sabe nada" + duda.
+    try { out.dudas.push({ campo: 'operacion', motivo: 'no se pudo leer el precio/estado de la ficha', valor_visto: String(precioTxt || '').slice(0, 200) }); } catch (e2) {}
+  }
+  return out;
 }
 
 // M20: alias de extraerPrecioDe (misma logica de extraccion). Antes era una copia byte-identica salvo que
@@ -26330,6 +26826,10 @@ async function procesarPropiedad(p) {
   return {
     numero: numero, titulo: titulo, tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
+    // ADITIVO: el texto CRUDO del Estado de la ficha ("Alquiler anual, En Venta, Oportunidad").
+    // Es lo que necesita parsearPrecioFicha para saber que operaciones ofrece de verdad. Antes se
+    // perdia: solo sobrevivia `operacion`, ya colapsada a UNA sola por detectarOperacion().
+    estado: pares['Estado'] || pares['Estado de la propiedad'] || null,
     ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles, caracteristicas: caract.join(', '), descripcion: descripcion,
     lat: _pin ? _pin.lat : null, lng: _pin ? _pin.lng : null,
     link: link, foto: foto, fotos: fotos, postId: p.id
@@ -26590,6 +27090,8 @@ async function procesarPropiedadURL(url, user_id, permitirIA, ctrlIA) {
   return {
     numero: numero, titulo: titulo || 'Sin titulo', tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
+    // ADITIVO (mismo motivo que en procesarPropiedad): texto CRUDO del Estado para el parser central.
+    estado: pares['Estado'] || pares['Estado de la propiedad'] || null,
     ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles,
     caracteristicas: caract.join(', '), descripcion: descripcion || '',
     lat: _pin ? _pin.lat : null, lng: _pin ? _pin.lng : null,
@@ -27457,11 +27959,18 @@ app.post('/api/scraping-config', async function(req, res) {
       frecuencia: ['dos_por_dia','dias_semana','semanal','mensual'].indexOf(b.frecuencia) >= 0 ? b.frecuencia : 'semanal',
       horarios: Array.isArray(b.horarios) ? b.horarios : [],
       dias_semana: Array.isArray(b.dias_semana) ? b.dias_semana : [],
-      modo: (b.modo === 'directo') ? 'directo' : 'pendiente'
+      // BUG PREEXISTENTE H3 (arreglo aprobado por Diego 2026-07-28): `modo` esta SOBRECARGADO.
+      // Inmobiliaria manda 'directo'|'pendiente'; el HOTEL manda 'ia'|'directo' (app/alojamiento).
+      // Este coercion mandaba TODO lo que no fuera 'directo' a 'pendiente' -> el 'ia' del hotel se
+      // perdia y el switch "usar IA" NO PERSISTIA (se veia apagado siempre al recargar).
+      // Ahora 'ia' se acepta tal cual (el hotel lo lee de vuelta en el GET) y, sobre todo, la
+      // AUTORIDAD pasa a ser la columna ia_habilitada, que ya existe.
+      modo: (b.modo === 'directo') ? 'directo' : ((b.modo === 'ia') ? 'ia' : 'pendiente')
     };
     // SWITCH DE IA para la actualizacion automatica. Solo `true` explicito prende (opt-in);
     // cualquier otra cosa (undefined incluido) apaga -> nunca se prende sola.
-    fila.ia_habilitada = (b.ia_habilitada === true);
+    // El hotel expresa el mismo permiso con modo='ia': se espeja aca para que haya UNA sola autoridad.
+    fila.ia_habilitada = (b.ia_habilitada === true) || (b.modo === 'ia');
     var up = await supabase.from('scraping_config').upsert(fila, { onConflict: 'user_id' }).select().maybeSingle();
     // DEPLOY-SAFE: si migracion-scraper-ia-cron.sql todavia NO corrio, la columna ia_habilitada
     // no existe y PostgREST tira PGRST204 -> el guardado ENTERO fallaria (regresion). Reintentamos
@@ -27478,6 +27987,261 @@ app.post('/api/scraping-config', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+
+// ============================================================================
+// ENGANCHE DEL PARSER EN LA ACTUALIZACION AUTOMATICA  (cambios 6, 7, 8, 9, 12)
+// ----------------------------------------------------------------------------
+// CERO IA. Todo lo de aca abajo es determinista y DEFENSIVO: si las columnas nuevas no existen
+// todavia (migracion-scraper-monedas.sql sin correr), cada helper cae al comportamiento ACTUAL.
+// ============================================================================
+
+// ¿Existen ya las columnas de moneda / no_disponible_web? Una sola query por corrida.
+async function _scrapTieneColsMoneda() {
+  try {
+    var r = await supabase.from('properties').select('venta_moneda, no_disponible_web').limit(1);
+    return !(r && r.error);
+  } catch (e) { return false; }
+}
+function _scrapNum(v) {
+  if (v == null || v === '') return null;
+  var n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+// NUCLEO: dado el resultado del parser y la fila que YA esta en la base, decide QUE se escribe.
+// Devuelve { fila: {...campos a mergear...}, dudas: [...] }.
+//
+// REGLAS (Diego):
+//  - Solo se escribe un precio cuyo TEXTO lo confirma (eso ya lo garantiza parsearPrecioFicha).
+//  - NUNCA se pisa un valor guardado con una inferencia. Si el valor nuevo contradice al guardado en
+//    MONEDA -> duda, no se escribe. Cambio de numero en la MISMA moneda = cambio sano -> se escribe.
+//  - Las operaciones NO se PRENDEN sobre una propiedad existente (podria revivir algo que el dueno
+//    apago a mano). Solo se APAGAN cuando la web declara la baja. En propiedades NUEVAS si se setean.
+//  - CORRECCION D2: la baja es POR OPERACION. Venta/anual se apagan solas; la propiedad entera solo se
+//    apaga si NO queda ninguna operacion viva, y ahi va con pausa_manual=true (sin eso, la corrida
+//    siguiente la revive: ver `fila.activa = ... ex.data.pausa_manual ...` en correrScrapingDeUsuario).
+//    El ALQUILER TEMPORAL NUNCA apaga la propiedad: su no-disponibilidad va por FECHAS
+//    (tabla temporario_periodos). Un "no disponible" sin fechas en una temporal -> DUDA, no apaga nada.
+function _scrapCamposDeParse(parse, ex, tieneCols) {
+  var fila = {}, dudas = [];
+  if (!parse) return { fila: fila, dudas: dudas };
+  var esNueva = !(ex && ex.id);
+  function duda(campo, motivo, valor) { dudas.push({ campo: campo, motivo: motivo, valor_visto: String(valor == null ? '' : valor).slice(0, 200) }); }
+
+  // ---- (a) precios + moneda, operacion por operacion ----
+  var mapa = [
+    { op: 'venta', obj: parse.venta, keyPrecio: 'venta_precio', keyMoneda: 'venta_moneda', keyActiva: 'venta_activa', valor: parse.venta ? parse.venta.precio : null, label: 'venta' },
+    { op: 'anual', obj: parse.anual, keyPrecio: 'anual_precio', keyMoneda: 'anual_moneda', keyActiva: 'anual_activa', valor: parse.anual ? parse.anual.precio : null, label: 'alquiler anual' },
+    { op: 'temporal', obj: parse.temporal, keyPrecio: 'temporal_precio_dia', keyMoneda: 'temporal_moneda', keyActiva: 'temporal_activa', valor: parse.temporal ? parse.temporal.precio_dia : null, label: 'alquiler temporal' }
+  ];
+  // Regla 3.7 (sin default silencioso a Venta): si la ficha NO trae operacion reconocible, una propiedad
+  // NUEVA entra SIN ninguna operacion activa (mas su duda), en vez de heredar el default de la base.
+  if (esNueva && !parse.venta && !parse.anual && !parse.temporal) {
+    fila.venta_activa = false; fila.anual_activa = false; fila.temporal_activa = false;
+  }
+  var confirmados = [];
+  for (var i = 0; i < mapa.length; i++) {
+    var m = mapa[i];
+    if (esNueva && m.obj) fila[m.keyActiva] = true;     // propiedad NUEVA: la web define que ofrece
+    if (!m.obj || m.valor == null) continue;
+    confirmados.push({ op: m.op, valor: m.valor });
+    var viejo = ex ? _scrapNum(ex[m.keyPrecio]) : null;
+    var monNuevo = m.obj.moneda || null;
+    var monViejo = ex ? (ex[m.keyMoneda] || null) : null;
+    if (viejo == null) {                                 // no habia nada cargado -> se completa
+      fila[m.keyPrecio] = m.valor;
+      if (tieneCols && monNuevo) fila[m.keyMoneda] = monNuevo;
+    } else if (viejo === m.valor) {                      // mismo numero -> a lo sumo completar la moneda
+      if (tieneCols && monNuevo && !monViejo) fila[m.keyMoneda] = monNuevo;
+    } else if (monViejo && monNuevo && monViejo !== monNuevo) {
+      duda(m.op, 'el precio de ' + m.label + ' cambio de moneda en la web (' + monViejo + ' -> ' + monNuevo + '): no se pisa solo', m.valor);
+    } else {                                             // cambio de precio en la misma moneda = cambio sano
+      fila[m.keyPrecio] = m.valor;
+      if (tieneCols && monNuevo) fila[m.keyMoneda] = monNuevo;
+    }
+  }
+
+  // ---- (b) FIRMA DEL ENVENENAMIENTO (hueco H2): el MISMO numero que la web confirma para una operacion
+  // ya esta cargado en OTRA operacion que la web NO confirma. Es exactamente lo que paso con los 4 anual y
+  // los 24 "por noche" de Anton. No se corrige solo: se avisa para que lo resuelva un humano.
+  if (ex && ex.id && confirmados.length) {
+    for (var c = 0; c < confirmados.length; c++) {
+      for (var k = 0; k < mapa.length; k++) {
+        var o = mapa[k];
+        if (o.op === confirmados[c].op) continue;
+        if (o.obj && o.valor != null) continue;          // la web tambien confirma esa operacion: no hay conflicto
+        var guardado = _scrapNum(ex[o.keyPrecio]);
+        if (guardado != null && guardado === confirmados[c].valor) {
+          duda(o.op, 'la base tiene ese mismo numero cargado como ' + o.label + ', pero la web lo publica como precio de ' + (confirmados[c].op === 'venta' ? 'venta' : confirmados[c].op === 'anual' ? 'alquiler anual' : 'alquiler temporal'), guardado);
+        }
+      }
+    }
+  }
+
+  // ---- (c) DISPONIBILIDAD (D2) ----
+  var apagarVenta = !!(parse.no_disponible && parse.no_disponible.venta);
+  var apagarAnual = !!(parse.no_disponible && parse.no_disponible.anual);
+  if (apagarVenta) fila.venta_activa = false;
+  if (apagarAnual) fila.anual_activa = false;
+  if ((apagarVenta || apagarAnual) && tieneCols) fila.no_disponible_web = true;
+  if (apagarVenta || apagarAnual) {
+    // "Viva" = la web la sigue ofreciendo O la base la tiene prendida. Mirar SOLO la base seria un
+    // error grave: una propiedad legacy con venta_activa en null que la web publica "En Venta, Alquiler
+    // anual, Alquilada" se apagaria ENTERA por la baja del alquiler, tapando una venta vigente.
+    var vivaVenta = apagarVenta ? false : (!!parse.venta || !!(ex && ex.venta_activa === true));
+    var vivaAnual = apagarAnual ? false : (!!parse.anual || !!(ex && ex.anual_activa === true));
+    var vivaTemp = (!!parse.temporal || !!(ex && ex.temporal_activa === true));
+    if (!vivaVenta && !vivaAnual && !vivaTemp) {
+      // No queda NINGUNA operacion viva -> recien ahi se apaga la propiedad entera.
+      // pausa_manual=true es OBLIGATORIO: es la unica marca que respeta la auto-despausa del cron.
+      // Contrapartida asumida: para el dueno queda igual que una pausa manual. Por eso ademas se
+      // graba no_disponible_web=true, que es lo que permite REVIVIRLA sola si la web la vuelve a publicar.
+      fila.activa = false;
+      fila.pausa_manual = true;
+    }
+  } else if (ex && ex.id && ex.no_disponible_web === true && (parse.venta || parse.anual || parse.temporal)) {
+    // AUTO-CURACION: la web la habia dado de baja y ahora la vuelve a publicar. Como no_disponible_web=true
+    // prueba que la pausa la puso el SISTEMA (no el dueno), se deshace: se reactiva y se reponen las
+    // operaciones que la web confirma hoy. Sin esto, una baja transitoria enterraba la propiedad para siempre.
+    if (tieneCols) fila.no_disponible_web = false;
+    fila.pausa_manual = false;
+    fila.activa = true;
+    if (parse.venta) fila.venta_activa = true;
+    if (parse.anual) fila.anual_activa = true;
+    if (parse.temporal) fila.temporal_activa = true;
+  }
+  return { fila: fila, dudas: dudas };
+}
+
+// ===== TEMPORADAS -> `temporario_periodos` (tabla que YA existe; no se crea nada nuevo) =====
+// El rango de la temporada se guarda como una fila con estado='temporada'. Es un estado NUEVO, y eso es
+// deliberado: los DOS consumidores actuales de esa tabla miran solo estado='ocupado' (el prompt lista las
+// lineas "OCUPADA del X al Y" y el filtro de fechas del RAG descarta por solape), asi que estas filas les
+// son INVISIBLES. Aditivo puro: no bloquean disponibilidad ni cambian nada de lo que ya funciona.
+// `nota` guarda la etiqueta + el TEXTO del precio con el que se derivo: es lo que permite detectar despues
+// si la web republico el precio (texto distinto = publicacion nueva) sin re-fechar lo que no cambio.
+async function _scrapEscribirTemporada(userId, propertyId, temp, precioDia, textoPrecio) {
+  try {
+    if (!userId || !propertyId || !temp || !temp.desde || !temp.hasta || precioDia == null) return 0;
+    await supabase.from('temporario_periodos').delete().eq('property_id', propertyId).eq('estado', 'temporada');
+    var ins = await supabase.from('temporario_periodos').insert({
+      property_id: propertyId, user_id: userId,
+      fecha_desde: temp.desde, fecha_hasta: temp.hasta,
+      estado: 'temporada', precio_dia: precioDia,
+      nota: 'temporada ' + (temp.etiqueta || '') + ' :: ' + String(textoPrecio == null ? '' : textoPrecio).trim().slice(0, 240)
+    });
+    if (ins && ins.error) {
+      // NO se traga el error en silencio: si `temporario_periodos.estado` tuviera un CHECK que no acepte
+      // el valor 'temporada', esta feature quedaria muerta sin que se entere nadie. Queda en el log.
+      console.error('[scraper temporada] no se pudo guardar el periodo de temporada (property ' + propertyId + '):', ins.error.message || ins.error,
+        '-> revisar si `temporario_periodos.estado` admite el valor "temporada".');
+      return 0;
+    }
+    return 1;
+  } catch (e) { console.error('[scraper temporada] excepcion guardando el periodo:', e && e.message); return 0; }
+}
+// Trae de una las temporadas ya derivadas del tenant (1 query por corrida, no una por propiedad).
+async function _scrapTemporadasPrevias(userId) {
+  var mapa = {};
+  try {
+    var r = await supabase.from('temporario_periodos').select('property_id, fecha_desde, fecha_hasta, precio_dia, nota').eq('user_id', userId).eq('estado', 'temporada');
+    if (r && r.error) return mapa;
+    (r.data || []).forEach(function (x) {
+      if (!x || !x.property_id) return;
+      var nota = String(x.nota || ''), i = nota.indexOf(' :: ');
+      mapa[x.property_id] = { desde: x.fecha_desde, hasta: x.fecha_hasta, precio_dia: x.precio_dia, texto: (i >= 0 ? nota.slice(i + 4) : '') };
+    });
+  } catch (e) {}
+  return mapa;
+}
+// ANCLA DE FECHA para inferir el año de una marca sin año (ver REGLA DEL AÑO en el parser):
+//  - ya hay temporada derivada y el texto del precio NO cambio -> se ancla en el inicio de ESA temporada,
+//    con lo que se re-deriva exactamente la misma (la temporada NO se re-fecha sola en cada corrida);
+//  - hay temporada derivada pero el texto CAMBIO -> es una publicacion nueva -> se ancla en HOY (null);
+//  - no hay nada derivado -> se ancla en el alta de la propiedad (la fecha mas temprana en la que podemos
+//    probar que ese precio ya estaba publicado). Ojo: el alta es cuando se scrapeo, no cuando la web lo
+//    publico, pero como ancla EMPUJA HACIA ATRAS, que es el lado seguro del error.
+function _scrapAnclaTemporada(prev, precioTxt, createdAt) {
+  var texto = String(precioTxt == null ? '' : precioTxt).trim().slice(0, 240);
+  if (prev && prev.texto === texto) return prev.desde;
+  if (prev) return null;
+  return createdAt || null;
+}
+// Sincroniza la temporada de UNA propiedad. Devuelve 1 si escribio, 0 si no habia nada que cambiar.
+async function _scrapSincronizarTemporada(userId, propertyId, parse, precioTxt, prev) {
+  try {
+    if (!propertyId) return 0;
+    var t = (parse && parse.temporada) ? parse.temporada : null;
+    var precio = (parse && parse.temporal) ? parse.temporal.precio_dia : null;
+    if (!t || precio == null) {
+      // El precio publicado ya no trae marca de temporada (o no se pudo confirmar): la fila vieja quedo
+      // sin respaldo -> se borra. Nunca se deja una temporada colgada de un precio que ya no existe.
+      if (prev) { try { await supabase.from('temporario_periodos').delete().eq('property_id', propertyId).eq('estado', 'temporada'); } catch (eD) {} }
+      return 0;
+    }
+    if (prev && prev.desde === t.desde && prev.hasta === t.hasta && Number(prev.precio_dia) === Number(precio)) return 0; // nada cambio
+    return await _scrapEscribirTemporada(userId, propertyId, t, precio, precioTxt);
+  } catch (e) { return 0; }
+}
+
+// Guarda UNA duda en la cola de revision (`scraping_pendientes`, tipo_cambio='duda').
+// NO se usa `scrape_jobs`: esa es la cola de DESARROLLADORA y su runner toma el pendiente mas viejo
+// SIN filtrar por tipo -> una duda ahi la mata como error y bloquea la cola de emprendimientos.
+// `datos_nuevos` NO lleva ningun campo de properties a proposito: aunque alguien la "acepte", no hay
+// nada que aplicar (ademas /aceptar saltea explicitamente las dudas).
+async function _scrapRegistrarDuda(userId, p, propertyId, dudas) {
+  try {
+    if (!dudas || !dudas.length) return 0;
+    var r = await supabase.from('scraping_pendientes').insert({
+      user_id: userId,
+      numero: String(p && p.numero != null ? p.numero : ''),
+      tipo_cambio: 'duda',
+      titulo: (p && p.titulo) || 'Sin titulo',
+      datos_nuevos: {
+        dudas: dudas,
+        price_texto: (p && p.precio) || null,
+        estado_texto: (p && p.estado) || null,
+        link: (p && p.link) || null,
+        aplicar: false
+      },
+      datos_viejos: null,
+      property_id: propertyId || null
+    });
+    return (r && r.error) ? 0 : 1;
+  } catch (e) { return 0; }
+}
+
+// CORRECCION D3 — EL AVISO. UNO SOLO POR CORRIDA (nunca uno por propiedad).
+// Reusa el mapa de avisos que YA funciona, sin construir ningun canal nuevo:
+//   1) _postearAvisoInterno(owner, 'general', texto, { soloRegistro: true })
+//        -> deja el aviso escrito en el canal interno "Todos" (team_messages), firmado "Sistema",
+//           SIN disparar el push masivo a todo el equipo (eso es lo que hace soloRegistro).
+//   2) _pushDuenoAdmins(owner, texto)
+//        -> push (app Android/FCM) al DUENO y a los ADMINISTRADORES. enviarPushAsesor ademas espeja
+//           el mismo texto por WhatsApp al numero del usuario si el tenant tiene notif_dm_wa_on ON.
+// Es EXACTAMENTE el patron que ya usa el aviso de citas (ver _avisarCitaEquipoCanales). 0 tokens IA.
+async function _scrapAvisarDudas(ownerId, cantidad) {
+  try {
+    if (!ownerId || !cantidad || cantidad < 1) return;
+    // Texto LARGO -> queda escrito en el canal "Todos" (ahi entra completo, con el link).
+    var textoCanal = 'Actualizacion de inventario: ' + cantidad + ' precio(s) para confirmar. '
+      + 'La web publica datos que no se pueden interpretar solos (no queda claro la moneda o a que operacion corresponde el precio), '
+      + 'asi que NO se tocaron para no ensuciar el inventario. Revisalos en Automatizacion: ' + FRONTEND_URL + '/automatizacion';
+    // Texto CORTO -> el push recorta el cuerpo a 120 caracteres; si mandaramos el largo, el aviso llegaria
+    // cortado a la mitad y sin el link. Este entra entero en la notificacion del celular.
+    var textoPush = cantidad + ' precio(s) del inventario para confirmar. Revisalos en Automatizacion.';
+    // (1) Registro en el canal interno "Todos" (lo ven el dueno y todo el equipo con login), firmado
+    //     "Sistema". soloRegistro=true = NO dispara el push masivo al equipo entero.
+    try { await _postearAvisoInterno(ownerId, 'general', textoCanal, { soloRegistro: true }); } catch (eCanal) {}
+    // (2) Push DIRIGIDO. Al DUENO explicitamente: _pushDuenoAdmins excluye al "remitente" del aviso y, en
+    //     las cuentas SIN usuario IA con login, ese remitente ES el dueno -> se quedaria sin push. Por eso
+    //     se le manda aparte y se pasa `vistos` para que no le llegue duplicado.
+    var _vistos = {};
+    try { await enviarPushAsesor(ownerId, 'Asistente', '', 'Aviso interno: ' + textoPush, { tipo: 'scraper_dudas' }); _vistos[ownerId] = true; } catch (eO) {}
+    try { await _pushDuenoAdmins(ownerId, textoPush, _vistos); } catch (ePush) {}
+    console.log('[scraper dudas] aviso enviado (canal "Todos" + push a dueno y administradores) tenant', ownerId, '->', cantidad, 'duda(s)');
+  } catch (e) { console.error('_scrapAvisarDudas:', e && e.message); }
+}
 
 // ===== MOTOR DE SCRAPING AUTOMATICO (revisa cada hora que cuentas deben actualizar inventario) =====
 async function correrScrapingDeUsuario(cfg) {
@@ -27512,7 +28276,29 @@ async function correrScrapingDeUsuario(cfg) {
     // ADITIVO: si la base tiene las columnas de geo, las leo para poder RELLENAR solo las vacias.
     var _tieneGeo = true;
     try { var _gb = await supabase.from('properties').select('lat, lng').limit(1); if (_gb.error) _tieneGeo = false; } catch (e) { _tieneGeo = false; }
-    var _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos';
+    // CAMBIO 6: columnas de moneda / no_disponible_web. Si la migracion todavia no corrio, _tieneCols=false
+    // y el parser sigue funcionando: escribe precios y apaga operaciones, pero no toca esas columnas.
+    var _tieneCols = await _scrapTieneColsMoneda();
+    // Columnas de OPERACION que necesita el parser para no pisar nada y para la baja por operacion (D2).
+    // Se leen con un select propio y DEFENSIVO: si fallara, se sigue exactamente como hoy (sin parser).
+    var _colsOps = 'venta_activa, venta_precio, anual_activa, anual_precio, temporal_activa, temporal_precio_dia'
+      + (_tieneCols ? ', venta_moneda, anual_moneda, temporal_moneda, no_disponible_web' : '');
+    var _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos, ' + _colsOps;
+    var _parserOn = true;
+    try { var _ob = await supabase.from('properties').select(_colsOps).limit(1); if (_ob.error) _parserOn = false; } catch (eOb) { _parserOn = false; }
+    if (!_parserOn) { _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos'; }
+    // Las DUDAS de la corrida anterior se reemplazan por las de esta (misma politica que el modo
+    // "pendiente"). Solo borra las de tipo 'duda': no toca cambios 'nueva'/'modificada' en revision.
+    var _dudasRun = 0;
+    if (_parserOn) { try { await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id).eq('tipo_cambio', 'duda'); } catch (eDel) {} }
+    // TEMPORADAS: se traen TODAS las ya derivadas de una sola vez (1 query por corrida) y se usa
+    // `created_at` como ancla para inferir el año de las marcas sin año. Ambas cosas con sonda propia:
+    // si `created_at` no estuviera, se ancla en hoy y el resto sigue funcionando igual.
+    var _tieneCreated = true;
+    try { var _cb = await supabase.from('properties').select('created_at').limit(1); if (_cb.error) _tieneCreated = false; } catch (eCb) { _tieneCreated = false; }
+    if (_parserOn && _tieneCreated) _selCols += ', created_at';
+    var _tempPrev = _parserOn ? await _scrapTemporadasPrevias(cfg.user_id) : {};
+    var _tempRun = 0;
     var _pinsRun = [];
     // Entero limpio de un valor de la tabla de detalles ("3", "3 ambientes"). null si no es un numero sano.
     function _intProp(v) {
@@ -27542,6 +28328,12 @@ async function correrScrapingDeUsuario(cfg) {
         };
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
         var ex = await supabase.from('properties').select(_selCols).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        // CAMBIO 6: parser central. Lo que el texto CONFIRMA se escribe; lo que no, va a DUDAS y NO se escribe.
+        var _tmpPrev = (_parserOn && ex.data && ex.data.id) ? (_tempPrev[ex.data.id] || null) : null;
+        var _anclaTemp = _parserOn ? _scrapAnclaTemporada(_tmpPrev, p.precio, (ex.data && ex.data.created_at) || null) : null;
+        var _pf = _parserOn ? parsearPrecioFicha(p.precio, p.estado, _anclaTemp) : null;
+        var _res = _pf ? _scrapCamposDeParse(_pf, (ex && ex.data) ? ex.data : null, _tieneCols) : { fila: {}, dudas: [] };
+        var _dudasProp = (_pf ? (_pf.dudas || []) : []).concat(_res.dudas || []);
         if (ex.data && ex.data.id) {
           // FIGURA en el sitio -> auto-DESPAUSA (activa=true) y actualiza info, SALVO que la hayas pausado a mano
           // (pausa_manual): en ese caso se respeta tu pausa (activa=false) pero igual se refresca la info.
@@ -27558,17 +28350,28 @@ async function correrScrapingDeUsuario(cfg) {
           // galerias buenas ni las fotos ya CLASIFICADAS (categoria) de las propiedades sanas.
           var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
           if (_stored < 2 && _fotos.length > _stored) fila.images = _fotos.map(function(u){ return { url: u }; });
+          // El merge del parser va DESPUES de fila.activa: la baja por operacion (D2) tiene que poder
+          // pisar la auto-despausa de arriba, si no la corrida siguiente revive lo que la web dio de baja.
+          Object.assign(fila, _res.fila);
           var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
           if (up.error) errores++; else actualizados++;
+          if (_parserOn) _tempRun += await _scrapSincronizarTemporada(cfg.user_id, ex.data.id, _pf, p.precio, _tmpPrev);
+          if (_dudasProp.length) _dudasRun += await _scrapRegistrarDuda(cfg.user_id, p, ex.data.id, _dudasProp);
         } else {
           fila.activa = true;
           if (_fotos.length) fila.images = _fotos.map(function(u){ return { url: u }; });
+          Object.assign(fila, _res.fila);
           if (_tieneGeo && p.lat != null && p.lng != null) _pinsRun.push({ numero: String(p.numero), lat: p.lat, lng: p.lng });
           var _rmN = _intProp(p.ambientes), _bnN = _intProp(p.banos);
           if (_rmN != null) fila.rooms = _rmN;
           if (_bnN != null) fila.banos = _bnN;
-          var ins = await supabase.from('properties').insert(fila);
+          var ins = await supabase.from('properties').insert(fila).select('id').maybeSingle();
           if (ins.error) errores++; else creados++;
+          // Temporada de una propiedad NUEVA: se necesita el id recien creado (por eso el .select('id')).
+          if (_parserOn && ins.data && ins.data.id) _tempRun += await _scrapSincronizarTemporada(cfg.user_id, ins.data.id, _pf, p.precio, null);
+          // Una propiedad NUEVA con dudas es justamente donde mas importa avisar (entra sin precio o sin
+          // operacion confirmada). Se registra igual que en el update, pero sin property_id (recien creada).
+          if (_dudasProp.length) _dudasRun += await _scrapRegistrarDuda(cfg.user_id, p, null, _dudasProp);
         }
       } catch (e) { errores++; }
     }
@@ -27624,7 +28427,9 @@ async function correrScrapingDeUsuario(cfg) {
         '| saltadas por tope de corrida (quedan para la proxima):', _ctrlIA.saltadas_tope_corrida,
         '| saltadas por tope del plan:', _ctrlIA.saltadas_tope_plan);
     }
-    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, total: lista.length };
+    // CORRECCION D3: UN solo aviso por corrida con el total ("12 precios a confirmar"), nunca uno por propiedad.
+    if (_dudasRun > 0) { try { await _scrapAvisarDudas(cfg.user_id, _dudasRun); } catch (eAv) {} }
+    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, dudas: _dudasRun, temporadas: _tempRun, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 
@@ -27679,6 +28484,17 @@ async function correrScrapingPendiente(cfg) {
     }
     // limpiar pendientes anteriores de este usuario (se reemplazan por el scraping nuevo)
     await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id);
+    // CAMBIO 8: mismas sondas defensivas que el modo directo (columnas de moneda / de operacion).
+    var _tieneColsP = await _scrapTieneColsMoneda();
+    var _colsOpsP = 'venta_activa, venta_precio, anual_activa, anual_precio, temporal_activa, temporal_precio_dia'
+      + (_tieneColsP ? ', venta_moneda, anual_moneda, temporal_moneda, no_disponible_web' : '');
+    var _parserOnP = true;
+    try { var _obP = await supabase.from('properties').select(_colsOpsP).limit(1); if (_obP.error) _parserOnP = false; } catch (eObP) { _parserOnP = false; }
+    var _tieneCreatedP = true;
+    try { var _cbP = await supabase.from('properties').select('created_at').limit(1); if (_cbP.error) _tieneCreatedP = false; } catch (eCbP) { _tieneCreatedP = false; }
+    var _selPend = 'id,title,price,zone,description,images' + (_parserOnP ? (', ' + _colsOpsP) : '') + ((_parserOnP && _tieneCreatedP) ? ', created_at' : '');
+    var _tempPrevP = _parserOnP ? await _scrapTemporadasPrevias(cfg.user_id) : {};
+    var _dudasRunP = 0;
     var nuevas = 0, modificadas = 0;
     for (var i = 0; i < lista.length; i++) {
       try {
@@ -27700,7 +28516,20 @@ async function correrScrapingPendiente(cfg) {
           description: _limpiarTextoInventario(p.descripcion) || null, caracteristicas: p.caracteristicas || null, link: p.link || null,
           images: _fotosPend.length ? _fotosPend.map(function(u){ return { url: u }; }) : null
         };
-        var ex = await supabase.from('properties').select('id,title,price,zone,description,images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select(_selPend).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        // CAMBIO 8: el parser corre TAMBIEN en el modo "me deja revisar antes". Lo confirmado viaja en
+        // `nuevo.ops` (lo aplica /aceptar); lo dudoso va a una fila APARTE con tipo_cambio='duda'.
+        var _tmpPrevP = (_parserOnP && ex && ex.data && ex.data.id) ? (_tempPrevP[ex.data.id] || null) : null;
+        var _anclaTempP = _parserOnP ? _scrapAnclaTemporada(_tmpPrevP, p.precio, (ex && ex.data && ex.data.created_at) || null) : null;
+        var _pfP = _parserOnP ? parsearPrecioFicha(p.precio, p.estado, _anclaTempP) : null;
+        var _resP = _pfP ? _scrapCamposDeParse(_pfP, (ex && ex.data) ? ex.data : null, _tieneColsP) : { fila: {}, dudas: [] };
+        var _dudasPropP = (_pfP ? (_pfP.dudas || []) : []).concat(_resP.dudas || []);
+        if (_resP.fila && Object.keys(_resP.fila).length) nuevo.ops = _resP.fila;
+        // TEMPORADA en modo "me deja revisar antes": NO se escribe ahora. Viaja en el pendiente y se aplica
+        // recien cuando el dueno acepta el cambio (el switch directo/pendiente sigue mandando).
+        if (_pfP && _pfP.temporada && _pfP.temporal && _pfP.temporal.precio_dia != null) {
+          nuevo.temporada = { tipo: _pfP.temporada.tipo, etiqueta: _pfP.temporada.etiqueta, desde: _pfP.temporada.desde, hasta: _pfP.temporada.hasta, precio_dia: _pfP.temporal.precio_dia, texto: String(p.precio || '').slice(0, 240) };
+        }
         if (ex.data && ex.data.id) {
           // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion) o si la web tiene MAS fotos que las guardadas
           var v = ex.data;
@@ -27711,10 +28540,12 @@ async function correrScrapingPendiente(cfg) {
             await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'modificada', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: { title: v.title, price: v.price, zone: v.zone }, property_id: v.id });
             modificadas++;
           }
+          if (_dudasPropP.length) _dudasRunP += await _scrapRegistrarDuda(cfg.user_id, p, v.id, _dudasPropP);
         } else {
           // no existe: es nueva
           await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'nueva', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: null, property_id: null });
           nuevas++;
+          if (_dudasPropP.length) _dudasRunP += await _scrapRegistrarDuda(cfg.user_id, p, null, _dudasPropP);
         }
       } catch (e) {}
     }
@@ -27724,7 +28555,9 @@ async function correrScrapingPendiente(cfg) {
         '| saltadas por tope de corrida (quedan para la proxima):', _ctrlIAP.saltadas_tope_corrida,
         '| saltadas por tope del plan:', _ctrlIAP.saltadas_tope_plan);
     }
-    return { ok: true, nuevas: nuevas, modificadas: modificadas, total: lista.length };
+    // CORRECCION D3: un solo aviso por corrida, igual que en el modo directo.
+    if (_dudasRunP > 0) { try { await _scrapAvisarDudas(cfg.user_id, _dudasRunP); } catch (eAvP) {} }
+    return { ok: true, nuevas: nuevas, modificadas: modificadas, dudas: _dudasRunP, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 async function revisarScrapingsAutomaticos() {
@@ -27779,7 +28612,9 @@ async function revisarScrapingsAutomaticos() {
       // correr el scraping segun el rubro. Hotel: siempre directo; usa IA (Sonnet) segun la preferencia del
       // cliente (modo='ia'). Si usa IA, el costo se descuenta de SUS mensajes (como el scraper de inventario).
       if (_esHotelCfg) {
-        var _iaHotel = (String(cfg.modo || '').indexOf('ia') >= 0);
+        // H3: la autoridad es la columna ia_habilitada. Se deja el chequeo de modo='ia' como fallback
+        // para las filas viejas guardadas antes de este arreglo (y por si la columna no existiera).
+        var _iaHotel = (cfg.ia_habilitada === true) || (String(cfg.modo || '').indexOf('ia') >= 0);
         // P1 (CRON): freno de gasto IA por tope de plan. El gate HTTP (_PREFIJOS_TOPE_IA) NO cubre los cron:
         // sin esto, el auto-update seguia gastando IA (y cobrando 3 msgs) POR ENCIMA del tope, solo y sin que
         // nadie mire. Si la corrida usa IA y la cuenta paso su tope -> saltear SIN marcar ultimo_scraping,
@@ -27819,31 +28654,56 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
     if (soloId) query = query.eq('id', soloId);
     var q = await query;
     var items = q.data || [];
-    var aplicados = 0;
+    var aplicados = 0, dudasCerradas = 0;
+    // Lectura DEFENSIVA de pausa_manual: si la columna no existiera, se cae al comportamiento anterior.
+    var _tienePausaAcc = true;
+    try { var _pbA = await supabase.from('properties').select('pausa_manual').limit(1); if (_pbA.error) _tienePausaAcc = false; } catch (ePbA) { _tienePausaAcc = false; }
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
+      // CAMBIO 9 (regla estrella): una DUDA no se aplica NUNCA, ni aceptandola a mano ni en modo directo.
+      // "Aceptar" sobre una duda solo la da por vista y la saca de la bandeja: el valor correcto lo carga
+      // una persona en el inventario. Ademas su datos_nuevos NO trae campos de properties, asi que el
+      // update de abajo la habria dejado sin titulo/precio/zona: por eso se corta ACA.
+      if (it.tipo_cambio === 'duda') {
+        await supabase.from('scraping_pendientes').delete().eq('id', it.id);
+        dudasCerradas++;
+        continue;
+      }
       var d = it.datos_nuevos || {};
       var fila = { user_id: user_id, numero: String(it.numero), title: d.title || 'Sin titulo', type: d.type || null, zone: d.zone || null, price: d.price || null, description: d.description || null, caracteristicas: d.caracteristicas || null, link: d.link || null, activa: true };
+      // Operaciones/precios/monedas que el parser CONFIRMO en la corrida (cambio 8). Solo campos confirmados.
+      if (d.ops && typeof d.ops === 'object') { try { Object.assign(fila, d.ops); } catch (eOps) {} }
       var _fotosAcc = Array.isArray(d.images) ? d.images : []; // ya vienen como [{url:...}]
       if (it.tipo_cambio === 'modificada' && it.property_id) {
         // refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar las sanas/clasificadas
-        var _cur = await supabase.from('properties').select('images').eq('id', it.property_id).maybeSingle();
+        var _cur = await supabase.from('properties').select(_tienePausaAcc ? 'images, pausa_manual' : 'images').eq('id', it.property_id).maybeSingle();
         var _curN = (_cur.data && Array.isArray(_cur.data.images)) ? _cur.data.images.length : 0;
         if (_curN < 2 && _fotosAcc.length > _curN) fila.images = _fotosAcc;
+        // AGUJERO TAPADO: antes escribia activa:true SIEMPRE -> aceptar un cambio de titulo/foto revivia una
+        // propiedad pausada (a mano o por baja de la web). Ahora la pausa manda, salvo que el propio cambio
+        // traiga una reactivacion explicita del parser (auto-curacion: la web la volvio a publicar).
+        if (_tienePausaAcc && _cur.data && _cur.data.pausa_manual === true && !(d.ops && d.ops.pausa_manual === false)) delete fila.activa;
         await supabase.from('properties').update(fila).eq('id', it.property_id);
+        if (d.temporada && d.temporada.desde) { try { await _scrapEscribirTemporada(user_id, it.property_id, d.temporada, d.temporada.precio_dia, d.temporada.texto); } catch (eT) {} }
       } else {
-        var ex = await supabase.from('properties').select('id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select(_tienePausaAcc ? 'id, images, pausa_manual' : 'id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
           var _exN = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
           if (_exN < 2 && _fotosAcc.length > _exN) fila.images = _fotosAcc;
+          if (_tienePausaAcc && ex.data.pausa_manual === true && !(d.ops && d.ops.pausa_manual === false)) delete fila.activa;
           await supabase.from('properties').update(fila).eq('id', ex.data.id);
+          if (d.temporada && d.temporada.desde) { try { await _scrapEscribirTemporada(user_id, ex.data.id, d.temporada, d.temporada.precio_dia, d.temporada.texto); } catch (eT2) {} }
         }
-        else { if (_fotosAcc.length) fila.images = _fotosAcc; await supabase.from('properties').insert(fila); }
+        else {
+          if (_fotosAcc.length) fila.images = _fotosAcc;
+          var _insAcc = await supabase.from('properties').insert(fila).select('id').maybeSingle();
+          if (d.temporada && d.temporada.desde && _insAcc && _insAcc.data && _insAcc.data.id) { try { await _scrapEscribirTemporada(user_id, _insAcc.data.id, d.temporada, d.temporada.precio_dia, d.temporada.texto); } catch (eT3) {} }
+        }
       }
       await supabase.from('scraping_pendientes').delete().eq('id', it.id);
       aplicados++;
     }
-    return res.json({ ok: true, aplicados: aplicados });
+    return res.json({ ok: true, aplicados: aplicados, dudas_cerradas: dudasCerradas });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/scraping-pendientes/rechazar', async function(req, res) {
@@ -30247,9 +31107,50 @@ app.post('/api/inventario/api-key/regenerar', async function(req, res){
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ===== CAMBIO 18: PUERTA TRASERA DEL INVENTARIO =====
+// Esta API (auth por api-key) escribia los 3 precios SIN NINGUNA validacion: por aca se puede volver a
+// envenenar el inventario aunque el scraper ya este blindado. Se le aplican los MISMOS chequeos de
+// sensatez que al parser central y se acepta la MONEDA explicita por operacion (o una `moneda` global).
+// No rompe integraciones existentes: solo se DESCARTA el campo que no pasa el chequeo (el resto del item
+// se guarda igual) y se devuelven los descartes en la respuesta para que el integrador los vea.
+function _sInvMoneda(v){
+  var m = String(v == null ? '' : v).trim().toUpperCase();
+  if (m === 'USD' || m === 'U$S' || m === 'US$' || m === 'U$D' || m === 'DOLAR' || m === 'DOLARES') return 'USD';
+  if (m === 'ARS' || m === '$' || m === 'PESO' || m === 'PESOS') return 'ARS';
+  return null;
+}
+function _sInvChequearPrecios(fila, it, tieneCols){
+  var rechazos = [];
+  var mGlobal = _sInvMoneda(it.moneda);
+  var mv = _sInvMoneda(it.venta_moneda) || mGlobal;
+  var ma = _sInvMoneda(it.anual_moneda) || mGlobal;
+  var mt = _sInvMoneda(it.temporal_moneda) || mGlobal;
+  function tirar(campo, motivo){ if (fila[campo] === undefined) return; delete fila[campo]; rechazos.push({ campo: campo, motivo: motivo }); }
+  ['venta_precio', 'anual_precio', 'temporal_precio_dia'].forEach(function(k){
+    if (fila[k] != null && !(Number(fila[k]) > 0)) tirar(k, 'precio 0 o invalido');
+  });
+  if (fila.anual_precio != null && ma === 'USD') tirar('anual_precio', 'alquiler anual en dolares: casi siempre es un precio de venta mal asignado');
+  if (fila.venta_precio != null && fila.anual_precio != null && Number(fila.venta_precio) === Number(fila.anual_precio)) {
+    tirar('venta_precio', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal');
+    tirar('anual_precio', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal');
+  }
+  if (fila.temporal_precio_dia != null) {
+    var pd = Number(fila.temporal_precio_dia);
+    if ((mt === 'USD') ? (pd > 5000 || pd < 5) : (pd > 2000000 || pd < 5000)) tirar('temporal_precio_dia', 'tarifa por noche fuera de un rango razonable');
+  }
+  if (tieneCols) {
+    if (fila.venta_precio != null && mv) fila.venta_moneda = mv;
+    if (fila.anual_precio != null && ma) fila.anual_moneda = ma;
+    if (fila.temporal_precio_dia != null && mt) fila.temporal_moneda = mt;
+  }
+  return rechazos;
+}
+
 // UPSERT inmobiliaria (properties) por 'numero'.
 async function _syncInvInmobiliaria(user_id, items){
   var creadas = 0, actualizadas = 0, errores = 0;
+  var descartes = [];
+  var _tieneColsSync = await _scrapTieneColsMoneda();
   for (var i = 0; i < items.length; i++){
     var it = items[i] || {};
     try {
@@ -30271,12 +31172,15 @@ async function _syncInvInmobiliaria(user_id, items){
       };
       if (Array.isArray(it.images)) fila.images = it.images;
       Object.keys(fila).forEach(function(k){ if (fila[k] === undefined) delete fila[k]; });
+      // CAMBIO 18: chequeos de sensatez + moneda explicita ANTES de escribir.
+      var _rech = _sInvChequearPrecios(fila, it, _tieneColsSync);
+      if (_rech.length && descartes.length < 100) descartes.push({ numero: numero, campos: _rech });
       var ex = await supabase.from('properties').select('id').eq('user_id', user_id).eq('numero', numero).maybeSingle();
       if (ex.data && ex.data.id) { var u = await supabase.from('properties').update(fila).eq('id', ex.data.id); if (u.error) errores++; else actualizadas++; }
       else { var ins = await supabase.from('properties').insert(fila); if (ins.error) errores++; else creadas++; }
     } catch (e) { errores++; }
   }
-  return { creadas: creadas, actualizadas: actualizadas, errores: errores, total: items.length };
+  return { creadas: creadas, actualizadas: actualizadas, errores: errores, total: items.length, descartados: descartes };
 }
 
 // UPSERT hotel (hotel_unidades) por 'numero' (o title si no hay numero).

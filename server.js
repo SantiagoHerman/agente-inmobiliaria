@@ -26183,13 +26183,235 @@ function detectarNumeroProp(pares, titulo, plataformaId) {
   return null;
 }
 // Detecta operacion y devuelve flags
+// CAMBIO 5 (Diego 2026-07-28): SE SACA EL DEFAULT SILENCIOSO A VENTA. Antes esta funcion terminaba en
+// `return 'venta'`: una ficha sin operacion reconocible se guardaba como VENTA (caso Omar) y la IA la ofrecia
+// como tal. Ahora devuelve null = "no se sabe" y el que llama decide (el parser central lo manda a DUDAS).
+// Los 3 call sites toleran null: /api/scrape/universal escribe `operation: p.operacion || null` (columna
+// nullable, el prompt solo la usa como fallback si no hay operaciones activas) y el mapeo wp-json ya no
+// inventa un Estado (ver _mapearPropWpJsonADetalle).
 function detectarOperacion(estado, textoExtra) {
   var t = ((estado || '') + ' ' + (textoExtra || '')).toLowerCase();
   if (/tempora|por noche|por dia|por d.a|alquiler temporal|temporario|veraneo|diaria/.test(t)) return 'temporal';
   if (/anual|alquiler anual|alquiler permanente|todo el a.o/.test(t)) return 'anual';
   if (/alquiler|renta|rent/.test(t)) return 'anual';
   if (/venta|vende|compra|sale/.test(t)) return 'venta';
-  return 'venta';
+  return null;
+}
+
+// ============================================================================
+// PARSER CENTRAL DE PRECIO + OPERACION DE UNA FICHA  —  parsearPrecioFicha()
+// ----------------------------------------------------------------------------
+// CERO IA: parsing 100% determinista (regex + reglas). NO llama a ningun modelo.
+//
+// POR QUE EXISTE (incidente 2026-07-28, lead Alejandro Cabrera / cuenta Anton): la ficha de la web trae UN
+// solo precio ("U$S 30.000") y un Estado con VARIAS operaciones ("Alquiler anual, En Venta"). El importador
+// copiaba el MISMO numero a TODAS las operaciones y tiraba la moneda -> la IA ofrecio locales EN VENTA en
+// dolares como "alquiler mensual en pesos" y le juro al lead dos veces que eran pesos.
+//
+// REGLA DE ORO (Diego): "si esta el campo claro de valores, bien; si hay discrepancia, que consulte antes."
+//   -> Solo se devuelve un numero para una operacion cuando el TEXTO lo confirma. Todo lo demas va a `dudas`
+//      (y el que llama NO lo escribe: lo manda a la cola de revision humana).
+//
+// CONTRATO DE SALIDA (fijado con el agente del front — respetarlo EXACTO):
+//   {
+//     venta:    { precio: <number|null>, moneda: 'USD'|'ARS'|null } | null,
+//     anual:    { precio: <number|null>, moneda: 'USD'|'ARS'|null } | null,
+//     temporal: { precio_dia: <number|null>, moneda: 'USD'|'ARS'|null } | null,
+//     no_disponible: { venta: <bool>, anual: <bool> },
+//     dudas: [ { campo, motivo, valor_visto } ]
+//   }
+//   null en una operacion = esa operacion NO se ofrece.
+//   precio null con la operacion presente = "a consultar" (la ofrece pero el precio no esta confirmado).
+//   `temporal_temporada` es un EXTRA informativo (no rompe el contrato): la marca de temporada del precio
+//   ("(DIC)", "verano 2026"). NO se escribe en la base (ver nota de temporada mas abajo).
+// ============================================================================
+function _ppNorm(s) {
+  return String(s == null ? '' : s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+}
+// "30.000" -> 30000 | "1.234.567,89" -> 1234567.89 | "45,000" -> 45000. null si no hay numero sano.
+function _ppANumero(s) {
+  var t = String(s == null ? '' : s).trim();
+  if (!/\d/.test(t)) return null;
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(t)) t = t.replace(/\./g, '').replace(',', '.');        // es-AR
+  else if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(t)) t = t.replace(/,/g, '');                       // en-US
+  else if (/^\d+,\d{1,2}$/.test(t)) t = t.replace(',', '.');                                    // decimal con coma
+  else if (/^\d+[.,]\d{3}$/.test(t)) t = t.replace(/[.,]/g, '');                                // miles suelto
+  else t = t.replace(/[.,]/g, '');
+  var n = Number(t);
+  return isFinite(n) ? n : null;
+}
+function _ppNumeros(txt) {
+  var out = [], m, re = /\d[\d.,]*/g, s = String(txt == null ? '' : txt);
+  while ((m = re.exec(s)) !== null) {
+    var crudo = m[0].replace(/[.,]+$/, '');
+    var n = _ppANumero(crudo);
+    if (n != null) out.push(n);
+  }
+  return out;
+}
+// Moneda EXPLICITA del texto. USD gana siempre (U$S contiene un '$', si no todo seria ARS). null = no se sabe.
+function _ppMoneda(txt) {
+  var t = _ppNorm(txt);
+  if (/u\$s|us\$|u\$d|\busd\b|dolar|dolares/.test(t)) return 'USD';
+  if (/\bars\b|\bpesos?\b|\$/.test(t)) return 'ARS';
+  return null;
+}
+// Marcas de OPERACION dentro del TEXTO DEL PRECIO (lo unico que CONFIRMA la semantica del numero).
+var _PP_RE_TEMPORAL = /por noche|x noche|\/ ?noche|por dia|x dia|\/ ?dia\b|diaria|la noche|el dia\b/;
+var _PP_RE_ANUAL = /\/ ?mes\b|por mes|mensual|x mes|al mes/;
+// Operaciones NOMBRADAS en el Estado de la ficha (puede nombrar varias: "Alquiler anual, En Venta").
+function _ppOpsEstado(estadoTxt) {
+  var t = _ppNorm(estadoTxt);
+  var ops = { venta: false, anual: false, temporal: false };
+  if (/tempora|veraneo|verano|por noche|por dia|diaria/.test(t)) ops.temporal = true;
+  if (/alquiler anual|alquiler permanente|\banual\b|todo el ano|alquiler mensual/.test(t)) ops.anual = true;
+  if (/en venta|\bventa\b|\bvende\b|\bvendo\b|vendid[ao]s?/.test(t)) ops.venta = true;
+  if (/alquilad[ao]s?/.test(t) && !ops.temporal) ops.anual = true;
+  // "Alquiler" a secas (sin anual ni temporal): se mantiene el criterio historico de detectarOperacion (anual).
+  if (!ops.anual && !ops.temporal && /\balquiler\b|\balquila\b|\brenta\b/.test(t)) ops.anual = true;
+  return ops;
+}
+function _ppFlagsEstado(estadoTxt) {
+  var t = _ppNorm(estadoTxt);
+  return {
+    noDisp: /no disponible|no-disponible|nodisponible|no esta disponible|dado de baja/.test(t),
+    vendida: /vendid[ao]s?/.test(t),
+    alquilada: /alquilad[ao]s?/.test(t),
+    reservada: /reservad[ao]s?/.test(t)
+  };
+}
+// Marca de TEMPORADA del precio temporal: "(DIC)", "(ENE)", "verano 2026", "temporada 2026".
+// OJO: "(DIC)" NO trae año -> solo se informa, NUNCA se escribe en la base (ver cambio 7/vigencia).
+function _ppTemporada(txt) {
+  var t = _ppNorm(txt);
+  var mMes = t.match(/\((ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\)/);
+  var mes = mMes ? mMes[1] : null;
+  var anio = null;
+  var mAnio = t.match(/(?:verano|temporada|temp\.?)\s*(20\d{2})/) || t.match(/\((20\d{2})\)/);
+  if (mAnio) anio = mAnio[1];
+  if (!mes && !anio) return null;
+  return (mes || '') + (anio || '');
+}
+function parsearPrecioFicha(precioTxt, estadoTxt) {
+  var out = {
+    venta: null, anual: null, temporal: null,
+    no_disponible: { venta: false, anual: false },
+    dudas: [],
+    temporal_temporada: null
+  };
+  function duda(campo, motivo, valor) {
+    out.dudas.push({ campo: campo, motivo: motivo, valor_visto: String(valor == null ? '' : valor).slice(0, 200) });
+  }
+  try {
+    var pTxt = String(precioTxt == null ? '' : precioTxt);
+    var eTxt = String(estadoTxt == null ? '' : estadoTxt);
+    // "RETASADO"/"OPORTUNIDAD"/"DESDE" son ruido comercial: no cambian ni el numero ni la operacion.
+    var pNorm = _ppNorm(pTxt).replace(/retasado|oportunidad|oferta|rebajado|precio|desde|hasta/g, ' ');
+    out.temporal_temporada = _ppTemporada(pTxt);
+
+    var moneda = _ppMoneda(pTxt);
+    var ops = _ppOpsEstado(eTxt);
+    var flags = _ppFlagsEstado(eTxt);
+
+    // ---- (1) EL NUMERO ----
+    var nums = _ppNumeros(pNorm);
+    var monto = null;
+    if (nums.length === 1) monto = nums[0];
+    else if (nums.length > 1) {
+      var unicos = nums.filter(function (v, i, a) { return a.indexOf(v) === i; });
+      if (unicos.length === 1) monto = unicos[0];
+      else duda('operacion', 'el texto del precio tiene mas de un valor distinto y no se sabe cual va en cada operacion', pTxt);
+    }
+    if (monto === 0) { duda('operacion', 'el precio publicado es 0', pTxt); monto = null; }
+
+    // ---- (2) QUE OPERACION CONFIRMA EL TEXTO DEL PRECIO ----
+    var opPrecio = null;
+    if (_PP_RE_TEMPORAL.test(pNorm)) opPrecio = 'temporal';
+    else if (_PP_RE_ANUAL.test(pNorm)) opPrecio = 'anual';
+    if (opPrecio === 'temporal') ops.temporal = true;
+    if (opPrecio === 'anual') ops.anual = true;
+
+    // ---- (3) SIN OPERACION RECONOCIBLE -> DUDA, y NADA se escribe (regla 3.7: sin default a Venta) ----
+    if (!ops.venta && !ops.anual && !ops.temporal) {
+      duda('operacion', 'la ficha no dice que operacion es (venta / alquiler anual / alquiler temporal)', (eTxt || pTxt));
+      return out;
+    }
+
+    // Operaciones PRESENTES (ofrecidas) pero todavia sin precio confirmado.
+    if (ops.venta) out.venta = { precio: null, moneda: null };
+    if (ops.anual) out.anual = { precio: null, moneda: null };
+    if (ops.temporal) out.temporal = { precio_dia: null, moneda: null };
+
+    // ---- (4) A QUE OPERACION LE CORRESPONDE EL NUMERO ----
+    var nOps = (ops.venta ? 1 : 0) + (ops.anual ? 1 : 0) + (ops.temporal ? 1 : 0);
+    var destino = null, dudaTemporalYa = false;
+    if (monto != null) {
+      if (opPrecio) destino = opPrecio;                                   // "POR NOCHE"/"/mes": el texto lo confirma
+      else if (nOps === 1) destino = ops.venta ? 'venta' : (ops.anual ? 'anual' : 'temporal');
+      else if (ops.venta && moneda === 'USD') destino = 'venta';          // regla 1: USD sin marca de alquiler = venta
+      // varias operaciones y sin senal clara -> destino null: NADA se escribe, todo a dudas (abajo).
+    }
+    // TEMPORAL ESTRICTO: la tarifa por noche SOLO se acepta si el texto del precio dice "por noche"/"por dia".
+    // Es el caso "U$S 52.000" en una propiedad temporal (Edificio San Jorge): 52.000 de VENTA terminaba
+    // guardado como 52.000 POR NOCHE.
+    if (destino === 'temporal' && opPrecio !== 'temporal') {
+      duda('temporal', 'el precio no dice "por noche" ni "por dia": no se puede confirmar que sea la tarifa diaria', pTxt);
+      dudaTemporalYa = true;
+      destino = null;
+    }
+    if (destino === 'venta') out.venta = { precio: monto, moneda: moneda };
+    else if (destino === 'anual') out.anual = { precio: monto, moneda: moneda };
+    else if (destino === 'temporal') out.temporal = { precio_dia: monto, moneda: moneda };
+
+    // Operaciones ofrecidas que quedaron SIN precio confirmado habiendo un numero en la ficha -> DUDA.
+    if (monto != null) {
+      if (ops.venta && destino !== 'venta') duda('venta', 'la ficha ofrece venta pero el precio publicado no se puede confirmar como precio de venta', pTxt);
+      if (ops.anual && destino !== 'anual') duda('anual', 'la ficha ofrece alquiler anual pero el precio publicado no se puede confirmar como alquiler mensual', pTxt);
+      if (ops.temporal && destino !== 'temporal' && !dudaTemporalYa) duda('temporal', 'la ficha ofrece alquiler temporal pero el precio publicado no se puede confirmar como tarifa por noche', pTxt);
+    }
+
+    // ---- (5) DISPONIBILIDAD — CORRECCION D2: la baja es POR OPERACION, y el TEMPORAL nunca se apaga ----
+    if (flags.vendida && ops.venta) out.no_disponible.venta = true;
+    if (flags.alquilada) {
+      if (ops.temporal) duda('disponibilidad', 'dice alquilada y ademas es alquiler temporal: la baja del temporal va por FECHAS, no se apaga la propiedad', eTxt);
+      else if (ops.anual) out.no_disponible.anual = true;
+    }
+    if (flags.noDisp) {
+      var nNoTemp = (ops.venta ? 1 : 0) + (ops.anual ? 1 : 0);
+      if (nNoTemp === 0) {
+        duda('disponibilidad', 'dice no disponible pero la unica operacion es alquiler temporal: la baja va por FECHAS, no se apaga la propiedad', eTxt);
+      } else if (nNoTemp === 1) {
+        if (ops.venta) out.no_disponible.venta = true; else out.no_disponible.anual = true;
+        if (ops.temporal) duda('disponibilidad', 'dice no disponible y ademas ofrece alquiler temporal: el temporal NO se da de baja (va por fechas)', eTxt);
+      } else {
+        duda('disponibilidad', 'dice no disponible pero ofrece mas de una operacion: no se sabe cual se dio de baja', eTxt);
+      }
+    }
+
+    // ---- (6) CHEQUEOS DE SENSATEZ (cambio 11): cualquiera -> DUDA y NO se escribe el numero ----
+    if (out.anual && out.anual.precio != null && out.anual.moneda === 'USD') {
+      duda('anual', 'alquiler anual en dolares: casi siempre es un precio de VENTA mal asignado', pTxt);
+      out.anual = { precio: null, moneda: null };
+    }
+    if (out.venta && out.anual && out.venta.precio != null && out.venta.precio === out.anual.precio) {
+      duda('venta', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal', pTxt);
+      duda('anual', 'venta y alquiler anual con el MISMO numero: uno de los dos esta mal', pTxt);
+      out.venta = { precio: null, moneda: null };
+      out.anual = { precio: null, moneda: null };
+    }
+    if (out.temporal && out.temporal.precio_dia != null) {
+      var pd = out.temporal.precio_dia;
+      var fuera = (out.temporal.moneda === 'USD') ? (pd > 5000 || pd < 5) : (pd > 2000000 || pd < 5000);
+      if (fuera) {
+        duda('temporal', 'la tarifa por noche queda fuera de un rango razonable', pTxt);
+        out.temporal = { precio_dia: null, moneda: null };
+      }
+    }
+  } catch (e) {
+    // Un parser que explota NO puede romper una corrida de scraping: se devuelve "no se sabe nada" + duda.
+    try { out.dudas.push({ campo: 'operacion', motivo: 'no se pudo leer el precio/estado de la ficha', valor_visto: String(precioTxt || '').slice(0, 200) }); } catch (e2) {}
+  }
+  return out;
 }
 
 // M20: alias de extraerPrecioDe (misma logica de extraccion). Antes era una copia byte-identica salvo que

@@ -27896,6 +27896,11 @@ function _scrapCamposDeParse(parse, ex, tieneCols) {
     { op: 'anual', obj: parse.anual, keyPrecio: 'anual_precio', keyMoneda: 'anual_moneda', keyActiva: 'anual_activa', valor: parse.anual ? parse.anual.precio : null, label: 'alquiler anual' },
     { op: 'temporal', obj: parse.temporal, keyPrecio: 'temporal_precio_dia', keyMoneda: 'temporal_moneda', keyActiva: 'temporal_activa', valor: parse.temporal ? parse.temporal.precio_dia : null, label: 'alquiler temporal' }
   ];
+  // Regla 3.7 (sin default silencioso a Venta): si la ficha NO trae operacion reconocible, una propiedad
+  // NUEVA entra SIN ninguna operacion activa (mas su duda), en vez de heredar el default de la base.
+  if (esNueva && !parse.venta && !parse.anual && !parse.temporal) {
+    fila.venta_activa = false; fila.anual_activa = false; fila.temporal_activa = false;
+  }
   var confirmados = [];
   for (var i = 0; i < mapa.length; i++) {
     var m = mapa[i];
@@ -28006,12 +28011,23 @@ async function _scrapRegistrarDuda(userId, p, propertyId, dudas) {
 async function _scrapAvisarDudas(ownerId, cantidad) {
   try {
     if (!ownerId || !cantidad || cantidad < 1) return;
-    var texto = 'Actualizacion de inventario: ' + cantidad + ' precio(s) para confirmar. '
+    // Texto LARGO -> queda escrito en el canal "Todos" (ahi entra completo, con el link).
+    var textoCanal = 'Actualizacion de inventario: ' + cantidad + ' precio(s) para confirmar. '
       + 'La web publica datos que no se pueden interpretar solos (no queda claro la moneda o a que operacion corresponde el precio), '
       + 'asi que NO se tocaron para no ensuciar el inventario. Revisalos en Automatizacion: ' + FRONTEND_URL + '/automatizacion';
-    try { await _postearAvisoInterno(ownerId, 'general', texto, { soloRegistro: true }); } catch (eCanal) {}
-    try { await _pushDuenoAdmins(ownerId, texto); } catch (ePush) {}
-    console.log('[scraper dudas] aviso enviado a dueno+admins de', ownerId, '->', cantidad, 'duda(s)');
+    // Texto CORTO -> el push recorta el cuerpo a 120 caracteres; si mandaramos el largo, el aviso llegaria
+    // cortado a la mitad y sin el link. Este entra entero en la notificacion del celular.
+    var textoPush = cantidad + ' precio(s) del inventario para confirmar. Revisalos en Automatizacion.';
+    // (1) Registro en el canal interno "Todos" (lo ven el dueno y todo el equipo con login), firmado
+    //     "Sistema". soloRegistro=true = NO dispara el push masivo al equipo entero.
+    try { await _postearAvisoInterno(ownerId, 'general', textoCanal, { soloRegistro: true }); } catch (eCanal) {}
+    // (2) Push DIRIGIDO. Al DUENO explicitamente: _pushDuenoAdmins excluye al "remitente" del aviso y, en
+    //     las cuentas SIN usuario IA con login, ese remitente ES el dueno -> se quedaria sin push. Por eso
+    //     se le manda aparte y se pasa `vistos` para que no le llegue duplicado.
+    var _vistos = {};
+    try { await enviarPushAsesor(ownerId, 'Asistente', '', 'Aviso interno: ' + textoPush, { tipo: 'scraper_dudas' }); _vistos[ownerId] = true; } catch (eO) {}
+    try { await _pushDuenoAdmins(ownerId, textoPush, _vistos); } catch (ePush) {}
+    console.log('[scraper dudas] aviso enviado (canal "Todos" + push a dueno y administradores) tenant', ownerId, '->', cantidad, 'duda(s)');
   } catch (e) { console.error('_scrapAvisarDudas:', e && e.message); }
 }
 

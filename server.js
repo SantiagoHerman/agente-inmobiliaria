@@ -2922,6 +2922,23 @@ async function iaToolCombinadaActivo(user_id, bs) {
     return !!(data && data.ia_tool_combinada === true);
   } catch (e) { return false; }
 }
+// CICLO DE TOOLS (ciclo_tools_v1, default OFF): convierte los 2 turnos fijos con el modelo en un CICLO real de
+// herramientas con tope duro. Hoy el codigo ejecuta UNA sola tool y, en el 2do turno, si el modelo pide otra
+// herramienta ese pedido SE DESCARTA en silencio (solo se lee el bloque de texto) -> sale una promesa
+// ("dejame buscar") que nunca se cumple. Ademas, si el modelo pide 2+ tools en un mismo turno se manda UN solo
+// tool_result y la API responde 400 (exige uno por cada tool_use) -> mismo final: promesa.
+// Con el flag ON: se ejecutan TODAS las tools de cada vuelta, se devuelven TODOS los tool_result y se vuelve a
+// llamar al modelo mientras siga pidiendo herramientas, hasta un TOPE DURO de vueltas.
+// FAIL-CLOSED: columna ausente / null / error -> false => comportamiento BYTE-IDENTICO al actual.
+async function cicloToolsActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ciclo_tools_v1')) return bs.ciclo_tools_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ciclo_tools_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ciclo_tools_v1 === true);
+  } catch (e) { return false; }
+}
 // (4) ia_historial_corto: baja el tope de mensajes de historial de 16 a 12 (menos tokens dinamicos por turno).
 async function iaHistorialCortoActivo(user_id, bs) {
   try {
@@ -6747,6 +6764,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     try { _iaToolCombinadaOn = await iaToolCombinadaActivo(user_id, settings || undefined); } catch (eTc) { _iaToolCombinadaOn = false; }
     try { _iaHistorialCortoOn = await iaHistorialCortoActivo(user_id, settings || undefined); } catch (eHc) { _iaHistorialCortoOn = false; }
   }
+  // CICLO DE TOOLS (gated ciclo_tools_v1, default OFF): permite que la IA encadene herramientas (buscar -> ficha ->
+  // ficha -> ... -> texto) en vez de quedarse en 2 turnos fijos. FAIL-CLOSED: con el flag OFF -> false => se usa la
+  // cadena de hoy TAL CUAL (byte-identica). Reusa el `settings` ya cargado (0 queries extra). SOLO en conv REAL.
+  let _cicloToolsOn = false;
+  if (conversation_id && !modoPrueba) { try { _cicloToolsOn = await cicloToolsActivo(user_id, settings || undefined); } catch (eCt) { _cicloToolsOn = false; } }
   // 5 FUENTES EXTERNAS (gated c/u por su flag): dolar / clima / feriados / georef / distancia. FAIL-CLOSED:
   // con la columna ausente el helper devuelve false -> la tool NO se ofrece y el prompt+flujo son BYTE-IDENTICOS
   // al actual (codigo INERTE hasta correr migracion-5-fuentes-flags.sql). SOLO en conv REAL (no modoPrueba).
@@ -7971,11 +7993,674 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // sigue 1 mensaje por respuesta; el RAG es ahorro de Diego, no gasto del cliente). Con el flag OFF queda false =>
   // el flag `usoTool` que se retorna es BYTE-IDENTICO al actual.
   let _ragToolUsado = false;
+
+  // ===== CICLO DE TOOLS (gated ciclo_tools_v1) — DISPATCHER UNICO DE HERRAMIENTAS =====
+  // Calcula el TEXTO DE RESULTADO de UNA herramienta a partir de su nombre + input. Es EXACTAMENTE el mismo
+  // codigo que corria inline en cada rama del if/else de mas abajo: se movio aca TAL CUAL para que haya UNA
+  // sola fuente de verdad y para que el ciclo pueda ejecutar CUALQUIER tool en CUALQUIER vuelta (antes solo
+  // se podia ejecutar UNA, en la primera). La cadena de hoy (flag OFF) llama a este mismo dispatcher => mismo
+  // texto de resultado, mismo 2do turno, mismo reply: comportamiento IDENTICO al actual.
+  // Devuelve { texto, fotoUrl, fueraHorario }: `fotoUrl` solo lo usa enviar_foto_propiedad y `fueraHorario`
+  // solo consultar_al_dueno (para elegir su fallback). Las tools TERMINALES (derivar_a_humano / agendar_cita)
+  // NO pasan por aca: no producen tool_result, cierran el turno (se manejan en la cadena y en el ciclo).
+  async function _toolResultadoCiclo(_nombre, _inp) {
+    const _out = { texto: '', fotoUrl: null, fueraHorario: false };
+    const _in = (_inp && typeof _inp === 'object') ? _inp : {};
+    if (_nombre === 'buscar_propiedades_cerca') {
+      let _resCercaTxt = '';
+      try {
+        const _refIn = (_in && _in.referencia) ? String(_in.referencia).trim() : '';
+        const _ciuIn = (_in && _in.ciudad) ? String(_in.ciudad).trim() : '';
+        const _geoRefLead = _refIn ? await geocodificarTextoOSM(_refIn, _ciuIn) : null;
+        if (!_geoRefLead) {
+          _resCercaTxt = 'No pude ubicar en el mapa la referencia "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Decile al lead con naturalidad que no ubicas ese punto exacto y pedile una referencia mas conocida (esquina, avenida y altura, o un lugar conocido). NO inventes la ubicacion.';
+        } else {
+          // Candidatos con coordenadas segun el rubro de la cuenta.
+          let _cands = [];
+          const _rubroC = normalizarRubro(rubro);
+          if (_rubroC === 'hotel_cabanas') {
+            try {
+              const _hc = await supabase.from('hotel_complejos').select('nombre, atributos').eq('user_id', user_id);
+              (_hc.data || []).forEach(function(c){ const a = (c.atributos && typeof c.atributos === 'object') ? c.atributos : {}; if (a.lat != null && a.lng != null) _cands.push({ nombre: c.nombre || 'Complejo', lat: Number(a.lat), lng: Number(a.lng), extra: a.direccion || '' }); });
+            } catch (eHC) {}
+          } else if (_rubroC === 'desarrolladora') {
+            try {
+              const _dv = await supabase.from('developments').select('nombre, zona, direccion, lat, lng').eq('user_id', user_id).eq('activo', true);
+              (_dv.data || []).forEach(function(d){ if (d.lat != null && d.lng != null) _cands.push({ nombre: d.nombre || 'Emprendimiento', lat: Number(d.lat), lng: Number(d.lng), extra: d.direccion || d.zona || '' }); });
+            } catch (eDV) {}
+          } else {
+            (properties || []).forEach(function(p){ if (p.lat != null && p.lng != null) _cands.push({ nombre: (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title || ''), lat: Number(p.lat), lng: Number(p.lng), extra: p.direccion || p.zone || '' }); });
+          }
+          if (!_cands.length) {
+            _resCercaTxt = 'Referencia ubicada, pero el inventario todavia no tiene coordenadas cargadas para comparar distancias. Responde usando la zona/direccion que figura en el inventario, sin inventar distancias ni lugares.';
+          } else {
+            const _cercanas = _cands.map(function(c){ return { nombre: c.nombre, extra: c.extra, km: haversineKm(_geoRefLead.lat, _geoRefLead.lng, c.lat, c.lng) }; }).sort(function(a,b){ return a.km - b.km; }).slice(0, 5);
+            const _lineasC = _cercanas.map(function(c){ return '- ' + c.nombre + (c.extra ? ' (' + c.extra + ')' : '') + ': a ' + _fmtDistancia(c.km); });
+            _resCercaTxt = 'Referencia ubicada: "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Lo mas cercano del inventario (distancia en linea recta):' + String.fromCharCode(10) + _lineasC.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele lo que corresponda con naturalidad mencionando la distancia TAL CUAL figura arriba (m/km y cuadras): NO la conviertas, NO la redondees para abajo y NUNCA digas "a pocas cuadras" o "cerquita" si figura a mas de 500 m — decir que algo lejano esta cerca es mentirle al lead. Si nada queda razonablemente cerca, decilo con honestidad y ofrece la opcion menos lejana aclarando su distancia real.';
+          }
+        }
+      } catch (eCerca) {
+        console.error('tool buscar_propiedades_cerca:', eCerca && eCerca.message);
+        _resCercaTxt = 'No se pudo consultar la ubicacion en este momento. Segui la conversacion con lo que sabes del inventario, sin inventar ubicaciones.';
+      }
+      _out.texto = _resCercaTxt;
+    }
+    else if (_nombre === 'ubicar_lugar') {
+      let _resUbicTxt = '';
+      try {
+        const _refU = (_in && _in.referencia) ? String(_in.referencia).trim() : '';
+        const _ciuU = (_in && _in.ciudad) ? String(_in.ciudad).trim() : '';
+        const _geoU = _refU ? await geocodificarTextoOSM(_refU, _ciuU) : null;
+        if (!_geoU) {
+          // Anti-invento: si OSM no lo ubica, la IA NO debe inventar una direccion ni coordenadas.
+          _resUbicTxt = 'No pude ubicar en el mapa "' + _refU + '"' + (_ciuU ? ' (' + _ciuU + ')' : '') + '. Decile al lead con naturalidad que no ubicas ese punto exacto y pedile una referencia mas precisa (calle y altura, una esquina, o un lugar conocido). NO inventes la direccion ni las coordenadas.';
+        } else {
+          const _mapsU = 'https://www.google.com/maps?q=' + _geoU.lat + ',' + _geoU.lng;
+          const _dirU = (_geoU.display && String(_geoU.display).trim()) ? String(_geoU.display).trim() : '';
+          _resUbicTxt = 'Ubicacion encontrada para "' + _refU + '"' + (_ciuU ? ' (' + _ciuU + ')' : '') + '.' +
+            (_dirU ? (' Direccion aproximada segun el mapa: ' + _dirU + '.') : '') +
+            ' Coordenadas: ' + _geoU.lat + ', ' + _geoU.lng + '.' +
+            ' Link de Google Maps para pasarle al lead: ' + _mapsU + '.' +
+            ' Compartile la calle/direccion' + (_dirU ? '' : ' (si la sabes)') + ' y el link de Google Maps. IMPORTANTE: esto te da SOLO la ubicacion del punto que nombro el lead, NO una lista de comercios; no nombres negocios ni lugares puntuales que no figuren en el inventario ni en este resultado.';
+        }
+      } catch (eUbic) {
+        console.error('tool ubicar_lugar:', eUbic && eUbic.message);
+        _resUbicTxt = 'No se pudo consultar la ubicacion en este momento. Segui la conversacion sin inventar direcciones ni coordenadas.';
+      }
+      _out.texto = _resUbicTxt;
+    }
+    else if (_nombre === 'consultar_disponibilidad') {
+      const _miles = function(n){ return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
+      let _resDispoTxt = '';
+      try {
+        const _ci = (_in && _in.check_in) ? String(_in.check_in).trim() : '';
+        const _co = (_in && _in.check_out) ? String(_in.check_out).trim() : '';
+        const _ad = (_in && _in.adultos) ? _in.adultos : 2;
+        const _ni = (_in && _in.ninos) ? _in.ninos : 0;
+        const _cfgPx = await _pxsolConfigDeCuenta(user_id);
+        if (!_cfgPx) {
+          _resDispoTxt = 'No pude conectar con el motor de reservas del hotel. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
+        } else {
+          const _disp = await _pxsolDisponibilidad(_cfgPx, _ci, _co, _ad, _ni);
+          if (!_disp.ok) {
+            _resDispoTxt = 'No se pudo consultar la disponibilidad (' + (_disp.error || 'error') + '). Confirma con el lead las fechas (entrada y salida) y cuantas personas, o decile que le confirmas a la brevedad. NO inventes precios.';
+          } else {
+            const _hay = (_disp.opciones || []).filter(function(o){ return !o.sinDisponibilidad; });
+            if (!_hay.length) {
+              const _conMin = (_disp.opciones || []).find(function(o){ return o.minLOS; });
+              _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches) NO hay disponibilidad.' + (_conMin ? (' Varias tarifas piden un minimo de ' + _conMin.minLOS + ' noches para esas fechas.') : '');
+              // ADITIVO: mismas fechas alternativas que muestra la WEB del hotel cuando no hay lugar,
+              // asi la IA responde IGUAL que la web en vez de un "no" seco (incongruencia 2026-07-15).
+              try {
+                const _alts = await _pxsolAlternativas(_cfgPx, _disp.sid);
+                if (_alts.length) {
+                  const _NLa = String.fromCharCode(10);
+                  _resDispoTxt += _NLa + 'PERO la web del hotel ofrece estas fechas alternativas REALES (ofrecelas, cada una en su propia linea con un renglon en blanco entre cada una):' + _NLa +
+                    _alts.map(function(x){ return '- Del ' + x.llegada + ' al ' + x.salida + ' (' + x.noches + ' noches)' + (x.desde ? ' desde ' + x.desde + ' por noche (precio web, sin IVA)' : ''); }).join(_NLa) +
+                    _NLa + 'Si alguna le sirve al lead, consulta de nuevo la disponibilidad con esas fechas para darle el precio exacto de cada habitacion. No inventes precios fuera de esta lista.';
+                } else {
+                  _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.';
+                }
+              } catch (eAlt) { _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.'; }
+            } else {
+              const _NLd = String.fromCharCode(10);
+              const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
+              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' adultos' + (_ni > 0 ? ' y ' + _ni + ' niños' : '') + '). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
+            }
+          }
+        }
+      } catch (eDispo) { console.error('tool consultar_disponibilidad:', eDispo && eDispo.message); _resDispoTxt = 'No se pudo consultar la disponibilidad ahora. Decile al lead que le confirmas a la brevedad, sin inventar precios.'; }
+      _out.texto = _resDispoTxt;
+    }
+    else if (_nombre === 'cotizacion_dolar') {
+      let _resDolarTxt = '';
+      try {
+        const _tipoDl = (_in && _in.tipo) ? String(_in.tipo).trim().toLowerCase() : 'blue';
+        const _montoDl = (_in && _in.monto_usd != null) ? Number(_in.monto_usd) : null;
+        const _d = await _fuenteDolar(_tipoDl);
+        if (!_d) {
+          _resDolarTxt = 'No se pudo obtener la cotizacion del dolar en este momento. Decile al lead con naturalidad que no la pudiste confirmar ahora y que la chequee en un rato. NO inventes un valor.';
+        } else {
+          const _fmtM = function(n){ return (n == null) ? '?' : String(Math.round(Number(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
+          _resDolarTxt = 'Cotizacion del dolar ' + (_d.nombre || _d.tipo) + ' (valor de REFERENCIA de mercado): compra $' + _fmtM(_d.compra) + ' / venta $' + _fmtM(_d.venta) + '. Actualizado: ' + (_d.fecha || 's/d') + '.';
+          if (_montoDl != null && !isNaN(_montoDl) && _d.venta != null) {
+            _resDolarTxt += ' Conversion pedida: USD ' + _fmtM(_montoDl) + ' equivalen a $' + _fmtM(_montoDl * Number(_d.venta)) + ' (al valor de venta del ' + (_d.nombre || _d.tipo) + ').';
+          }
+          _resDolarTxt += ' Aclarale al lead que es una referencia de mercado y puede variar; no inventes otros valores.';
+        }
+      } catch (eDl) { console.error('tool cotizacion_dolar:', eDl && eDl.message); _resDolarTxt = 'No se pudo consultar la cotizacion ahora. Segui la conversacion sin inventar valores.'; }
+      _out.texto = _resDolarTxt;
+    }
+    else if (_nombre === 'pronostico_clima') {
+      let _resClimaTxt = '';
+      try {
+        let _la = (_in && _in.lat != null) ? Number(_in.lat) : null;
+        let _lo = (_in && _in.lon != null) ? Number(_in.lon) : null;
+        const _idPc = (_in && _in.id_propiedad != null) ? _in.id_propiedad : null;
+        if ((_la == null || _lo == null || isNaN(_la) || isNaN(_lo)) && _idPc != null) {
+          const _coC = await _coordsDeIdPropiedad(user_id, rubro, properties, _idPc);
+          if (_coC) { _la = _coC.lat; _lo = _coC.lng; }
+        }
+        const _fdC = (_in && _in.fecha_desde) ? String(_in.fecha_desde).trim() : '';
+        let _diasC = (_in && _in.dias != null) ? parseInt(_in.dias, 10) : 3;
+        if (!(_diasC >= 1)) _diasC = 3;
+        if (_diasC > 16) _diasC = 16;
+        if (_la == null || _lo == null || isNaN(_la) || isNaN(_lo)) {
+          _resClimaTxt = 'No tengo la ubicacion (lat/lon) para el pronostico. Pedile al lead la zona o la propiedad concreta; no inventes el clima.';
+        } else {
+          let _fueraRango = false;
+          if (_fdC && /^\d{4}-\d{2}-\d{2}$/.test(_fdC)) {
+            try { var _hoyC = new Date(); _hoyC.setHours(0, 0, 0, 0); var _difC = Math.round((new Date(_fdC + 'T12:00:00Z').getTime() - _hoyC.getTime()) / 86400000); if (_difC > 16) _fueraRango = true; } catch (eR) {}
+          }
+          if (_fueraRango) {
+            _resClimaTxt = 'Todavia no hay pronostico para esa fecha (el pronostico llega hasta ~16 dias). Decile al lead que mas cerca de la fecha se lo podes chequear; no inventes el clima.';
+          } else {
+            const _cl = await _fuenteClima(_la, _lo, _fdC, _diasC);
+            if (!_cl || !_cl.dias || !_cl.dias.length) {
+              _resClimaTxt = 'No se pudo obtener el pronostico en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes el clima.';
+            } else {
+              const _NLc = String.fromCharCode(10);
+              const _lineasCl = _cl.dias.map(function(x){ return '- ' + x.fecha + ': ' + x.cielo + ', minima ' + (x.tmin != null ? Math.round(x.tmin) + '°' : '?') + ' / maxima ' + (x.tmax != null ? Math.round(x.tmax) + '°' : '?') + (x.prob_lluvia != null ? (', probabilidad de lluvia ' + Math.round(x.prob_lluvia) + '%') : ''); });
+              _resClimaTxt = 'Pronostico (valor de referencia):' + _NLc + _lineasCl.join(_NLc) + _NLc + 'Contaselo al lead de forma clara y natural; no agregues dias ni datos que no esten en esta lista.';
+            }
+          }
+        }
+      } catch (eCl) { console.error('tool pronostico_clima:', eCl && eCl.message); _resClimaTxt = 'No se pudo consultar el clima ahora. Segui la conversacion sin inventar el pronostico.'; }
+      _out.texto = _resClimaTxt;
+    }
+    else if (_nombre === 'feriados_ar') {
+      let _resFeriTxt = '';
+      const _aclaraFe = ' IMPORTANTE: son SOLO feriados NACIONALES (no incluye feriados turisticos por decreto ni provinciales); aclaraselo al lead si corresponde.';
+      try {
+        const _modoFe = (_in && _in.modo) ? String(_in.modo).trim() : 'proximos';
+        const _anioFe = (_in && _in.anio) ? parseInt(_in.anio, 10) : new Date().getFullYear();
+        const _fechaFe = (_in && _in.fecha) ? String(_in.fecha).trim() : '';
+        const _NLf = String.fromCharCode(10);
+        if (_modoFe === 'finde_largo') {
+          const _lw = await _fuenteFeriadosURL('https://date.nager.at/api/v3/LongWeekend/' + _anioFe + '/AR');
+          if (!_lw) _resFeriTxt = 'No se pudo obtener la info de fines de semana largos en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes fechas.';
+          else if (!_lw.length) _resFeriTxt = 'No figuran fines de semana largos para ' + _anioFe + '.' + _aclaraFe;
+          else _resFeriTxt = 'Fines de semana largos ' + _anioFe + ':' + _NLf + _lw.map(function(w){ return '- del ' + w.startDate + ' al ' + w.endDate + ' (' + w.dayCount + ' dias)'; }).join(_NLf) + _NLf + 'Contaselos al lead con naturalidad.' + _aclaraFe;
+        } else if (_modoFe === 'es_feriado') {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(_fechaFe)) {
+            _resFeriTxt = 'Para saber si es feriado necesito la fecha exacta (AAAA-MM-DD). Pedisela al lead con naturalidad.';
+          } else {
+            const _anioDe = parseInt(_fechaFe.slice(0, 4), 10) || _anioFe;
+            const _ph = await _fuenteFeriadosURL('https://date.nager.at/api/v3/PublicHolidays/' + _anioDe + '/AR');
+            if (!_ph) _resFeriTxt = 'No se pudo verificar el feriado en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes.';
+            else {
+              const _match = _ph.find(function(h){ return h && h.date === _fechaFe; });
+              _resFeriTxt = _match ? ('El ' + _fechaFe + ' SI es feriado nacional: ' + (_match.localName || _match.name || 'feriado') + '.' + _aclaraFe) : ('El ' + _fechaFe + ' NO es feriado nacional.' + _aclaraFe);
+            }
+          }
+        } else if (_modoFe === 'del_anio') {
+          const _ph = await _fuenteFeriadosURL('https://date.nager.at/api/v3/PublicHolidays/' + _anioFe + '/AR');
+          if (!_ph) _resFeriTxt = 'No se pudo obtener el listado de feriados en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes.';
+          else if (!_ph.length) _resFeriTxt = 'No figuran feriados para ' + _anioFe + '.' + _aclaraFe;
+          else _resFeriTxt = 'Feriados nacionales ' + _anioFe + ':' + _NLf + _ph.map(function(h){ return '- ' + h.date + ': ' + (h.localName || h.name || ''); }).join(_NLf) + _NLf + 'Compartilos con naturalidad segun lo que pregunte el lead.' + _aclaraFe;
+        } else {
+          const _np = await _fuenteFeriadosURL('https://date.nager.at/api/v3/NextPublicHolidays/AR');
+          if (!_np) _resFeriTxt = 'No se pudo obtener los proximos feriados en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes fechas.';
+          else if (!_np.length) _resFeriTxt = 'No figuran proximos feriados nacionales.' + _aclaraFe;
+          else _resFeriTxt = 'Proximos feriados nacionales:' + _NLf + _np.slice(0, 6).map(function(h){ return '- ' + h.date + ': ' + (h.localName || h.name || ''); }).join(_NLf) + _NLf + 'Deciles el/los que correspondan a lo que pregunto el lead.' + _aclaraFe;
+        }
+      } catch (eFe) { console.error('tool feriados_ar:', eFe && eFe.message); _resFeriTxt = 'No se pudo consultar los feriados ahora. Segui la conversacion sin inventar fechas.'; }
+      _out.texto = _resFeriTxt;
+    }
+    else if (_nombre === 'normalizar_direccion_ar') {
+      let _resGeoTxt = '';
+      try {
+        const _dirGe = (_in && _in.direccion) ? String(_in.direccion).trim() : '';
+        const _provGe = (_in && _in.provincia) ? String(_in.provincia).trim() : '';
+        const _locGe = (_in && _in.localidad) ? String(_in.localidad).trim() : '';
+        if (!_dirGe) {
+          _resGeoTxt = 'No recibi una direccion para normalizar. Pedile al lead la calle y la altura.';
+        } else {
+          const _g = await _fuenteGeoref(_dirGe, _provGe, _locGe);
+          if (!_g) {
+            _resGeoTxt = 'No pude normalizar la direccion "' + _dirGe + '". Pedile al lead que aclare la localidad y la provincia; NO inventes el partido ni la localidad.';
+          } else {
+            _resGeoTxt = 'Direccion normalizada (fuente oficial Georef): ' + (_g.nomenclatura || _dirGe) + '. Provincia: ' + (_g.provincia || 's/d') + '. Departamento/partido: ' + (_g.departamento || 's/d') + '. Localidad: ' + (_g.localidad || 's/d') + '.' + ((_g.lat != null && _g.lon != null) ? (' Coordenadas: ' + _g.lat + ', ' + _g.lon + '.') : '') + ' Usala para confirmarle la zona/partido al lead; no agregues datos que no esten en este resultado.';
+          }
+        }
+      } catch (eGe) { console.error('tool normalizar_direccion_ar:', eGe && eGe.message); _resGeoTxt = 'No se pudo normalizar la direccion ahora. Segui la conversacion sin inventar el partido ni la localidad.'; }
+      _out.texto = _resGeoTxt;
+    }
+    else if (_nombre === 'distancia_viaje') {
+      let _resOsrmTxt = '';
+      try {
+        let _la1 = (_in && _in.origen_lat != null) ? Number(_in.origen_lat) : null;
+        let _lo1 = (_in && _in.origen_lon != null) ? Number(_in.origen_lon) : null;
+        let _la2 = (_in && _in.destino_lat != null) ? Number(_in.destino_lat) : null;
+        let _lo2 = (_in && _in.destino_lon != null) ? Number(_in.destino_lon) : null;
+        const _idPo = (_in && _in.id_propiedad != null) ? _in.id_propiedad : null;
+        const _destTxtO = (_in && _in.destino_texto) ? String(_in.destino_texto).trim() : '';
+        const _ciuO = (_in && _in.ciudad) ? String(_in.ciudad).trim() : '';
+        // id_propiedad completa el extremo que falte (primero el origen; si el origen ya vino, el destino).
+        if (_idPo != null) {
+          const _coO = await _coordsDeIdPropiedad(user_id, rubro, properties, _idPo);
+          if (_coO) {
+            if (_la1 == null || _lo1 == null || isNaN(_la1) || isNaN(_lo1)) { _la1 = _coO.lat; _lo1 = _coO.lng; }
+            else if (_la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2)) { _la2 = _coO.lat; _lo2 = _coO.lng; }
+          }
+        }
+        // destino_texto geocodifica el extremo destino si falta (reusa geocodificarTextoOSM, con cache OSM).
+        if ((_la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2)) && _destTxtO) {
+          const _geoO = await geocodificarTextoOSM(_destTxtO, _ciuO);
+          if (_geoO) { _la2 = _geoO.lat; _lo2 = _geoO.lng; }
+        }
+        const _faltan = (_la1 == null || _lo1 == null || isNaN(_la1) || isNaN(_lo1) || _la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2));
+        if (_faltan) {
+          _resOsrmTxt = 'No tengo los dos puntos para calcular la distancia (faltan coordenadas o no pude ubicar el destino). Pedile al lead una referencia mas precisa; no inventes la distancia ni el tiempo.';
+        } else {
+          const _ru = await _fuenteOsrm(_la1, _lo1, _la2, _lo2);
+          if (_ru) {
+            _resOsrmTxt = 'Distancia EN AUTO (ruta real): ' + _fmtDistancia(_ru.distancia_m / 1000) + ', tiempo estimado ' + _fmtDuracionMin(_ru.duracion_s) + '. Contaselo al lead como estimado de manejo; no inventes otro tiempo.';
+          } else {
+            const _kmL = haversineKm(_la1, _lo1, _la2, _lo2);
+            _resOsrmTxt = 'No se pudo calcular la ruta en auto ahora. En LINEA RECTA hay ~' + _fmtDistancia(_kmL) + ' (NO es la distancia por calle ni un tiempo de viaje). Aclarale al lead que es una aproximacion en linea recta y que no tenes el tiempo exacto de manejo; NO inventes un tiempo.';
+          }
+        }
+      } catch (eOs) { console.error('tool distancia_viaje:', eOs && eOs.message); _resOsrmTxt = 'No se pudo calcular la distancia ahora. Segui la conversacion sin inventar distancias ni tiempos.'; }
+      _out.texto = _resOsrmTxt;
+    }
+    else if (_nombre === 'buscar_inventario') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLbi = String.fromCharCode(10);
+      let _resBiTxt = '';
+      try {
+        const _inpBi = _in || {};
+        const _resBi = _buscarInventarioProps(properties, {
+          zonas: _inpBi.zonas, operacion: _inpBi.operacion, tipo: _inpBi.tipo,
+          precio_min: _inpBi.precio_min, precio_max: _inpBi.precio_max,
+          dormitorios_min: _inpBi.dormitorios_min, ambientes_min: _inpBi.ambientes_min,
+          capacidad_min: _inpBi.capacidad_min, texto_libre: _inpBi.texto_libre,
+          // AMPLIACION (Diego 2026-07-23): por numero/id, por nombre, por caracteristicas/amenities, filtros duros,
+          // disponibilidad por fechas (temporal) y limite pedido por la IA.
+          numero: _inpBi.numero, nombre: _inpBi.nombre, caracteristicas: _inpBi.caracteristicas,
+          apto_credito: _inpBi.apto_credito, cocheras_min: _inpBi.cocheras_min,
+          banos_min: _inpBi.banos_min, superficie_min: _inpBi.superficie_min,
+          fecha_desde: _inpBi.fecha_desde, fecha_hasta: _inpBi.fecha_hasta, limite: _inpBi.limite
+        }, periodosPorProp); // calendario temporal (ya cargado arriba, sin query extra)
+        if (!_resBi.length) {
+          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
+          _resBiTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes propiedades. Opciones: (a) relaja algun filtro (ampli el rango de precio o suma zonas) y volve a llamar buscar_inventario; (b) pedile al lead un dato que acote mejor (zona, presupuesto, ambientes). Para referencia, este es el panorama del inventario:' + _NLbi + _indiceInv;
+        } else {
+          _resBiTxt = 'Resultados del inventario (' + _resBi.length + '; usa SOLO estos, no inventes otros). Para dar fotos o el detalle completo de una, usa ficha_inventario con su numero:' + _NLbi + _resBi.map(_fichaCompactaProp).join(_NLbi) + _NLbi + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su precio y link si tiene. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.';
+        }
+      } catch (eBi) {
+        console.error('tool buscar_inventario:', eBi && eBi.message);
+        // FAIL-OPEN A LA CALIDAD: si el buscador falla, le pasamos el CATALOGO COMPLETO comprimido para que la IA NO
+        // responda a ciegas (nunca degradar la respuesta; el costo extra es raro y solo ante error).
+        _resBiTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el CATALOGO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbi + (_invCompactoRag || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
+      }
+      _out.texto = _resBiTxt;
+    }
+    else if (_nombre === 'ficha_inventario') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLfi = String.fromCharCode(10);
+      let _resFiTxt = '';
+      try {
+        const _inpFi = _in || {};
+        const _idRaw = (_inpFi.id != null && _inpFi.id !== '') ? _inpFi.id : (_inpFi.numero != null ? _inpFi.numero : '');
+        const _idPed = String(_idRaw).trim();
+        let _pFi = null;
+        if (_idPed) _pFi = (properties || []).find(function(p){ return (p.numero != null && String(p.numero).trim() === _idPed) || (p.id != null && String(p.id).trim() === _idPed); });
+        if (!_pFi) {
+          _resFiTxt = 'No encontre una propiedad con ese numero/id (' + _idPed + '). Volve a buscar con buscar_inventario o pedile al lead que aclare cual le interesa. No inventes datos.';
+        } else {
+          _resFiTxt = 'Ficha completa de la propiedad pedida (usa SOLO estos datos):' + _NLfi + _fichaCompletaProp(_pFi) + _NLfi + 'Para mandarle una FOTO usa enviar_foto_propiedad con el numero. No inventes datos que no figuren aca.';
+        }
+      } catch (eFi) { console.error('tool ficha_inventario:', eFi && eFi.message); _resFiTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del inventario, sin inventar.'; }
+      _out.texto = _resFiTxt;
+    }
+    else if (_nombre === 'buscar_y_detallar') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLbd = String.fromCharCode(10);
+      let _resBdTxt = '';
+      try {
+        const _inpBd = _in || {};
+        // Tope propio mas chico (default 4, max 8): como cada resultado viaja con su ficha completa, N grande infla el turno.
+        const _limBd = (_inpBd.limite && Number(_inpBd.limite) > 0) ? Math.min(Number(_inpBd.limite), 8) : 4;
+        const _resBd = _buscarInventarioProps(properties, {
+          zonas: _inpBd.zonas, operacion: _inpBd.operacion, tipo: _inpBd.tipo,
+          precio_min: _inpBd.precio_min, precio_max: _inpBd.precio_max,
+          dormitorios_min: _inpBd.dormitorios_min, ambientes_min: _inpBd.ambientes_min,
+          capacidad_min: _inpBd.capacidad_min, texto_libre: _inpBd.texto_libre,
+          numero: _inpBd.numero, nombre: _inpBd.nombre, caracteristicas: _inpBd.caracteristicas,
+          apto_credito: _inpBd.apto_credito, cocheras_min: _inpBd.cocheras_min,
+          banos_min: _inpBd.banos_min, superficie_min: _inpBd.superficie_min,
+          fecha_desde: _inpBd.fecha_desde, fecha_hasta: _inpBd.fecha_hasta, limite: _limBd
+        }, periodosPorProp);
+        if (!_resBd.length) {
+          _resBdTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes propiedades. Opciones: (a) relaja algun filtro (ampli el rango de precio o suma zonas) y volve a llamar buscar_y_detallar; (b) pedile al lead un dato que acote mejor (zona, presupuesto, ambientes). Para referencia, este es el panorama del inventario:' + _NLbd + _indiceInv;
+        } else {
+          _resBdTxt = 'Resultados del inventario CON FICHA COMPLETA (' + _resBd.length + '; usa SOLO estos, no inventes otros; ya tenes todos sus datos aca, NO hace falta que vuelvas a pedir la ficha):' + _NLbd + _resBd.map(_fichaCompletaProp).join(_NLbd) + _NLbd + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su precio y link si tiene. Para MANDAR una foto usa enviar_foto_propiedad con el numero. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.';
+        }
+      } catch (eBd) {
+        console.error('tool buscar_y_detallar:', eBd && eBd.message);
+        // FAIL-OPEN A LA CALIDAD (igual que buscar_inventario): ante error, catalogo completo comprimido, sin inventar.
+        _resBdTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el CATALOGO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbd + (_invCompactoRag || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
+      }
+      _out.texto = _resBdTxt;
+    }
+    else if (_nombre === 'buscar_unidades') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLbu = String.fromCharCode(10);
+      let _resBuTxt = '';
+      try {
+        const _inpBu = _in || {};
+        const _resBu = _buscarUnidadesHotel(_hotelUnidades, {
+          complejo: _inpBu.complejo, tipo: _inpBu.tipo, capacidad_min: _inpBu.capacidad_min,
+          precio_min: _inpBu.precio_min, precio_max: _inpBu.precio_max, temporada: _inpBu.temporada,
+          texto_libre: _inpBu.texto_libre, numero: _inpBu.numero,
+          check_in: _inpBu.check_in, check_out: _inpBu.check_out, limite: _inpBu.limite
+        });
+        // Si el lead dio fechas y PXSOL esta activo, la lista corta se cierra con la tool EN VIVO (precio/disponibilidad exactos).
+        const _hayFechasBu = !!(_inpBu.check_in && _inpBu.check_out && /^\d{4}-\d{2}-\d{2}$/.test(String(_inpBu.check_in)) && /^\d{4}-\d{2}-\d{2}$/.test(String(_inpBu.check_out)));
+        const _notaDispo = (_hayFechasBu && _iaDisponibilidadOn && _esHotel) ? (_NLbu + 'IMPORTANTE: para el PRECIO y la DISPONIBILIDAD EXACTOS de esas fechas usa la herramienta consultar_disponibilidad (motor en vivo); esta lista es orientativa.') : '';
+        if (!_resBu.length) {
+          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
+          _resBuTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes unidades. Opciones: (a) relaja algun filtro (ampli el rango de precio o quita el complejo) y volve a llamar buscar_unidades; (b) pedile al lead un dato que acote mejor (personas, complejo, presupuesto). Para referencia, este es el panorama del alojamiento:' + _NLbu + _indiceHotel + _notaDispo;
+        } else {
+          _resBuTxt = 'Unidades del alojamiento (' + _resBu.length + '; usa SOLO estas, no inventes otras). Para dar fotos o el detalle completo de una, usa ficha_unidad con su numero:' + _NLbu + _resBu.map(_fichaCompactaUnidad).join(_NLbu) + _NLbu + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su tarifa por noche. Si una figura OCUPADA en las fechas pedidas, no la ofrezcas para ese rango: proponé otra libre o fechas alternativas. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.' + _notaDispo;
+        }
+      } catch (eBu) {
+        console.error('tool buscar_unidades:', eBu && eBu.message);
+        // FAIL-OPEN A LA CALIDAD: si el buscador falla, le pasamos el LISTADO COMPLETO comprimido para que la IA NO
+        // responda a ciegas (nunca degradar la respuesta; el costo extra es raro y solo ante error).
+        _resBuTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el LISTADO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbu + (_invHotelCompacto || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
+      }
+      _out.texto = _resBuTxt;
+    }
+    else if (_nombre === 'ficha_unidad') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLfu = String.fromCharCode(10);
+      let _resFuTxt = '';
+      try {
+        const _inpFu = _in || {};
+        const _idRawU = (_inpFu.id != null && _inpFu.id !== '') ? _inpFu.id : (_inpFu.numero != null ? _inpFu.numero : '');
+        const _idPedU = String(_idRawU).trim();
+        let _uFi = null;
+        if (_idPedU) _uFi = (_hotelUnidades || []).find(function(u){ return (u.numero != null && String(u.numero).trim() === _idPedU) || (u.id != null && String(u.id).trim() === _idPedU); });
+        if (!_uFi) {
+          _resFuTxt = 'No encontre una unidad con ese numero/id (' + _idPedU + '). Volve a buscar con buscar_unidades o pedile al lead que aclare cual le interesa. No inventes datos.';
+        } else {
+          _resFuTxt = 'Ficha completa de la unidad pedida (usa SOLO estos datos):' + _NLfu + _fichaCompletaUnidad(_uFi) + _NLfu + 'Para mandarle una FOTO usa enviar_foto_propiedad con el numero.' + ((_iaDisponibilidadOn && _esHotel) ? ' Para el PRECIO/DISPONIBILIDAD EXACTOS de fechas concretas usa consultar_disponibilidad.' : '') + ' No inventes datos que no figuren aca.';
+        }
+      } catch (eFu) { console.error('tool ficha_unidad:', eFu && eFu.message); _resFuTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del alojamiento, sin inventar.'; }
+      _out.texto = _resFuTxt;
+    }
+    else if (_nombre === 'buscar_desarrollos') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLbd = String.fromCharCode(10);
+      let _resBdTxt = '';
+      try {
+        const _inpBd = _in || {};
+        const _resBd = _buscarUnidadesDev(_devsRag, _unitsRag, _sectorNombrePorId, {
+          desarrollo: _inpBd.desarrollo, etapa: _inpBd.etapa, estado: _inpBd.estado,
+          tipo_producto: _inpBd.tipo_producto, tipologia: _inpBd.tipologia,
+          precio_min: _inpBd.precio_min, precio_max: _inpBd.precio_max,
+          m2_min: _inpBd.m2_min, m2_max: _inpBd.m2_max,
+          numero: _inpBd.numero, texto_libre: _inpBd.texto_libre, limite: _inpBd.limite
+        });
+        if (!_resBd.length) {
+          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
+          _resBdTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes unidades ni lotes. Opciones: (a) relaja algun filtro (ampli el rango de precio/m2 o quita el emprendimiento) y volve a llamar buscar_desarrollos; (b) pedile al lead un dato que acote mejor (emprendimiento, presupuesto, tipo de producto). Para referencia, este es el panorama de los emprendimientos:' + _NLbd + _indiceDev;
+        } else {
+          _resBdTxt = 'Unidades / lotes de los emprendimientos (' + _resBd.length + '; usa SOLO estos, no inventes otros). Para dar el detalle completo de uno, usa ficha_desarrollo con su numero:' + _NLbd + _resBd.map(function(u){ return _fichaCompactaDevUnit(u, null); }).join(_NLbd) + _NLbd + 'Ofrece el/los que mejor encajen con lo que pidio el lead, con su precio y estado. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse. Si ninguno encaja del todo, decilo con honestidad y ofrece el mas parecido o pedi un dato para afinar.';
+        }
+      } catch (eBd) {
+        console.error('tool buscar_desarrollos:', eBd && eBd.message);
+        // FAIL-OPEN A LA CALIDAD: para loteos GRANDES NO volcamos miles de lineas -> el INDICE + el inventario ya capado
+        // (mismo piso que hoy). Respaldo bounded: inventarioDesarrollos (cap 30/dev) o el compacto capado.
+        const _respaldoDev = inventarioDesarrollos || _inventarioCompactoDevUnits(_unitsRag, 30);
+        _resBdTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el PANORAMA de los emprendimientos; elegi de aca lo que corresponda (no inventes nada fuera de esto):' + _NLbd + (_indiceDev || '') + (_respaldoDev ? (_NLbd + _respaldoDev) : '');
+      }
+      _out.texto = _resBdTxt;
+    }
+    else if (_nombre === 'ficha_desarrollo') {
+      _ragToolUsado = true; // mismo criterio de cobro que hoy: la busqueda no se cobra aparte
+      const _NLfd = String.fromCharCode(10);
+      let _resFdTxt = '';
+      try {
+        const _inpFd = _in || {};
+        const _idRawD = (_inpFd.numero != null && _inpFd.numero !== '') ? _inpFd.numero : (_inpFd.id != null ? _inpFd.id : '');
+        const _idPedD = String(_idRawD).trim();
+        let _uFd = null;
+        if (_idPedD) {
+          const _normD = _ragNorm(_idPedD);
+          const _flatD = [];
+          try { Object.keys(_unitsRag || {}).forEach(function(k){ (_unitsRag[k] || []).forEach(function(u){ _flatD.push(u); }); }); } catch (eFlat) {}
+          _uFd = _flatD.find(function(u){ return u.numero != null && _ragNorm(u.numero) === _normD; }) || null;
+        }
+        if (!_uFd) {
+          _resFdTxt = 'No encontre una unidad/lote con ese numero (' + _idPedD + '). Volve a buscar con buscar_desarrollos o pedile al lead que aclare cual le interesa. No inventes datos.';
+        } else {
+          _resFdTxt = 'Ficha completa de la unidad/lote pedido (usa SOLO estos datos):' + _NLfd + _fichaCompletaDevUnit(_uFd, null, _uFd.etapa) + _NLfd + 'Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse. No inventes datos que no figuren aca.';
+        }
+      } catch (eFd) { console.error('tool ficha_desarrollo:', eFd && eFd.message); _resFdTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes de los emprendimientos, sin inventar.'; }
+      _out.texto = _resFdTxt;
+    }
+    else if (_nombre === 'consultar_al_dueno') {
+        const _pregunta = (_in && _in.pregunta) ? String(_in.pregunta).trim() : '';
+        // Registrar + avisar al dueno en segundo plano (no bloquea la respuesta al lead). user_id = TENANT (aislamiento).
+        if (_pregunta) { registrarConsultaAprendizaje(user_id, conversation_id, _pregunta).catch(function(){}); }
+        // FUERA DE HORARIO: si estamos afuera del horario de oficina de la cuenta, el mensaje al lead cambia a la
+        // variante que pidio Diego (el dueno quizas esta durmiendo): "voy a ver si consigo a alguien del equipo,
+        // apenas lo tenga te confirmo, y si no, a primera hora del otro dia en horario de oficina". DEFENSIVO: solo
+        // si hay horario_oficina cargado y estamos afuera; si no hay horario o falla, se usa la guia normal (actual).
+        let _fueraHorarioD = false;
+        try { _fueraHorarioD = !!(settings && settings.horario_oficina && !dentroHorarioOficina(settings.horario_oficina)); } catch (eFH) { _fueraHorarioD = false; }
+        const _guiaTool = _fueraHorarioD
+          ? 'Consulta registrada y enviada al equipo. IMPORTANTE: estamos FUERA del horario de oficina. Decile al lead con naturalidad que vas a ver si consegues a alguien del equipo para conseguir ese dato, que apenas lo tengas se lo confirmas, y que si no llega a ser hoy, se lo respondes a primera hora del proximo dia habil en horario de oficina. Segui la conversacion normal con lo que si podes responder.'
+          : 'Consulta registrada y enviada al dueno. Decile al lead con naturalidad que estas averiguando ese dato y le confirmas enseguida; segui la conversacion normal con lo que si podes responder.';
+      _out.texto = _guiaTool; _out.fueraHorario = _fueraHorarioD;
+    }
+    else if (_nombre === 'enviar_foto_propiedad') {
+      const toolUse = (_inp && typeof _inp === 'object') ? { input: _inp } : null;
+      let fotoUrl = null;
+      let fotoCategoria = null;
+      let toolResultTexto = '';
+      if (toolUse && toolUse.input) {
+        const numPedido = String(toolUse.input.numero == null ? '' : toolUse.input.numero).trim();
+        fotoCategoria = String(toolUse.input.categoria == null ? '' : toolUse.input.categoria).trim();
+        // Buscar la propiedad por numero entre las YA cargadas (no re-consultamos la DB).
+        let propFoto = (properties || []).find(function(p){ return p.numero != null && String(p.numero).trim() === numPedido; });
+        // F6.3: HOTEL — si no matcheo una propiedad, buscar una UNIDAD por numero o por nombre (title contiene lo pedido).
+        if (!propFoto && _esHotel) {
+          const _pedNorm = numPedido.toLowerCase();
+          const _uH = (_hotelUnidsFoto || []).find(function(u){
+            return (u.numero != null && String(u.numero).trim() === numPedido) ||
+                   (u.title && String(u.title).toLowerCase().indexOf(_pedNorm) >= 0);
+          });
+          if (_uH) propFoto = { numero: (_uH.numero != null ? _uH.numero : _uH.title), images: _uH.images };
+        }
+        if (propFoto) {
+          // E3: consulta concreta sobre esta propiedad/unidad -> alimentar "propiedades mas consultadas". 0 IA, best-effort.
+          try { _contarConsultaPropiedad(user_id, numPedido, (propFoto.title || null)).catch(function(){}); } catch (eCnt) {}
+          const imgs = Array.isArray(propFoto.images) ? propFoto.images : [];
+          if (imgs.length > 0) {
+            // ARREGLO 2 (Diego 2026-07-28): la comparacion ya NO es texto exacto. Se resuelve la categoria PEDIDA y la
+            // de CADA foto a su forma canonica (minusculas, sin acentos, plural y SINONIMOS POR RUBRO) y se comparan
+            // esas. Asi 'baño' guardado matchea con 'bano' pedido (arreglo 1) y "fondo"/"fachada"/"garage" caen donde
+            // corresponde. Si no se puede resolver -> null (no matchea).
+            const _catPedida = _resolverCategoriaFoto(fotoCategoria, rubro);
+            // Categorias que la propiedad SI tiene (canonicas, sin repetir). Sirve para el aviso del arreglo 3.
+            const _catsDisp = [];
+            imgs.forEach(function(im){
+              if (!im || !im.url) return;
+              const _c = _resolverCategoriaFoto(im.categoria, rubro);
+              if (_c && _catsDisp.indexOf(_c) === -1) _catsDisp.push(_c);
+            });
+            let cand = _catPedida ? imgs.filter(function(im){ return im && im.url && _resolverCategoriaFoto(im.categoria, rubro) === _catPedida; }) : [];
+            // ARREGLO 3 (Diego 2026-07-28): NO mandar una foto que no es la pedida. El fallback "primera foto de la
+            // galeria" se ELIMINA cuando la propiedad TIENE fotos categorizadas: si no hay de la categoria pedida no se
+            // manda ninguna y se le dice a la IA que categorias SI hay para que las ofrezca (el texto al lead lo arma
+            // ella). EXCEPCION deliberada: si la propiedad/unidad no tiene NINGUNA foto categorizada (_catsDisp vacio;
+            // pasa en HOTEL, donde las fotos se guardan con categoria:'' — ver ~21047/21323 — y en galerias importadas
+            // sin clasificar), no hay forma de saber que la foto "no es la pedida": ahi se conserva el comportamiento
+            // de hoy (mandar una foto y pedirle a la IA que aclare) para no dejar al hotel sin fotos.
+            if (cand.length === 0 && _catsDisp.length === 0) cand = imgs.filter(function(im){ return im && im.url; });
+            if (cand.length > 0) {
+              fotoUrl = cand[0].url;
+              const huboCategoria = !!(_catPedida && _resolverCategoriaFoto(cand[0].categoria, rubro) === _catPedida);
+              toolResultTexto = huboCategoria
+                ? ('OK: foto enviada de la propiedad N' + numPedido + ', categoria ' + fotoCategoria + '. Acompanala con un comentario breve y natural.')
+                : ('No habia foto especifica de la categoria ' + fotoCategoria + ' para la propiedad N' + numPedido + '. Se envio otra foto disponible de la propiedad. Aclara con naturalidad que le mandas una foto de la propiedad aunque no sea exactamente de ' + fotoCategoria + '.');
+            } else if (_catsDisp.length > 0) {
+              toolResultTexto = 'NO se envio ninguna foto: la propiedad N' + numPedido + ' no tiene fotos de la categoria ' + fotoCategoria + '. Categorias de foto que SI tiene esta propiedad: ' + _catsDisp.join(', ') + '. Decile que de esa no tenes y ofrecele las que si hay.';
+            } else {
+              toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
+            }
+          } else {
+            toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
+          }
+        } else {
+          toolResultTexto = 'No se encontro ninguna propiedad con el numero ' + numPedido + ' en el inventario. Pedile al lead que aclare de que propiedad quiere la foto.';
+        }
+      } else {
+        toolResultTexto = 'No se pudo procesar el pedido de foto. Segui la conversacion con normalidad.';
+      }
+      _out.texto = toolResultTexto; _out.fotoUrl = fotoUrl;
+    }
+    return _out;
+  }
+
+  // ===== CICLO DE TOOLS (gated ciclo_tools_v1, default OFF) — BUCLE REAL DE HERRAMIENTAS =====
+  // QUE ARREGLA (caso real 2026-07-28, lead Alejandro Cabrera / cuenta Anton): hoy el turno tiene DOS llamadas
+  // fijas al modelo. En la 2da se le ofrecen todas las tools otra vez, pero SOLO se lee el bloque de TEXTO: si el
+  // modelo pide otra herramienta ese pedido se DESCARTA en silencio y sale una promesa ("dejame buscar y te paso")
+  // que nunca se cumple. Y como ficha_inventario acepta UN id por llamada, pedir el detalle de 4 locales necesita
+  // SI O SI una 3ra vuelta que no existia. Ademas, si el modelo pide 2+ tools en el MISMO turno, hoy se ejecuta una
+  // sola y se manda UN solo tool_result -> la API exige uno por CADA tool_use -> 400 -> catch -> la misma promesa.
+  // Ese mismo mecanismo impedia que la IA DERIVARA despues de ver los resultados (el pedido de derivar caia en el
+  // turno 3, que no existia). Resultado medido: 4 promesas seguidas y el lead perdido.
+  //
+  // TOPE DURO: 3 vueltas de herramientas por mensaje del lead => como MAXIMO 4 llamadas al modelo (1 inicial + 3).
+  // Hoy son 2 cuando la IA usa una tool. Por que 3 y no 4: el caso documentado necesita 2 (buscar -> ficha xN ->
+  // texto) y la 3ra deja margen exacto para "ver resultados -> derivar" o "busqueda vacia -> volver a buscar". Una
+  // 4a vuelta sumaria otra llamada de Sonnet con el prompt entero (mas plata y mas latencia en WhatsApp) para un
+  // encadenado que no aparecio en los casos reales.
+  //
+  // ANTI-BUCLE / ANTI-PROMESA: en la ULTIMA vuelta permitida el request va con tool_choice {type:'none'}, asi el
+  // modelo NO puede pedir otra herramienta y queda OBLIGADO a cerrar con texto -> el tope nunca corta con una
+  // promesa. max_tokens sigue en 500 en las vueltas normales (igual que hoy) y sube a 800 SOLO en ese cierre
+  // forzado, que es donde puede tener que describir varias propiedades juntas.
+  // stop_reason 'max_tokens': una respuesta truncada NO trae stop_reason 'tool_use', asi que el ciclo la toma como
+  // texto final y usa lo que haya (la cadena vieja sigue sin cubrir ese caso; no se toco).
+  // FALLBACK TOTAL: ante CUALQUIER error o si no hay nada usable, devuelve null y corre la cadena de hoy tal cual.
+  const _CICLO_MAX_VUELTAS = 3;
+  async function _correrCicloTools() {
+    // Acumula el usage de cada vuelta sobre `completion.usage` (mismo criterio que los 2dos turnos de hoy) para que
+    // el costo logueado sea el REAL del turno completo.
+    function _acumUso(_c) {
+      try {
+        if (_c && _c.usage && completion && completion.usage) {
+          completion.usage = {
+            input_tokens: (completion.usage.input_tokens || 0) + (_c.usage.input_tokens || 0),
+            output_tokens: (completion.usage.output_tokens || 0) + (_c.usage.output_tokens || 0),
+            cache_read_input_tokens: (completion.usage.cache_read_input_tokens || 0) + (_c.usage.cache_read_input_tokens || 0),
+            cache_creation_input_tokens: (completion.usage.cache_creation_input_tokens || 0) + (_c.usage.cache_creation_input_tokens || 0)
+          };
+        }
+      } catch (eU) {}
+    }
+    function _textoDe(_c) {
+      try { return ((_c && _c.content) || []).filter(function (b) { return b && b.type === 'text' && b.text; }).map(function (b) { return b.text; }).join(' ').trim(); } catch (eT) { return ''; }
+    }
+    // Abandonar el ciclo = devolver null para que corra la cadena de hoy. Se limpia mediaAEnviar para que una foto
+    // ya resuelta por el ciclo no se duplique cuando la cadena vuelva a resolverla.
+    function _abandonar() { try { mediaAEnviar.length = 0; } catch (eM) {} return null; }
+
+    let _msgs = mensajesParaIA;
+    let _comp = completion;
+    let _textoAcum = '';
+    for (let _v = 1; _v <= _CICLO_MAX_VUELTAS; _v++) {
+      const _tus = ((_comp && _comp.content) || []).filter(function (b) { return b && b.type === 'tool_use' && b.name; });
+      const _txtV = _textoDe(_comp);
+      if (_txtV) _textoAcum = _txtV;
+      if (!_tus.length) return _txtV || _textoAcum || _abandonar();
+
+      // TOOLS TERMINALES (derivar_a_humano / agendar_cita): cierran el turno SIN otra llamada al modelo (0 tokens
+      // extra), igual que hoy. En la 1a vuelta se las deja a la cadena de hoy TAL CUAL (con el flag ON ese caso no
+      // cambia ni un byte). De la 2a en adelante el ciclo las resuelve: es justo el caso que hoy se pierde (la IA
+      // ve los resultados y RECIEN AHI decide derivar).
+      const _tuDeriv = _derivacionV3On ? _tus.find(function (t) { return t.name === 'derivar_a_humano'; }) : null;
+      const _tuAgen = _iaAgendaOn ? _tus.find(function (t) { return t.name === 'agendar_cita'; }) : null;
+      if (_tuDeriv || _tuAgen) {
+        if (_v === 1) return _abandonar();
+        if (_tuDeriv) {
+          _pidioDerivarV3 = true;
+          try {
+            _derivarMotivoV3 = (_tuDeriv.input && _tuDeriv.input.motivo) ? String(_tuDeriv.input.motivo).trim() : null;
+            _derivarDeptoV3 = (_tuDeriv.input && _tuDeriv.input.departamento) ? String(_tuDeriv.input.departamento).trim() : null;
+          } catch (eDv) {}
+          return _textoAcum || 'Perfecto, busco un asesor disponible para que te atienda, aguardame un momento.';
+        }
+        let _resAg = { ok: false };
+        try { _resAg = await _agendarCitaTentativaAgente(user_id, conversation_id, _tuAgen.input || {}, (datosLead && datosLead.name) ? datosLead.name : null); }
+        catch (eAg) { console.error('ciclo tools agendar_cita:', eAg && eAg.message); _resAg = { ok: false }; }
+        _agendaDerivada = !!(_resAg && _resAg.derivada);
+        if (_resAg && _resAg.fechaInvalida) return _textoAcum || 'Para dejarlo agendado necesito el dia y la hora exactos. ¿Que dia y a que hora te queda bien?';
+        return _textoAcum || 'Listo, te lo dejo agendado y un asesor del equipo te confirma. ¡Gracias!';
+      }
+
+      // EJECUTAR TODAS las tools de esta vuelta y devolver UN tool_result POR CADA tool_use (la API lo exige; hoy
+      // se mandaba uno solo y por eso el pedido de 4 fichas terminaba en 400 + promesa).
+      const _results = [];
+      for (let _i = 0; _i < _tus.length; _i++) {
+        const _tu = _tus[_i];
+        let _rt = null;
+        try { _rt = await _toolResultadoCiclo(_tu.name, _tu.input || {}); }
+        catch (eEj) { console.error('ciclo tools ejecutar ' + _tu.name + ':', eEj && eEj.message); _rt = null; }
+        if (_rt && _rt.fotoUrl) mediaAEnviar.push({ url: _rt.fotoUrl, caption: '' });
+        let _txtRes = (_rt && _rt.texto) ? _rt.texto : '';
+        if (!_txtRes) _txtRes = 'No se pudo obtener el resultado de esa herramienta en este momento. Segui la conversacion con lo que ya sabes y NO inventes datos: si hace falta, pedile un dato al lead u ofrecele pasarlo con un asesor.';
+        _results.push({ type: 'tool_result', tool_use_id: _tu.id, content: _txtRes });
+      }
+
+      _msgs = _msgs.concat([{ role: 'assistant', content: _comp.content }, { role: 'user', content: _results }]);
+      const _ultima = (_v === _CICLO_MAX_VUELTAS);
+      const _params = { model: MODELO_CLIENTE, max_tokens: _ultima ? 800 : 500, system: systemBlocks, tools: toolsAgente, messages: _msgs };
+      if (_ultima) _params.tool_choice = { type: 'none' }; // tope agotado: obligado a cerrar con texto, nunca con una promesa
+      let _c = null;
+      try { _c = await llamarIAConFailover(_params, 'generarRespuestaAgente:ciclo-v' + (_v + 1)); }
+      catch (eLl) {
+        console.error('ciclo tools vuelta ' + _v + ':', eLl && eLl.message);
+        if (_params.tool_choice) {
+          // RESGUARDO: si el proveedor no aceptara tool_choice 'none', se reintenta el MISMO request sin ese campo
+          // (las tools quedan en el request, asi el prefijo cacheado no cambia).
+          try { delete _params.tool_choice; _c = await llamarIAConFailover(_params, 'generarRespuestaAgente:ciclo-v' + (_v + 1) + '-sinchoice'); }
+          catch (eLl2) { console.error('ciclo tools vuelta ' + _v + ' reintento:', eLl2 && eLl2.message); _c = null; }
+        }
+      }
+      if (!_c) return (_v === 1) ? _abandonar() : (_textoAcum || _abandonar());
+      _acumUso(_c);
+      _comp = _c;
+      const _txtF = _textoDe(_comp);
+      if (_txtF) _textoAcum = _txtF;
+      if (_comp.stop_reason !== 'tool_use') return _txtF || _textoAcum || _abandonar(); // texto final (o truncado por max_tokens)
+      if (_ultima) return _txtF || _textoAcum || _abandonar();                          // con tool_choice 'none' no deberia entrar aca
+    }
+    return _textoAcum || _abandonar();
+  }
   // PARTE B (punto 6 / regla 19): ¿la IA pidio consultar_al_dueno? Lo manejamos ANTES de la tool de foto. Registra
   // la duda + avisa al dueno (registrarConsultaAprendizaje, sin tokens de IA en ese paso) y hace un SEGUNDO turno
   // para que la IA cierre con un mensaje natural al lead ("lo consulto y te confirmo"). Gateado: la tool solo existe
   // con reparto_v2 ON, asi que esta rama nunca se entra con flag OFF (ACTUAL EXACTO).
   if (completion && completion.stop_reason === 'tool_use') {
+    // ===== CICLO DE TOOLS (gated ciclo_tools_v1, default OFF) =====
+    // Con el flag ON intentamos resolver el turno con el CICLO (ejecuta todas las tools de cada vuelta, devuelve un
+    // tool_result por cada tool_use y vuelve a llamar al modelo mientras siga pidiendo herramientas, con tope duro).
+    // Si el ciclo devuelve null (no aplica / fallo / no hay nada usable) cae a la CADENA DE HOY, intacta.
+    // Con el flag OFF NUNCA se ejecuta y el camino es BYTE-IDENTICO al actual.
+    let _replyDelCiclo = null;
+    if (_cicloToolsOn) {
+      try { _replyDelCiclo = await _correrCicloTools(); }
+      catch (eCiclo) { console.error('ciclo de tools:', eCiclo && eCiclo.message); _replyDelCiclo = null; try { mediaAEnviar.length = 0; } catch (eMc) {} }
+    }
+    if (_replyDelCiclo) { reply = _replyDelCiclo; } else {
     // DERIVACION v3 (gated): ¿la IA pidio derivar_a_humano? Se maneja ANTES que las otras tools. NO hace 2do turno
     // (0 tokens): usa el texto que el agente ya escribio junto a la tool, o un fallback fijo. El disparo real de la
     // rotacion lo hace el WEBHOOK con estos flags (el modoPrueba nunca ofrece la tool, asi que aca conv es real).
@@ -8066,42 +8751,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     const _toolFichaDev = _ragDevActivo ? (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'ficha_desarrollo'; }) : null;
     if (_toolCerca) {
       const _textoPrevioC = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resCercaTxt = '';
-      try {
-        const _refIn = (_toolCerca.input && _toolCerca.input.referencia) ? String(_toolCerca.input.referencia).trim() : '';
-        const _ciuIn = (_toolCerca.input && _toolCerca.input.ciudad) ? String(_toolCerca.input.ciudad).trim() : '';
-        const _geoRefLead = _refIn ? await geocodificarTextoOSM(_refIn, _ciuIn) : null;
-        if (!_geoRefLead) {
-          _resCercaTxt = 'No pude ubicar en el mapa la referencia "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Decile al lead con naturalidad que no ubicas ese punto exacto y pedile una referencia mas conocida (esquina, avenida y altura, o un lugar conocido). NO inventes la ubicacion.';
-        } else {
-          // Candidatos con coordenadas segun el rubro de la cuenta.
-          let _cands = [];
-          const _rubroC = normalizarRubro(rubro);
-          if (_rubroC === 'hotel_cabanas') {
-            try {
-              const _hc = await supabase.from('hotel_complejos').select('nombre, atributos').eq('user_id', user_id);
-              (_hc.data || []).forEach(function(c){ const a = (c.atributos && typeof c.atributos === 'object') ? c.atributos : {}; if (a.lat != null && a.lng != null) _cands.push({ nombre: c.nombre || 'Complejo', lat: Number(a.lat), lng: Number(a.lng), extra: a.direccion || '' }); });
-            } catch (eHC) {}
-          } else if (_rubroC === 'desarrolladora') {
-            try {
-              const _dv = await supabase.from('developments').select('nombre, zona, direccion, lat, lng').eq('user_id', user_id).eq('activo', true);
-              (_dv.data || []).forEach(function(d){ if (d.lat != null && d.lng != null) _cands.push({ nombre: d.nombre || 'Emprendimiento', lat: Number(d.lat), lng: Number(d.lng), extra: d.direccion || d.zona || '' }); });
-            } catch (eDV) {}
-          } else {
-            (properties || []).forEach(function(p){ if (p.lat != null && p.lng != null) _cands.push({ nombre: (p.numero ? 'N' + p.numero + ' - ' : '') + (p.title || ''), lat: Number(p.lat), lng: Number(p.lng), extra: p.direccion || p.zone || '' }); });
-          }
-          if (!_cands.length) {
-            _resCercaTxt = 'Referencia ubicada, pero el inventario todavia no tiene coordenadas cargadas para comparar distancias. Responde usando la zona/direccion que figura en el inventario, sin inventar distancias ni lugares.';
-          } else {
-            const _cercanas = _cands.map(function(c){ return { nombre: c.nombre, extra: c.extra, km: haversineKm(_geoRefLead.lat, _geoRefLead.lng, c.lat, c.lng) }; }).sort(function(a,b){ return a.km - b.km; }).slice(0, 5);
-            const _lineasC = _cercanas.map(function(c){ return '- ' + c.nombre + (c.extra ? ' (' + c.extra + ')' : '') + ': a ' + _fmtDistancia(c.km); });
-            _resCercaTxt = 'Referencia ubicada: "' + _refIn + '"' + (_ciuIn ? ' (' + _ciuIn + ')' : '') + '. Lo mas cercano del inventario (distancia en linea recta):' + String.fromCharCode(10) + _lineasC.join(String.fromCharCode(10)) + String.fromCharCode(10) + 'Ofrecele lo que corresponda con naturalidad mencionando la distancia TAL CUAL figura arriba (m/km y cuadras): NO la conviertas, NO la redondees para abajo y NUNCA digas "a pocas cuadras" o "cerquita" si figura a mas de 500 m — decir que algo lejano esta cerca es mentirle al lead. Si nada queda razonablemente cerca, decilo con honestidad y ofrece la opcion menos lejana aclarando su distancia real.';
-          }
-        }
-      } catch (eCerca) {
-        console.error('tool buscar_propiedades_cerca:', eCerca && eCerca.message);
-        _resCercaTxt = 'No se pudo consultar la ubicacion en este momento. Segui la conversacion con lo que sabes del inventario, sin inventar ubicaciones.';
-      }
+      const _resCercaTxt = (await _toolResultadoCiclo('buscar_propiedades_cerca', _toolCerca.input || {})).texto;
       // 2do turno con el tool_result (la IA redacta la respuesta final). Acumula usage para costeo exacto.
       let _textoCierreC = '';
       try {
@@ -8128,27 +8778,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       // devuelve calle/direccion + coordenadas + link de Google Maps en un 2do turno (mismo patron que foto/cerca).
       // La tool solo existe con el flag ON => esta rama nunca se entra con OFF (ACTUAL EXACTO). $0 recurrente: OSM gratis.
       const _textoPrevioU = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resUbicTxt = '';
-      try {
-        const _refU = (_toolUbicar.input && _toolUbicar.input.referencia) ? String(_toolUbicar.input.referencia).trim() : '';
-        const _ciuU = (_toolUbicar.input && _toolUbicar.input.ciudad) ? String(_toolUbicar.input.ciudad).trim() : '';
-        const _geoU = _refU ? await geocodificarTextoOSM(_refU, _ciuU) : null;
-        if (!_geoU) {
-          // Anti-invento: si OSM no lo ubica, la IA NO debe inventar una direccion ni coordenadas.
-          _resUbicTxt = 'No pude ubicar en el mapa "' + _refU + '"' + (_ciuU ? ' (' + _ciuU + ')' : '') + '. Decile al lead con naturalidad que no ubicas ese punto exacto y pedile una referencia mas precisa (calle y altura, una esquina, o un lugar conocido). NO inventes la direccion ni las coordenadas.';
-        } else {
-          const _mapsU = 'https://www.google.com/maps?q=' + _geoU.lat + ',' + _geoU.lng;
-          const _dirU = (_geoU.display && String(_geoU.display).trim()) ? String(_geoU.display).trim() : '';
-          _resUbicTxt = 'Ubicacion encontrada para "' + _refU + '"' + (_ciuU ? ' (' + _ciuU + ')' : '') + '.' +
-            (_dirU ? (' Direccion aproximada segun el mapa: ' + _dirU + '.') : '') +
-            ' Coordenadas: ' + _geoU.lat + ', ' + _geoU.lng + '.' +
-            ' Link de Google Maps para pasarle al lead: ' + _mapsU + '.' +
-            ' Compartile la calle/direccion' + (_dirU ? '' : ' (si la sabes)') + ' y el link de Google Maps. IMPORTANTE: esto te da SOLO la ubicacion del punto que nombro el lead, NO una lista de comercios; no nombres negocios ni lugares puntuales que no figuren en el inventario ni en este resultado.';
-        }
-      } catch (eUbic) {
-        console.error('tool ubicar_lugar:', eUbic && eUbic.message);
-        _resUbicTxt = 'No se pudo consultar la ubicacion en este momento. Segui la conversacion sin inventar direcciones ni coordenadas.';
-      }
+      const _resUbicTxt = (await _toolResultadoCiclo('ubicar_lugar', _toolUbicar.input || {})).texto;
       // 2do turno con el tool_result (la IA redacta la respuesta final). Acumula usage para costeo exacto.
       let _textoCierreU = '';
       try {
@@ -8173,46 +8803,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } else if (_toolDispo) {
       // DISPONIBILIDAD PXSOL: consulta en vivo por fechas + 2do turno para que la IA redacte.
       const _textoPrevioD = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      const _miles = function(n){ return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
-      let _resDispoTxt = '';
-      try {
-        const _ci = (_toolDispo.input && _toolDispo.input.check_in) ? String(_toolDispo.input.check_in).trim() : '';
-        const _co = (_toolDispo.input && _toolDispo.input.check_out) ? String(_toolDispo.input.check_out).trim() : '';
-        const _ad = (_toolDispo.input && _toolDispo.input.adultos) ? _toolDispo.input.adultos : 2;
-        const _ni = (_toolDispo.input && _toolDispo.input.ninos) ? _toolDispo.input.ninos : 0;
-        const _cfgPx = await _pxsolConfigDeCuenta(user_id);
-        if (!_cfgPx) {
-          _resDispoTxt = 'No pude conectar con el motor de reservas del hotel. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
-        } else {
-          const _disp = await _pxsolDisponibilidad(_cfgPx, _ci, _co, _ad, _ni);
-          if (!_disp.ok) {
-            _resDispoTxt = 'No se pudo consultar la disponibilidad (' + (_disp.error || 'error') + '). Confirma con el lead las fechas (entrada y salida) y cuantas personas, o decile que le confirmas a la brevedad. NO inventes precios.';
-          } else {
-            const _hay = (_disp.opciones || []).filter(function(o){ return !o.sinDisponibilidad; });
-            if (!_hay.length) {
-              const _conMin = (_disp.opciones || []).find(function(o){ return o.minLOS; });
-              _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches) NO hay disponibilidad.' + (_conMin ? (' Varias tarifas piden un minimo de ' + _conMin.minLOS + ' noches para esas fechas.') : '');
-              // ADITIVO: mismas fechas alternativas que muestra la WEB del hotel cuando no hay lugar,
-              // asi la IA responde IGUAL que la web en vez de un "no" seco (incongruencia 2026-07-15).
-              try {
-                const _alts = await _pxsolAlternativas(_cfgPx, _disp.sid);
-                if (_alts.length) {
-                  const _NLa = String.fromCharCode(10);
-                  _resDispoTxt += _NLa + 'PERO la web del hotel ofrece estas fechas alternativas REALES (ofrecelas, cada una en su propia linea con un renglon en blanco entre cada una):' + _NLa +
-                    _alts.map(function(x){ return '- Del ' + x.llegada + ' al ' + x.salida + ' (' + x.noches + ' noches)' + (x.desde ? ' desde ' + x.desde + ' por noche (precio web, sin IVA)' : ''); }).join(_NLa) +
-                    _NLa + 'Si alguna le sirve al lead, consulta de nuevo la disponibilidad con esas fechas para darle el precio exacto de cada habitacion. No inventes precios fuera de esta lista.';
-                } else {
-                  _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.';
-                }
-              } catch (eAlt) { _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.'; }
-            } else {
-              const _NLd = String.fromCharCode(10);
-              const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
-              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' adultos' + (_ni > 0 ? ' y ' + _ni + ' niños' : '') + '). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
-            }
-          }
-        }
-      } catch (eDispo) { console.error('tool consultar_disponibilidad:', eDispo && eDispo.message); _resDispoTxt = 'No se pudo consultar la disponibilidad ahora. Decile al lead que le confirmas a la brevedad, sin inventar precios.'; }
+      const _resDispoTxt = (await _toolResultadoCiclo('consultar_disponibilidad', _toolDispo.input || {})).texto;
       let _textoCierreD = '';
       try {
         const _msgsD2 = mensajesParaIA.concat([
@@ -8236,213 +8827,41 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } else if (_toolDolar) {
       // FUENTE #1 dolar (gated ia_dolar_lead): cotizacion + conversion USD<->ARS. Ante fallo -> texto de fallback (no inventa).
       const _textoPrevioDl = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resDolarTxt = '';
-      try {
-        const _tipoDl = (_toolDolar.input && _toolDolar.input.tipo) ? String(_toolDolar.input.tipo).trim().toLowerCase() : 'blue';
-        const _montoDl = (_toolDolar.input && _toolDolar.input.monto_usd != null) ? Number(_toolDolar.input.monto_usd) : null;
-        const _d = await _fuenteDolar(_tipoDl);
-        if (!_d) {
-          _resDolarTxt = 'No se pudo obtener la cotizacion del dolar en este momento. Decile al lead con naturalidad que no la pudiste confirmar ahora y que la chequee en un rato. NO inventes un valor.';
-        } else {
-          const _fmtM = function(n){ return (n == null) ? '?' : String(Math.round(Number(n))).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
-          _resDolarTxt = 'Cotizacion del dolar ' + (_d.nombre || _d.tipo) + ' (valor de REFERENCIA de mercado): compra $' + _fmtM(_d.compra) + ' / venta $' + _fmtM(_d.venta) + '. Actualizado: ' + (_d.fecha || 's/d') + '.';
-          if (_montoDl != null && !isNaN(_montoDl) && _d.venta != null) {
-            _resDolarTxt += ' Conversion pedida: USD ' + _fmtM(_montoDl) + ' equivalen a $' + _fmtM(_montoDl * Number(_d.venta)) + ' (al valor de venta del ' + (_d.nombre || _d.tipo) + ').';
-          }
-          _resDolarTxt += ' Aclarale al lead que es una referencia de mercado y puede variar; no inventes otros valores.';
-        }
-      } catch (eDl) { console.error('tool cotizacion_dolar:', eDl && eDl.message); _resDolarTxt = 'No se pudo consultar la cotizacion ahora. Segui la conversacion sin inventar valores.'; }
+      const _resDolarTxt = (await _toolResultadoCiclo('cotizacion_dolar', _toolDolar.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolDolar, _resDolarTxt, 'dolar', _textoPrevioDl, 'Dejame chequear la cotizacion y te confirmo.');
     } else if (_toolClima) {
       // FUENTE #2 clima (gated ia_clima): pronostico por lat/lon o por id_propiedad. Fuera de 16 dias -> no hay dato.
       const _textoPrevioCl = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resClimaTxt = '';
-      try {
-        let _la = (_toolClima.input && _toolClima.input.lat != null) ? Number(_toolClima.input.lat) : null;
-        let _lo = (_toolClima.input && _toolClima.input.lon != null) ? Number(_toolClima.input.lon) : null;
-        const _idPc = (_toolClima.input && _toolClima.input.id_propiedad != null) ? _toolClima.input.id_propiedad : null;
-        if ((_la == null || _lo == null || isNaN(_la) || isNaN(_lo)) && _idPc != null) {
-          const _coC = await _coordsDeIdPropiedad(user_id, rubro, properties, _idPc);
-          if (_coC) { _la = _coC.lat; _lo = _coC.lng; }
-        }
-        const _fdC = (_toolClima.input && _toolClima.input.fecha_desde) ? String(_toolClima.input.fecha_desde).trim() : '';
-        let _diasC = (_toolClima.input && _toolClima.input.dias != null) ? parseInt(_toolClima.input.dias, 10) : 3;
-        if (!(_diasC >= 1)) _diasC = 3;
-        if (_diasC > 16) _diasC = 16;
-        if (_la == null || _lo == null || isNaN(_la) || isNaN(_lo)) {
-          _resClimaTxt = 'No tengo la ubicacion (lat/lon) para el pronostico. Pedile al lead la zona o la propiedad concreta; no inventes el clima.';
-        } else {
-          let _fueraRango = false;
-          if (_fdC && /^\d{4}-\d{2}-\d{2}$/.test(_fdC)) {
-            try { var _hoyC = new Date(); _hoyC.setHours(0, 0, 0, 0); var _difC = Math.round((new Date(_fdC + 'T12:00:00Z').getTime() - _hoyC.getTime()) / 86400000); if (_difC > 16) _fueraRango = true; } catch (eR) {}
-          }
-          if (_fueraRango) {
-            _resClimaTxt = 'Todavia no hay pronostico para esa fecha (el pronostico llega hasta ~16 dias). Decile al lead que mas cerca de la fecha se lo podes chequear; no inventes el clima.';
-          } else {
-            const _cl = await _fuenteClima(_la, _lo, _fdC, _diasC);
-            if (!_cl || !_cl.dias || !_cl.dias.length) {
-              _resClimaTxt = 'No se pudo obtener el pronostico en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes el clima.';
-            } else {
-              const _NLc = String.fromCharCode(10);
-              const _lineasCl = _cl.dias.map(function(x){ return '- ' + x.fecha + ': ' + x.cielo + ', minima ' + (x.tmin != null ? Math.round(x.tmin) + '°' : '?') + ' / maxima ' + (x.tmax != null ? Math.round(x.tmax) + '°' : '?') + (x.prob_lluvia != null ? (', probabilidad de lluvia ' + Math.round(x.prob_lluvia) + '%') : ''); });
-              _resClimaTxt = 'Pronostico (valor de referencia):' + _NLc + _lineasCl.join(_NLc) + _NLc + 'Contaselo al lead de forma clara y natural; no agregues dias ni datos que no esten en esta lista.';
-            }
-          }
-        }
-      } catch (eCl) { console.error('tool pronostico_clima:', eCl && eCl.message); _resClimaTxt = 'No se pudo consultar el clima ahora. Segui la conversacion sin inventar el pronostico.'; }
+      const _resClimaTxt = (await _toolResultadoCiclo('pronostico_clima', _toolClima.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolClima, _resClimaTxt, 'clima', _textoPrevioCl, 'Dejame chequear el pronostico y te confirmo.');
     } else if (_toolFeriados) {
       // FUENTE #3 feriados (gated ia_feriados): feriados NACIONALES + findes largos (Nager.Date). Ante fallo -> fallback.
       const _textoPrevioFe = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resFeriTxt = '';
-      const _aclaraFe = ' IMPORTANTE: son SOLO feriados NACIONALES (no incluye feriados turisticos por decreto ni provinciales); aclaraselo al lead si corresponde.';
-      try {
-        const _modoFe = (_toolFeriados.input && _toolFeriados.input.modo) ? String(_toolFeriados.input.modo).trim() : 'proximos';
-        const _anioFe = (_toolFeriados.input && _toolFeriados.input.anio) ? parseInt(_toolFeriados.input.anio, 10) : new Date().getFullYear();
-        const _fechaFe = (_toolFeriados.input && _toolFeriados.input.fecha) ? String(_toolFeriados.input.fecha).trim() : '';
-        const _NLf = String.fromCharCode(10);
-        if (_modoFe === 'finde_largo') {
-          const _lw = await _fuenteFeriadosURL('https://date.nager.at/api/v3/LongWeekend/' + _anioFe + '/AR');
-          if (!_lw) _resFeriTxt = 'No se pudo obtener la info de fines de semana largos en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes fechas.';
-          else if (!_lw.length) _resFeriTxt = 'No figuran fines de semana largos para ' + _anioFe + '.' + _aclaraFe;
-          else _resFeriTxt = 'Fines de semana largos ' + _anioFe + ':' + _NLf + _lw.map(function(w){ return '- del ' + w.startDate + ' al ' + w.endDate + ' (' + w.dayCount + ' dias)'; }).join(_NLf) + _NLf + 'Contaselos al lead con naturalidad.' + _aclaraFe;
-        } else if (_modoFe === 'es_feriado') {
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(_fechaFe)) {
-            _resFeriTxt = 'Para saber si es feriado necesito la fecha exacta (AAAA-MM-DD). Pedisela al lead con naturalidad.';
-          } else {
-            const _anioDe = parseInt(_fechaFe.slice(0, 4), 10) || _anioFe;
-            const _ph = await _fuenteFeriadosURL('https://date.nager.at/api/v3/PublicHolidays/' + _anioDe + '/AR');
-            if (!_ph) _resFeriTxt = 'No se pudo verificar el feriado en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes.';
-            else {
-              const _match = _ph.find(function(h){ return h && h.date === _fechaFe; });
-              _resFeriTxt = _match ? ('El ' + _fechaFe + ' SI es feriado nacional: ' + (_match.localName || _match.name || 'feriado') + '.' + _aclaraFe) : ('El ' + _fechaFe + ' NO es feriado nacional.' + _aclaraFe);
-            }
-          }
-        } else if (_modoFe === 'del_anio') {
-          const _ph = await _fuenteFeriadosURL('https://date.nager.at/api/v3/PublicHolidays/' + _anioFe + '/AR');
-          if (!_ph) _resFeriTxt = 'No se pudo obtener el listado de feriados en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes.';
-          else if (!_ph.length) _resFeriTxt = 'No figuran feriados para ' + _anioFe + '.' + _aclaraFe;
-          else _resFeriTxt = 'Feriados nacionales ' + _anioFe + ':' + _NLf + _ph.map(function(h){ return '- ' + h.date + ': ' + (h.localName || h.name || ''); }).join(_NLf) + _NLf + 'Compartilos con naturalidad segun lo que pregunte el lead.' + _aclaraFe;
-        } else {
-          const _np = await _fuenteFeriadosURL('https://date.nager.at/api/v3/NextPublicHolidays/AR');
-          if (!_np) _resFeriTxt = 'No se pudo obtener los proximos feriados en este momento. Decile al lead que no lo pudiste confirmar ahora; no inventes fechas.';
-          else if (!_np.length) _resFeriTxt = 'No figuran proximos feriados nacionales.' + _aclaraFe;
-          else _resFeriTxt = 'Proximos feriados nacionales:' + _NLf + _np.slice(0, 6).map(function(h){ return '- ' + h.date + ': ' + (h.localName || h.name || ''); }).join(_NLf) + _NLf + 'Deciles el/los que correspondan a lo que pregunto el lead.' + _aclaraFe;
-        }
-      } catch (eFe) { console.error('tool feriados_ar:', eFe && eFe.message); _resFeriTxt = 'No se pudo consultar los feriados ahora. Segui la conversacion sin inventar fechas.'; }
+      const _resFeriTxt = (await _toolResultadoCiclo('feriados_ar', _toolFeriados.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolFeriados, _resFeriTxt, 'feriados', _textoPrevioFe, 'Dejame chequear los feriados y te confirmo.');
     } else if (_toolGeoref) {
       // FUENTE #4 georef (gated ia_georef): normaliza una direccion argentina. Si no matchea -> pedir localidad/provincia.
       const _textoPrevioGe = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resGeoTxt = '';
-      try {
-        const _dirGe = (_toolGeoref.input && _toolGeoref.input.direccion) ? String(_toolGeoref.input.direccion).trim() : '';
-        const _provGe = (_toolGeoref.input && _toolGeoref.input.provincia) ? String(_toolGeoref.input.provincia).trim() : '';
-        const _locGe = (_toolGeoref.input && _toolGeoref.input.localidad) ? String(_toolGeoref.input.localidad).trim() : '';
-        if (!_dirGe) {
-          _resGeoTxt = 'No recibi una direccion para normalizar. Pedile al lead la calle y la altura.';
-        } else {
-          const _g = await _fuenteGeoref(_dirGe, _provGe, _locGe);
-          if (!_g) {
-            _resGeoTxt = 'No pude normalizar la direccion "' + _dirGe + '". Pedile al lead que aclare la localidad y la provincia; NO inventes el partido ni la localidad.';
-          } else {
-            _resGeoTxt = 'Direccion normalizada (fuente oficial Georef): ' + (_g.nomenclatura || _dirGe) + '. Provincia: ' + (_g.provincia || 's/d') + '. Departamento/partido: ' + (_g.departamento || 's/d') + '. Localidad: ' + (_g.localidad || 's/d') + '.' + ((_g.lat != null && _g.lon != null) ? (' Coordenadas: ' + _g.lat + ', ' + _g.lon + '.') : '') + ' Usala para confirmarle la zona/partido al lead; no agregues datos que no esten en este resultado.';
-          }
-        }
-      } catch (eGe) { console.error('tool normalizar_direccion_ar:', eGe && eGe.message); _resGeoTxt = 'No se pudo normalizar la direccion ahora. Segui la conversacion sin inventar el partido ni la localidad.'; }
+      const _resGeoTxt = (await _toolResultadoCiclo('normalizar_direccion_ar', _toolGeoref.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolGeoref, _resGeoTxt, 'georef', _textoPrevioGe, 'Dejame chequear bien esa direccion y te confirmo la zona.');
     } else if (_toolOsrm) {
       // FUENTE #5 distancia (gated ia_osrm): distancia/tiempo en auto (OSRM). Si no hay ruta -> haversine aclarandolo.
       const _textoPrevioOs = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resOsrmTxt = '';
-      try {
-        let _la1 = (_toolOsrm.input && _toolOsrm.input.origen_lat != null) ? Number(_toolOsrm.input.origen_lat) : null;
-        let _lo1 = (_toolOsrm.input && _toolOsrm.input.origen_lon != null) ? Number(_toolOsrm.input.origen_lon) : null;
-        let _la2 = (_toolOsrm.input && _toolOsrm.input.destino_lat != null) ? Number(_toolOsrm.input.destino_lat) : null;
-        let _lo2 = (_toolOsrm.input && _toolOsrm.input.destino_lon != null) ? Number(_toolOsrm.input.destino_lon) : null;
-        const _idPo = (_toolOsrm.input && _toolOsrm.input.id_propiedad != null) ? _toolOsrm.input.id_propiedad : null;
-        const _destTxtO = (_toolOsrm.input && _toolOsrm.input.destino_texto) ? String(_toolOsrm.input.destino_texto).trim() : '';
-        const _ciuO = (_toolOsrm.input && _toolOsrm.input.ciudad) ? String(_toolOsrm.input.ciudad).trim() : '';
-        // id_propiedad completa el extremo que falte (primero el origen; si el origen ya vino, el destino).
-        if (_idPo != null) {
-          const _coO = await _coordsDeIdPropiedad(user_id, rubro, properties, _idPo);
-          if (_coO) {
-            if (_la1 == null || _lo1 == null || isNaN(_la1) || isNaN(_lo1)) { _la1 = _coO.lat; _lo1 = _coO.lng; }
-            else if (_la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2)) { _la2 = _coO.lat; _lo2 = _coO.lng; }
-          }
-        }
-        // destino_texto geocodifica el extremo destino si falta (reusa geocodificarTextoOSM, con cache OSM).
-        if ((_la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2)) && _destTxtO) {
-          const _geoO = await geocodificarTextoOSM(_destTxtO, _ciuO);
-          if (_geoO) { _la2 = _geoO.lat; _lo2 = _geoO.lng; }
-        }
-        const _faltan = (_la1 == null || _lo1 == null || isNaN(_la1) || isNaN(_lo1) || _la2 == null || _lo2 == null || isNaN(_la2) || isNaN(_lo2));
-        if (_faltan) {
-          _resOsrmTxt = 'No tengo los dos puntos para calcular la distancia (faltan coordenadas o no pude ubicar el destino). Pedile al lead una referencia mas precisa; no inventes la distancia ni el tiempo.';
-        } else {
-          const _ru = await _fuenteOsrm(_la1, _lo1, _la2, _lo2);
-          if (_ru) {
-            _resOsrmTxt = 'Distancia EN AUTO (ruta real): ' + _fmtDistancia(_ru.distancia_m / 1000) + ', tiempo estimado ' + _fmtDuracionMin(_ru.duracion_s) + '. Contaselo al lead como estimado de manejo; no inventes otro tiempo.';
-          } else {
-            const _kmL = haversineKm(_la1, _lo1, _la2, _lo2);
-            _resOsrmTxt = 'No se pudo calcular la ruta en auto ahora. En LINEA RECTA hay ~' + _fmtDistancia(_kmL) + ' (NO es la distancia por calle ni un tiempo de viaje). Aclarale al lead que es una aproximacion en linea recta y que no tenes el tiempo exacto de manejo; NO inventes un tiempo.';
-          }
-        }
-      } catch (eOs) { console.error('tool distancia_viaje:', eOs && eOs.message); _resOsrmTxt = 'No se pudo calcular la distancia ahora. Segui la conversacion sin inventar distancias ni tiempos.'; }
+      const _resOsrmTxt = (await _toolResultadoCiclo('distancia_viaje', _toolOsrm.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolOsrm, _resOsrmTxt, 'distancia', _textoPrevioOs, 'Dejame chequear esa distancia y te confirmo.');
     } else if (_toolBuscarInv) {
       // RAG (gated ia_rag_v1): la IA pidio buscar_inventario. Filtro en memoria sobre `properties` (0 IA, 0 query)
       // + 2do turno para que redacte (usage acumulado en _cerrarTurnoFuente). La tool solo existe con _ragActivo =>
       // nunca se entra con el flag OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
       _ragToolUsado = true;
-      const _NLbi = String.fromCharCode(10);
       const _textoPrevioBi = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resBiTxt = '';
-      try {
-        const _inpBi = _toolBuscarInv.input || {};
-        const _resBi = _buscarInventarioProps(properties, {
-          zonas: _inpBi.zonas, operacion: _inpBi.operacion, tipo: _inpBi.tipo,
-          precio_min: _inpBi.precio_min, precio_max: _inpBi.precio_max,
-          dormitorios_min: _inpBi.dormitorios_min, ambientes_min: _inpBi.ambientes_min,
-          capacidad_min: _inpBi.capacidad_min, texto_libre: _inpBi.texto_libre,
-          // AMPLIACION (Diego 2026-07-23): por numero/id, por nombre, por caracteristicas/amenities, filtros duros,
-          // disponibilidad por fechas (temporal) y limite pedido por la IA.
-          numero: _inpBi.numero, nombre: _inpBi.nombre, caracteristicas: _inpBi.caracteristicas,
-          apto_credito: _inpBi.apto_credito, cocheras_min: _inpBi.cocheras_min,
-          banos_min: _inpBi.banos_min, superficie_min: _inpBi.superficie_min,
-          fecha_desde: _inpBi.fecha_desde, fecha_hasta: _inpBi.fecha_hasta, limite: _inpBi.limite
-        }, periodosPorProp); // calendario temporal (ya cargado arriba, sin query extra)
-        if (!_resBi.length) {
-          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
-          _resBiTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes propiedades. Opciones: (a) relaja algun filtro (ampli el rango de precio o suma zonas) y volve a llamar buscar_inventario; (b) pedile al lead un dato que acote mejor (zona, presupuesto, ambientes). Para referencia, este es el panorama del inventario:' + _NLbi + _indiceInv;
-        } else {
-          _resBiTxt = 'Resultados del inventario (' + _resBi.length + '; usa SOLO estos, no inventes otros). Para dar fotos o el detalle completo de una, usa ficha_inventario con su numero:' + _NLbi + _resBi.map(_fichaCompactaProp).join(_NLbi) + _NLbi + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su precio y link si tiene. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.';
-        }
-      } catch (eBi) {
-        console.error('tool buscar_inventario:', eBi && eBi.message);
-        // FAIL-OPEN A LA CALIDAD: si el buscador falla, le pasamos el CATALOGO COMPLETO comprimido para que la IA NO
-        // responda a ciegas (nunca degradar la respuesta; el costo extra es raro y solo ante error).
-        _resBiTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el CATALOGO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbi + (_invCompactoRag || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
-      }
+      const _resBiTxt = (await _toolResultadoCiclo('buscar_inventario', _toolBuscarInv.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolBuscarInv, _resBiTxt, 'buscar-inventario', _textoPrevioBi, 'Dejame buscar en el inventario y te paso opciones.');
     } else if (_toolFichaInv) {
       // RAG (gated ia_rag_v1): detalle completo de UNA propiedad por numero/id (sobre `properties` en memoria).
       _ragToolUsado = true;
-      const _NLfi = String.fromCharCode(10);
       const _textoPrevioFi = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resFiTxt = '';
-      try {
-        const _inpFi = _toolFichaInv.input || {};
-        const _idRaw = (_inpFi.id != null && _inpFi.id !== '') ? _inpFi.id : (_inpFi.numero != null ? _inpFi.numero : '');
-        const _idPed = String(_idRaw).trim();
-        let _pFi = null;
-        if (_idPed) _pFi = (properties || []).find(function(p){ return (p.numero != null && String(p.numero).trim() === _idPed) || (p.id != null && String(p.id).trim() === _idPed); });
-        if (!_pFi) {
-          _resFiTxt = 'No encontre una propiedad con ese numero/id (' + _idPed + '). Volve a buscar con buscar_inventario o pedile al lead que aclare cual le interesa. No inventes datos.';
-        } else {
-          _resFiTxt = 'Ficha completa de la propiedad pedida (usa SOLO estos datos):' + _NLfi + _fichaCompletaProp(_pFi) + _NLfi + 'Para mandarle una FOTO usa enviar_foto_propiedad con el numero. No inventes datos que no figuren aca.';
-        }
-      } catch (eFi) { console.error('tool ficha_inventario:', eFi && eFi.message); _resFiTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del inventario, sin inventar.'; }
+      const _resFiTxt = (await _toolResultadoCiclo('ficha_inventario', _toolFichaInv.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolFichaInv, _resFiTxt, 'ficha-inventario', _textoPrevioFi, 'Dejame traer los detalles y te confirmo.');
     } else if (_toolBuscarDetallar) {
       // PLAN MEDIANO (gated ia_tool_combinada): buscar_y_detallar = busca (top-N) + adjunta la FICHA COMPLETA de cada
@@ -8450,156 +8869,44 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       // + _fichaCompletaProp (0 IA, 0 query; filtro en memoria sobre `properties`). La tool solo existe con el flag ON =>
       // esta rama nunca se entra con OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
       _ragToolUsado = true;
-      const _NLbd = String.fromCharCode(10);
       const _textoPrevioBd = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resBdTxt = '';
-      try {
-        const _inpBd = _toolBuscarDetallar.input || {};
-        // Tope propio mas chico (default 4, max 8): como cada resultado viaja con su ficha completa, N grande infla el turno.
-        const _limBd = (_inpBd.limite && Number(_inpBd.limite) > 0) ? Math.min(Number(_inpBd.limite), 8) : 4;
-        const _resBd = _buscarInventarioProps(properties, {
-          zonas: _inpBd.zonas, operacion: _inpBd.operacion, tipo: _inpBd.tipo,
-          precio_min: _inpBd.precio_min, precio_max: _inpBd.precio_max,
-          dormitorios_min: _inpBd.dormitorios_min, ambientes_min: _inpBd.ambientes_min,
-          capacidad_min: _inpBd.capacidad_min, texto_libre: _inpBd.texto_libre,
-          numero: _inpBd.numero, nombre: _inpBd.nombre, caracteristicas: _inpBd.caracteristicas,
-          apto_credito: _inpBd.apto_credito, cocheras_min: _inpBd.cocheras_min,
-          banos_min: _inpBd.banos_min, superficie_min: _inpBd.superficie_min,
-          fecha_desde: _inpBd.fecha_desde, fecha_hasta: _inpBd.fecha_hasta, limite: _limBd
-        }, periodosPorProp);
-        if (!_resBd.length) {
-          _resBdTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes propiedades. Opciones: (a) relaja algun filtro (ampli el rango de precio o suma zonas) y volve a llamar buscar_y_detallar; (b) pedile al lead un dato que acote mejor (zona, presupuesto, ambientes). Para referencia, este es el panorama del inventario:' + _NLbd + _indiceInv;
-        } else {
-          _resBdTxt = 'Resultados del inventario CON FICHA COMPLETA (' + _resBd.length + '; usa SOLO estos, no inventes otros; ya tenes todos sus datos aca, NO hace falta que vuelvas a pedir la ficha):' + _NLbd + _resBd.map(_fichaCompletaProp).join(_NLbd) + _NLbd + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su precio y link si tiene. Para MANDAR una foto usa enviar_foto_propiedad con el numero. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.';
-        }
-      } catch (eBd) {
-        console.error('tool buscar_y_detallar:', eBd && eBd.message);
-        // FAIL-OPEN A LA CALIDAD (igual que buscar_inventario): ante error, catalogo completo comprimido, sin inventar.
-        _resBdTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el CATALOGO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbd + (_invCompactoRag || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
-      }
+      const _resBdTxt = (await _toolResultadoCiclo('buscar_y_detallar', _toolBuscarDetallar.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolBuscarDetallar, _resBdTxt, 'buscar-y-detallar', _textoPrevioBd, 'Dejame buscar en el inventario y te paso opciones.');
     } else if (_toolBuscarUni) {
       // RAG HOTEL (gated ia_rag_v1): la IA pidio buscar_unidades. Filtro en memoria sobre `_hotelUnidades` (0 IA, 0 query)
       // + 2do turno para que redacte (usage acumulado en _cerrarTurnoFuente). La tool solo existe con _ragHotelActivo =>
       // nunca se entra con el flag OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
       _ragToolUsado = true;
-      const _NLbu = String.fromCharCode(10);
       const _textoPrevioBu = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resBuTxt = '';
-      try {
-        const _inpBu = _toolBuscarUni.input || {};
-        const _resBu = _buscarUnidadesHotel(_hotelUnidades, {
-          complejo: _inpBu.complejo, tipo: _inpBu.tipo, capacidad_min: _inpBu.capacidad_min,
-          precio_min: _inpBu.precio_min, precio_max: _inpBu.precio_max, temporada: _inpBu.temporada,
-          texto_libre: _inpBu.texto_libre, numero: _inpBu.numero,
-          check_in: _inpBu.check_in, check_out: _inpBu.check_out, limite: _inpBu.limite
-        });
-        // Si el lead dio fechas y PXSOL esta activo, la lista corta se cierra con la tool EN VIVO (precio/disponibilidad exactos).
-        const _hayFechasBu = !!(_inpBu.check_in && _inpBu.check_out && /^\d{4}-\d{2}-\d{2}$/.test(String(_inpBu.check_in)) && /^\d{4}-\d{2}-\d{2}$/.test(String(_inpBu.check_out)));
-        const _notaDispo = (_hayFechasBu && _iaDisponibilidadOn && _esHotel) ? (_NLbu + 'IMPORTANTE: para el PRECIO y la DISPONIBILIDAD EXACTOS de esas fechas usa la herramienta consultar_disponibilidad (motor en vivo); esta lista es orientativa.') : '';
-        if (!_resBu.length) {
-          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
-          _resBuTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes unidades. Opciones: (a) relaja algun filtro (ampli el rango de precio o quita el complejo) y volve a llamar buscar_unidades; (b) pedile al lead un dato que acote mejor (personas, complejo, presupuesto). Para referencia, este es el panorama del alojamiento:' + _NLbu + _indiceHotel + _notaDispo;
-        } else {
-          _resBuTxt = 'Unidades del alojamiento (' + _resBu.length + '; usa SOLO estas, no inventes otras). Para dar fotos o el detalle completo de una, usa ficha_unidad con su numero:' + _NLbu + _resBu.map(_fichaCompactaUnidad).join(_NLbu) + _NLbu + 'Ofrece la/s que mejor encajen con lo que pidio el lead, con su tarifa por noche. Si una figura OCUPADA en las fechas pedidas, no la ofrezcas para ese rango: proponé otra libre o fechas alternativas. Si ninguna encaja del todo, decilo con honestidad y ofrece la mas parecida o pedi un dato para afinar.' + _notaDispo;
-        }
-      } catch (eBu) {
-        console.error('tool buscar_unidades:', eBu && eBu.message);
-        // FAIL-OPEN A LA CALIDAD: si el buscador falla, le pasamos el LISTADO COMPLETO comprimido para que la IA NO
-        // responda a ciegas (nunca degradar la respuesta; el costo extra es raro y solo ante error).
-        _resBuTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el LISTADO COMPLETO resumido; elegi de aca lo que corresponda (no inventes nada fuera de esta lista):' + _NLbu + (_invHotelCompacto || 'Inventario no disponible en este momento; decile al lead que aguarde un momento y ofrece derivarlo a un asesor.');
-      }
+      const _resBuTxt = (await _toolResultadoCiclo('buscar_unidades', _toolBuscarUni.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolBuscarUni, _resBuTxt, 'buscar-unidades', _textoPrevioBu, 'Dejame ver las unidades disponibles y te paso opciones.');
     } else if (_toolFichaUni) {
       // RAG HOTEL (gated ia_rag_v1): detalle completo de UNA unidad por numero/id (sobre `_hotelUnidades` en memoria).
       _ragToolUsado = true;
-      const _NLfu = String.fromCharCode(10);
       const _textoPrevioFu = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resFuTxt = '';
-      try {
-        const _inpFu = _toolFichaUni.input || {};
-        const _idRawU = (_inpFu.id != null && _inpFu.id !== '') ? _inpFu.id : (_inpFu.numero != null ? _inpFu.numero : '');
-        const _idPedU = String(_idRawU).trim();
-        let _uFi = null;
-        if (_idPedU) _uFi = (_hotelUnidades || []).find(function(u){ return (u.numero != null && String(u.numero).trim() === _idPedU) || (u.id != null && String(u.id).trim() === _idPedU); });
-        if (!_uFi) {
-          _resFuTxt = 'No encontre una unidad con ese numero/id (' + _idPedU + '). Volve a buscar con buscar_unidades o pedile al lead que aclare cual le interesa. No inventes datos.';
-        } else {
-          _resFuTxt = 'Ficha completa de la unidad pedida (usa SOLO estos datos):' + _NLfu + _fichaCompletaUnidad(_uFi) + _NLfu + 'Para mandarle una FOTO usa enviar_foto_propiedad con el numero.' + ((_iaDisponibilidadOn && _esHotel) ? ' Para el PRECIO/DISPONIBILIDAD EXACTOS de fechas concretas usa consultar_disponibilidad.' : '') + ' No inventes datos que no figuren aca.';
-        }
-      } catch (eFu) { console.error('tool ficha_unidad:', eFu && eFu.message); _resFuTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes del alojamiento, sin inventar.'; }
+      const _resFuTxt = (await _toolResultadoCiclo('ficha_unidad', _toolFichaUni.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolFichaUni, _resFuTxt, 'ficha-unidad', _textoPrevioFu, 'Dejame traer los detalles y te confirmo.');
     } else if (_toolBuscarDev) {
       // RAG DESARROLLADORA (gated ia_rag_v1): la IA pidio buscar_desarrollos. Filtro en memoria sobre `_unitsRag` (0 IA,
       // 0 query) + 2do turno para que redacte (usage acumulado en _cerrarTurnoFuente). La tool solo existe con
       // _ragDevActivo => nunca se entra con el flag OFF (ACTUAL EXACTO). _ragToolUsado=true => este turno NO se cobra aparte.
       _ragToolUsado = true;
-      const _NLbd = String.fromCharCode(10);
       const _textoPrevioBd = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resBdTxt = '';
-      try {
-        const _inpBd = _toolBuscarDev.input || {};
-        const _resBd = _buscarUnidadesDev(_devsRag, _unitsRag, _sectorNombrePorId, {
-          desarrollo: _inpBd.desarrollo, etapa: _inpBd.etapa, estado: _inpBd.estado,
-          tipo_producto: _inpBd.tipo_producto, tipologia: _inpBd.tipologia,
-          precio_min: _inpBd.precio_min, precio_max: _inpBd.precio_max,
-          m2_min: _inpBd.m2_min, m2_max: _inpBd.m2_max,
-          numero: _inpBd.numero, texto_libre: _inpBd.texto_libre, limite: _inpBd.limite
-        });
-        if (!_resBd.length) {
-          // 0 resultados: NO inventar. Relajar filtros o repreguntar, con el indice de panorama como apoyo.
-          _resBdTxt = 'No hubo coincidencias EXACTAS con esos filtros. NO inventes unidades ni lotes. Opciones: (a) relaja algun filtro (ampli el rango de precio/m2 o quita el emprendimiento) y volve a llamar buscar_desarrollos; (b) pedile al lead un dato que acote mejor (emprendimiento, presupuesto, tipo de producto). Para referencia, este es el panorama de los emprendimientos:' + _NLbd + _indiceDev;
-        } else {
-          _resBdTxt = 'Unidades / lotes de los emprendimientos (' + _resBd.length + '; usa SOLO estos, no inventes otros). Para dar el detalle completo de uno, usa ficha_desarrollo con su numero:' + _NLbd + _resBd.map(function(u){ return _fichaCompactaDevUnit(u, null); }).join(_NLbd) + _NLbd + 'Ofrece el/los que mejor encajen con lo que pidio el lead, con su precio y estado. Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse. Si ninguno encaja del todo, decilo con honestidad y ofrece el mas parecido o pedi un dato para afinar.';
-        }
-      } catch (eBd) {
-        console.error('tool buscar_desarrollos:', eBd && eBd.message);
-        // FAIL-OPEN A LA CALIDAD: para loteos GRANDES NO volcamos miles de lineas -> el INDICE + el inventario ya capado
-        // (mismo piso que hoy). Respaldo bounded: inventarioDesarrollos (cap 30/dev) o el compacto capado.
-        const _respaldoDev = inventarioDesarrollos || _inventarioCompactoDevUnits(_unitsRag, 30);
-        _resBdTxt = 'Hubo un problema con el buscador. Para no dejarte sin datos, aca va el PANORAMA de los emprendimientos; elegi de aca lo que corresponda (no inventes nada fuera de esto):' + _NLbd + (_indiceDev || '') + (_respaldoDev ? (_NLbd + _respaldoDev) : '');
-      }
+      const _resBdTxt = (await _toolResultadoCiclo('buscar_desarrollos', _toolBuscarDev.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolBuscarDev, _resBdTxt, 'buscar-desarrollos', _textoPrevioBd, 'Dejame ver los emprendimientos y te paso opciones.');
     } else if (_toolFichaDev) {
       // RAG DESARROLLADORA (gated ia_rag_v1): detalle completo de UNA unidad/lote por numero (sobre `_unitsRag` en memoria).
       _ragToolUsado = true;
-      const _NLfd = String.fromCharCode(10);
       const _textoPrevioFd = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let _resFdTxt = '';
-      try {
-        const _inpFd = _toolFichaDev.input || {};
-        const _idRawD = (_inpFd.numero != null && _inpFd.numero !== '') ? _inpFd.numero : (_inpFd.id != null ? _inpFd.id : '');
-        const _idPedD = String(_idRawD).trim();
-        let _uFd = null;
-        if (_idPedD) {
-          const _normD = _ragNorm(_idPedD);
-          const _flatD = [];
-          try { Object.keys(_unitsRag || {}).forEach(function(k){ (_unitsRag[k] || []).forEach(function(u){ _flatD.push(u); }); }); } catch (eFlat) {}
-          _uFd = _flatD.find(function(u){ return u.numero != null && _ragNorm(u.numero) === _normD; }) || null;
-        }
-        if (!_uFd) {
-          _resFdTxt = 'No encontre una unidad/lote con ese numero (' + _idPedD + '). Volve a buscar con buscar_desarrollos o pedile al lead que aclare cual le interesa. No inventes datos.';
-        } else {
-          _resFdTxt = 'Ficha completa de la unidad/lote pedido (usa SOLO estos datos):' + _NLfd + _fichaCompletaDevUnit(_uFd, null, _uFd.etapa) + _NLfd + 'Aclara que valores, cuotas y fechas de entrega son estimados y pueden ajustarse. No inventes datos que no figuren aca.';
-        }
-      } catch (eFd) { console.error('tool ficha_desarrollo:', eFd && eFd.message); _resFdTxt = 'No pude traer la ficha en este momento. Segui con lo que sabes de los emprendimientos, sin inventar.'; }
+      const _resFdTxt = (await _toolResultadoCiclo('ficha_desarrollo', _toolFichaDev.input || {})).texto;
       reply = await _cerrarTurnoFuente(_toolFichaDev, _resFdTxt, 'ficha-desarrollo', _textoPrevioFd, 'Dejame traer los detalles y te confirmo.');
     } else {
     const _toolDueno = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'consultar_al_dueno'; });
     if (_toolDueno) {
       try {
-        const _pregunta = (_toolDueno.input && _toolDueno.input.pregunta) ? String(_toolDueno.input.pregunta).trim() : '';
-        // Registrar + avisar al dueno en segundo plano (no bloquea la respuesta al lead). user_id = TENANT (aislamiento).
-        if (_pregunta) { registrarConsultaAprendizaje(user_id, conversation_id, _pregunta).catch(function(){}); }
-        // FUERA DE HORARIO: si estamos afuera del horario de oficina de la cuenta, el mensaje al lead cambia a la
-        // variante que pidio Diego (el dueno quizas esta durmiendo): "voy a ver si consigo a alguien del equipo,
-        // apenas lo tenga te confirmo, y si no, a primera hora del otro dia en horario de oficina". DEFENSIVO: solo
-        // si hay horario_oficina cargado y estamos afuera; si no hay horario o falla, se usa la guia normal (actual).
-        let _fueraHorarioD = false;
-        try { _fueraHorarioD = !!(settings && settings.horario_oficina && !dentroHorarioOficina(settings.horario_oficina)); } catch (eFH) { _fueraHorarioD = false; }
-        const _guiaTool = _fueraHorarioD
-          ? 'Consulta registrada y enviada al equipo. IMPORTANTE: estamos FUERA del horario de oficina. Decile al lead con naturalidad que vas a ver si consegues a alguien del equipo para conseguir ese dato, que apenas lo tengas se lo confirmas, y que si no llega a ser hoy, se lo respondes a primera hora del proximo dia habil en horario de oficina. Segui la conversacion normal con lo que si podes responder.'
-          : 'Consulta registrada y enviada al dueno. Decile al lead con naturalidad que estas averiguando ese dato y le confirmas enseguida; segui la conversacion normal con lo que si podes responder.';
+        const _rDueno = await _toolResultadoCiclo('consultar_al_dueno', _toolDueno.input || {});
+        const _guiaTool = _rDueno.texto;
+        const _fueraHorarioD = _rDueno.fueraHorario;
         let _textoCierre = '';
         try {
           const _msgsT2 = mensajesParaIA.concat([
@@ -8634,69 +8941,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     try {
       const toolUse = (completion.content || []).find(function(b){ return b && b.type === 'tool_use' && b.name === 'enviar_foto_propiedad'; });
       const textoPrevio = (completion.content || []).filter(function(b){ return b && b.type === 'text' && b.text; }).map(function(b){ return b.text; }).join(' ').trim();
-      let fotoUrl = null;
-      let fotoCategoria = null;
-      let toolResultTexto = '';
-      if (toolUse && toolUse.input) {
-        const numPedido = String(toolUse.input.numero == null ? '' : toolUse.input.numero).trim();
-        fotoCategoria = String(toolUse.input.categoria == null ? '' : toolUse.input.categoria).trim();
-        // Buscar la propiedad por numero entre las YA cargadas (no re-consultamos la DB).
-        let propFoto = (properties || []).find(function(p){ return p.numero != null && String(p.numero).trim() === numPedido; });
-        // F6.3: HOTEL — si no matcheo una propiedad, buscar una UNIDAD por numero o por nombre (title contiene lo pedido).
-        if (!propFoto && _esHotel) {
-          const _pedNorm = numPedido.toLowerCase();
-          const _uH = (_hotelUnidsFoto || []).find(function(u){
-            return (u.numero != null && String(u.numero).trim() === numPedido) ||
-                   (u.title && String(u.title).toLowerCase().indexOf(_pedNorm) >= 0);
-          });
-          if (_uH) propFoto = { numero: (_uH.numero != null ? _uH.numero : _uH.title), images: _uH.images };
-        }
-        if (propFoto) {
-          // E3: consulta concreta sobre esta propiedad/unidad -> alimentar "propiedades mas consultadas". 0 IA, best-effort.
-          try { _contarConsultaPropiedad(user_id, numPedido, (propFoto.title || null)).catch(function(){}); } catch (eCnt) {}
-          const imgs = Array.isArray(propFoto.images) ? propFoto.images : [];
-          if (imgs.length > 0) {
-            // ARREGLO 2 (Diego 2026-07-28): la comparacion ya NO es texto exacto. Se resuelve la categoria PEDIDA y la
-            // de CADA foto a su forma canonica (minusculas, sin acentos, plural y SINONIMOS POR RUBRO) y se comparan
-            // esas. Asi 'baño' guardado matchea con 'bano' pedido (arreglo 1) y "fondo"/"fachada"/"garage" caen donde
-            // corresponde. Si no se puede resolver -> null (no matchea).
-            const _catPedida = _resolverCategoriaFoto(fotoCategoria, rubro);
-            // Categorias que la propiedad SI tiene (canonicas, sin repetir). Sirve para el aviso del arreglo 3.
-            const _catsDisp = [];
-            imgs.forEach(function(im){
-              if (!im || !im.url) return;
-              const _c = _resolverCategoriaFoto(im.categoria, rubro);
-              if (_c && _catsDisp.indexOf(_c) === -1) _catsDisp.push(_c);
-            });
-            let cand = _catPedida ? imgs.filter(function(im){ return im && im.url && _resolverCategoriaFoto(im.categoria, rubro) === _catPedida; }) : [];
-            // ARREGLO 3 (Diego 2026-07-28): NO mandar una foto que no es la pedida. El fallback "primera foto de la
-            // galeria" se ELIMINA cuando la propiedad TIENE fotos categorizadas: si no hay de la categoria pedida no se
-            // manda ninguna y se le dice a la IA que categorias SI hay para que las ofrezca (el texto al lead lo arma
-            // ella). EXCEPCION deliberada: si la propiedad/unidad no tiene NINGUNA foto categorizada (_catsDisp vacio;
-            // pasa en HOTEL, donde las fotos se guardan con categoria:'' — ver ~21047/21323 — y en galerias importadas
-            // sin clasificar), no hay forma de saber que la foto "no es la pedida": ahi se conserva el comportamiento
-            // de hoy (mandar una foto y pedirle a la IA que aclare) para no dejar al hotel sin fotos.
-            if (cand.length === 0 && _catsDisp.length === 0) cand = imgs.filter(function(im){ return im && im.url; });
-            if (cand.length > 0) {
-              fotoUrl = cand[0].url;
-              const huboCategoria = !!(_catPedida && _resolverCategoriaFoto(cand[0].categoria, rubro) === _catPedida);
-              toolResultTexto = huboCategoria
-                ? ('OK: foto enviada de la propiedad N' + numPedido + ', categoria ' + fotoCategoria + '. Acompanala con un comentario breve y natural.')
-                : ('No habia foto especifica de la categoria ' + fotoCategoria + ' para la propiedad N' + numPedido + '. Se envio otra foto disponible de la propiedad. Aclara con naturalidad que le mandas una foto de la propiedad aunque no sea exactamente de ' + fotoCategoria + '.');
-            } else if (_catsDisp.length > 0) {
-              toolResultTexto = 'NO se envio ninguna foto: la propiedad N' + numPedido + ' no tiene fotos de la categoria ' + fotoCategoria + '. Categorias de foto que SI tiene esta propiedad: ' + _catsDisp.join(', ') + '. Decile que de esa no tenes y ofrecele las que si hay.';
-            } else {
-              toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
-            }
-          } else {
-            toolResultTexto = 'La propiedad N' + numPedido + ' no tiene fotos disponibles. Avisale con amabilidad que por ahora no tenes una foto de esa propiedad para mandarle, y ofrecele el link si lo hay.';
-          }
-        } else {
-          toolResultTexto = 'No se encontro ninguna propiedad con el numero ' + numPedido + ' en el inventario. Pedile al lead que aclare de que propiedad quiere la foto.';
-        }
-      } else {
-        toolResultTexto = 'No se pudo procesar el pedido de foto. Segui la conversacion con normalidad.';
-      }
+      const _rFoto = await _toolResultadoCiclo('enviar_foto_propiedad', (toolUse && toolUse.input) ? toolUse.input : null);
+      const toolResultTexto = _rFoto.texto;
+      const fotoUrl = _rFoto.fotoUrl;
 
       // SEGUNDO TURNO: devolvemos el tool_result para que la IA cierre con texto natural (en idioma base).
       let textoFinal = '';
@@ -8744,6 +8991,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } // UBICACION OSM: cierra el else de _toolCerca (rama dueno/foto/otras tools)
     } // FEATURE #15: cierra el else de _toolAgendar (rama dueno/foto/otras tools)
     } // DERIVACION v3: cierra el else de _toolDerivar (rama tools existentes)
+    } // CICLO DE TOOLS: cierra el else del ciclo (arriba). Con el flag OFF esta rama es la unica que corre.
   } else {
     const block = (completion && completion.content) ? completion.content[0] : null;
     reply = (block && block.type === 'text') ? block.text : 'No pude generar una respuesta.';

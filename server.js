@@ -27947,9 +27947,12 @@ function _scrapCamposDeParse(parse, ex, tieneCols) {
   if (apagarAnual) fila.anual_activa = false;
   if ((apagarVenta || apagarAnual) && tieneCols) fila.no_disponible_web = true;
   if (apagarVenta || apagarAnual) {
-    var vivaVenta = apagarVenta ? false : (ex && ex.id ? ex.venta_activa === true : !!parse.venta);
-    var vivaAnual = apagarAnual ? false : (ex && ex.id ? ex.anual_activa === true : !!parse.anual);
-    var vivaTemp = (ex && ex.id) ? ex.temporal_activa === true : !!parse.temporal;
+    // "Viva" = la web la sigue ofreciendo O la base la tiene prendida. Mirar SOLO la base seria un
+    // error grave: una propiedad legacy con venta_activa en null que la web publica "En Venta, Alquiler
+    // anual, Alquilada" se apagaria ENTERA por la baja del alquiler, tapando una venta vigente.
+    var vivaVenta = apagarVenta ? false : (!!parse.venta || !!(ex && ex.venta_activa === true));
+    var vivaAnual = apagarAnual ? false : (!!parse.anual || !!(ex && ex.anual_activa === true));
+    var vivaTemp = (!!parse.temporal || !!(ex && ex.temporal_activa === true));
     if (!vivaVenta && !vivaAnual && !vivaTemp) {
       // No queda NINGUNA operacion viva -> recien ahi se apaga la propiedad entera.
       // pausa_manual=true es OBLIGATORIO: es la unica marca que respeta la auto-despausa del cron.

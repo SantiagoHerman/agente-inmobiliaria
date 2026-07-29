@@ -119,6 +119,90 @@ chequear('entrada vacia no explota', e11 && e11.venta === null && Array.isArray(
 var e12 = parsearPrecioFicha('$0', 'En Venta');
 chequear('precio 0 -> duda y no se escribe', e12.venta && e12.venta.precio === null && (e12.dudas || []).length > 0, j(e12));
 
+// ============================================================================
+// SEGUNDA PARTE: _scrapCamposDeParse — QUE se escribe de verdad en la base (correccion D2).
+// El parser dice que confirma la web; esta funcion decide que columnas se tocan mirando ademas la
+// fila que YA esta guardada. Es donde vive la "baja por operacion" y el anti-regresion.
+// ============================================================================
+var iniC = txt.indexOf('function _scrapCamposDeParse(parse, ex, tieneCols) {');
+var finC = txt.indexOf('// Guarda UNA duda en la cola de revision');
+if (iniC < 0 || finC < 0) { console.error('No se pudo aislar _scrapCamposDeParse'); process.exit(1); }
+var _scrapCamposDeParse;
+try {
+  // eslint-disable-next-line no-eval
+  _scrapCamposDeParse = eval('(function(){ function _scrapNum(v){ if (v == null || v === "") return null; var n = Number(v); return isFinite(n) ? n : null; } '
+    + txt.slice(iniC, finC) + ' return _scrapCamposDeParse; })()');
+} catch (e) { console.error('_scrapCamposDeParse no evalua:', e && e.message); process.exit(1); }
+
+console.log('');
+console.log('== D2: la baja es POR OPERACION, y el temporal NUNCA apaga la propiedad ==');
+
+// Sabor a Mama: local EN VENTA "No disponible", sin ninguna otra operacion viva.
+var d1 = _scrapCamposDeParse(parsearPrecioFicha('RETASADO U$S 45.000', 'En Venta, No disponible'),
+  { id: 'x', venta_activa: true, venta_precio: 45000, anual_activa: false, temporal_activa: false }, true);
+chequear('apaga la operacion de VENTA', d1.fila.venta_activa === false, j(d1.fila));
+chequear('sin operaciones vivas -> apaga la propiedad', d1.fila.activa === false, j(d1.fila));
+chequear('la apaga CON pausa_manual (si no, el cron la revive)', d1.fila.pausa_manual === true, j(d1.fila));
+chequear('deja registrado no_disponible_web', d1.fila.no_disponible_web === true, j(d1.fila));
+
+// Misma baja de venta pero la propiedad TAMBIEN se alquila: la propiedad NO se apaga.
+var d2 = _scrapCamposDeParse(parsearPrecioFicha('U$S 45.000', 'En Venta, No disponible'),
+  { id: 'x', venta_activa: true, anual_activa: true, temporal_activa: false }, true);
+chequear('con otra operacion viva NO apaga la propiedad', d2.fila.activa === undefined, j(d2.fila));
+chequear('no la pausa a mano', d2.fila.pausa_manual === undefined, j(d2.fila));
+
+// LEGACY: columnas de operacion en null y la web dice "En Venta, Alquiler anual, Alquilada".
+var d3 = _scrapCamposDeParse(parsearPrecioFicha('U$S 120.000', 'En Venta, Alquiler anual, Alquilada'),
+  { id: 'x', venta_activa: null, anual_activa: null, temporal_activa: null }, true);
+chequear('NO apaga una propiedad cuya venta la web sigue publicando', d3.fila.activa === undefined, j(d3.fila));
+
+// Temporal: "no disponible" sin fechas NO apaga nada (va por temporario_periodos).
+var d4 = _scrapCamposDeParse(parsearPrecioFicha('POR NOCHE $90.000', 'Alquiler temporario, No disponible'),
+  { id: 'x', venta_activa: false, anual_activa: false, temporal_activa: true }, true);
+chequear('temporal no disponible -> NO apaga la propiedad', d4.fila.activa === undefined, j(d4.fila));
+chequear('temporal no disponible -> NO la pausa', d4.fila.pausa_manual === undefined, j(d4.fila));
+
+console.log('');
+console.log('== Anti-regresion: no pisar datos guardados con inferencias ==');
+
+// Misma moneda, precio nuevo -> cambio sano, se escribe.
+var a1 = _scrapCamposDeParse(parsearPrecioFicha('U$S 33.000', 'En Venta'),
+  { id: 'x', venta_activa: true, venta_precio: 30000, venta_moneda: 'USD' }, true);
+chequear('precio nuevo en la MISMA moneda se actualiza', a1.fila.venta_precio === 33000, j(a1.fila));
+
+// Cambio de moneda -> NO se pisa, va a duda.
+var a2 = _scrapCamposDeParse(parsearPrecioFicha('$ 33.000', 'En Venta'),
+  { id: 'x', venta_activa: true, venta_precio: 30000, venta_moneda: 'USD' }, true);
+chequear('cambio de MONEDA no se escribe', a2.fila.venta_precio === undefined, j(a2.fila));
+chequear('cambio de MONEDA genera duda', (a2.dudas || []).length > 0, j(a2.dudas));
+
+// Mismo numero: solo completa la moneda que falta, no toca el numero.
+var a3 = _scrapCamposDeParse(parsearPrecioFicha('U$S 30.000', 'En Venta'),
+  { id: 'x', venta_activa: true, venta_precio: 30000, venta_moneda: null }, true);
+chequear('completa la moneda que faltaba', a3.fila.venta_moneda === 'USD', j(a3.fila));
+chequear('no reescribe el numero que ya estaba', a3.fila.venta_precio === undefined, j(a3.fila));
+
+// Sin la migracion corrida (tieneCols=false) no se toca ninguna columna nueva.
+var a4 = _scrapCamposDeParse(parsearPrecioFicha('U$S 30.000', 'En Venta'), { id: 'x', venta_activa: true }, false);
+chequear('sin migracion NO escribe columnas de moneda', a4.fila.venta_moneda === undefined && a4.fila.no_disponible_web === undefined, j(a4.fila));
+
+// FIRMA DEL ENVENENAMIENTO: el mismo numero cargado en una operacion que la web no confirma.
+var a5 = _scrapCamposDeParse(parsearPrecioFicha('U$S 52.000', 'En Venta'),
+  { id: 'x', venta_activa: true, venta_precio: null, temporal_activa: true, temporal_precio_dia: 52000 }, true);
+chequear('detecta el numero de venta cargado como tarifa por noche', (a5.dudas || []).some(function (d) { return d.campo === 'temporal'; }), j(a5.dudas));
+chequear('NO lo corrige solo (no borra el dato)', a5.fila.temporal_precio_dia === undefined, j(a5.fila));
+
+// AUTO-CURACION: la web la vuelve a publicar y la pausa la habia puesto el sistema.
+var a6 = _scrapCamposDeParse(parsearPrecioFicha('U$S 45.000', 'En Venta'),
+  { id: 'x', venta_activa: false, activa: false, pausa_manual: true, no_disponible_web: true }, true);
+chequear('se despausa sola si la web la vuelve a publicar', a6.fila.activa === true && a6.fila.pausa_manual === false, j(a6.fila));
+chequear('y repone la operacion que la web confirma', a6.fila.venta_activa === true, j(a6.fila));
+
+// Una pausa MANUAL del dueno (sin no_disponible_web) NO se toca.
+var a7 = _scrapCamposDeParse(parsearPrecioFicha('U$S 45.000', 'En Venta'),
+  { id: 'x', venta_activa: true, activa: false, pausa_manual: true, no_disponible_web: false }, true);
+chequear('NO revive una propiedad pausada a mano por el dueno', a7.fila.activa === undefined && a7.fila.pausa_manual === undefined, j(a7.fila));
+
 console.log('');
 console.log('=======================================');
 console.log('  OK: ' + okTotal + '   FALLAS: ' + falloTotal);

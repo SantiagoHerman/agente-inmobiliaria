@@ -20509,7 +20509,10 @@ function _mapearPropWpJsonADetalle(p, urlOriginal, mediaMap) {
   var estadoTax = _taxNombre(emb, 'property_status') || '';
   // normalizar a lo que entiende el front: Venta / Alquiler anual / Alquiler temporario
   var op = detectarOperacion(estadoTax, titulo + ' ' + descripcion.substring(0, 200));
-  campos['Estado'] = (op === 'temporal') ? 'Alquiler temporario' : (op === 'anual') ? 'Alquiler anual' : 'Venta';
+  // CAMBIO 5: si NO se reconoce la operacion Y la taxonomia no dice nada, ya NO se inventa 'Venta'.
+  // Se deja la clave AUSENTE: el que consume decide (el parser central lo manda a dudas). Cuando la
+  // taxonomia SI dice algo, el valor normalizado queda EXACTAMENTE como hoy (cero cambio para el front).
+  if (op || estadoTax) campos['Estado'] = (op === 'temporal') ? 'Alquiler temporario' : (op === 'anual') ? 'Alquiler anual' : 'Venta';
 
   // --- Ambientes / habitaciones / banos / cochera ---
   var ambientes = _metaVal(meta, 'fave_property_rooms');
@@ -20574,7 +20577,11 @@ function _mapearPropWpJsonADetalle(p, urlOriginal, mediaMap) {
   // si por algun motivo no hay galeria pero si portada, dejar al menos la portada en fotos
   if (fotos.length === 0 && foto) fotos.push(foto);
 
-  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, foto: foto, fotos: fotos, _idsGaleria: idsGaleria, wpjson: true };
+  // `estado_crudo`: la taxonomia property_status TAL CUAL ("Alquiler anual, En Venta"). ADITIVO y aparte de
+  // campos['Estado'] (que sigue colapsado a UNA operacion por compatibilidad con el front de hoy). Sin esto,
+  // el parser central veria una sola operacion en las fichas resueltas por wp-json y perderia el caso que
+  // origino todo el problema (un precio + varias operaciones en el mismo Estado).
+  return { url: url, titulo: titulo, descripcion: descripcion, campos: campos, estado_crudo: estadoTax || null, foto: foto, fotos: fotos, _idsGaleria: idsGaleria, wpjson: true };
 }
 
 // Resuelve EN BLOQUE un set de IDs de adjuntos WordPress a sus source_url.
@@ -26552,6 +26559,10 @@ async function procesarPropiedad(p) {
   return {
     numero: numero, titulo: titulo, tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
+    // ADITIVO: el texto CRUDO del Estado de la ficha ("Alquiler anual, En Venta, Oportunidad").
+    // Es lo que necesita parsearPrecioFicha para saber que operaciones ofrece de verdad. Antes se
+    // perdia: solo sobrevivia `operacion`, ya colapsada a UNA sola por detectarOperacion().
+    estado: pares['Estado'] || pares['Estado de la propiedad'] || null,
     ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles, caracteristicas: caract.join(', '), descripcion: descripcion,
     lat: _pin ? _pin.lat : null, lng: _pin ? _pin.lng : null,
     link: link, foto: foto, fotos: fotos, postId: p.id
@@ -26812,6 +26823,8 @@ async function procesarPropiedadURL(url, user_id, permitirIA, ctrlIA) {
   return {
     numero: numero, titulo: titulo || 'Sin titulo', tipo: pares['Tipo de propiedad'] || pares['Tipo'] || null,
     operacion: operacion, precio: precio, ambientes: ambientes, banos: banos,
+    // ADITIVO (mismo motivo que en procesarPropiedad): texto CRUDO del Estado para el parser central.
+    estado: pares['Estado'] || pares['Estado de la propiedad'] || null,
     ciudad: ciudad, zona: zona, direccion: direccion, entre_calles: entreCalles,
     caracteristicas: caract.join(', '), descripcion: descripcion || '',
     lat: _pin ? _pin.lat : null, lng: _pin ? _pin.lng : null,
@@ -27701,6 +27714,171 @@ app.post('/api/scraping-config', async function(req, res) {
 });
 
 
+// ============================================================================
+// ENGANCHE DEL PARSER EN LA ACTUALIZACION AUTOMATICA  (cambios 6, 7, 8, 9, 12)
+// ----------------------------------------------------------------------------
+// CERO IA. Todo lo de aca abajo es determinista y DEFENSIVO: si las columnas nuevas no existen
+// todavia (migracion-scraper-monedas.sql sin correr), cada helper cae al comportamiento ACTUAL.
+// ============================================================================
+
+// ¿Existen ya las columnas de moneda / no_disponible_web? Una sola query por corrida.
+async function _scrapTieneColsMoneda() {
+  try {
+    var r = await supabase.from('properties').select('venta_moneda, no_disponible_web').limit(1);
+    return !(r && r.error);
+  } catch (e) { return false; }
+}
+function _scrapNum(v) {
+  if (v == null || v === '') return null;
+  var n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+// NUCLEO: dado el resultado del parser y la fila que YA esta en la base, decide QUE se escribe.
+// Devuelve { fila: {...campos a mergear...}, dudas: [...] }.
+//
+// REGLAS (Diego):
+//  - Solo se escribe un precio cuyo TEXTO lo confirma (eso ya lo garantiza parsearPrecioFicha).
+//  - NUNCA se pisa un valor guardado con una inferencia. Si el valor nuevo contradice al guardado en
+//    MONEDA -> duda, no se escribe. Cambio de numero en la MISMA moneda = cambio sano -> se escribe.
+//  - Las operaciones NO se PRENDEN sobre una propiedad existente (podria revivir algo que el dueno
+//    apago a mano). Solo se APAGAN cuando la web declara la baja. En propiedades NUEVAS si se setean.
+//  - CORRECCION D2: la baja es POR OPERACION. Venta/anual se apagan solas; la propiedad entera solo se
+//    apaga si NO queda ninguna operacion viva, y ahi va con pausa_manual=true (sin eso, la corrida
+//    siguiente la revive: ver `fila.activa = ... ex.data.pausa_manual ...` en correrScrapingDeUsuario).
+//    El ALQUILER TEMPORAL NUNCA apaga la propiedad: su no-disponibilidad va por FECHAS
+//    (tabla temporario_periodos). Un "no disponible" sin fechas en una temporal -> DUDA, no apaga nada.
+function _scrapCamposDeParse(parse, ex, tieneCols) {
+  var fila = {}, dudas = [];
+  if (!parse) return { fila: fila, dudas: dudas };
+  var esNueva = !(ex && ex.id);
+  function duda(campo, motivo, valor) { dudas.push({ campo: campo, motivo: motivo, valor_visto: String(valor == null ? '' : valor).slice(0, 200) }); }
+
+  // ---- (a) precios + moneda, operacion por operacion ----
+  var mapa = [
+    { op: 'venta', obj: parse.venta, keyPrecio: 'venta_precio', keyMoneda: 'venta_moneda', keyActiva: 'venta_activa', valor: parse.venta ? parse.venta.precio : null, label: 'venta' },
+    { op: 'anual', obj: parse.anual, keyPrecio: 'anual_precio', keyMoneda: 'anual_moneda', keyActiva: 'anual_activa', valor: parse.anual ? parse.anual.precio : null, label: 'alquiler anual' },
+    { op: 'temporal', obj: parse.temporal, keyPrecio: 'temporal_precio_dia', keyMoneda: 'temporal_moneda', keyActiva: 'temporal_activa', valor: parse.temporal ? parse.temporal.precio_dia : null, label: 'alquiler temporal' }
+  ];
+  var confirmados = [];
+  for (var i = 0; i < mapa.length; i++) {
+    var m = mapa[i];
+    if (esNueva && m.obj) fila[m.keyActiva] = true;     // propiedad NUEVA: la web define que ofrece
+    if (!m.obj || m.valor == null) continue;
+    confirmados.push({ op: m.op, valor: m.valor });
+    var viejo = ex ? _scrapNum(ex[m.keyPrecio]) : null;
+    var monNuevo = m.obj.moneda || null;
+    var monViejo = ex ? (ex[m.keyMoneda] || null) : null;
+    if (viejo == null) {                                 // no habia nada cargado -> se completa
+      fila[m.keyPrecio] = m.valor;
+      if (tieneCols && monNuevo) fila[m.keyMoneda] = monNuevo;
+    } else if (viejo === m.valor) {                      // mismo numero -> a lo sumo completar la moneda
+      if (tieneCols && monNuevo && !monViejo) fila[m.keyMoneda] = monNuevo;
+    } else if (monViejo && monNuevo && monViejo !== monNuevo) {
+      duda(m.op, 'el precio de ' + m.label + ' cambio de moneda en la web (' + monViejo + ' -> ' + monNuevo + '): no se pisa solo', m.valor);
+    } else {                                             // cambio de precio en la misma moneda = cambio sano
+      fila[m.keyPrecio] = m.valor;
+      if (tieneCols && monNuevo) fila[m.keyMoneda] = monNuevo;
+    }
+  }
+
+  // ---- (b) FIRMA DEL ENVENENAMIENTO (hueco H2): el MISMO numero que la web confirma para una operacion
+  // ya esta cargado en OTRA operacion que la web NO confirma. Es exactamente lo que paso con los 4 anual y
+  // los 24 "por noche" de Anton. No se corrige solo: se avisa para que lo resuelva un humano.
+  if (ex && ex.id && confirmados.length) {
+    for (var c = 0; c < confirmados.length; c++) {
+      for (var k = 0; k < mapa.length; k++) {
+        var o = mapa[k];
+        if (o.op === confirmados[c].op) continue;
+        if (o.obj && o.valor != null) continue;          // la web tambien confirma esa operacion: no hay conflicto
+        var guardado = _scrapNum(ex[o.keyPrecio]);
+        if (guardado != null && guardado === confirmados[c].valor) {
+          duda(o.op, 'la base tiene ese mismo numero cargado como ' + o.label + ', pero la web lo publica como precio de ' + (confirmados[c].op === 'venta' ? 'venta' : confirmados[c].op === 'anual' ? 'alquiler anual' : 'alquiler temporal'), guardado);
+        }
+      }
+    }
+  }
+
+  // ---- (c) DISPONIBILIDAD (D2) ----
+  var apagarVenta = !!(parse.no_disponible && parse.no_disponible.venta);
+  var apagarAnual = !!(parse.no_disponible && parse.no_disponible.anual);
+  if (apagarVenta) fila.venta_activa = false;
+  if (apagarAnual) fila.anual_activa = false;
+  if ((apagarVenta || apagarAnual) && tieneCols) fila.no_disponible_web = true;
+  if (apagarVenta || apagarAnual) {
+    var vivaVenta = apagarVenta ? false : (ex && ex.id ? ex.venta_activa === true : !!parse.venta);
+    var vivaAnual = apagarAnual ? false : (ex && ex.id ? ex.anual_activa === true : !!parse.anual);
+    var vivaTemp = (ex && ex.id) ? ex.temporal_activa === true : !!parse.temporal;
+    if (!vivaVenta && !vivaAnual && !vivaTemp) {
+      // No queda NINGUNA operacion viva -> recien ahi se apaga la propiedad entera.
+      // pausa_manual=true es OBLIGATORIO: es la unica marca que respeta la auto-despausa del cron.
+      // Contrapartida asumida: para el dueno queda igual que una pausa manual. Por eso ademas se
+      // graba no_disponible_web=true, que es lo que permite REVIVIRLA sola si la web la vuelve a publicar.
+      fila.activa = false;
+      fila.pausa_manual = true;
+    }
+  } else if (ex && ex.id && ex.no_disponible_web === true && (parse.venta || parse.anual || parse.temporal)) {
+    // AUTO-CURACION: la web la habia dado de baja y ahora la vuelve a publicar. Como no_disponible_web=true
+    // prueba que la pausa la puso el SISTEMA (no el dueno), se deshace: se reactiva y se reponen las
+    // operaciones que la web confirma hoy. Sin esto, una baja transitoria enterraba la propiedad para siempre.
+    if (tieneCols) fila.no_disponible_web = false;
+    fila.pausa_manual = false;
+    fila.activa = true;
+    if (parse.venta) fila.venta_activa = true;
+    if (parse.anual) fila.anual_activa = true;
+    if (parse.temporal) fila.temporal_activa = true;
+  }
+  return { fila: fila, dudas: dudas };
+}
+
+// Guarda UNA duda en la cola de revision (`scraping_pendientes`, tipo_cambio='duda').
+// NO se usa `scrape_jobs`: esa es la cola de DESARROLLADORA y su runner toma el pendiente mas viejo
+// SIN filtrar por tipo -> una duda ahi la mata como error y bloquea la cola de emprendimientos.
+// `datos_nuevos` NO lleva ningun campo de properties a proposito: aunque alguien la "acepte", no hay
+// nada que aplicar (ademas /aceptar saltea explicitamente las dudas).
+async function _scrapRegistrarDuda(userId, p, propertyId, dudas) {
+  try {
+    if (!dudas || !dudas.length) return 0;
+    var r = await supabase.from('scraping_pendientes').insert({
+      user_id: userId,
+      numero: String(p && p.numero != null ? p.numero : ''),
+      tipo_cambio: 'duda',
+      titulo: (p && p.titulo) || 'Sin titulo',
+      datos_nuevos: {
+        dudas: dudas,
+        price_texto: (p && p.precio) || null,
+        estado_texto: (p && p.estado) || null,
+        link: (p && p.link) || null,
+        aplicar: false
+      },
+      datos_viejos: null,
+      property_id: propertyId || null
+    });
+    return (r && r.error) ? 0 : 1;
+  } catch (e) { return 0; }
+}
+
+// CORRECCION D3 — EL AVISO. UNO SOLO POR CORRIDA (nunca uno por propiedad).
+// Reusa el mapa de avisos que YA funciona, sin construir ningun canal nuevo:
+//   1) _postearAvisoInterno(owner, 'general', texto, { soloRegistro: true })
+//        -> deja el aviso escrito en el canal interno "Todos" (team_messages), firmado "Sistema",
+//           SIN disparar el push masivo a todo el equipo (eso es lo que hace soloRegistro).
+//   2) _pushDuenoAdmins(owner, texto)
+//        -> push (app Android/FCM) al DUENO y a los ADMINISTRADORES. enviarPushAsesor ademas espeja
+//           el mismo texto por WhatsApp al numero del usuario si el tenant tiene notif_dm_wa_on ON.
+// Es EXACTAMENTE el patron que ya usa el aviso de citas (ver _avisarCitaEquipoCanales). 0 tokens IA.
+async function _scrapAvisarDudas(ownerId, cantidad) {
+  try {
+    if (!ownerId || !cantidad || cantidad < 1) return;
+    var texto = 'Actualizacion de inventario: ' + cantidad + ' precio(s) para confirmar. '
+      + 'La web publica datos que no se pueden interpretar solos (no queda claro la moneda o a que operacion corresponde el precio), '
+      + 'asi que NO se tocaron para no ensuciar el inventario. Revisalos en Automatizacion: ' + FRONTEND_URL + '/automatizacion';
+    try { await _postearAvisoInterno(ownerId, 'general', texto, { soloRegistro: true }); } catch (eCanal) {}
+    try { await _pushDuenoAdmins(ownerId, texto); } catch (ePush) {}
+    console.log('[scraper dudas] aviso enviado a dueno+admins de', ownerId, '->', cantidad, 'duda(s)');
+  } catch (e) { console.error('_scrapAvisarDudas:', e && e.message); }
+}
+
 // ===== MOTOR DE SCRAPING AUTOMATICO (revisa cada hora que cuentas deben actualizar inventario) =====
 async function correrScrapingDeUsuario(cfg) {
   // trae propiedades de la fuente y las guarda en modo directo (upsert por numero)
@@ -27734,7 +27912,21 @@ async function correrScrapingDeUsuario(cfg) {
     // ADITIVO: si la base tiene las columnas de geo, las leo para poder RELLENAR solo las vacias.
     var _tieneGeo = true;
     try { var _gb = await supabase.from('properties').select('lat, lng').limit(1); if (_gb.error) _tieneGeo = false; } catch (e) { _tieneGeo = false; }
-    var _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos';
+    // CAMBIO 6: columnas de moneda / no_disponible_web. Si la migracion todavia no corrio, _tieneCols=false
+    // y el parser sigue funcionando: escribe precios y apaga operaciones, pero no toca esas columnas.
+    var _tieneCols = await _scrapTieneColsMoneda();
+    // Columnas de OPERACION que necesita el parser para no pisar nada y para la baja por operacion (D2).
+    // Se leen con un select propio y DEFENSIVO: si fallara, se sigue exactamente como hoy (sin parser).
+    var _colsOps = 'venta_activa, venta_precio, anual_activa, anual_precio, temporal_activa, temporal_precio_dia'
+      + (_tieneCols ? ', venta_moneda, anual_moneda, temporal_moneda, no_disponible_web' : '');
+    var _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos, ' + _colsOps;
+    var _parserOn = true;
+    try { var _ob = await supabase.from('properties').select(_colsOps).limit(1); if (_ob.error) _parserOn = false; } catch (eOb) { _parserOn = false; }
+    if (!_parserOn) { _selCols = (_tienePausa ? 'id, images, pausa_manual' : 'id, images') + (_tieneGeo ? ', lat, lng' : '') + ', rooms, banos'; }
+    // Las DUDAS de la corrida anterior se reemplazan por las de esta (misma politica que el modo
+    // "pendiente"). Solo borra las de tipo 'duda': no toca cambios 'nueva'/'modificada' en revision.
+    var _dudasRun = 0;
+    if (_parserOn) { try { await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id).eq('tipo_cambio', 'duda'); } catch (eDel) {} }
     var _pinsRun = [];
     // Entero limpio de un valor de la tabla de detalles ("3", "3 ambientes"). null si no es un numero sano.
     function _intProp(v) {
@@ -27764,6 +27956,10 @@ async function correrScrapingDeUsuario(cfg) {
         };
         var _fotos = Array.isArray(p.fotos) ? p.fotos : [];
         var ex = await supabase.from('properties').select(_selCols).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        // CAMBIO 6: parser central. Lo que el texto CONFIRMA se escribe; lo que no, va a DUDAS y NO se escribe.
+        var _pf = _parserOn ? parsearPrecioFicha(p.precio, p.estado) : null;
+        var _res = _pf ? _scrapCamposDeParse(_pf, (ex && ex.data) ? ex.data : null, _tieneCols) : { fila: {}, dudas: [] };
+        var _dudasProp = (_pf ? (_pf.dudas || []) : []).concat(_res.dudas || []);
         if (ex.data && ex.data.id) {
           // FIGURA en el sitio -> auto-DESPAUSA (activa=true) y actualiza info, SALVO que la hayas pausado a mano
           // (pausa_manual): en ese caso se respeta tu pausa (activa=false) pero igual se refresca la info.
@@ -27780,11 +27976,16 @@ async function correrScrapingDeUsuario(cfg) {
           // galerias buenas ni las fotos ya CLASIFICADAS (categoria) de las propiedades sanas.
           var _stored = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
           if (_stored < 2 && _fotos.length > _stored) fila.images = _fotos.map(function(u){ return { url: u }; });
+          // El merge del parser va DESPUES de fila.activa: la baja por operacion (D2) tiene que poder
+          // pisar la auto-despausa de arriba, si no la corrida siguiente revive lo que la web dio de baja.
+          Object.assign(fila, _res.fila);
           var up = await supabase.from('properties').update(fila).eq('id', ex.data.id);
           if (up.error) errores++; else actualizados++;
+          if (_dudasProp.length) _dudasRun += await _scrapRegistrarDuda(cfg.user_id, p, ex.data.id, _dudasProp);
         } else {
           fila.activa = true;
           if (_fotos.length) fila.images = _fotos.map(function(u){ return { url: u }; });
+          Object.assign(fila, _res.fila);
           if (_tieneGeo && p.lat != null && p.lng != null) _pinsRun.push({ numero: String(p.numero), lat: p.lat, lng: p.lng });
           var _rmN = _intProp(p.ambientes), _bnN = _intProp(p.banos);
           if (_rmN != null) fila.rooms = _rmN;
@@ -27846,7 +28047,9 @@ async function correrScrapingDeUsuario(cfg) {
         '| saltadas por tope de corrida (quedan para la proxima):', _ctrlIA.saltadas_tope_corrida,
         '| saltadas por tope del plan:', _ctrlIA.saltadas_tope_plan);
     }
-    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, total: lista.length };
+    // CORRECCION D3: UN solo aviso por corrida con el total ("12 precios a confirmar"), nunca uno por propiedad.
+    if (_dudasRun > 0) { try { await _scrapAvisarDudas(cfg.user_id, _dudasRun); } catch (eAv) {} }
+    return { ok: true, creados: creados, actualizados: actualizados, pausadas: pausadas, errores: errores, dudas: _dudasRun, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 
@@ -27901,6 +28104,14 @@ async function correrScrapingPendiente(cfg) {
     }
     // limpiar pendientes anteriores de este usuario (se reemplazan por el scraping nuevo)
     await supabase.from('scraping_pendientes').delete().eq('user_id', cfg.user_id);
+    // CAMBIO 8: mismas sondas defensivas que el modo directo (columnas de moneda / de operacion).
+    var _tieneColsP = await _scrapTieneColsMoneda();
+    var _colsOpsP = 'venta_activa, venta_precio, anual_activa, anual_precio, temporal_activa, temporal_precio_dia'
+      + (_tieneColsP ? ', venta_moneda, anual_moneda, temporal_moneda, no_disponible_web' : '');
+    var _parserOnP = true;
+    try { var _obP = await supabase.from('properties').select(_colsOpsP).limit(1); if (_obP.error) _parserOnP = false; } catch (eObP) { _parserOnP = false; }
+    var _selPend = 'id,title,price,zone,description,images' + (_parserOnP ? (', ' + _colsOpsP) : '');
+    var _dudasRunP = 0;
     var nuevas = 0, modificadas = 0;
     for (var i = 0; i < lista.length; i++) {
       try {
@@ -27922,7 +28133,13 @@ async function correrScrapingPendiente(cfg) {
           description: _limpiarTextoInventario(p.descripcion) || null, caracteristicas: p.caracteristicas || null, link: p.link || null,
           images: _fotosPend.length ? _fotosPend.map(function(u){ return { url: u }; }) : null
         };
-        var ex = await supabase.from('properties').select('id,title,price,zone,description,images').eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select(_selPend).eq('user_id', cfg.user_id).eq('numero', String(p.numero)).maybeSingle();
+        // CAMBIO 8: el parser corre TAMBIEN en el modo "me deja revisar antes". Lo confirmado viaja en
+        // `nuevo.ops` (lo aplica /aceptar); lo dudoso va a una fila APARTE con tipo_cambio='duda'.
+        var _pfP = _parserOnP ? parsearPrecioFicha(p.precio, p.estado) : null;
+        var _resP = _pfP ? _scrapCamposDeParse(_pfP, (ex && ex.data) ? ex.data : null, _tieneColsP) : { fila: {}, dudas: [] };
+        var _dudasPropP = (_pfP ? (_pfP.dudas || []) : []).concat(_resP.dudas || []);
+        if (_resP.fila && Object.keys(_resP.fila).length) nuevo.ops = _resP.fila;
         if (ex.data && ex.data.id) {
           // existe: detectar si cambio algo relevante (precio, titulo, zona, descripcion) o si la web tiene MAS fotos que las guardadas
           var v = ex.data;
@@ -27933,10 +28150,12 @@ async function correrScrapingPendiente(cfg) {
             await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'modificada', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: { title: v.title, price: v.price, zone: v.zone }, property_id: v.id });
             modificadas++;
           }
+          if (_dudasPropP.length) _dudasRunP += await _scrapRegistrarDuda(cfg.user_id, p, v.id, _dudasPropP);
         } else {
           // no existe: es nueva
           await supabase.from('scraping_pendientes').insert({ user_id: cfg.user_id, numero: String(p.numero), tipo_cambio: 'nueva', titulo: nuevo.title, datos_nuevos: nuevo, datos_viejos: null, property_id: null });
           nuevas++;
+          if (_dudasPropP.length) _dudasRunP += await _scrapRegistrarDuda(cfg.user_id, p, null, _dudasPropP);
         }
       } catch (e) {}
     }
@@ -27946,7 +28165,9 @@ async function correrScrapingPendiente(cfg) {
         '| saltadas por tope de corrida (quedan para la proxima):', _ctrlIAP.saltadas_tope_corrida,
         '| saltadas por tope del plan:', _ctrlIAP.saltadas_tope_plan);
     }
-    return { ok: true, nuevas: nuevas, modificadas: modificadas, total: lista.length };
+    // CORRECCION D3: un solo aviso por corrida, igual que en el modo directo.
+    if (_dudasRunP > 0) { try { await _scrapAvisarDudas(cfg.user_id, _dudasRunP); } catch (eAvP) {} }
+    return { ok: true, nuevas: nuevas, modificadas: modificadas, dudas: _dudasRunP, total: lista.length };
   } catch (e) { return { ok: false, motivo: e && e.message }; }
 }
 async function revisarScrapingsAutomaticos() {
@@ -28041,23 +28262,42 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
     if (soloId) query = query.eq('id', soloId);
     var q = await query;
     var items = q.data || [];
-    var aplicados = 0;
+    var aplicados = 0, dudasCerradas = 0;
+    // Lectura DEFENSIVA de pausa_manual: si la columna no existiera, se cae al comportamiento anterior.
+    var _tienePausaAcc = true;
+    try { var _pbA = await supabase.from('properties').select('pausa_manual').limit(1); if (_pbA.error) _tienePausaAcc = false; } catch (ePbA) { _tienePausaAcc = false; }
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
+      // CAMBIO 9 (regla estrella): una DUDA no se aplica NUNCA, ni aceptandola a mano ni en modo directo.
+      // "Aceptar" sobre una duda solo la da por vista y la saca de la bandeja: el valor correcto lo carga
+      // una persona en el inventario. Ademas su datos_nuevos NO trae campos de properties, asi que el
+      // update de abajo la habria dejado sin titulo/precio/zona: por eso se corta ACA.
+      if (it.tipo_cambio === 'duda') {
+        await supabase.from('scraping_pendientes').delete().eq('id', it.id);
+        dudasCerradas++;
+        continue;
+      }
       var d = it.datos_nuevos || {};
       var fila = { user_id: user_id, numero: String(it.numero), title: d.title || 'Sin titulo', type: d.type || null, zone: d.zone || null, price: d.price || null, description: d.description || null, caracteristicas: d.caracteristicas || null, link: d.link || null, activa: true };
+      // Operaciones/precios/monedas que el parser CONFIRMO en la corrida (cambio 8). Solo campos confirmados.
+      if (d.ops && typeof d.ops === 'object') { try { Object.assign(fila, d.ops); } catch (eOps) {} }
       var _fotosAcc = Array.isArray(d.images) ? d.images : []; // ya vienen como [{url:...}]
       if (it.tipo_cambio === 'modificada' && it.property_id) {
         // refrescar fotos SOLO si la galeria guardada es POBRE (<2): rellena las de 0-1 foto sin pisar las sanas/clasificadas
-        var _cur = await supabase.from('properties').select('images').eq('id', it.property_id).maybeSingle();
+        var _cur = await supabase.from('properties').select(_tienePausaAcc ? 'images, pausa_manual' : 'images').eq('id', it.property_id).maybeSingle();
         var _curN = (_cur.data && Array.isArray(_cur.data.images)) ? _cur.data.images.length : 0;
         if (_curN < 2 && _fotosAcc.length > _curN) fila.images = _fotosAcc;
+        // AGUJERO TAPADO: antes escribia activa:true SIEMPRE -> aceptar un cambio de titulo/foto revivia una
+        // propiedad pausada (a mano o por baja de la web). Ahora la pausa manda, salvo que el propio cambio
+        // traiga una reactivacion explicita del parser (auto-curacion: la web la volvio a publicar).
+        if (_tienePausaAcc && _cur.data && _cur.data.pausa_manual === true && !(d.ops && d.ops.pausa_manual === false)) delete fila.activa;
         await supabase.from('properties').update(fila).eq('id', it.property_id);
       } else {
-        var ex = await supabase.from('properties').select('id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
+        var ex = await supabase.from('properties').select(_tienePausaAcc ? 'id, images, pausa_manual' : 'id, images').eq('user_id', user_id).eq('numero', String(it.numero)).maybeSingle();
         if (ex.data && ex.data.id) {
           var _exN = Array.isArray(ex.data.images) ? ex.data.images.length : 0;
           if (_exN < 2 && _fotosAcc.length > _exN) fila.images = _fotosAcc;
+          if (_tienePausaAcc && ex.data.pausa_manual === true && !(d.ops && d.ops.pausa_manual === false)) delete fila.activa;
           await supabase.from('properties').update(fila).eq('id', ex.data.id);
         }
         else { if (_fotosAcc.length) fila.images = _fotosAcc; await supabase.from('properties').insert(fila); }
@@ -28065,7 +28305,7 @@ app.post('/api/scraping-pendientes/aceptar', async function(req, res) {
       await supabase.from('scraping_pendientes').delete().eq('id', it.id);
       aplicados++;
     }
-    return res.json({ ok: true, aplicados: aplicados });
+    return res.json({ ok: true, aplicados: aplicados, dudas_cerradas: dudasCerradas });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 app.post('/api/scraping-pendientes/rechazar', async function(req, res) {

@@ -31804,6 +31804,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _cav = await supabase.from('business_settings').select('cloud_api_v1').eq('user_id', user_id).maybeSingle();
       if (_cav && _cav.data) cloud_api_v1 = _cav.data.cloud_api_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // pipeline_filtros_v1 (Diego 2026-07-30): gate del panel de FILTROS + el RESUMEN POR USUARIO del Pipeline.
+    // Diego pidio verlo primero SOLO en Anton: "desplegalo y quiero verlo en Anton y espera mi dale para los 3
+    // mundos". Query SEPARADA y defensiva: columna ausente / error -> false => el Pipeline queda EXACTAMENTE
+    // como hoy (solo el buscador de texto libre). 0 tokens de IA: es una vista, no llama a ningun modelo.
+    var pipeline_filtros_v1 = false;
+    try {
+      var _pfv = await supabase.from('business_settings').select('pipeline_filtros_v1').eq('user_id', user_id).maybeSingle();
+      if (_pfv && _pfv.data) pipeline_filtros_v1 = _pfv.data.pipeline_filtros_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
     // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
     // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
     // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
@@ -31835,7 +31844,7 @@ app.get('/api/ui-flags', async function(req, res){
         if (_ceh && _ceh >= 1 && _ceh <= 168) cita_escalada_horas = _ceh;
       }
     } catch (e) { /* columnas ausentes / error -> defaults */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
   }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 

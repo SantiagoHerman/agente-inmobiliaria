@@ -6125,9 +6125,14 @@ function _construirIndiceInventario(properties) {
   if (nOp.alquiler_anual) { var ra = rango(precios.alquiler_anual); var sa = simbolo('alquiler_anual', '$'); opsTxt.push('alquiler anual: ' + nOp.alquiler_anual + ((ra && sa) ? ' (' + sa + ' ' + _ragMiles(ra.min) + (ra.min !== ra.max ? ' a ' + sa + ' ' + _ragMiles(ra.max) : '') + '/mes)' : '')); }
   if (nOp.alquiler_temporal) { var rt = rango(precios.alquiler_temporal); var st = simbolo('alquiler_temporal', '$'); opsTxt.push('alquiler temporal: ' + nOp.alquiler_temporal + ((rt && st) ? ' (' + st + ' ' + _ragMiles(rt.min) + (rt.min !== rt.max ? ' a ' + st + ' ' + _ragMiles(rt.max) : '') + '/dia)' : '')); }
   if (opsTxt.length) lineas.push('Operaciones disponibles (cantidad y rango de precio): ' + opsTxt.join(' | ') + '.');
-  var tipos = Object.keys(porTipo).sort(function (a, b) { return porTipo[b] - porTipo[a]; });
+  // DESEMPATE ALFABETICO (Diego 2026-07-31): ordenar SOLO por cantidad deja a los empatados en el orden en que
+  // llegaron de la base, que no es estable. Medido en Anton: 14 de 20 tipos y 23 de 30 zonas empatan en cantidad.
+  // Con el desempate, el mismo inventario produce SIEMPRE el mismo texto -> el bloque cacheado conserva su huella
+  // y Anthropic lo reusa en vez de cobrar una escritura nueva. Es el cinturon del .order('id') de la carga: aunque
+  // manana alguien cambie como se traen las propiedades, el indice sigue siendo estable.
+  var tipos = Object.keys(porTipo).sort(function (a, b) { return (porTipo[b] - porTipo[a]) || a.localeCompare(b); });
   if (tipos.length) lineas.push('Tipos de propiedad: ' + tipos.map(function (t) { return t + ' (' + porTipo[t] + ')'; }).join(', ') + '.');
-  var zonas = Object.keys(porZona).sort(function (a, b) { return porZona[b] - porZona[a]; });
+  var zonas = Object.keys(porZona).sort(function (a, b) { return (porZona[b] - porZona[a]) || a.localeCompare(b); });
   var zTop = zonas.slice(0, 60);
   var zTxt = zTop.map(function (z) { return z + ' (' + porZona[z] + ')'; }).join(', ');
   if (zonas.length > zTop.length) zTxt += ', y ' + (zonas.length - zTop.length) + ' zona(s) mas';
@@ -6385,13 +6390,16 @@ function _construirIndiceHotel(unidades, headersTxt) {
   });
   var pan = [];
   pan.push('Total de unidades activas: ' + uds.length + '.');
-  var comps = Object.keys(porComplejo);
+  // ORDEN ESTABLE (Diego 2026-07-31): mismo criterio que el indice de inmobiliaria. Object.keys() devuelve las
+  // claves en orden de insercion, que depende del orden en que vinieron las unidades de la base -> el mismo
+  // inventario podia generar un texto distinto y romper el cache. Se ordena SIEMPRE, con desempate alfabetico.
+  var comps = Object.keys(porComplejo).sort(function (a, b) { return (porComplejo[b] - porComplejo[a]) || a.localeCompare(b); });
   if (comps.length) pan.push('Unidades por complejo: ' + comps.map(function (c) { return c + ' (' + porComplejo[c] + ')'; }).join(', ') + '.');
-  var tipos = Object.keys(porTipo).sort(function (a, b) { return porTipo[b] - porTipo[a]; });
+  var tipos = Object.keys(porTipo).sort(function (a, b) { return (porTipo[b] - porTipo[a]) || a.localeCompare(b); });
   if (tipos.length) pan.push('Tipos de unidad: ' + tipos.map(function (t) { return t + ' (' + porTipo[t] + ')'; }).join(', ') + '.');
   if (caps.length) pan.push('Capacidad: de ' + Math.min.apply(null, caps) + ' a ' + Math.max.apply(null, caps) + ' personas.');
   if (precios.length) { var _mn = Math.min.apply(null, precios), _mx = Math.max.apply(null, precios); pan.push('Precio por noche: ' + (_monedaPan || 'ARS') + ' ' + _ragMiles(_mn) + (_mn !== _mx ? ' a ' + (_monedaPan || 'ARS') + ' ' + _ragMiles(_mx) : '') + '.'); }
-  var temps = Object.keys(temporadas);
+  var temps = Object.keys(temporadas).sort(); // orden estable (ver comentario de arriba)
   if (temps.length) pan.push('Temporadas con tarifa: ' + temps.join(', ') + '.');
   lineas.push(pan.join(NL));
   return lineas.join(NL + NL);
@@ -6912,20 +6920,28 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // reintenta solo, asi despues de correr la migracion se cura sin redeploy.
     if (_monColsOk === false && (Date.now() - _monColsTs) > 600000) _monColsOk = null;
     const _colsMon = (_monColsOk === false) ? '' : ', venta_moneda, anual_moneda, temporal_moneda';
+    // ORDEN DETERMINISTA (Diego 2026-07-31) — .order('id') en las TRES variantes.
+    // Sin ORDER BY, Postgres NO garantiza el orden de las filas, y ese orden cambia solo con el mantenimiento
+    // interno de la tabla. Como el indice del inventario agrupa por tipo/zona y ordena por cantidad SIN
+    // desempatar, un orden distinto de entrada producia un TEXTO distinto con el MISMO inventario -> el bloque
+    // cacheado cambiaba de huella -> Anthropic no reusaba el cache y cobraba la escritura de nuevo.
+    // Medido en Anton (28-31/07): 10 huellas distintas del bloque en 4 dias sin que cambiara una sola
+    // propiedad (0 altas desde el 27/07), y 40 escrituras de cache a $0.082 cada una.
+    // Con el orden fijo el mismo inventario produce SIEMPRE el mismo texto, tenga 10 propiedades o 10.000.
     let _listo = false;
     if (_colsMon) {
       try {
-        const _rpM = await supabase.from('properties').select(_colsProp + _colsMon + _colsDir).eq('user_id', user_id).eq('activa', true);
+        const _rpM = await supabase.from('properties').select(_colsProp + _colsMon + _colsDir).eq('user_id', user_id).eq('activa', true).order('id');
         if (_rpM.error) throw _rpM.error;
         properties = _rpM.data; _listo = true; _monColsOk = true;
       } catch (eMon) { _monColsOk = false; _monColsTs = Date.now(); }
     }
     if (!_listo) try {
-      const _rp = await supabase.from('properties').select(_colsProp + _colsDir).eq('user_id', user_id).eq('activa', true);
+      const _rp = await supabase.from('properties').select(_colsProp + _colsDir).eq('user_id', user_id).eq('activa', true).order('id');
       if (_rp.error) throw _rp.error;
       properties = _rp.data;
     } catch (eDirProp) {
-      const _rp2 = await supabase.from('properties').select(_colsProp).eq('user_id', user_id).eq('activa', true);
+      const _rp2 = await supabase.from('properties').select(_colsProp).eq('user_id', user_id).eq('activa', true).order('id');
       properties = _rp2.data;
     }
   }
@@ -7104,9 +7120,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       let _devs = null, _devErr = null;
       {
         const _colsDev = 'id, nombre, tipo, zona, descripcion, link, estado_obra, avance_pct, fecha_entrega, dev_data';
-        const _rd = await supabase.from('developments').select(_colsDev + ', direccion, entre_calles, ciudad, lat, lng, referencias_zona').eq('user_id', user_id).eq('activo', true);
+        // ORDEN DETERMINISTA (Diego 2026-07-31): ver comentario en la carga de propiedades.
+        const _rd = await supabase.from('developments').select(_colsDev + ', direccion, entre_calles, ciudad, lat, lng, referencias_zona').eq('user_id', user_id).eq('activo', true).order('id');
         if (_rd.error) {
-          const _rd2 = await supabase.from('developments').select(_colsDev).eq('user_id', user_id).eq('activo', true);
+          const _rd2 = await supabase.from('developments').select(_colsDev).eq('user_id', user_id).eq('activo', true).order('id');
           _devs = _rd2.data; _devErr = _rd2.error;
         } else { _devs = _rd.data; }
       }
@@ -7276,11 +7293,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   if (_esHotel) try {
     // F1: la IA tambien lee los COMPLEJOS (info general del hotel/cabaña) para poder responder
     // "que servicios/amenities/politicas tiene el hotel" y, con cadena, distinguir cada complejo.
-    const { data: _complejos } = await supabase.from('hotel_complejos').select('id, nombre, atributos').eq('user_id', user_id);
+    // ORDEN DETERMINISTA (Diego 2026-07-31): igual que en propiedades. Sin ORDER BY el orden de las filas no
+    // esta garantizado y el mismo inventario podia armar un texto distinto -> huella nueva -> cache recargado.
+    const { data: _complejos } = await supabase.from('hotel_complejos').select('id, nombre, atributos').eq('user_id', user_id).order('id');
     const _compsById = {}; (_complejos || []).forEach(function (c) { _compsById[c.id] = c; });
     const { data: _uds, error: _udErr } = await supabase.from('hotel_unidades')
       .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos, images, complejo_id')
-      .eq('user_id', user_id).eq('activa', true);
+      .eq('user_id', user_id).eq('activa', true).order('id');
     if (!_udErr && _uds && _uds.length > 0) {
       const _udIds = _uds.map(function(u){ return u.id; });
       _hotelUnidsFoto = _uds; // F6.3: fuente para la tool de fotos (unidades con images)

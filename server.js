@@ -2939,6 +2939,39 @@ async function cicloToolsActivo(user_id, bs) {
     return !!(data && data.ciclo_tools_v1 === true);
   } catch (e) { return false; }
 }
+// VALIDACION DEL AREA AL DERIVAR (derivacion_validada_v1, default OFF) — Diego 2026-07-31.
+// PROBLEMA: la IA elige el departamento a mano cuando llama derivar_a_humano, y el codigo lo aplica sin
+// chequear NADA. Caso Max (30/07): primer mensaje del lead, sin decir si compra o alquila, y la IA derivo a
+// "Alquiler Temporal"; dos horas y media despues el asesor tuvo que preguntarle "buscas comprar o alquilar?".
+// El registro de la decision lo confirma: deducido=false, clasificador_corrio=false -> lo escribio el modelo.
+// El prompt YA le prohibe adivinar (regla de oro ~7517 y la descripcion de la tool ~7670), pero otra regla le
+// ordena derivar en ese mismo caso (~7560): son ordenes opuestas y gana la mas pegada al caso. Por eso esto NO
+// se arregla con otra regla de texto: se arregla con una validacion que el modelo no puede saltear.
+// FAIL-CLOSED: columna ausente / null / error -> false => comportamiento BYTE-IDENTICO al actual.
+async function derivacionValidadaActiva(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_validada_v1')) return bs.derivacion_validada_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('derivacion_validada_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.derivacion_validada_v1 === true);
+  } catch (e) { return false; }
+}
+// TOOLS BAJO DEMANDA (tools_bajo_demanda_v1, default OFF) — Diego 2026-07-31.
+// Las 5 fuentes de datos vivos (dolar, clima, feriados, direccion, distancia) suman 1.303 tokens que viajan en
+// el bloque CACHEADO de TODAS las conversaciones. Medido en Anton del 28 al 31/07: 770 llamadas al modelo y
+// NINGUNA fue a estas tools; sin embargo se pagaron en cada una de las 38 escrituras de cache ($0.0049 c/u).
+// Con el flag ON se agregan SOLO si el lead nombro el tema. FAIL-CLOSED en el flag, FAIL-OPEN en el chequeo:
+// ante cualquier duda (sin texto, error) se agregan igual que hoy -> el agente nunca pierde una capacidad.
+async function toolsBajoDemandaActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'tools_bajo_demanda_v1')) return bs.tools_bajo_demanda_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('tools_bajo_demanda_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.tools_bajo_demanda_v1 === true);
+  } catch (e) { return false; }
+}
 // (4) ia_historial_corto: baja el tope de mensajes de historial de 16 a 12 (menos tokens dinamicos por turno).
 async function iaHistorialCortoActivo(user_id, bs) {
   try {
@@ -4987,6 +5020,43 @@ async function _asignarRotacionV3(convId, asesorId, deptoId, nowIso, condicional
   }
 }
 
+// ============================================================================
+// ¿LO QUE DIJO EL LEAD RESPALDA EL AREA QUE ELIGIO LA IA? (gated derivacion_validada_v1)
+// ----------------------------------------------------------------------------
+// Se chequea contra el CRITERIO DE DERIVACION que el dueno escribio para ese departamento en Configuracion,
+// mas el nombre del area. NO menciona compra ni alquiler ni ningun rubro: si manana la cuenta crea Limpieza,
+// Mantenimiento o Capacitacion, esto sigue funcionando sin tocar una linea.
+// Alcance: es una RED contra el area inventada, no un clasificador. Alcanza UNA coincidencia para aceptar.
+// FAIL-OPEN en todo camino raro (sin criterio cargado, sin mensajes del lead, error de query): devuelve true
+// y el hint se aplica igual que hoy. Solo devuelve false cuando de verdad NO hay NADA que lo respalde.
+const _STOP_CRITERIO = new Set(['para','cuando','porque','que','con','los','las','del','una','uno','unos','por','sobre',
+  'este','esta','estos','estas','como','sus','sea','son','pero','mas','muy','todo','toda','todos','todas','desde',
+  'hasta','entre','tiene','tienen','quiere','quieren','lead','leads','cliente','clientes','consulta','consultas',
+  'tema','temas','caso','casos','area','areas','general','cualquier','algo','tambien','solo','sino','cuando']);
+function _normCrit(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+// Raiz corta para tolerar variantes (alquiler/alquilar/alquilo -> "alqui"). Terminos cortos van enteros.
+function _raizCrit(w) { return w.length >= 6 ? w.slice(0, 5) : w; }
+async function _areaTieneRespaldo(convId, depto) {
+  try {
+    if (!convId || !depto) return true;
+    const _nom = _normCrit(depto.nombre || '');
+    const _crit = _normCrit(depto.criterio_derivacion || '');
+    if (!_nom && !_crit) return true; // el dueno no cargo criterio: no hay contra que chequear
+    const { data: _msgs, error: _eM } = await supabase.from('messages')
+      .select('content').eq('conversation_id', convId).eq('role', 'contact')
+      .order('created_at', { ascending: false }).limit(12);
+    if (_eM || !_msgs || !_msgs.length) return true; // sin mensajes del lead no se puede juzgar
+    const _texto = _normCrit(_msgs.map(function (m) { return m.content || ''; }).join(' '));
+    if (!_texto.trim()) return true;
+    const _terminos = (_nom + ' ' + _crit).split(/[^a-z0-9]+/)
+      .filter(function (w) { return w.length >= 4 && !_STOP_CRITERIO.has(w); })
+      .map(_raizCrit);
+    if (!_terminos.length) return true;
+    for (const t of _terminos) { if (_texto.indexOf(t) >= 0) return true; }
+    return false;
+  } catch (e) { return true; } // ante cualquier error, como hoy
+}
+
 // ARRANQUE de la rotacion (lo llama el webhook cuando la IA uso la tool derivar_a_humano y el flag esta ON).
 // Elige un usuario disponible del depto, lo asigna (IA sigue), anuncia al lead SIN nombre, notifica y marca rotando.
 // Si NO hay nadie disponible: marca rotando con asesor_id=null (la IA sigue; el cron deriva cuando alguien se libere).
@@ -5021,7 +5091,7 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
         // deducirDepartamentoPorTexto (~4642): minusculas + sin acentos. Mismo criterio en los dos lados.
         const _normDep = function (s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim(); };
         const _hint = _normDep(opts.deptoHint);
-        const { data: _deps } = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId).eq('activo', true);
+        const { data: _deps } = await supabase.from('departamentos').select('id, nombre, criterio_derivacion').eq('user_id', ownerId).eq('activo', true);
         // 1) match exacto normalizado. 2) fallback: que uno contenga al otro (cubre "Ventas" vs "Venta",
         //    "Alquileres" vs "Alquiler"). Solo con hint de 4+ caracteres, para no matchear cualquier cosa.
         let _m = (_deps || []).find(function (d) { return d.nombre && _normDep(d.nombre) === _hint; });
@@ -5031,11 +5101,27 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
             return _n && (_n.indexOf(_hint) === 0 || _hint.indexOf(_n) === 0);
           });
         }
-        if (_m) { _deptoId = _m.id; _hintResolvio = true; }
+        if (_m) {
+          // VALIDACION DEL AREA (gated derivacion_validada_v1): el nombre matcheo un depto real, pero eso NO
+          // significa que corresponda. La IA lo escribe a mano y puede inventarlo (caso Max). Si lo que dijo el
+          // LEAD no respalda ese area, se DESCARTA el hint: el lead se deriva IGUAL (nunca se frena una
+          // derivacion), pero sin departamento -> cae al pool general en vez de a un area equivocada.
+          let _valOn = false;
+          try { _valOn = await derivacionValidadaActiva(ownerId); } catch (eV) { _valOn = false; }
+          if (_valOn && !(await _areaTieneRespaldo(convId, _m))) {
+            console.log('[DERIVACION] hint "' + opts.deptoHint + '" DESCARTADO (sin respaldo en lo que dijo el lead) conv=' + convId);
+            opts._hintDescartado = _m.nombre || String(opts.deptoHint); // queda para el registro de decisiones
+          } else {
+            _deptoId = _m.id; _hintResolvio = true;
+          }
+        }
       } catch (eH) { /* si falla la query de departamentos, caemos al depto de la conv abajo */ }
     }
     if (!_deptoId) _deptoId = _cv.departamento_id || null; // sin hint valido -> depto de la conv
-    if (!_deptoId) {
+    // Si el hint se DESCARTO por falta de respaldo, tampoco vale caer al es_default: seria elegir un area
+    // inventada por otra via (en Anton el default es "Venta", asi que un lead sin intencion clara terminaria
+    // igual en un area que no pidio). Sin respaldo y sin depto propio -> SIN departamento, al pool general.
+    if (!_deptoId && !opts._hintDescartado) {
       try { const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); _deptoId = _dd && _dd.id ? _dd.id : null; } catch (eDD) {}
     }
     // Persistir el depto en la conv (mejora el reparto). Best-effort. Escribir cuando: la conv NO tenia depto, o el
@@ -6741,7 +6827,16 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // al actual. Reusa el `settings` ya cargado (0 queries extra). El _ragActivo real (que ademas exige inventario de
   // propiedades cargado y rubro no-hotel, con fail-open a la calidad ante cualquier error) se resuelve mas abajo.
   let _iaRagOn = false;
-  if (conversation_id && !modoPrueba) { try { _iaRagOn = await iaRagActivo(user_id, settings || undefined); } catch (eIaRag) { _iaRagOn = false; } }
+  // PANEL DE PRUEBA (Diego 2026-07-31): el RAG ahora TAMBIEN se resuelve en modoPrueba. Antes quedaba apagado y
+  // eso traia dos problemas medidos:
+  //  1) COSTO: sin RAG el prompt lleva el inventario COMPLETO. Medido en Anton: una sola prueba escribio 58.171
+  //     tokens de cache ($0.2197) contra 17.026 de una conversacion real ($0.064). 8,6 veces lo que sale atender
+  //     a un cliente, y ese cache se tira (no hay conversacion despues).
+  //  2) LO QUE SE PRUEBA: con el inventario entero adentro, el agente responde SIN usar buscar_inventario. O sea
+  //     que el panel probaba un agente que NO es el que atiende. Ahora prueba el mismo camino que produccion.
+  // Los otros flags (derivar_a_humano, agendar_cita, aprendizaje) SIGUEN apagados en prueba a proposito: no hay
+  // conversacion real, ni asesor a quien derivar, ni dueno a quien preguntar. Solo cambia el RAG.
+  if (user_id) { try { _iaRagOn = await iaRagActivo(user_id, settings || undefined); } catch (eIaRag) { _iaRagOn = false; } }
   // CACHE TTL 1h (gated ai_cache_ttl_1h): resuelve UNA vez si el bloque estatico cacheado usa TTL de 1h en vez del
   // default de 5 min. FAIL-CLOSED: ante columna ausente / error / null -> false. Reusa el `settings` ya cargado
   // (0 queries extra). `_cacheTtl` es SOLO para la telemetria (registra que TTL efectivo se uso: '5m' u '1h'); el
@@ -7514,7 +7609,12 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // la config; va SIEMPRE en el prompt). Fix del caso Fabiana: que la IA no adivine el area y pregunte cuando duda.
     _esHotel
       ? 'REGLA DE ORO (obligatoria, no negociable): antes de encaminar al huesped, entende PRIMERO que necesita. Distingui si es una CONSULTA para reservar (fechas de entrada/salida, cantidad de personas, tipo de unidad/cabania), un tema de una RESERVA ya hecha (pago, sena, check-in/check-out, cambio de fechas) o info general del alojamiento. Si el mensaje no lo deja claro o mezcla temas, PREGUNTASELO con naturalidad y espera la respuesta antes de encaminarlo. NUNCA supongas por una palabra suelta. Si la intencion es obvia (pregunta un precio, disponibilidad o una unidad) NO hace falta preguntar: segui normal.'
-      : 'REGLA DE ORO (obligatoria, no negociable): antes de dar por sentada un area o de encaminar el lead a un asesor, entende PRIMERO que necesita. Distingui si quiere COMPRAR, ALQUILAR, o si es un tema de ADMINISTRACION de un cliente que YA opera con la empresa (un pago, una expensa, un recibo, una cobranza). Si el mensaje no lo deja claro, o mezcla temas, o no estas segura, PREGUNTASELO con naturalidad (por ejemplo: "para orientarte bien: es por una compra o alquiler, o por un tema de administracion como un pago o una expensa?") y espera la respuesta antes de encaminarlo. NUNCA supongas el area por una palabra suelta: alguien que quiere comprar/alquilar y habla de FINANCIACION, CUOTAS, ANTICIPO, SEÑA o CONTRATO de la operacion es VENTA o ALQUILER, NO Administracion. Si la intencion es obvia (pregunta un precio, una propiedad, disponibilidad) NO hace falta preguntar: seguí normal.',
+      // REESCRITA 2026-07-31 (Diego): antes nombraba COMPRAR / ALQUILAR / ADMINISTRACION fijos, o sea las areas de
+      // una inmobiliaria. Las areas las define CADA cuenta en Configuracion y cambian (manana puede haber Limpieza,
+      // Mantenimiento, Capacitacion, Alquiler de verano...). Ahora apunta a la lista real, que ya viaja en la
+      // herramienta de derivacion con el criterio que escribio el dueno. El principio que resolvia el misruteo de
+      // Fabiana (una palabra suelta no define el area) queda, pero como ejemplo y no como regla de un solo rubro.
+      : 'REGLA DE ORO (obligatoria, no negociable): antes de dar por sentada un area o de encaminar el lead a un asesor, entende PRIMERO que necesita. Las areas de esta empresa, con el criterio de cada una, te las paso en la herramienta de derivacion: usa SOLO esas. Si el mensaje no deja claro cual corresponde, o mezcla temas, o no estas segura, PREGUNTASELO con naturalidad y espera la respuesta antes de encaminarlo. NUNCA supongas el area por una palabra suelta: mira de que se trata la consulta COMPLETA (por ejemplo, que alguien mencione un pago o un contrato dentro de una consulta por comprar o alquilar NO la convierte en un tema administrativo). Si la intencion es obvia (pregunta un precio, una propiedad, disponibilidad) NO hace falta preguntar: seguí normal.',
     instruccionesRubro,
     _comportamientoSetterFinal,
     // AGENTE PREMIUM EN REAL ESTATE (aplicado a TODOS por default; se apaga con agente_premium_re=false a nivel cuenta
@@ -7543,7 +7643,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // aclararte (una politica, un dato del negocio que no tenes), usa la herramienta consultar_al_dueno para
     // preguntarle, y mientras tanto decile al lead con naturalidad que lo averiguas y le confirmas. NO la uses para
     // cosas que ya se derivan a un humano ni para datos puntuales de un solo cliente.
-    aprendizajeActivo ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes: usa la herramienta consultar_al_dueno con la pregunta concreta, y decile al lead con naturalidad que lo consultas y le confirmas enseguida.' : '',
+    // ELIMINADA LA PROMESA 2026-07-31 (Diego): antes cerraba con "decile al lead que lo consultas y le confirmas
+    // enseguida" — exactamente la frase que la REGLA CLAVE de abajo prohibe. Eran dos ordenes opuestas a 9 lineas
+    // de distancia, y por repeticion ganaba la de prometer (caso Nes: cuatro promesas de "te confirmo manana",
+    // ninguna cumplida). La herramienta consultar_al_dueno NO se toca: se saca solo la orden de prometer.
+    aprendizajeActivo ? 'SI NO SABES algo que excede tu conocimiento y la base cargada (una politica o dato del negocio que no figura), NO inventes: usa la herramienta consultar_al_dueno con la pregunta concreta.' : '',
     // TAREA B (ia_no_sabe_modo='derivar'): el dueno eligio que la IA NO consulte a nadie y pase el lead a un
     // humano cuando no sabe. Esta linea SOLO existe con el modo 'derivar' Y derivacion_v3 ON (_noSabeDerivar);
     // con el default 'preguntar' queda '' y el .filter(Boolean) la descarta => prompt BYTE-IDENTICO al actual.
@@ -7557,7 +7661,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // UNA sola linea, y SOLO con derivacion_v3 ON: si la tool derivar_a_humano no existe, pedirle que derive seria
     // una regla que no puede cumplir (Diego: "no quiero agregar cosas al prompt al pedo si no las cumple").
     // El resto ya esta cubierto por reglas vigentes: "usa SOLO estas propiedades" y la REGLA CLAVE de arriba.
-    _derivacionV3On ? 'Si el lead pregunta por una propiedad puntual que NO figura en tu listado, o de la que no tenes el precio o la condicion confirmada: NO digas "no disponible" ni inventes nada. Deci que no contas con esa informacion y derivá con derivar_a_humano al departamento que corresponda.' : '',
+    // LIMPIEZA 2026-07-31 (Diego): se SACO "al departamento que corresponda". Esta regla se dispara justo cuando
+    // la IA MENOS sabe (el lead pregunto por algo que no esta en el listado, muchas veces en el primer mensaje) y
+    // le exigia elegir un area sin tener el dato -> caso Max, derivado a "Alquiler Temporal" sin que el lead
+    // dijera nunca si compraba o alquilaba. El area la resuelve la validacion del codigo, no esta frase.
+    _derivacionV3On ? 'Si el lead pregunta por una propiedad puntual que NO figura en tu listado, o de la que no tenes el precio o la condicion confirmada: NO digas "no disponible" ni inventes nada. Deci que no contas con esa informacion y derivá con derivar_a_humano.' : '',
     // TEMPORADA VENCIDA: esta linea SOLO aparece si de verdad hay alguna propiedad cuyo precio por noche
     // quedo de una temporada ya terminada (_hayTemporadaVencida). En las cuentas donde no pasa, el prompt
     // queda BYTE-IDENTICO. Es la salida que aprobo Diego: no citar el precio viejo, avisar que todavia no
@@ -7712,8 +7820,38 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // ===== TOOLS BAJO DEMANDA (gated tools_bajo_demanda_v1) — Diego 2026-07-31 =====
+  // Las 5 fuentes de abajo pesan 1.303 tokens en el bloque CACHEADO y se pagan en CADA escritura de cache.
+  // Con el flag ON solo se agregan si el lead nombro el tema en la charla. Se mira TODO el historial que ya
+  // viaja (mensajesParaIA), no solo el ultimo mensaje: si pregunto por el dolar hace 3 mensajes y ahora dice
+  // "y en pesos?", la tool sigue estando. FAIL-OPEN: si no se puede leer el texto -> se agregan como hoy.
+  let _toolsDemandaOn = false;
+  try { _toolsDemandaOn = await toolsBajoDemandaActivo(user_id, settings || undefined); } catch (eTd) { _toolsDemandaOn = false; }
+  const _textoCharla = (function () {
+    try {
+      const partes = [];
+      const arr = Array.isArray(mensajesParaIA) ? mensajesParaIA : [];
+      for (const m of arr) {
+        if (!m || m.role !== 'user') continue;
+        if (typeof m.content === 'string') partes.push(m.content);
+        else if (Array.isArray(m.content)) { for (const b of m.content) { if (b && b.type === 'text' && b.text) partes.push(b.text); } }
+      }
+      const t = partes.join(' ').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+      return t.trim() ? t : null;
+    } catch (e) { return null; }
+  })();
+  // true = agregar la tool. Con el flag OFF, sin texto legible o ante error -> SIEMPRE true (identico a hoy).
+  const _pideTema = function (palabras) {
+    try {
+      if (!_toolsDemandaOn) return true;
+      if (!_textoCharla) return true;
+      for (var i = 0; i < palabras.length; i++) { if (_textoCharla.indexOf(palabras[i]) >= 0) return true; }
+      return false;
+    } catch (e) { return true; }
+  };
+
   // FUENTE #1 (gated ia_dolar_lead, 3 mundos): cotizacion del dolar + conversion USD<->ARS (dolarapi.com, $0, sin API key).
-  if (_iaDolarOn) {
+  if (_iaDolarOn && _pideTema(['dolar', 'dolares', 'usd', 'u$s', 'peso', 'pesos', 'ars', 'cotiza', 'cambio', 'blue', 'oficial', 'moneda', 'convert', 'equivale'])) {
     toolsAgente.push({
       name: 'cotizacion_dolar',
       description: 'Usala cuando el lead pregunta a cuanto esta el dolar, o pide convertir un monto entre dolares (USD) y pesos (ARS) (ej: "a cuanto esta el blue?", "cuanto es USD 50.000 en pesos?", "el oficial hoy"). Te devuelve la cotizacion (compra/venta) y la fecha de actualizacion. Es un valor de REFERENCIA de mercado: aclaraselo al lead. Nunca inventes un numero si la tool no lo trae.',
@@ -7722,7 +7860,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }
 
   // FUENTE #2 (gated ia_clima, LOS 3 MUNDOS): pronostico por lat/lon o por id_propiedad (Open-Meteo, $0, sin API key).
-  if (_iaClimaOn) {
+  if (_iaClimaOn && _pideTema(['clima', 'tiempo', 'lluvia', 'llover', 'llueve', 'temperatura', 'pronostico', 'calor', 'frio', 'sol', 'viento', 'grados', 'nublado'])) {
     toolsAgente.push({
       name: 'pronostico_clima',
       description: 'Usala cuando el lead pregunta por el clima o el pronostico de una zona/propiedad para los proximos dias (ej: "como viene el clima el finde?", "va a llover en Gesell la semana que viene?"). Pasa lat y lon del lugar, o id_propiedad para usar la ubicacion de una propiedad del inventario. Devuelve maxima, minima, probabilidad de lluvia y estado del cielo por dia. Solo hay pronostico hasta 16 dias; mas lejos NO hay dato y no debes inventarlo.',
@@ -7731,7 +7869,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }
 
   // FUENTE #3 (gated ia_feriados, 3 mundos): feriados NACIONALES de Argentina + findes largos (Nager.Date, $0, sin API key).
-  if (_iaFeriadosOn) {
+  if (_iaFeriadosOn && _pideTema(['feriado', 'finde', 'fin de semana', 'puente', 'vacaciones', 'semana santa', 'carnaval', 'dia no laborable', 'asueto'])) {
     toolsAgente.push({
       name: 'feriados_ar',
       description: 'Usala cuando el lead pregunta por feriados o fines de semana largos en Argentina (ej: "cuando cae el proximo feriado?", "hay finde largo en octubre?", "el 25 es feriado?"). Devuelve feriados NACIONALES unicamente (NO incluye feriados turisticos por decreto ni provinciales; aclaraselo al lead si viene al caso). Elegi el modo segun lo que pregunten.',
@@ -7740,7 +7878,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }
 
   // FUENTE #4 (gated ia_georef, 3 mundos): normaliza una direccion argentina (provincia/partido/localidad + coords) (Georef, $0, sin API key).
-  if (_iaGeorefOn) {
+  if (_iaGeorefOn && _pideTema(['direccion', 'calle', 'avenida', 'altura', 'barrio', 'localidad', 'partido', 'provincia', 'ubicacion', 'donde queda', 'donde esta', 'codigo postal', 'esquina', 'paseo', 'zona'])) {
     toolsAgente.push({
       name: 'normalizar_direccion_ar',
       description: 'Usala para normalizar/validar una direccion argentina que dio el lead y saber a que provincia, departamento (partido) y localidad pertenece, con su nomenclatura oficial (fuente: Georef del Estado). Ej: "vivo en San Martin 1234, La Plata". Si la direccion no matchea, pedile al lead que aclare la localidad y la provincia; NUNCA inventes el partido ni la localidad.',
@@ -7749,7 +7887,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   }
 
   // FUENTE #5 (gated ia_osrm, 3 mundos): distancia y tiempo EN AUTO entre dos puntos (OSRM, $0, sin API key).
-  if (_iaOsrmOn) {
+  if (_iaOsrmOn && _pideTema(['distancia', 'cuanto tarda', 'cuanto hay', 'en auto', 'manejando', 'viaje', 'viajar', 'km', 'kilometro', 'lejos', 'cerca', 'llegar', 'ruta', 'horas de'])) {
     toolsAgente.push({
       name: 'distancia_viaje',
       description: 'Usala cuando el lead pregunta cuanto tarda o que distancia hay EN AUTO entre dos puntos (ej: "a cuanto esta la propiedad de la playa?", "cuanto tardo de la terminal hasta ahi?"). Pasa origen y destino por coordenadas, o usa id_propiedad como uno de los extremos y destino_texto (una referencia) para el otro. Devuelve distancia y tiempo estimado por ruta. Si no se puede calcular la ruta, se da la distancia en linea recta aclarandolo; NUNCA prometas un tiempo que la tool no devolvio.',
@@ -7911,16 +8049,20 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // dinamico, no cacheado) => con flag OFF el system es BYTE-IDENTICO al actual.
   // 5 FUENTES EXTERNAS (gated c/u): regla anti-invento. Bloque dinamico (no cacheado). Solo se agrega si HAY al menos
   // una fuente ON => con todas OFF el system es BYTE-IDENTICO al actual. Enumera SOLO las tools activas.
-  if (_iaDolarOn || _iaClimaOn || _iaFeriadosOn || _iaGeorefOn || _iaOsrmOn) {
+  // SINCRONIZADO CON LAS TOOLS QUE DE VERDAD VIAJAN (Diego 2026-07-31): con tools_bajo_demanda_v1 una fuente
+  // puede NO haberse agregado. Se pregunta por la tool REAL en vez de por el flag, asi el prompt nunca nombra
+  // una herramienta que no existe (si la nombrara, la IA la pediria y el pedido moriria en el vacio).
+  var _tieneTool = function (n) { try { return toolsAgente.some(function (t) { return t && t.name === n; }); } catch (e) { return false; } };
+  if (_tieneTool('cotizacion_dolar') || _tieneTool('pronostico_clima') || _tieneTool('feriados_ar') || _tieneTool('normalizar_direccion_ar') || _tieneTool('distancia_viaje')) {
     var _fp = [];
-    if (_iaDolarOn) _fp.push('para la cotizacion del dolar o convertir USD<->ARS usa cotizacion_dolar');
-    if (_iaClimaOn) _fp.push('para el clima o pronostico usa pronostico_clima');
-    if (_iaFeriadosOn) _fp.push('para feriados nacionales o findes largos usa feriados_ar');
-    if (_iaGeorefOn) _fp.push('para normalizar/validar una direccion argentina (provincia/partido/localidad) usa normalizar_direccion_ar');
-    if (_iaOsrmOn) _fp.push('para distancia o tiempo en auto entre dos puntos usa distancia_viaje');
+    if (_tieneTool('cotizacion_dolar')) _fp.push('para la cotizacion del dolar o convertir USD<->ARS usa cotizacion_dolar');
+    if (_tieneTool('pronostico_clima')) _fp.push('para el clima o pronostico usa pronostico_clima');
+    if (_tieneTool('feriados_ar')) _fp.push('para feriados nacionales o findes largos usa feriados_ar');
+    if (_tieneTool('normalizar_direccion_ar')) _fp.push('para normalizar/validar una direccion argentina (provincia/partido/localidad) usa normalizar_direccion_ar');
+    if (_tieneTool('distancia_viaje')) _fp.push('para distancia o tiempo en auto entre dos puntos usa distancia_viaje');
     systemBlocks.push({ type: 'text', text: 'DATOS EN VIVO (fuentes externas): ' + _fp.join('; ') + '. REGLA DURA: estos datos NO los sabes de memoria — pedilos SIEMPRE con la tool correspondiente y NUNCA inventes una cotizacion, un pronostico del clima, un feriado, una direccion normalizada ni una distancia/tiempo de viaje. Los valores son de REFERENCIA. Si la tool no trae el dato (no se pudo consultar), decile al lead con naturalidad que no lo pudiste confirmar en el momento en vez de inventar.' });
   }
-  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada. REGLA DURA DE DISTANCIAS: NUNCA estimes vos una distancia ("a X cuadras", "cerquita", "a la vuelta") comparando numeros de calles o paseos de memoria — para saber que tan lejos queda algo usa buscar_propiedades_cerca (o distancia_viaje) y repeti el dato que devuelve tal cual (incluidas las cuadras). Si no usaste la tool, no afirmes cercania.' });
+  if (_iaUbicacionOn) systemBlocks.push({ type: 'text', text: 'UBICACION Y LUGARES CERCANOS: tenes la tool buscar_propiedades_cerca para ubicar una direccion o referencia que nombre el lead y ver que opciones del inventario quedan cerca (usala en vez de decir que no conoces la ubicacion). Ademas tenes la tool ubicar_lugar: cuando el lead pregunte DONDE queda una direccion, esquina o punto de referencia (o te pida la ubicacion / como llegar), usala para darle la calle/direccion aproximada y un link de Google Maps — NO inventes direcciones ni links de memoria. ubicar_lugar te da SOLO la ubicacion de ese punto, NO comercios cercanos: la regla de abajo sobre no nombrar comercios/lugares puntuales de memoria sigue valiendo igual. UBICACION DE UNA OPCION DEL INVENTARIO: si una propiedad/emprendimiento/complejo trae "ubicacion Maps" o "Maps" (link de Google Maps), podes pasarle ESE link cuando pidan la ubicacion o como llegar; si NO lo trae (direccion aproximada, sin altura de calle), dale la direccion/zona en texto y NUNCA inventes un link ni coordenadas. REGLA DURA: cuando hables de comercios o lugares concretos cerca de una propiedad (supermercado, cafe, farmacia, parada), SOLO podes nombrar los que figuran en los datos "cerca:"/"Cerca:" del inventario o en el resultado de la tool. NUNCA nombres un comercio o lugar puntual de memoria (podes equivocarte y quedar mal con el lead). Referencias amplias de la zona (playa, centro, zona comercial) las podes usar con criterio si la direccion/zona de la propiedad esta cargada. REGLA DURA DE DISTANCIAS: NUNCA estimes vos una distancia ("a X cuadras", "cerquita", "a la vuelta") comparando numeros de calles o paseos de memoria — para saber que tan lejos queda algo usa buscar_propiedades_cerca' + (_tieneTool('distancia_viaje') ? ' (o distancia_viaje)' : '') + ' y repeti el dato que devuelve tal cual (incluidas las cuadras). Si no usaste la tool, no afirmes cercania.' });
   // PAUTA META (NIVEL 1/2, gated ia_pauta_meta): contexto del aviso Click-to-WhatsApp del que viene el lead. Bloque
   // DINAMICO (NO cacheado, dato por-lead) => NUNCA va dentro del bloque estatico cacheado. Solo se agrega si el caller
   // lo paso (flag ON + pauta presente); con el flag OFF _pautaContexto es null => system BYTE-IDENTICO al actual.
@@ -30920,11 +31062,17 @@ app.get('/api/maestro/consumo', async function(req, res){
     var qHasta = req.query && req.query.hasta ? String(req.query.hasta) : null;
     var rangoCustom = !!(qDesde && qHasta);
     var desde = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
-    var q = supabase.from('ia_uso').select('user_id, cost_usd, input_tokens, output_tokens');
-    if (rangoCustom) { q = q.gte('created_at', qDesde).lte('created_at', (qHasta.indexOf('T') >= 0 ? qHasta : qHasta + 'T23:59:59.999Z')); }
-    else { q = q.gte('created_at', desde); }
-    var u = await q.limit(100000);
-    var rows = u.data || [];
+    // PAGINADO (Diego 2026-07-31): antes era UN select con .limit(100000), pero PostgREST corta en 1000 filas
+    // por request y devuelve solo esas. Resultado medido: el panel mostraba $16.06 / 1000 mensajes en julio
+    // cuando el real era $59.65 / 5074 — la QUINTA parte del gasto, y el "1000" no era un dato sino el techo.
+    // Se detectaba partiendo el rango: el mes entero daba $16.06 y el mismo mes en 4 tramos daba $50.93.
+    // Ahora reusa _consumoLeerIaUso(), que ya pagina de a 1000 hasta terminar (es la que usan los endpoints
+    // por cliente y por lead, que por eso SI daban bien). Sin cambio de comportamiento: solo deja de faltar data.
+    var _lect = await _consumoLeerIaUso(function (q) {
+      if (rangoCustom) return q.gte('created_at', qDesde).lte('created_at', (qHasta.indexOf('T') >= 0 ? qHasta : qHasta + 'T23:59:59.999Z'));
+      return q.gte('created_at', desde);
+    });
+    var rows = _lect.filas || [];
     // SALVAGUARDA anti-dato-corrupto: una sola llamada a Claude no puede costar mas de ~$3-4 (1M tokens Sonnet = $3).
     // Si una fila tiene un costo absurdo (> $10) es un dato corrupto (ej. un costo viejo logueado sin dividir por
     // 1.000.000) -> NO se suma, para que el panel no se dispare. Se reportan aparte (filas_anomalas_ignoradas).
@@ -30950,8 +31098,11 @@ app.get('/api/maestro/consumo', async function(req, res){
     var saldoCargado = (cfg.data && cfg.data.saldo_cargado != null) ? Number(cfg.data.saldo_cargado) : null;
     var saldoRestante = null;
     if (saldoCargado != null && cfg.data.saldo_fecha) {
-      var ud = await supabase.from('ia_uso').select('cost_usd').gte('created_at', cfg.data.saldo_fecha).limit(100000);
-      var gastado = (ud.data || []).reduce(function(a, r){ var c = Number(r.cost_usd) || 0; return (c > MAX_COSTO_FILA || c < 0) ? a : a + c; }, 0); // misma salvaguarda anti-dato-corrupto que el total
+      // MISMO paginado que el total (Diego 2026-07-31): con .limit(100000) PostgREST devolvia solo 1000 filas,
+      // asi que el "gastado" salia CORTO y el saldo restante quedaba INFLADO. Es el bug mas caro de los dos:
+      // el total mal solo desinforma, pero el saldo mal te hace creer que te queda plata que ya gastaste.
+      var _lectSaldo = await _consumoLeerIaUso(function (q) { return q.gte('created_at', cfg.data.saldo_fecha); });
+      var gastado = (_lectSaldo.filas || []).reduce(function(a, r){ var c = Number(r.cost_usd) || 0; return (c > MAX_COSTO_FILA || c < 0) ? a : a + c; }, 0); // misma salvaguarda anti-dato-corrupto que el total
       saldoRestante = Math.round((saldoCargado - gastado) * 100) / 100;
     }
     return res.json({ ok: true, periodo: periodo, desde: rangoCustom ? qDesde : null, hasta: rangoCustom ? qHasta : null, rango_custom: rangoCustom, costo_usd: Math.round(totalCost * 100) / 100, input_tokens: totalIn, output_tokens: totalOut, mensajes: rows.length, mensajes_validos: rows.length - corruptas, filas_anomalas_ignoradas: corruptas, costo_anomalo_ignorado: Math.round(costoCorrupto * 100) / 100, ranking: ranking.slice(0, 50), alertas: alertas, saldo_cargado: saldoCargado, saldo_restante: saldoRestante, saldo_fecha: (cfg.data && cfg.data.saldo_fecha) || null, pausa_global: _pausaGlobal === true });
@@ -32543,8 +32694,11 @@ async function revisarConsumoAnomalo() {
     var TOPE_ALERTA_USD = 15;            // mismo tope que /api/maestro/consumo
     var MAX_COSTO_FILA = 10;             // misma salvaguarda anti-dato-corrupto
     var desde = new Date(ahora - 24 * 3600 * 1000).toISOString();
-    var u = await supabase.from('ia_uso').select('user_id, cost_usd').gte('created_at', desde).limit(100000);
-    var rows = (u && u.data) || [];
+    // PAGINADO (Diego 2026-07-31): mismo bug que el endpoint de consumo — .limit(100000) traia solo 1000 filas.
+    // Aca la consecuencia era doble: el aviso de "uso alto" se calculaba sobre una fraccion del dia, y la MEDIANA
+    // contra la que se compara tambien salia deformada. Reusa el paginador que ya existe.
+    var _lectAnom = await _consumoLeerIaUso(function (q) { return q.gte('created_at', desde); });
+    var rows = _lectAnom.filas || [];
     var porCliente = {};
     rows.forEach(function(r){ var c = Number(r.cost_usd) || 0; if (c > MAX_COSTO_FILA) return; if (!r.user_id) return; porCliente[r.user_id] = (porCliente[r.user_id] || 0) + c; });
     var ranking = Object.keys(porCliente).map(function(k){ return { user_id: k, cost: porCliente[k] }; });

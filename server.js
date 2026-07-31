@@ -1189,10 +1189,20 @@ const PLAN_LIMITS = {
 // (El override del Maestro por cliente sigue mandando aparte, ver topeEfectivoIA.)
 // Plan por defecto cuando la funcion esta apagada o el tenant no tiene fila: acceso total.
 const PLAN_DEFECTO = 'premium';
+// PLAN de un tenant SIN FILA de suscripcion, con la funcion PRENDIDA — Diego 2026-07-31.
+// REGLA: "ningun usuario nuevo entra de 0 sin suscripcion, salvo que lo cree yo desde el Maestro o le de cortesia".
+// ANTES esto caia a PLAN_DEFECTO ('premium'): una cuenta recien registrada, sin pagar nada, arrancaba con 2.500
+// mensajes IA, asesores ILIMITADOS y TODAS las features (backup Drive, multi WhatsApp, reportes IA). Detectado en
+// la cuenta "Pagel Propiedades" (sin plan, 2.500 de cupo, 0 usados). A $0.023 el mensaje son ~$57 de tokens que
+// una cuenta sin contrato podia gastar. Ahora cae al cupo de PRUEBA (100). La cortesia sigue mandando aparte
+// (topeEfectivoIA la resuelve ANTES que esto) y el override del Maestro tambien.
+const PLAN_SIN_SUSCRIPCION = 'trial';
 
 // Tope de mensajes EFECTIVO de un plan = el de PLAN_LIMITS (mismo para todos; el override del Maestro se aplica aparte).
+// El fallback es el plan de PRUEBA, no premium: si llega un nombre de plan desconocido, se cae al cupo MAS CHICO,
+// no al mas grande (antes un plan mal escrito en la base regalaba 2.500 mensajes).
 function topeMensajesPlan(plan, sub) {
-  return (PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO]).ai_messages;
+  return (PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_SIN_SUSCRIPCION]).ai_messages;
 }
 
 // Lee la suscripcion del tenant. Si la tabla no existe o no hay fila, devuelve null (no rompe).
@@ -1207,9 +1217,10 @@ async function getSubscription(user_id) {
 
 // Plan vigente del tenant (considera estado y vencimiento). DEFAULT-OPEN si la funcion esta apagada.
 async function planActual(user_id) {
-  if (!SUBSCRIPTIONS_ENABLED) return PLAN_DEFECTO;
+  if (!SUBSCRIPTIONS_ENABLED) return PLAN_DEFECTO; // funcion apagada: todo abierto (no rompe a los clientes actuales)
   const sub = await getSubscription(user_id);
-  if (!sub) return PLAN_DEFECTO; // sin fila todavia: no bloquear
+  // Sin fila de suscripcion: cupo de PRUEBA, no premium (Diego 2026-07-31). Ver PLAN_SIN_SUSCRIPCION.
+  if (!sub) return PLAN_SIN_SUSCRIPCION;
   if (sub.cortesia === true) return PLAN_DEFECTO; // cortesia: acceso libre con features plenas
   const activo = (sub.status === 'active' || sub.status === 'trial');
   const vigente = !sub.current_period_end || new Date(sub.current_period_end).getTime() >= Date.now();
@@ -1221,7 +1232,7 @@ async function planActual(user_id) {
 async function planPermite(user_id, feature) {
   if (!SUBSCRIPTIONS_ENABLED) return true;
   const plan = await planActual(user_id);
-  const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+  const lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_SIN_SUSCRIPCION];
   return !!lim[feature];
 }
 
@@ -17191,7 +17202,7 @@ app.post('/api/asesores/crear', async (req, res) => {
     // (limits_override.asesores, seteable desde el Maestro) que MANDA si es un numero > 0. Soporta Infinity (no bloquea).
     const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
     const _planAse = await planActual(admin_id);
-    let topeAsesores = (PLAN_LIMITS[_planAse] || PLAN_LIMITS[PLAN_DEFECTO]).asesores;
+    let topeAsesores = (PLAN_LIMITS[_planAse] || PLAN_LIMITS[PLAN_SIN_SUSCRIPCION]).asesores;
     try { const { data: subA } = await supabase.from('subscriptions').select('limits_override').eq('user_id', admin_id).maybeSingle(); if (subA && subA.limits_override && typeof subA.limits_override.asesores === 'number' && subA.limits_override.asesores > 0) topeAsesores = subA.limits_override.asesores; } catch (eLim) {}
     if (topeAsesores !== Infinity && existentes && existentes.length >= topeAsesores) return res.status(400).json({ error: 'Maximo ' + topeAsesores + ' usuarios' });
     // El email interno se arma con el usuario (no se usa para login real, pero Auth lo requiere)
@@ -29208,7 +29219,7 @@ app.get('/api/suscripcion', async function(req, res) {
     } catch (e) { /* sin fila -> es el dueño, user_id queda igual */ }
     var sub = await getSubscription(user_id);
     var plan = await planActual(user_id);
-    var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_DEFECTO];
+    var lim = PLAN_LIMITS[plan] || PLAN_LIMITS[PLAN_SIN_SUSCRIPCION];
     var ov = (sub && sub.limits_override) || {};
     var hayOvMsgs = (typeof ov.ai_messages === 'number');
     var esCortesia = !!(sub && sub.cortesia === true);

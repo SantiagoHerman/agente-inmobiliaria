@@ -12863,6 +12863,21 @@ async function _resolverOwnerId(uid) {
   return ownerId;
 }
 
+// Helper: ¿el que llama es el DUEÑO de la cuenta, o un asesor?
+// OJO, la diferencia con _resolverOwnerId es la que importa: esa resuelve "de quien es la cuenta" y por eso un
+// ASESOR termina operando CON LA IDENTIDAD DE SU JEFE. Eso alcanza para aislar tenants, pero NO para decidir
+// quien puede hacer que DENTRO de un tenant. Auditoria 2026-08-01: por eso cualquier asesor podia encolar un
+// envio masivo a TODOS los leads del negocio, o borrar una campaña en curso.
+// Devuelve { ownerId, esDueno }. FAIL-CLOSED: ante cualquier error se asume que NO es el dueño (se restringe).
+async function _duenoOAsesor(uid) {
+  try {
+    const _a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (_a && _a.error) return { ownerId: uid, esDueno: false };
+    if (_a && _a.data && _a.data.admin_id) return { ownerId: _a.data.admin_id, esDueno: false };
+    return { ownerId: uid, esDueno: true }; // sin fila en asesores -> es el dueño
+  } catch (e) { return { ownerId: uid, esDueno: false }; }
+}
+
 // Helper: resuelve el UNIVERSO de una oportunidad para un tenant (ownerId) segun
 // los segmentos elegidos + custom_ids (union, deduplicado por conversation_id).
 // Segmentos soportados (por status/temperatura de conversations del tenant):
@@ -13013,7 +13028,12 @@ app.post('/api/oportunidades', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const b = req.body || {};
     // Universo -> total. (Se recalcula en el cron de todas formas via oportunidad_envios/dedupe.)
     const universo = await _resolverUniversoOportunidad(ownerId, b.segmentos, b.custom_ids);
@@ -13065,7 +13085,12 @@ app.patch('/api/oportunidades/:id', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const id = req.params.id;
     // Cargar la fila y validar pertenencia al tenant.
     let actual = null;
@@ -13110,7 +13135,12 @@ app.post('/api/oportunidades/:id/pausar', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const id = req.params.id;
     try {
       const { data, error } = await supabase.from('oportunidades').update({ estado: 'pausada', updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId).neq('estado', 'completada').select('*').maybeSingle();
@@ -13128,7 +13158,12 @@ app.post('/api/oportunidades/:id/reanudar', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const id = req.params.id;
     try {
       const { data, error } = await supabase.from('oportunidades').update({ estado: 'en_cola', updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId).neq('estado', 'completada').select('*').maybeSingle();
@@ -13150,7 +13185,12 @@ app.post('/api/oportunidades/:id/reiniciar', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const id = req.params.id;
     // Validar pertenencia antes de tocar nada.
     let existe = null;
@@ -13177,7 +13217,12 @@ app.post('/api/oportunidades/reordenar', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const b = req.body || {};
     const orden = Array.isArray(b.orden) ? b.orden.map(function (x) { return String(x || '').trim(); }).filter(Boolean) : [];
     if (!orden.length) return res.status(400).json({ error: 'Falta orden:[ids]' });
@@ -13199,7 +13244,12 @@ app.delete('/api/oportunidades/:id', async (req, res) => {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
-    const ownerId = await _resolverOwnerId(uid);
+    // SEGURIDAD (auditoria 2026-08-01): _resolverOwnerId resuelve DE QUIEN ES LA CUENTA, y por eso un asesor
+    // operaba con la identidad de su jefe: podia encolar un envio masivo a TODOS los leads del negocio, o
+    // borrar una campaña en curso. Administrar los envios es del DUEÑO. Fail-closed: ante duda, 403.
+    const _idOp = await _duenoOAsesor(uid);
+    if (!_idOp.esDueno) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede administrar los envíos masivos.' });
+    const ownerId = _idOp.ownerId;
     const id = req.params.id;
     // Validar pertenencia antes de borrar.
     let existe = null;

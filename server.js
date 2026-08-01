@@ -1182,7 +1182,13 @@ const PLAN_LIMITS = {
   enterprise: { ai_messages: 4500,  asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
   // 'personal' (a medida): el CUPO real lo fija limits_override.ai_messages = la cantidad elegida (>=9.000) al contratar.
   // Aca ai_messages: 9000 es solo el piso/fallback si por algun motivo no hubiera override.
-  personal:   { ai_messages: 9000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true }
+  personal:   { ai_messages: 9000, asesores: Infinity, contactos: Infinity, reportes_ia: true,  audio_traduccion: true,  backup_drive: true,  multi_whatsapp: true },
+  // SIN PLAN (Diego 2026-08-01): "si crean la cuenta y no se suscriben, 0 mensajes de credito".
+  // NO es un plan vendible ni una prueba gratis (la prueba de 4 dias se elimino en 287df452): es el nivel de
+  // una cuenta que se registro y todavia no contrato. CERO mensajes de IA y sin features.
+  // Se dejan 5 asesores a proposito: el gate de suscripcion NO bloquea /api/asesores (crear el equipo es
+  // configuracion, no consumo), asi el dueno puede dejar la cuenta armada mientras contrata.
+  sin_plan:   { ai_messages: 0,    asesores: 5,        contactos: Infinity, reportes_ia: false, audio_traduccion: false, backup_drive: false, multi_whatsapp: false }
 };
 // SIN grandfathering de topes (Diego 2026-07-20): se ELIMINO. TODOS los clientes (viejos y nuevos) usan los topes
 // actuales de PLAN_LIMITS. Ya no hay PLAN_LIMITS_LEGACY ni fecha de corte: nadie conserva topes "viejos" mas altos.
@@ -1194,9 +1200,10 @@ const PLAN_DEFECTO = 'premium';
 // ANTES esto caia a PLAN_DEFECTO ('premium'): una cuenta recien registrada, sin pagar nada, arrancaba con 2.500
 // mensajes IA, asesores ILIMITADOS y TODAS las features (backup Drive, multi WhatsApp, reportes IA). Detectado en
 // la cuenta "Pagel Propiedades" (sin plan, 2.500 de cupo, 0 usados). A $0.023 el mensaje son ~$57 de tokens que
-// una cuenta sin contrato podia gastar. Ahora cae al cupo de PRUEBA (100). La cortesia sigue mandando aparte
-// (topeEfectivoIA la resuelve ANTES que esto) y el override del Maestro tambien.
-const PLAN_SIN_SUSCRIPCION = 'trial';
+// una cuenta sin contrato podia gastar. Ahora cae a CERO mensajes (Diego 2026-08-01: "si crean la cuenta y no
+// se suscriben, 0 mensajes de credito"). La cortesia sigue mandando aparte (topeEfectivoIA la resuelve ANTES
+// que esto) y el override del Maestro tambien.
+const PLAN_SIN_SUSCRIPCION = 'sin_plan';
 
 // Tope de mensajes EFECTIVO de un plan = el de PLAN_LIMITS (mismo para todos; el override del Maestro se aplica aparte).
 // El fallback es el plan de PRUEBA, no premium: si llega un nombre de plan desconocido, se cae al cupo MAS CHICO,
@@ -30134,7 +30141,12 @@ var CONOCIMIENTO_SOPORTE = [
   '',
   '8) BASE DE CONOCIMIENTO: es la memoria del agente. Cargas preguntas frecuentes y datos del negocio (horarios, formas de pago, ubicacion, politicas) para que la IA responda con info correcta. Se organiza por categorias; cada entrada es una pregunta y su respuesta. Elegi una categoria, carga la pregunta y la respuesta con "+ Agregar a la base". Cuanto mas completes, mejor responde la IA.',
   '',
-  '9) IMPORTAR LEADS: sirve para subir una lista de contactos que ya tenes (archivo CSV) y cargarlos como leads para hacerles recontacto. Tambien podes traer los contactos que ya te escribieron a tu WhatsApp. Prepara el CSV, arrastralo o hace clic para elegirlo, y el CRM los carga como leads listos para recontactar.'
+  '9) IMPORTAR LEADS: sirve para subir una lista de contactos que ya tenes (archivo CSV) y cargarlos como leads para hacerles recontacto. Tambien podes traer los contactos que ya te escribieron a tu WhatsApp. Prepara el CSV, arrastralo o hace clic para elegirlo, y el CRM los carga como leads listos para recontactar.',
+  '',
+  // Diego 2026-08-01: la consulta mas comun ("no puedo entrar a mi cuenta") casi nunca es un problema tecnico
+  // de login. Antes el asistente la trataba como una falla y escalaba; ahora primero descarta lo que la explica
+  // en la mayoria de los casos: la cuenta no tiene suscripcion activa, o el pago no se acredito.
+  '10) NO PUEDO ENTRAR A MI CUENTA / EL MENU ME APARECE INCOMPLETO: antes de pensar en un problema tecnico, revisa la SUSCRIPCION. El sistema restringe la cuenta cuando no hay una suscripcion activa: pasa si la cuenta se creo y nunca se contrato un plan, si el pago no se acredito todavia, si la suscripcion vencio o se cancelo, o si quedo un pago pendiente. En ese caso se puede entrar igual, pero solo a Suscripcion, Ayuda y Soporte: el resto del menu queda restringido y la IA deja de responderle a los leads (los mensajes se siguen guardando, no se pierde ningun lead). La solucion es entrar a Suscripcion y contratar o regularizar el pago; en cuanto se acredita, la cuenta se habilita sola. Si la suscripcion figura al dia y aun asi no entra, ahi si es un tema tecnico y hay que derivarlo a una persona.'
 ].join('\n');
 
 app.post('/api/soporte/agente', async function(req, res) {
@@ -30144,6 +30156,46 @@ app.post('/api/soporte/agente', async function(req, res) {
     var pregunta = (req.body && req.body.pregunta) ? String(req.body.pregunta).slice(0, 2000) : '';
     var telefono = (req.body && req.body.telefono) ? String(req.body.telefono).replace(/[^0-9+ ]/g, '').slice(0, 30) : '';
     if (!pregunta.trim()) return res.status(400).json({ error: 'La consulta esta vacia' });
+
+    // ===== TOPE DIARIO DE CONSULTAS AL ASISTENTE (Diego 2026-08-01) =====
+    // Antes este endpoint NO tenia ningun freno: alcanzaba con poder iniciar sesion para preguntarle al modelo
+    // las veces que uno quisiera, incluso desde una cuenta BLOQUEADA (no esta en el gate de suscripcion, y a
+    // proposito: el paywall invita a "acceder a Ayuda y Soporte", ahi es donde el cliente pregunta como contratar).
+    // Cupo POR CUENTA (se reparte entre el dueno y sus asesores, no por persona):
+    //   - sin suscripcion (bloqueada) -> 5/dia   -> al agotarse se le pide ACTUALIZAR LA SUSCRIPCION
+    //   - con suscripcion             -> 30/dia  -> al agotarse, limite diario alcanzado
+    // Se cuenta sobre ia_uso (etiqueta 'soporte_agente'), el mismo mecanismo que ya usa la ventana de prueba.
+    // DEFENSIVO: si la lectura falla NO bloquea (deja pasar) — nunca dejar a un cliente sin soporte por un
+    // problema de base. En AMBOS casos igual se ESCALA el ticket (decision de Diego): el equipo se entera de
+    // quien quiere contratar y tiene un problema.
+    var _TOPE_SOP_SIN_SUB = 5, _TOPE_SOP_CON_SUB = 30;
+    var _sopBloqueada = false, _sopTope = _TOPE_SOP_CON_SUB, _sopUsadas = 0, _sopLleno = false;
+    try {
+      // Owner de la cuenta: si el que pregunta es un asesor, el cupo es el del DUENO (cupo por cuenta).
+      var _sopOwner = user_id;
+      try { var _aq = await supabase.from('asesores').select('admin_id').eq('auth_user_id', user_id).maybeSingle(); if (_aq && _aq.data && _aq.data.admin_id) _sopOwner = _aq.data.admin_id; } catch (eOw) {}
+      try { _sopBloqueada = await debeBloquearAcceso(_sopOwner); } catch (eB) { _sopBloqueada = false; }
+      _sopTope = _sopBloqueada ? _TOPE_SOP_SIN_SUB : _TOPE_SOP_CON_SUB;
+      var _desdeHoy = new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z';
+      var _cq = await supabase.from('ia_uso').select('id', { count: 'exact', head: true })
+        .eq('user_id', _sopOwner).eq('etiqueta', 'soporte_agente').gte('created_at', _desdeHoy);
+      _sopUsadas = (_cq && typeof _cq.count === 'number') ? _cq.count : 0;
+      _sopLleno = _sopUsadas >= _sopTope;
+    } catch (eTope) { _sopLleno = false; } // ante cualquier error -> no frenar
+
+    if (_sopLleno) {
+      var _msgTope = _sopBloqueada
+        ? 'Llegaste al limite de ' + _TOPE_SOP_SIN_SUB + ' consultas por dia del asistente. Tu cuenta no tiene una suscripcion activa: actualiza tu suscripcion para seguir usando el sistema y el soporte completo. Igual le paso tu consulta al equipo.'
+        : 'Llegaste al limite de ' + _TOPE_SOP_CON_SUB + ' consultas por dia del asistente. Se reinicia manana. Igual le paso tu consulta al equipo para que la vea una persona.';
+      // Se ESCALA igual (Diego): el ticket llega aunque el asistente no haya podido responder.
+      try {
+        var _filaT = { user_id: user_id, categoria: 'consulta', mensaje: pregunta, estado: 'escalado' };
+        var _insT = await supabase.from('support_messages').insert(Object.assign({}, _filaT, { telefono: telefono }));
+        if (_insT.error && /telefono|column|does not exist|schema cache/i.test(String(_insT.error.message || ''))) await supabase.from('support_messages').insert(_filaT);
+      } catch (eInsT) {}
+      crearNotifMaestro('soporte', (_sopBloqueada ? 'Soporte: cuenta SIN suscripcion sin cupo' : 'Soporte: tope diario alcanzado'), pregunta.slice(0, 280), { ref_user_id: user_id, severidad: 'warning' }).catch(function(){});
+      return res.json({ ok: true, respuesta: _msgTope, escalado: true, tope_alcanzado: true, sin_suscripcion: _sopBloqueada });
+    }
 
     var sys = 'Sos el asistente de soporte del CRM Raices. Respondé SOLO con la info provista sobre cómo funciona el producto, en español rioplatense, claro y breve. Si la consulta requiere una ACCIÓN que cambia la cuenta (cancelar suscripción, cambiar límites, pausar, borrar datos) NO la ejecutes: explicá y ofrecé derivar a una persona. Si no sabés la respuesta o el usuario pide hablar con alguien, indicá que derivás al equipo.\n\nCONOCIMIENTO DEL PRODUCTO:\n' + CONOCIMIENTO_SOPORTE + '\n\nAl final de tu respuesta, en una linea aparte, escribi exactamente "ESCALAR: SI" si no podes resolver la consulta con la info de arriba, si el usuario pide hablar con una persona, o si pide una accion que cambia la cuenta; en cualquier otro caso escribi "ESCALAR: NO". Esa linea es interna, el usuario igual la vera.';
 

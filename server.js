@@ -141,6 +141,9 @@ const _PREFIJOS_TOPE_IA = [
   '/api/marketing/informe'
   // NO se listan /api/probar-agente (tiene un camino de "agregar instrucción" con 0 tokens que no hay que bloquear)
   // ni /api/agent/ (la respuesta al lead YA está gateada por dentroDelTopeIA en los paths WA/Meta).
+  // Aclaración (2026-08-01): que /api/agent/ no esté en esta lista NO quiere decir que sea libre. La auditoría
+  // encontró que /api/agent/respond sí gastaba sin freno, y ahora tiene sus propios controles adentro del
+  // handler (dentroDelTopeIA + tope diario propio). Este comentario decía lo contrario y confundía.
 ];
 app.use(async function(req, res, next) {
   try {
@@ -1527,10 +1530,13 @@ async function registrarUsoIA(user_id, cantidad) {
 const MODELO_CLIENTE = 'claude-sonnet-4-6';
 const MODELO_INTERNO = 'claude-haiku-4-5';
 // Precio de Sonnet 4.6 (MODELO_CLIENTE) en USD por 1M de tokens (input / output / cache read / cache write).
-const PRECIO_IA = { in: 3, out: 15, cache_read: 0.30, cache_write: 3.75 };
+// OJO cache_write: el precio DEPENDE DEL TTL. Anthropic cobra 1.25x el input para el cache de 5 minutos y 2x
+// para el de 1 hora. Hasta el 2026-08-01 se registraba SIEMPRE al precio de 5 minutos, asi que las cuentas con
+// el flag ai_cache_ttl_1h prendido quedaban subvaluadas (medido: USD 1,09 en 4 dias de Anton, 1,72 historico).
+const PRECIO_IA = { in: 3, out: 15, cache_read: 0.30, cache_write: 3.75, cache_write_1h: 6.00 };
 // Precio de Haiku 4.5 (MODELO_INTERNO, mucho mas barato) — para tareas de fondo (memoria viva, clasificadores). Asi el panel
 // contabiliza el costo REAL del modelo usado y no infla el gasto (~3x) registrando Haiku a precio de Sonnet.
-const PRECIO_HAIKU = { in: 1, out: 5, cache_read: 0.10, cache_write: 1.25 };
+const PRECIO_HAIKU = { in: 1, out: 5, cache_read: 0.10, cache_write: 1.25, cache_write_1h: 2.00 };
 // ===== MEDIDOR DE CONSUMO (2026-07-23): atribucion por LEAD y por MENSAJE =====
 // ia_uso gana dos columnas NUEVAS (conversation_id, turno_id) que se agregan con
 // migracion-medidor-consumo.sql. Esa migracion la corre el dueno A MANO y MAS TARDE,
@@ -1598,7 +1604,11 @@ async function registrarUsoTokens(user_id, usage, etiqueta, precio, opts) {
     const o = usage.output_tokens || 0;
     const cr = usage.cache_read_input_tokens || 0;
     const cw = usage.cache_creation_input_tokens || 0;
-    const costo = (i * P.in + o * P.out + cr * P.cache_read + cw * P.cache_write) / 1000000;
+    // El cache de 1 HORA se escribe al doble que el de 5 minutos. El TTL ya viene en opts (lo manda quien pidio
+    // el cache largo) y ya se guardaba en la fila como telemetria: aca ademas ENTRA EN LA CUENTA. Fallback al
+    // precio de 5 minutos cuando no viene TTL, que es lo correcto: el unico lugar que pide 1h siempre lo manda.
+    const _cwPrecio = (opts && opts.cache_ttl === '1h' && P.cache_write_1h) ? P.cache_write_1h : P.cache_write;
+    const costo = (i * P.in + o * P.out + cr * P.cache_read + cw * _cwPrecio) / 1000000;
     const fila = { user_id: user_id, input_tokens: i, output_tokens: o, cache_read: cr, cache_creation: cw, cost_usd: costo, etiqueta: etiqueta || null };
     // MEDIDOR: atribucion opcional. Solo se intenta si el caller mando datos Y no sabemos que faltan las columnas.
     var _cid = (opts && opts.conversation_id) ? String(opts.conversation_id) : null;
@@ -9927,82 +9937,10 @@ app.get('/health/deep', async (req, res) => {
   const payload = { status: degradado ? 'degraded' : 'ok', ts: Date.now(), protected: protegido, checks: checks };
   res.status(degradado ? 503 : 200).json(payload);
 });
-// ===== DIAG (read-only) — guard ?k=rz-diag-pauta-9f — modos utiles: ?costos=1 / ?rag=1 / ?respaldo=1 =====
-app.get('/_diag-pauta2', async (req, res) => {
-  try {
-    if (req.query.k !== 'rz-diag-pauta-9f') return res.status(401).json({ e: 'no' });
-    // F6 (Diego 2026-07-24): limpiadas las ramas de diagnostico TEMPORALES (rb/iausers/evo/ragcheck/props/chat y el
-    // default que dumpeaba chats/props/pauta de Anton) que exponian datos crudos de clientes. QUEDAN los chequeos
-    // utiles: ?costos=1 (medidor de gasto), ?rag=1 y ?respaldo=1.
-    // VERIFICAR RAG: ?rag=1 -> flag ia_rag_v1 por cuenta + ultimas respuestas de Anton (cache chico = RAG activo).
-    if (req.query.rag === '1') {
-      const out = {};
-      try {
-        const { data: bsR, error: eR } = await supabase.from('business_settings').select('company_name, ia_rag_v1');
-        if (eR) throw eR;
-        out.flags = (bsR || []).map(function (b) { return { cuenta: b.company_name, ia_rag_v1: b.ia_rag_v1 === true }; });
-      } catch (eF) { out.flags_err = 'columna ia_rag_v1 no existe o error: ' + (eF && eF.message); }
-      try {
-        const { data: bsA } = await supabase.from('business_settings').select('user_id').ilike('company_name', '%anton%');
-        const uidA = bsA && bsA[0] && bsA[0].user_id;
-        const { data: ult } = await supabase.from('ia_uso').select('created_at, input_tokens, output_tokens, cache_read, cache_creation, cost_usd')
-          // MEDIDOR 2026-07-23: la respuesta al lead ya NO se guarda con etiqueta null (ahora es 'respuesta_agente').
-          // Se aceptan LAS DOS para que este diagnostico siga viendo las respuestas viejas Y las nuevas.
-          .eq('user_id', uidA).or('etiqueta.is.null,etiqueta.eq.respuesta_agente').order('created_at', { ascending: false }).limit(8);
-        out.ultimas_respuestas_anton = (ult || []).map(function (r) { return { t: r.created_at, in_tok: r.input_tokens, out_tok: r.output_tokens, cacheR: r.cache_read, cacheW: r.cache_creation, usd: r.cost_usd }; });
-      } catch (eU) { out.uso_err = eU && eU.message; }
-      return res.json(out);
-    }
-    // INVESTIGACION GASTO TOKENS: ?costos=1 -> agrega ia_uso de julio por cuenta / operacion / dia. Read-only.
-    if (req.query.costos === '1') {
-      const desde = String(req.query.desde || '2026-07-01');
-      const out = { desde: desde, hasta: 'ahora' };
-      const { data: bsAll } = await supabase.from('business_settings').select('user_id, company_name');
-      const nom = {}; (bsAll || []).forEach(function (b) { nom[b.user_id] = b.company_name || b.user_id; });
-      let filas = [], from = 0; const PAGE = 1000;
-      while (from < 200000) {
-        const { data: pg, error: e1 } = await supabase.from('ia_uso')
-          .select('user_id, input_tokens, output_tokens, cache_read, cache_creation, cost_usd, etiqueta, created_at')
-          .gte('created_at', desde).order('created_at', { ascending: true }).range(from, from + PAGE - 1);
-        if (e1) { out.err = e1.message; break; }
-        if (!pg || !pg.length) break;
-        filas = filas.concat(pg); if (pg.length < PAGE) break; from += PAGE;
-      }
-      out.total_llamadas = filas.length;
-      const agg = function (keyFn) {
-        const m = {};
-        filas.forEach(function (f) {
-          const k = keyFn(f) || '(sin)';
-          if (!m[k]) m[k] = { llamadas: 0, in_tok: 0, out_tok: 0, cache_read: 0, cache_write: 0, usd: 0 };
-          m[k].llamadas++; m[k].in_tok += (f.input_tokens || 0); m[k].out_tok += (f.output_tokens || 0);
-          m[k].cache_read += (f.cache_read || 0); m[k].cache_write += (f.cache_creation || 0); m[k].usd += (f.cost_usd || 0);
-        });
-        return Object.keys(m).map(function (k) { const v = m[k]; v.usd = Math.round(v.usd * 100) / 100; return Object.assign({ clave: k }, v); })
-          .sort(function (a, b) { return b.usd - a.usd; });
-      };
-      out.por_cuenta = agg(function (f) { return nom[f.user_id] || f.user_id; });
-      // MEDIDOR 2026-07-23: las filas NUEVAS ya traen etiqueta; el fallback 'respuesta_agente(null)' queda solo para las VIEJAS.
-      out.por_operacion = agg(function (f) { return f.etiqueta || 'respuesta_agente(null)'; });
-      out.por_dia = agg(function (f) { return String(f.created_at).slice(0, 10); }).sort(function (a, b) { return a.clave.localeCompare(b.clave); });
-      out.cuenta_x_operacion = agg(function (f) { return (nom[f.user_id] || f.user_id) + ' | ' + (f.etiqueta || 'respuesta_agente'); }).slice(0, 15);
-      return res.json(out);
-    }
-    // VERIFICAR RESPALDO RELOJ: ?respaldo=1 -> columna existe? cuentas con respaldo_v2 ON? relojes armados?
-    if (req.query.respaldo === '1') {
-      const salida = {};
-      // columna existe?
-      try { const r = await supabase.from('conversations').select('id, respaldo_reloj').not('respaldo_reloj', 'is', null).limit(5); if (r.error) throw r.error; salida.columna = 'existe'; salida.relojes_armados_muestra = (r.data || []).length; salida.ejemplos = (r.data || []).map(function(x){ return { conv: x.id, reloj: x.respaldo_reloj }; }); }
-      catch (eC) { salida.columna = 'NO existe / error: ' + (eC && eC.message); }
-      // count total de relojes armados
-      try { const { count } = await supabase.from('conversations').select('id', { count: 'exact', head: true }).not('respaldo_reloj', 'is', null); salida.total_relojes_armados = count; } catch (e) { salida.total_relojes_armados = '(no se pudo contar)'; }
-      // cuentas con respaldo_v2 ON
-      try { const { data } = await supabase.from('business_settings').select('company_name, respaldo_v2, respaldo_umbral_min').eq('respaldo_v2', true); salida.cuentas_respaldo_v2_ON = (data || []).map(function(b){ return { cuenta: b.company_name, umbral_min: b.respaldo_umbral_min || '(default 10)' }; }); } catch (e) { salida.cuentas_respaldo_v2_ON = '(no se pudo leer)'; }
-      return res.json(salida);
-    }
-    // F6: sin rama que matchee -> respuesta benigna (sin dump de datos de clientes). Modos utiles que quedan.
-    return res.json({ ok: true, modos: ['costos', 'rag', 'respaldo'] });
-  } catch (e) { return res.status(500).json({ e: e && e.message }); }
-});
+// A1 (seguridad, Diego 2026-08-01): BORRADO el endpoint /_diag-pauta2 (arrancaba aca con guard de clave fija
+// "rz-diag-pauta-9f" viajando en la URL, sin login). Sin autenticacion, devolvia nombre/id/gasto real de IA de
+// TODOS los clientes (?costos=1), flags ia_rag_v1 por cuenta (?rag=1) y estado de respaldo_v2 (?respaldo=1).
+// Verificado por grep antes de borrar: nada del sistema (front, cron, otro endpoint) lo llamaba.
 app.get('/', (req, res) => { res.json({ message: 'Raices CRM API', status: 'online' }); });
 
 // Endpoint para probar el agente desde el CRM (escribir como cliente)
@@ -10030,11 +9968,37 @@ app.post('/api/agent/respond', async (req, res) => {
       await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: convOwn.user_id, role: 'contact', content: message });
       _uidGen = convOwn.user_id;
     }
+    // B1 (seguridad, Diego 2026-08-01): este endpoint arma el prompt ENTERO (con el inventario, el mismo motor
+    // que atiende al lead) y llamaba a MODELO_CLIENTE sin pasar por dentroDelTopeIA ni por ningun tope propio.
+    // Como a proposito NO descuenta cupo del plan (ver comentario de abajo), una cuenta sin pago o sin cupo
+    // podia llamarlo en bucle y el gasto era ilimitado. Dos controles, mismo criterio que /api/probar-agente:
+    //  (a) el tope REAL de la cuenta (dentroDelTopeIA) -- si la cuenta esta topeada, tampoco puede probar aca.
+    //  (b) un tope DIARIO propio (etiqueta 'api_respond' en ia_uso) para que, aun con cupo/plan
+    //      ilimitado, esto no se pueda martillar sin limite.
+    // El tope es de 100/dia y no de 30: es POR CUENTA, no por usuario, y el objetivo es frenar el bucle
+    // (que serian miles), no el uso legitimo. Con 30 el dueño mostrando el sistema, o dos asesores probando
+    // el mismo dia, se lo comen sin hacer nada raro.
+    // FAIL-CLOSED (a pedido): cualquier error en estos chequeos = NO se gasta IA (nunca al reves).
+    let _puedeAgentRespond = false;
+    try { _puedeAgentRespond = await dentroDelTopeIA(_uidGen); } catch (eTopeAR) { _puedeAgentRespond = false; }
+    if (!_puedeAgentRespond) return res.status(429).json({ error: 'Alcanzaste el tope de mensajes IA de tu plan. Ampliá el plan o esperá al próximo período para usar esta función.', tope_alcanzado: true });
+    try {
+      const _AGENT_RESPOND_TOPE_DIA = 100;
+      const _desdeAR = new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z'; // desde las 00:00 UTC de hoy
+      const _cntAR = await supabase.from('ia_uso').select('id', { count: 'exact', head: true })
+        .eq('user_id', _uidGen).eq('etiqueta', 'api_respond').gte('created_at', _desdeAR);
+      if (!_cntAR || _cntAR.error || typeof _cntAR.count !== 'number') return res.status(429).json({ error: 'No se pudo verificar el limite diario de esta funcion. Proba de nuevo en un momento.' });
+      if (_cntAR.count >= _AGENT_RESPOND_TOPE_DIA) return res.status(429).json({ error: 'Llegaste al límite de ' + _AGENT_RESPOND_TOPE_DIA + ' usos de este endpoint por hoy. Se reinicia mañana.' });
+    } catch (eTopeDiaAR) { return res.status(429).json({ error: 'No se pudo verificar el limite diario de esta funcion. Proba de nuevo en un momento.' }); }
     const resultado = await generarRespuestaAgente(_uidGen, conversation_id, message);
     // FUGA TAPADA (medidor 2026-07-23): este endpoint gasta Sonnet (el mismo motor que atiende al lead) y NO
     // registraba NADA en ia_uso -> ese gasto era invisible en el panel. Ahora se REGISTRA el costo con etiqueta
-    // propia. OJO: a proposito NO se llama a registrarUsoIA -> NO descuenta cupo del plan (eso no cambia).
-    try { if (resultado && resultado.usage) await registrarUsoTokens(_uidGen, resultado.usage, 'api_respond', PRECIO_IA, { conversation_id: conversation_id || null }); } catch (eMed) {}
+    // propia. OJO: a proposito NO se llama a registrarUsoIA -> NO descuenta cupo del plan (eso no cambia; el
+    // freno de gasto en bucle lo dan los dos controles de arriba, no el cupo del plan).
+    // SIEMPRE se escribe la fila, aunque la respuesta venga SIN usage: el tope diario de arriba CUENTA ESTAS
+    // FILAS, asi que si solo se registraran las llamadas con usage, una respuesta sin usage no sumaria y el
+    // tope tendria una fuga por donde martillar gratis. Sin usage la fila queda en 0 tokens y costo 0.
+    try { await registrarUsoTokens(_uidGen, (resultado && resultado.usage) || { input_tokens: 0, output_tokens: 0 }, 'api_respond', PRECIO_IA, { conversation_id: conversation_id || null }); } catch (eMed) {}
     res.json(resultado);
   } catch (err) {
     console.error('Error en /api/agent/respond:', err && err.message);
@@ -11175,6 +11139,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         if (_bsDueno && _bsDueno.reportes_config && _bsDueno.reportes_config.whatsapp) _numsDueno.push(String(_bsDueno.reportes_config.whatsapp).replace(/[^0-9]/g, ''));
         const _numTel = String(telefono).replace(/[^0-9]/g, '');
         // Match por los ultimos 8 digitos (mismo criterio que el canal de reportes -> evita lios de prefijos/0/15).
+        // AGUJERO CONOCIDO (auditoria 2026-08-01): 8 digitos es flojo -- otro numero que coincida en esa cola entra
+        // como si fuera el dueno. Se PROBO subirlo a 10 digitos y se REVIRTIO: el numero entrante viene completo del
+        // JID, pero el guardado lo escribe el dueño A MANO, y con "0" o "15" adelante el sufijo de 10 deja de
+        // coincidir -> el dueño cae al flujo de LEAD y la IA lo atiende como cliente, en silencio. Se verifico en la
+        // base que hoy las 4 cuentas vivas lo tienen en formato internacional (54 + area + numero), asi que el fix
+        // de 10 no las rompia; se revirtio igual porque el proximo numero cargado a mano si lo rompe.
+        // LO QUE SI QUEDA TAPADO: el gasto. El control de suscripcion/cupo de mas abajo corre ANTES de llamar a la
+        // IA, asi que un falso positivo de 8 digitos ya no puede gastar sin pasar por el tope. Para cerrarlo del
+        // todo hay que normalizar (sacar 54/9 y el 0/15 local) antes de comparar.
         const _esDueno = _numTel.length >= 8 && _numsDueno.some(function(n){ return n && n.length >= 8 && n.slice(-8) === _numTel.slice(-8); });
         if (_esDueno) {
           // Pausa total del Maestro o cliente en papelera: no procesar (mismo criterio que el canal del dueno de reportes).
@@ -11196,13 +11169,31 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       const { data: bsRep } = await supabase.from('business_settings').select('reportes_config, crm_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
       const repCfg = bsRep && bsRep.reportes_config ? bsRep.reportes_config : null;
       if (repCfg && repCfg.whatsapp) {
+        // Mismo criterio que el comando "agregar instruccion" de arriba: los ultimos 8 digitos. Ver ahi el
+        // comentario largo de por que el fix a 10 digitos se probo y se revirtio (rompe al dueño cargado con 0/15).
         const soloNumRep = String(repCfg.whatsapp).replace(/[^0-9]/g, '');
         const soloNumTel = String(telefono).replace(/[^0-9]/g, '');
-        // comparar por los ultimos 8 digitos (evita lios de prefijos/0/15)
         const coincide = soloNumRep.length >= 8 && soloNumTel.length >= 8 && soloNumRep.slice(-8) === soloNumTel.slice(-8);
         if (coincide && (!tipoMediaEntrante || tipoMediaEntrante === 'audio')) {
           // Pausa total del Maestro o cliente en papelera: NO gastar tokens ni siquiera en el canal del dueno.
           if (bsRep && (bsRep.crm_pausado === true || bsRep.eliminado_at)) return;
+          // B3 (seguridad, Diego 2026-08-01): el control de suscripcion/cupo se mueve ARRIBA de este bloque,
+          // ANTES de clasificarIntencionDueno (Haiku) y de responderConsultaAdmin (Sonnet, el modelo caro).
+          // ANTES esas dos llamadas se disparaban SIEMPRE sin mirar si la cuenta tenia plata o cupo -> B1/B3.
+          // Mismo criterio combinado que usa el resto del sistema (ver dentroDelTopeNocturno/~L15466):
+          // debeBloquearAcceso() (suscripcion vencida/papelera) OR !dentroDelTopeIA() (cupo agotado).
+          // FAIL-CLOSED PARA EL GASTO: si cualquiera de los dos chequeos tira error, NO se gasta IA.
+          // Pero el AVISO se manda solo cuando sabemos con certeza que esta sin cupo. Un error transitorio de
+          // Supabase no puede terminar diciendole "no tenes plan" a un cliente que SI paga: en ese caso se corta
+          // callado y el dueño reintenta. Mentirle al que paga es peor que no contestarle una vez.
+          let _sinCupoAdmin = true, _cupoIncierto = false;
+          try { _sinCupoAdmin = (await debeBloquearAcceso(user_id)) || !(await dentroDelTopeIA(user_id)); }
+          catch (eCupoAdmin) { _sinCupoAdmin = true; _cupoIncierto = true; }
+          if (_sinCupoAdmin) {
+            if (!_cupoIncierto) await enviarWhatsapp(instanciaNombre, telefono, 'Tu cuenta esta sin cupo o sin suscripcion activa para usar el asistente por este canal. Revisa tu plan en el panel.');
+            else console.error('[canal dueno] no se pudo verificar cupo de', user_id, '-> se corta sin avisar (posible falso positivo)');
+            return;
+          }
           let textoAdmin = texto;
           const _esAudioDueno = (tipoMediaEntrante === 'audio');
           if (_esAudioDueno) {
@@ -14132,21 +14123,44 @@ async function instanciaActiva(user_id) {
 }
 
 // Configura el webhook de una instancia para que apunte a nuestro backend
+// A2 (seguridad, Diego 2026-08-01): si WHATSAPP_WEBHOOK_SECRET esta seteada, le pedimos a Evolution (via
+// webhook.headers, que Evolution reenvia tal cual en cada POST a nuestra url) que mande ese secreto de vuelta.
+// Usa el MISMO header que ya acepta _whatsappWebhookOk (~L10927): 'x-webhook-secret'. Sin la env, el payload
+// queda BYTE-IDENTICO al de hoy (sin campo `headers`) -> cero cambio de comportamiento mientras no se active.
 async function configurarWebhookInstancia(instancia) {
   try {
+    const _webhookCfg = {
+      enabled: true,
+      url: BACKEND_PUBLIC_URL + '/api/webhook/whatsapp',
+      events: ['MESSAGES_UPSERT', 'MESSAGES_UPDATE'] // UPSERT = mensajes entrantes; UPDATE = confirmacion de entrega/ack (nivel 2)
+    };
+    const _whSecret = process.env.WHATSAPP_WEBHOOK_SECRET || '';
+    if (_whSecret) _webhookCfg.headers = { 'x-webhook-secret': _whSecret };
     await fetch(EVOLUTION_URL + '/webhook/set/' + instancia, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-      body: JSON.stringify({
-        webhook: {
-          enabled: true,
-          url: BACKEND_PUBLIC_URL + '/api/webhook/whatsapp',
-          events: ['MESSAGES_UPSERT', 'MESSAGES_UPDATE'] // UPSERT = mensajes entrantes; UPDATE = confirmacion de entrega/ack (nivel 2)
-        }
-      })
+      body: JSON.stringify({ webhook: _webhookCfg })
     });
   } catch (e) { console.error('Error configurando webhook:', e && e.message); }
 }
+
+// POST /api/whatsapp/re-registrar-webhook -> A2: re-envia la config del webhook de MI instancia a Evolution
+// (idempotente, no corta la sesion ni pide reescanear QR). Sirve para que Evolution empiece a mandar el header
+// del secreto EN SEGUNDOS, sin esperar los ~2 min del auto-repair de arranque (resetearWebhooksNivel2): asi, el
+// dia que el dueno active WHATSAPP_WEBHOOK_SECRET en Railway, se puede llamar este endpoint apenas reinicie el
+// servicio y minimizar la ventana en la que Evolution todavia no manda el header (ver pasos en el reporte).
+app.post('/api/whatsapp/re-registrar-webhook', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const instancia = await instanciaActiva(uid);
+    await configurarWebhookInstancia(instancia);
+    res.json({ ok: true, instancia: instancia });
+  } catch (err) {
+    console.error('Error en /api/whatsapp/re-registrar-webhook:', err && err.message);
+    res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
 
 // NIVEL 2: re-configura el webhook de TODAS las instancias ya existentes para que incluyan MESSAGES_UPDATE (acks de entrega).
 // Es ADITIVO e IDEMPOTENTE: reusa configurarWebhookInstancia (misma url + MESSAGES_UPSERT), solo agrega el evento de entrega.
@@ -23850,6 +23864,14 @@ async function _leerLotesDePlano(url, user_id, maxTokens, deep) {
     ] }]
   });
   try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'scraper_vision', PRECIO_SCRAPE_VISION); } catch (e) {}
+  // AGUJERO CONOCIDO (auditoria 2026-08-01), A PROPOSITO SIN TAPAR TODAVIA: esto gasta VISION (lo mas caro
+  // del sistema) y NO suma al contador de cupo (registrarUsoIA), asi que dentroDelTopeIA lee un numero que
+  // nunca se mueve y este gasto no se frena nunca.
+  // Se PROBO taparlo con `registrarUsoIA(user_id, 1)` aca y se REVIRTIO: el cron revisarScrapingsDesarrollo
+  // corre solo y gasta hasta 6 mensajes por emprendimiento por ciclo, asi que cobrarlo puede comerse el cupo
+  // del plan y dejar a la IA SIN CONTESTARLE A LOS LEADS. Cobrar el gasto no puede costar mas caro que el
+  // agujero. Falta la decision del dueño: o el cron queda exento y se cobra solo lo que dispara una persona,
+  // o se cobra todo pero con un cupo aparte que no toque el del plan.
   var t = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
   return _parseJsonObjetoDefensivo(t);
 }
@@ -23939,6 +23961,10 @@ async function _scrapeDesarrolloProfundo(url, user_id, opts) {
   }
   // Costo -> panel (best-effort, con el precio del MODELO usado)
   try { if (iaResp && iaResp.usage) await registrarUsoTokens(user_id, iaResp.usage, 'scraper_desarrollo', PRECIO_SCRAPE_DESARROLLO); } catch (eTok) {}
+  // AGUJERO CONOCIDO, LA OTRA MITAD DEL DE _leerLotesDePlano (ver el comentario largo alla): esta extraccion
+  // tampoco suma al contador de cupo, asi que el tope de la cuenta no se mueve por el scraper de desarrollo.
+  // Tambien se probo taparlo y se revirtio por el mismo motivo: lo dispara un cron, y cobrarlo puede dejar a
+  // la IA sin contestarle a los leads. Se tapan los dos juntos, cuando el dueño decida como.
 
   var txt = (iaResp && iaResp.content && iaResp.content[0] && iaResp.content[0].text) ? iaResp.content[0].text : '';
   var parsed = _parseJsonObjetoDefensivo(txt);
@@ -32056,6 +32082,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _pfv = await supabase.from('business_settings').select('pipeline_filtros_v1').eq('user_id', user_id).maybeSingle();
       if (_pfv && _pfv.data) pipeline_filtros_v1 = _pfv.data.pipeline_filtros_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // pipeline_exportar_v1 (Diego 2026-08-01): gate de los botones EXPORTAR del Pipeline (PDF por impresion del
+    // navegador + imagen del resumen dibujada en canvas). Flag SEPARADO de pipeline_filtros_v1 a proposito: se
+    // puede tener los filtros sin la exportacion. Misma query defensiva -> columna ausente / error = false, o sea
+    // los botones no se dibujan y la pantalla queda igual que hoy. 0 tokens de IA: se genera todo en el navegador.
+    var pipeline_exportar_v1 = false;
+    try {
+      var _pev = await supabase.from('business_settings').select('pipeline_exportar_v1').eq('user_id', user_id).maybeSingle();
+      if (_pev && _pev.data) pipeline_exportar_v1 = _pev.data.pipeline_exportar_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
     // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
     // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
     // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
@@ -32087,7 +32122,7 @@ app.get('/api/ui-flags', async function(req, res){
         if (_ceh && _ceh >= 1 && _ceh <= 168) cita_escalada_horas = _ceh;
       }
     } catch (e) { /* columnas ausentes / error -> defaults */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
   }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 

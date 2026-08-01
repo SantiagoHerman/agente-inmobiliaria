@@ -1374,20 +1374,10 @@ async function debeBloquearAcceso(user_id) {
     const est = sub ? sub.status : null;
     const cortesia = sub && sub.cortesia === true;
     if (cortesia) return false; // cortesia: acceso libre, nunca se bloquea
-    // Sin fila de suscripcion -> NO opera (Diego 2026-07-31). Con TRIAL_DESDE configurado se conserva el
-    // grandfathering por fecha para las cuentas anteriores al corte; sin esa fecha, se exige suscripcion a todos.
+    // Sin fila de suscripcion: solo se bloquea si la cuenta es NUEVA (creada DESDE TRIAL_DESDE).
+    // Los anteriores quedan grandfathered (gratis) -> NO se bloquean. (mismo criterio que el webhook ~1277-1284)
     if (!sub) {
-      // Diego 2026-07-31: "se tiene que suscribir". Sin fila de suscripcion NO se opera.
-      // ANTES devolvia false con TRIAL_DESDE vacio ("nadie obligado a suscribirse"): cualquiera que se
-      // registrara entraba y podia operar, ademas con el cupo de premium (ver PLAN_SIN_SUSCRIPCION).
-      // La CORTESIA ya salio por el return de arriba, asi que esto NO puede alcanzar a una cuenta de cortesia
-      // (la cortesia se lee de la propia fila: sin fila no hay cortesia posible).
-      // Que se bloquea: WhatsApp, propiedades, scraping, probar-agente, citas y todo lo que gaste IA.
-      // Que NO se bloquea: entrar al panel, Suscripcion, Ayuda, Soporte y gestionar usuarios -> el dueno
-      // puede ver su cuenta y CONTRATAR. No queda afuera del sistema, queda sin operar hasta suscribirse.
-      if (!TRIAL_DESDE) return true;
-      // Con TRIAL_DESDE configurado se respeta el grandfathering por fecha: las cuentas ANTERIORES al corte
-      // siguen pasando (son las que ya operaban antes de que existieran los planes).
+      if (!TRIAL_DESDE) return false; // nadie obligado a suscribirse
       try {
         const u = await supabase.auth.admin.getUserById(user_id);
         const ca = u && u.data && u.data.user && u.data.user.created_at;

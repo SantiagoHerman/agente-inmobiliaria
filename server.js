@@ -17863,8 +17863,67 @@ app.post('/api/asesores/cambiar-clave', async (req, res) => {
     // cambiar la clave en Supabase Auth
     const { error: errUpd } = await supabase.auth.admin.updateUserById(ases.auth_user_id, { password: String(clave_nueva) });
     if (errUpd) return res.status(500).json({ error: 'No se pudo cambiar la clave: ' + errUpd.message });
-    // Mantener clave_visible en sync (si no, el listado muestra la clave vieja tras cambiarla). Best-effort.
-    try { await supabase.from('asesores').update({ clave_visible: String(clave_nueva) }).eq('id', asesor_id).eq('admin_id', admin_id); } catch (eCv) {}
+    // Mantener la clave visible en sync (si no, el listado muestra la clave vieja tras cambiarla). Best-effort.
+    // SEGURIDAD (auditoria 2026-08-01): vive en asesores_clave, NO en asesores. Esa tabla tiene RLS prendida y
+    // CERO policies, asi que desde el navegador no la lee nadie: solo el backend con la service key. Antes la
+    // columna estaba en asesores, que cualquier asesor lee entera -> se llevaba las claves de todo el equipo.
+    try { await supabase.from('asesores_clave').upsert({ asesor_id: asesor_id, clave_visible: String(clave_nueva), actualizado_at: new Date().toISOString() }, { onConflict: 'asesor_id' }); } catch (eCv) {}
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Claves visibles del equipo, para la pantalla Usuarios. Devuelve { <asesor_id>: '<clave>' }.
+// ----------------------------------------------------------------------------------------------------
+// POR QUE EXISTE (auditoria 2026-08-01): antes la clave vivia en asesores.clave_visible y la pantalla la leia
+// DIRECTO de la base. Como cualquier asesor puede leer la tabla asesores de su tenant, cualquiera se llevaba
+// las claves de TODO el equipo pidiendolas a mano, tuviera o no el panel de Usuarios habilitado.
+// Diego decidio el 2026-07-30 que "quien puede ver Usuarios puede ver las contraseñas": ESO NO CAMBIA. Lo que
+// cambia es que ahora se VERIFICA. Antes no habia verificacion de ninguna clase.
+// Dueño -> siempre. Asesor -> solo si tiene permisos_paneles.asesores === true. Fail-closed ante cualquier duda.
+app.get('/api/asesores/claves', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const { data: yo } = await supabase.from('asesores').select('admin_id, permisos_paneles').eq('auth_user_id', uid).maybeSingle();
+    let ownerId = uid;
+    if (yo && yo.admin_id) {
+      const pp = yo.permisos_paneles;
+      const puede = pp && typeof pp === 'object' && !Array.isArray(pp) && pp.asesores === true;
+      if (!puede) return res.status(403).json({ error: 'No tenés acceso a las claves del equipo.' });
+      ownerId = yo.admin_id;
+    }
+    const { data: ases } = await supabase.from('asesores').select('id').eq('admin_id', ownerId);
+    const ids = (ases || []).map(function(a){ return a.id; });
+    if (!ids.length) return res.json({});
+    const { data: cl } = await supabase.from('asesores_clave').select('asesor_id, clave_visible').in('asesor_id', ids);
+    const out = {};
+    (cl || []).forEach(function(r){ if (r && r.asesor_id) out[r.asesor_id] = r.clave_visible || ''; });
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Guardar la clave visible de un asesor (la escribe la pantalla Usuarios al crear o editar).
+// Mismo criterio de acceso que el GET de arriba. La clave REAL vive en Supabase Auth; esto es solo la copia
+// que el dueño mira en pantalla.
+app.post('/api/asesores/clave-visible', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const asesor_id = req.body && req.body.asesor_id;
+    const clave = req.body && req.body.clave;
+    if (!asesor_id) return res.status(400).json({ error: 'Falta asesor_id' });
+    const { data: yo } = await supabase.from('asesores').select('admin_id, permisos_paneles').eq('auth_user_id', uid).maybeSingle();
+    let ownerId = uid;
+    if (yo && yo.admin_id) {
+      const pp = yo.permisos_paneles;
+      const puede = pp && typeof pp === 'object' && !Array.isArray(pp) && pp.asesores === true;
+      if (!puede) return res.status(403).json({ error: 'No tenés acceso a las claves del equipo.' });
+      ownerId = yo.admin_id;
+    }
+    // El asesor tiene que ser de ESTE tenant: si no, un dueño podria escribirle la clave a otro negocio.
+    const { data: destino } = await supabase.from('asesores').select('id').eq('id', asesor_id).eq('admin_id', ownerId).maybeSingle();
+    if (!destino) return res.status(404).json({ error: 'Usuario no encontrado en esta cuenta' });
+    await supabase.from('asesores_clave').upsert({ asesor_id: asesor_id, clave_visible: String(clave || ''), actualizado_at: new Date().toISOString() }, { onConflict: 'asesor_id' });
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

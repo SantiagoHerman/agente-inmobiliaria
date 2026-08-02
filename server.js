@@ -17114,6 +17114,11 @@ setInterval(enviarReportesProgramados, 60 * 60 * 1000); // reportes programados:
 setInterval(guardarSnapshotDiario, 60 * 60 * 1000); // snapshot de metricas: actualizar cada hora
 setTimeout(guardarSnapshotDiario, 50 * 1000); // primer snapshot al arrancar
 setTimeout(enviarReportesProgramados, 45 * 1000); // primer chequeo al arrancar
+// Reportes v2 ("Reportes completos", Diego 2026-08-02): informes programados diario/semanal/mensual.
+// Cron SEPARADO del legado de arriba a proposito -- gateado por reportes_v2, con flag OFF (las 6
+// cuentas vivas hoy) hace una sola query barata y listo. Misma granularidad horaria que el legado.
+setInterval(enviarReportesV2Programados, 60 * 60 * 1000);
+setTimeout(enviarReportesV2Programados, 48 * 1000); // primer chequeo al arrancar (offset propio, no pisa al legado)
 setTimeout(revisarInactividad, 30 * 1000);
 // Envio de recontactos: revisar cada 15 min si hay que mandar (respeta horario de oficina y salvaguardas)
 setInterval(enviarRecontactosPendientes, 15 * 60 * 1000);
@@ -32613,6 +32618,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _vsv = await supabase.from('business_settings').select('visibilidad_server_v1').eq('user_id', user_id).maybeSingle();
       if (_vsv && _vsv.data) visibilidad_server_v1 = _vsv.data.visibilidad_server_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // reportes_v2 (Diego 2026-08-02): gate de "Reportes completos" (informes configurables + historial
+    // de corridas + vistas guardadas del Pipeline). migracion-reportes-v2.sql SIN CORRER todavia -> esta
+    // query da error / columna ausente -> false, MISMO patron defensivo que pipeline_filtros_v1. Con el
+    // flag OFF (default en las 6 cuentas vivas) el reporte diario viejo (reportes_config) sigue igual.
+    var reportes_v2 = false;
+    try {
+      var _rp2 = await supabase.from('business_settings').select('reportes_v2').eq('user_id', user_id).maybeSingle();
+      if (_rp2 && _rp2.data) reportes_v2 = _rp2.data.reportes_v2 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
     // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
     // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
     // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
@@ -32644,8 +32658,8 @@ app.get('/api/ui-flags', async function(req, res){
         if (_ceh && _ceh >= 1 && _ceh <= 168) cita_escalada_horas = _ceh;
       }
     } catch (e) { /* columnas ausentes / error -> defaults */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================
@@ -32861,6 +32875,1255 @@ app.get('/api/reportes/metricas', async function (req, res) {
     });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+
+// ============================================================================
+// ===== REPORTES v2 — MOTOR DE MEDIDORES + GENERACION (Diego 2026-08-02) ====
+// ----------------------------------------------------------------------------
+// Pedido de Diego: "el reporte se arma con DATOS, no es una captura de pantalla" + "todos los
+// medidores... poder armar un sistema de reportes completos... elegir que reporte del pipeline
+// enviar de forma programada". Gateado por business_settings.reportes_v2 (migracion-reportes-v2.sql,
+// escrita y SIN CORRER). Con el flag OFF (default en las 6 cuentas vivas) estos endpoints devuelven
+// 409 "gated" -- MISMO patron que visibilidad_server_v1 (~L27790) -- y nada de lo que ya funciona
+// (el reporte diario viejo, reportes_config, el cron enviarReportesProgramados) se toca.
+//
+// ESTA SECCION IMPLEMENTA: el motor de medidores (una funcion chica por medidor), el generador
+// (corre los medidores prendidos de un informe y devuelve un OBJETO DE DATOS), el formateador a
+// texto de WhatsApp, el guardado de la corrida (datos + asignacion congelada por lead) y la
+// comparacion contra una corrida anterior. Los endpoints CRUD de informes/corridas van al final.
+//
+// LO QUE **NO** HACE ESTA SECCION (a proposito, fuera del alcance de esta tarea):
+//   * NO manda WhatsApp a nadie. generar-ahora devuelve los datos; nunca llama a enviarWhatsapp().
+//   * NO agrega un cron que dispare envios programados (Fase 9 del plan, mas adelante).
+//   * NO expone CRUD de pipeline_vistas: el generador LEE una vista por id si el informe la
+//     referencia, pero crear/editar/borrar vistas es tarea del Pipeline (fuera de este pedido).
+//   * CERO IA: todo esto es SQL + aritmetica. Ningun medidor llama a un modelo. $0.
+// ============================================================================
+
+// Flag por-cuenta (MISMO patron defensivo exacto que visibilidadServerV1Activo/pipeline_filtros_v1):
+// columna ausente / error / false -> OFF. La migracion (migracion-reportes-v2.sql) esta escrita y
+// SIN CORRER; hasta que corra, esta funcion siempre da false y los endpoints de abajo dan 409.
+async function reportesV2Activo(ownerId) {
+  try {
+    if (!ownerId) return false;
+    var r = await supabase.from('business_settings').select('reportes_v2').eq('user_id', ownerId).maybeSingle();
+    if (r.error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(r.data && r.data.reportes_v2 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// ── MOTOR DE PUNTAJE — replica del motor del Pipeline (frontend app/pipeline/page.tsx) ──────────
+// OJO (documentado en migracion-reportes-v2.sql, seccion 5.f): el puntaje se calcula HOY en el
+// NAVEGADOR (motor por reglas, 0 IA). Un informe PROGRAMADO corre en el SERVIDOR, donde no hay
+// navegador, asi que esta es una copia deliberada de los MISMOS cortes y los MISMOS factores. Si
+// el frontend cambia el motor, hay que replicar el cambio aca tambien (riesgo de codigo, no de
+// datos: las dos implementaciones se pueden desincronizar y mostrar puntajes distintos).
+function _repBandaDe(score, cortes) {
+  var co = cortes || { tibio: 40, caliente: 70, urgente: 85 };
+  if (score >= (co.urgente != null ? co.urgente : 85)) return 'urgente';
+  if (score >= (co.caliente != null ? co.caliente : 70)) return 'caliente';
+  if (score >= (co.tibio != null ? co.tibio : 40)) return 'tibio';
+  return 'frio';
+}
+function _repReciente(iso, horas) {
+  if (!iso) return false;
+  var ms = Date.now() - new Date(iso).getTime();
+  return !isNaN(ms) && ms < (horas || 24) * 3600 * 1000;
+}
+function _repAvanceEtapa(status) {
+  var map = { nuevo: 0, en_conversacion: 4, interesado: 10, listo_humano: 12, negociacion: 12, cerrado: 14 };
+  return map[status || ''] || 0;
+}
+function _repTempCaliente(t) { var k = String(t || '').toLowerCase(); return k === 'caliente' || k === 'alta'; }
+function _repMenciona(c, etqNombrePorId, palabras) {
+  var etqIds = Array.isArray(c.etiquetas) ? c.etiquetas : [];
+  var nombresEtq = etqIds.map(function (id) { return etqNombrePorId[id] || ''; }).join(' ');
+  var texto = (nombresEtq + ' ' + (c.summary || '') + ' ' + ((c.contacts && c.contacts.interest) || '') + ' ' + (c.last_message || '')).toLowerCase();
+  for (var i = 0; i < palabras.length; i++) { if (texto.indexOf(palabras[i]) !== -1) return true; }
+  return false;
+}
+function _repFactoresRubro(rubro) {
+  var base = [
+    { k: 'presup', pts: 20, on: function (c) { return !!(c.presupuesto || (c.contacts && c.contacts.budget)); } },
+    { k: 'contacto', pts: 6, on: function (c) { return !!((c.contacts && c.contacts.phone) && (c.contacts && c.contacts.name)); } },
+    { k: 'charla', pts: 10, on: function (c) { return !!c.summary; } },
+    { k: 'rapido', pts: 15, on: function (c) { return _repReciente(c.updated_at, 24); } },
+    { k: 'avance', pts: 14, on: function (c) { return _repAvanceEtapa(c.status) >= 10; } }
+  ];
+  if (rubro === 'hotel') return base.concat([
+    { k: 'fechas', pts: 15, mencion: ['check', 'fecha', 'noche', 'ingreso', 'salida'] },
+    { k: 'pax', pts: 10, mencion: ['adulto', 'niñ', 'personas', 'pax', 'huésped'] },
+    { k: 'disp', pts: 10, mencion: ['disponib', 'reserv', 'seña'] }
+  ]);
+  if (rubro === 'desarrolladora') return base.concat([
+    { k: 'unidad', pts: 12, mencion: ['lote', 'manzana', 'unidad', 'm12', 'm7'] },
+    { k: 'financ', pts: 10, mencion: ['cuota', 'financ', 'anticipo', 'contado'] },
+    { k: 'fecha', pts: 8, on: function (c) { return _repTempCaliente(c.temperatura); } }
+  ]);
+  return base.concat([
+    { k: 'visita', pts: 15, mencion: ['visita', 'visitar', 'conocer', 'ver la'] },
+    { k: 'propiedad', pts: 10, mencion: ['esta propiedad', 'esa casa', 'ese depto', 'me interesa la', 'la de'] },
+    { k: 'financ', pts: 10, mencion: ['financ', 'crédito', 'contado', 'forma de pago', 'cuota'] }
+  ]);
+}
+function _repScoreLead(c, rubro, etqNombrePorId) {
+  var factores = _repFactoresRubro(rubro);
+  var s = 0;
+  for (var i = 0; i < factores.length; i++) {
+    var f = factores[i];
+    var on = f.mencion ? _repMenciona(c, etqNombrePorId, f.mencion) : f.on(c);
+    if (on) s += f.pts;
+  }
+  if (s > 100) s = 100;
+  return s;
+}
+
+// ── INTERES — mismo diccionario y mismo orden que el Pipeline (el orden importa, ver comentario
+// original en app/pipeline/page.tsx: captacion antes que venta, temporal antes que anual, etc.).
+var REP_INTERES_PALABRAS = [
+  { key: 'captacion', palabras: ['captacion', 'captar', 'tasacion', 'tasar', 'quiero vender', 'vendo mi', 'vender mi', 'publicar mi', 'poner en venta mi', 'alquilar mi', 'quiero alquilar mi'] },
+  { key: 'alq_temporal', palabras: ['temporal', 'temporario', 'temporada', 'por dia', 'por noche', 'noches', 'fin de semana', 'vacacion', 'turistic', 'diaria'] },
+  { key: 'alq_anual', palabras: ['alquil', 'arrend', 'locacion', 'anual', 'inquilin'] },
+  { key: 'venta', palabras: ['venta', 'vender', 'comprar', 'compra', 'adquirir', 'vta'] }
+];
+function _repSinTildes(s) {
+  return s.replace(/[áàä]/g, 'a').replace(/[éèë]/g, 'e').replace(/[íìï]/g, 'i').replace(/[óòö]/g, 'o').replace(/[úùü]/g, 'u').replace(/ñ/g, 'n');
+}
+function _repClasificarInteres(txt) {
+  var s = _repSinTildes(String(txt == null ? '' : txt).toLowerCase());
+  if (!s.trim()) return null;
+  for (var i = 0; i < REP_INTERES_PALABRAS.length; i++) {
+    var g = REP_INTERES_PALABRAS[i];
+    for (var j = 0; j < g.palabras.length; j++) { if (s.indexOf(g.palabras[j]) !== -1) return g.key; }
+  }
+  return null;
+}
+// { key, origen: 'depto'|'texto'|null } -- mismo criterio que interesDeLead() del Pipeline.
+function _repInteresDeLead(c, deptoNombrePorId) {
+  if (c && c.departamento_id) return { key: _repClasificarInteres(deptoNombrePorId[c.departamento_id]), origen: 'depto' };
+  var k = _repClasificarInteres(c && c.contacts ? c.contacts.interest : null);
+  return { key: k, origen: (k ? 'texto' : null) };
+}
+
+// ── "Sin tocar hace N dias" — mismo criterio que el Pipeline: dias desde el ultimo mensaje DEL
+// NEGOCIO (o desde que el lead escribio sin que nadie le contestara). last_message_at, con
+// updated_at como respaldo si esa columna no llego a escribirse.
+function _repDiasSinTocar(c) {
+  var iso = c ? (c.last_message_at || c.updated_at) : null;
+  if (!iso) return null;
+  var t = new Date(iso).getTime();
+  if (isNaN(t)) return null;
+  var d = Math.floor((Date.now() - t) / 86400000);
+  return d < 0 ? 0 : d;
+}
+function _repTempLabel(t) {
+  if (!t) return null;
+  var k = String(t).toLowerCase();
+  if (k === 'caliente' || k === 'alta') return 'Caliente';
+  if (k === 'tibio' || k === 'media') return 'Tibio';
+  if (k === 'frio' || k === 'baja') return 'Frío';
+  return String(t).charAt(0).toUpperCase() + String(t).slice(1);
+}
+function _repEnVentanaAlta(iso, k, rango) {
+  if (!iso) return false;
+  var d = new Date(iso);
+  var t = d.getTime();
+  if (isNaN(t)) return false;
+  if (k === 'hoy') { var h = new Date(); return d.getUTCFullYear() === h.getUTCFullYear() && d.getUTCMonth() === h.getUTCMonth() && d.getUTCDate() === h.getUTCDate(); }
+  if (k === 'semana') return (Date.now() - t) <= 7 * 86400000;
+  if (k === 'mes') return (Date.now() - t) <= 30 * 86400000;
+  if (k === 'rango' && rango && rango.desde && rango.hasta) {
+    var de = new Date(String(rango.desde) + 'T00:00:00Z').getTime(), a = new Date(String(rango.hasta) + 'T23:59:59Z').getTime();
+    return t >= de && t <= a;
+  }
+  return false;
+}
+function _repCumpleSinTocar(dias, k) {
+  if (k === '+7') return dias > 7;
+  var n = Number(k);
+  return isFinite(n) && dias >= n;
+}
+
+// ── FILTROS — misma semantica que pasaFiltros() del Pipeline: dentro de un grupo, OR; entre
+// grupos, AND; grupo vacio no filtra. `f` es el jsonb de pipeline_vistas.filtros (+ filtros_extra
+// del informe, mezclado encima). `citasSet` = Set de conversation_id con al menos una cita (solo
+// se resuelve si algun filtro pide con_cita; ver _repObtenerLeads).
+function _repPasaFiltros(e, f, citasSet) {
+  var c = e.c;
+  if (!f) return true;
+  if (Array.isArray(f.estados) && f.estados.length && f.estados.indexOf(c.status || 'en_conversacion') === -1) return false;
+  if (Array.isArray(f.bandas) && f.bandas.length && f.bandas.indexOf(e.banda) === -1) return false;
+  var de = (f.puntaje_de !== undefined && f.puntaje_de !== null && f.puntaje_de !== '') ? Number(f.puntaje_de) : null;
+  var a = (f.puntaje_a !== undefined && f.puntaje_a !== null && f.puntaje_a !== '') ? Number(f.puntaje_a) : null;
+  if (de != null && isFinite(de) && e.score < de) return false;
+  if (a != null && isFinite(a) && e.score > a) return false;
+  if (Array.isArray(f.asesores) && f.asesores.length) {
+    var key = c.asesor_id || 'sin_asignar';
+    if (f.asesores.indexOf(key) === -1) return false;
+  }
+  if (Array.isArray(f.interes) && f.interes.length && !(e.interes.key && f.interes.indexOf(e.interes.key) !== -1)) return false;
+  if (f.interes_incluir === 'confirmados' && e.interes.origen !== 'depto') return false;
+  if (f.interes_incluir === 'inferidos' && e.interes.origen !== 'texto') return false;
+  if (Array.isArray(f.temperatura) && f.temperatura.length) {
+    var tl = _repTempLabel(c.temperatura);
+    if (!tl || f.temperatura.indexOf(tl) === -1) return false;
+  }
+  if (Array.isArray(f.etiquetas) && f.etiquetas.length) {
+    var ids = Array.isArray(c.etiquetas) ? c.etiquetas : [];
+    var hit = false; for (var i = 0; i < f.etiquetas.length; i++) { if (ids.indexOf(f.etiquetas[i]) !== -1) { hit = true; break; } }
+    if (!hit) return false;
+  }
+  if (Array.isArray(f.departamentos) && f.departamentos.length && !(c.departamento_id && f.departamentos.indexOf(c.departamento_id) !== -1)) return false;
+  if (Array.isArray(f.canales) && f.canales.length && f.canales.indexOf(String(c.channel || '').toLowerCase()) === -1) return false;
+  if (f.alta && f.alta.tipo && !_repEnVentanaAlta(c.created_at, f.alta.tipo, f.alta)) return false;
+  if (f.sin_tocar_dias !== undefined && f.sin_tocar_dias !== null && f.sin_tocar_dias !== '') {
+    if (e.dias == null || !_repCumpleSinTocar(e.dias, String(f.sin_tocar_dias))) return false;
+  }
+  if (f.ia === 'prendida' && c.ai_enabled !== true) return false;
+  if (f.ia === 'apagada' && c.ai_enabled === true) return false;
+  if (f.con_cita === true && citasSet && !citasSet.has(c.id)) return false;
+  if (f.con_cita === false && citasSet && citasSet.has(c.id)) return false;
+  if (f.texto && String(f.texto).trim()) {
+    var t = String(f.texto).trim().toLowerCase();
+    var hay = (((c.contacts && c.contacts.name) || '') + ' ' + ((c.contacts && c.contacts.phone) || '') + ' ' + (c.last_message || '')).toLowerCase();
+    if (hay.indexOf(t) === -1) return false;
+  }
+  return true;
+}
+
+// ── DATASET — trae las conversaciones del dueño (paginado, TOPEADO), las enriquece (score/banda/
+// interes/dias) y aplica los filtros de la vista + el ajuste fino del informe. UNA sola pasada:
+// todos los medidores de un informe se calculan sobre este mismo array, sin volver a pegarle a la
+// base por cada uno (pedido explicito: "no traigas miles de filas", "si un medidor sale caro, decilo").
+// CAP defensivo: en cuentas muy grandes esto es una MUESTRA (las mas recientes), no el universo
+// completo -- se devuelve truncado:true para que el reporte lo pueda advertir. AVISO DE RENDIMIENTO
+// (para Diego): con mas de REP_CAP_LEADS conversaciones en una cuenta, los medidores de puntaje/banda/
+// interes/usuario de ESE informe van a estar calculados sobre una muestra, no sobre el total. Los
+// medidores de volumen simple podrian resolverse con count-exact sin este limite, pero el resto
+// (banda, interes, "sin tocar") no existen como columna: exigen traer la fila. Si hace falta soportar
+// cuentas de +6000 leads sin muestreo, la salida es una tabla de agregacion en SQL -- no está hecha aca.
+var REP_CAP_LEADS = 6000;
+async function _repObtenerLeads(ownerId, filtros, rubro, etqNombrePorId, deptoNombrePorId) {
+  var SELECT_FULL = 'id, status, last_message, last_message_at, last_role, updated_at, created_at, channel, presupuesto, temperatura, etiquetas, summary, asesor_id, departamento_id, ai_enabled, motivo_perdida, primera_respuesta_ms, contact_id, contacts(name, phone, interest, budget)';
+  var SELECT_MINIMO = 'id, status, last_message, last_message_at, last_role, updated_at, created_at, channel, presupuesto, temperatura, etiquetas, summary, asesor_id, departamento_id, ai_enabled, contact_id, contacts(name, phone, interest, budget)';
+  var filas = [], from = 0, size = 1000, usoSelect = SELECT_FULL, colFaltan = false;
+  while (from < REP_CAP_LEADS) {
+    var q = await supabase.from('conversations').select(usoSelect).eq('user_id', ownerId).order('updated_at', { ascending: false }).range(from, Math.min(from + size, REP_CAP_LEADS) - 1);
+    if (q.error) {
+      // motivo_perdida / primera_respuesta_ms pueden no existir (migracion-reportes-e3.sql sin correr) ->
+      // reintentar UNA vez sin esas columnas opcionales antes de rendirse.
+      if (!colFaltan) { colFaltan = true; usoSelect = SELECT_MINIMO; continue; }
+      break;
+    }
+    var rows = q.data || [];
+    filas = filas.concat(rows);
+    if (rows.length < size) break;
+    from += size;
+  }
+  var truncado = filas.length >= REP_CAP_LEADS;
+
+  // El set de conversation_id con cita SOLO se resuelve si algun filtro de "con_cita" esta activo
+  // (evita una consulta de mas cuando ningun informe la necesita).
+  var citasSet = null;
+  if (filtros && filtros.con_cita !== undefined && filtros.con_cita !== null) {
+    citasSet = new Set();
+    try {
+      var qc = await supabase.from('citas').select('conversation_id').eq('user_id', ownerId).limit(20000);
+      ((qc && qc.data) || []).forEach(function (r) { if (r && r.conversation_id) citasSet.add(r.conversation_id); });
+    } catch (eCit) { /* sin citas -> con_cita nunca matchea, no rompe el resto */ }
+  }
+
+  var out = [];
+  for (var i = 0; i < filas.length; i++) {
+    var c = filas[i];
+    var score = _repScoreLead(c, rubro, etqNombrePorId);
+    var e = { c: c, score: score, banda: _repBandaDe(score, null), interes: _repInteresDeLead(c, deptoNombrePorId), dias: _repDiasSinTocar(c) };
+    if (_repPasaFiltros(e, filtros, citasSet)) out.push(e);
+  }
+  return { leads: out, truncado: truncado, colFaltan: colFaltan };
+}
+
+// ── PERIODO — ventana LOCAL del tenant (offset por informe, hoy -3 para todos, MISMO criterio que
+// enviarReportesProgramados). Devuelve {desde,hasta} como Date UTC que representan el borde de esa
+// ventana local.
+function _repResolverPeriodo(informe, ahoraMs) {
+  var tz = (typeof informe.tz_offset_horas === 'number') ? informe.tz_offset_horas : -3;
+  var ahora = new Date(ahoraMs || Date.now());
+  var local = new Date(ahora.getTime() + tz * 3600000);
+  var Y = local.getUTCFullYear(), M = local.getUTCMonth(), D = local.getUTCDate();
+  function utcDeLocal(y, m, d, h, mi, s) { return new Date(Date.UTC(y, m, d, h, mi, s) - tz * 3600000); }
+  var tipo = informe.periodo_tipo;
+  var desde, hasta;
+  if (tipo === 'semana') {
+    hasta = utcDeLocal(Y, M, D, 23, 59, 59);
+    desde = new Date(hasta.getTime() - 7 * 86400000 + 1000);
+  } else if (tipo === 'mes') {
+    hasta = utcDeLocal(Y, M, D, 23, 59, 59);
+    desde = new Date(hasta.getTime() - 30 * 86400000 + 1000);
+  } else if (tipo === 'rango_fijo' && informe.periodo_desde && informe.periodo_hasta) {
+    desde = new Date(String(informe.periodo_desde) + 'T00:00:00Z');
+    hasta = new Date(String(informe.periodo_hasta) + 'T23:59:59Z');
+  } else if (tipo === 'rango_relativo' && informe.periodo_dias) {
+    hasta = utcDeLocal(Y, M, D, 23, 59, 59);
+    desde = new Date(hasta.getTime() - Number(informe.periodo_dias) * 86400000 + 1000);
+  } else { // 'dia' (default)
+    hasta = utcDeLocal(Y, M, D, 23, 59, 59);
+    desde = utcDeLocal(Y, M, D, 0, 0, 0);
+  }
+  return { desde: desde, hasta: hasta };
+}
+// Rango anterior de IGUAL duracion, pegado inmediatamente antes (comparar_con='periodo_anterior').
+function _repPeriodoAnterior(p) {
+  var dur = p.hasta.getTime() - p.desde.getTime();
+  return { desde: new Date(p.desde.getTime() - dur - 1000), hasta: new Date(p.desde.getTime() - 1000) };
+}
+// Mismo rango, un mes calendario atras (comparar_con='mes_pasado').
+function _repMesPasado(p) {
+  function menosUnMes(d) { var x = new Date(d.getTime()); x.setUTCMonth(x.getUTCMonth() - 1); return x; }
+  return { desde: menosUnMes(p.desde), hasta: menosUnMes(p.hasta) };
+}
+
+// ── CATALOGO — ids validos + parametros por defecto (documentado tambien en migracion-reportes-v2.sql
+// seccion 5, que es el contrato entre base/backend/front). `tipo` decide COMO se calcula:
+//   'estado'       -> sobre el ESTADO ACTUAL del dataset filtrado por la vista (no se puede "consultar
+//                      el pasado" sin una corrida guardada; ver comparacion mas abajo).
+//   'periodo'      -> sobre un EVENTO con timestamp propio, acotado a periodo_desde/periodo_hasta.
+//   'corrida_diff' -> necesita la corrida ANTERIOR del mismo informe (no existe sin historial).
+// NOTA: el ejemplo de pts_distribucion_banda en migracion-reportes-v2.sql usa caliente:65, pero el
+// motor REAL del Pipeline (bandaScore) corta caliente en 70. Se uso el corte REAL como default para
+// que un reporte con parametros default coincida con lo que se ve en pantalla (era un ejemplo en el
+// comentario del SQL, no una columna con ese valor). Avisado en el reporte final de esta tarea.
+var REP_CATALOGO = {
+  vol_total: { defaults: {}, tipo: 'estado' },
+  vol_por_estado: { defaults: { estados: [] }, tipo: 'estado' },
+  vol_nuevos: { defaults: {}, tipo: 'periodo' },
+  vol_por_canal: { defaults: {}, tipo: 'estado' },
+  vol_sin_asignar: { defaults: {}, tipo: 'estado' },
+  usr_leads: { defaults: {}, tipo: 'estado' },
+  usr_urgentes: { defaults: { puntaje_min: 85 }, tipo: 'estado' },
+  usr_sin_tocar: { defaults: { dias: 3 }, tipo: 'estado' },
+  usr_derivados_recibidos: { defaults: {}, tipo: 'corrida_diff' },
+  usr_cerrados: { defaults: {}, tipo: 'periodo' },
+  cal_primera_respuesta: { defaults: { metrica: 'promedio' }, tipo: 'periodo' },
+  cal_msgs_por_lead: { defaults: {}, tipo: 'periodo' },
+  cal_ia_derivo_vs_resolvio: { defaults: {}, tipo: 'periodo' },
+  res_motivos_perdida: { defaults: {}, tipo: 'estado' },
+  res_propiedades: { defaults: { top: 5 }, tipo: 'estado' },
+  res_citas: { defaults: { estados: ['agendada', 'cumplida'] }, tipo: 'periodo' },
+  res_absorcion: { defaults: {}, tipo: 'estado' },
+  pts_distribucion_banda: { defaults: { cortes: { tibio: 40, caliente: 70, urgente: 85 } }, tipo: 'estado' },
+  pts_promedio: { defaults: {}, tipo: 'estado' },
+  pts_cambios_banda: { defaults: {}, tipo: 'corrida_diff' }
+};
+function _repParamsDe(item) {
+  var cat = REP_CATALOGO[item && item.id];
+  if (!cat) return null;
+  var p = (item.params && typeof item.params === 'object') ? item.params : {};
+  var out = {};
+  Object.keys(cat.defaults).forEach(function (k) { out[k] = (p[k] !== undefined ? p[k] : cat.defaults[k]); });
+  Object.keys(p).forEach(function (k) { if (out[k] === undefined) out[k] = p[k]; }); // claves extra: no rompen nada (jsonb libre)
+  return out;
+}
+
+// ── MEDIDORES — una funcion chica por medidor. Los 'estado'/'corrida_diff' son sincronos (corren
+// sobre el array ya en memoria); los 'periodo' que dependen de OTRAS tablas son async.
+function _medVolTotal(leads) { return { valor: leads.length }; }
+function _medVolPorEstado(leads, params) {
+  var out = {};
+  leads.forEach(function (e) {
+    var st = e.c.status || 'en_conversacion';
+    if (params.estados && params.estados.length && params.estados.indexOf(st) === -1) return;
+    out[st] = (out[st] || 0) + 1;
+  });
+  return { estados: out };
+}
+function _medVolNuevos(leadsPeriodo) { return { valor: leadsPeriodo.length }; }
+function _medVolPorCanal(leads) {
+  var out = {};
+  leads.forEach(function (e) { var ch = String(e.c.channel || 'otro').toLowerCase(); out[ch] = (out[ch] || 0) + 1; });
+  return { canales: out };
+}
+function _medVolSinAsignar(leads) {
+  var n = 0; leads.forEach(function (e) { if (!e.c.asesor_id) n++; });
+  return { valor: n };
+}
+function _medUsrLeads(leads) {
+  var out = {};
+  leads.forEach(function (e) { var k = e.c.asesor_id || 'sin_asignar'; out[k] = (out[k] || 0) + 1; });
+  return { grupos: out };
+}
+function _medUsrUrgentes(leads, params) {
+  var min = (params.puntaje_min != null) ? Number(params.puntaje_min) : 85;
+  var out = {};
+  leads.forEach(function (e) { if (e.score >= min) { var k = e.c.asesor_id || 'sin_asignar'; out[k] = (out[k] || 0) + 1; } });
+  return { grupos: out };
+}
+function _medUsrSinTocar(leads, params) {
+  var dias = (params.dias != null) ? Number(params.dias) : 3;
+  var out = {};
+  leads.forEach(function (e) { if (e.dias != null && e.dias >= dias) { var k = e.c.asesor_id || 'sin_asignar'; out[k] = (out[k] || 0) + 1; } });
+  return { grupos: out };
+}
+function _medPtsDistribucionBanda(leads, params) {
+  var cortes = params.cortes || { tibio: 40, caliente: 70, urgente: 85 };
+  var out = { frio: 0, tibio: 0, caliente: 0, urgente: 0 };
+  leads.forEach(function (e) { out[_repBandaDe(e.score, cortes)]++; });
+  return { bandas: out };
+}
+function _medPtsPromedio(leads) {
+  if (!leads.length) return { valor: 0, muestras: 0 };
+  var s = 0; leads.forEach(function (e) { s += e.score; });
+  return { valor: Math.round((s / leads.length) * 10) / 10, muestras: leads.length };
+}
+function _medResMotivosPerdida(leads) {
+  var out = {};
+  leads.forEach(function (e) { if (e.c.motivo_perdida) out[e.c.motivo_perdida] = (out[e.c.motivo_perdida] || 0) + 1; });
+  return { motivos: out };
+}
+async function _medResPropiedades(ownerId, params) {
+  var top = (params.top != null) ? Number(params.top) : 5;
+  try {
+    var r = await supabase.from('property_consultas').select('prop_key, prop_label, consultas').eq('user_id', ownerId).order('consultas', { ascending: false }).limit(top);
+    if (r.error) return null; // tabla ausente (migracion-reportes-e3.sql sin correr)
+    return { propiedades: (r.data || []).map(function (p) { return { key: p.prop_key, label: p.prop_label || p.prop_key, n: p.consultas || 0 }; }) };
+  } catch (e) { return null; }
+}
+// Mismo calculo que /api/reportes/metricas (Etapa 3), acotado a rubro='desarrolladora'.
+async function _medResAbsorcion(ownerId, rubro) {
+  if (rubro !== 'desarrolladora') return null;
+  try {
+    var r = await supabase.from('development_units').select('tipologia, tipo_producto, estado_updated_at').eq('user_id', ownerId).eq('estado', 'vendido').limit(10000);
+    if (r.error) return null;
+    var g = {}, sinTs = 0;
+    (r.data || []).forEach(function (u) {
+      if (!u.estado_updated_at) { sinTs++; return; }
+      var mes = String(u.estado_updated_at).slice(0, 7);
+      var tip = u.tipologia || u.tipo_producto || 'unidad';
+      if (!g[mes]) g[mes] = {};
+      g[mes][tip] = (g[mes][tip] || 0) + 1;
+    });
+    var meses = Object.keys(g).sort().slice(-12);
+    return {
+      vendidas_total: (r.data || []).length, sin_timestamp: sinTs,
+      meses: meses.map(function (m) { var tot = 0; Object.keys(g[m]).forEach(function (t) { tot += g[m][t]; }); return { mes: m, por_tipologia: g[m], total: tot }; })
+    };
+  } catch (e) { return null; }
+}
+function _medCalPrimeraRespuesta(leadsPeriodo, params, colFaltan) {
+  if (colFaltan) return null; // migracion-reportes-e3.sql sin correr -> no existe la columna
+  var vals = [];
+  leadsPeriodo.forEach(function (e) { var v = e.c.primera_respuesta_ms; if (v != null) { var n = Number(v); if (!isNaN(n) && n >= 0) vals.push(n); } });
+  if (!vals.length) return { disponible: true, muestras: 0, promedio_ms: 0, mediana_ms: 0 };
+  vals.sort(function (x, y) { return x - y; });
+  var sum = vals.reduce(function (x, y) { return x + y; }, 0);
+  var mid = Math.floor(vals.length / 2);
+  var med = vals.length % 2 ? vals[mid] : Math.round((vals[mid - 1] + vals[mid]) / 2);
+  return { disponible: true, muestras: vals.length, promedio_ms: Math.round(sum / vals.length), mediana_ms: med };
+}
+// APROXIMACION documentada: numerador = mensajes de la cuenta dentro del periodo (count exact,
+// barato); denominador = leads CREADOS en el periodo (no exige traer los mensajes de cada lead uno
+// por uno, que seria carisimo). No es "mensajes de ESTOS leads puntuales", es la densidad de
+// conversacion de la cuenta en la ventana. Documentado en vez de aproximar en silencio.
+async function _medCalMsgsPorLead(ownerId, periodo, leadsPeriodoLen) {
+  try {
+    var r = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).gte('created_at', periodo.desde.toISOString()).lte('created_at', periodo.hasta.toISOString());
+    if (r.error) return null;
+    var total = r.count || 0;
+    if (!leadsPeriodoLen) return { valor: 0, mensajes: total, leads: 0, aproximado: true };
+    return { valor: Math.round((total / leadsPeriodoLen) * 10) / 10, mensajes: total, leads: leadsPeriodoLen, aproximado: true };
+  } catch (e) { return null; }
+}
+async function _medCalIaDerivoVsResolvio(ownerId, periodo) {
+  try {
+    var base = function () { return supabase.from('ia_decisiones').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).gte('created_at', periodo.desde.toISOString()).lte('created_at', periodo.hasta.toISOString()); };
+    var rD = await base().eq('derivo', true);
+    if (rD.error) return null; // tabla/columna ausente (migracion-registro-decisiones-ia.sql sin correr)
+    var rT = await base();
+    var derivo = rD.count || 0, total = rT.count || 0;
+    return { derivo: derivo, resolvio_sola: Math.max(0, total - derivo), total: total };
+  } catch (e) { return null; }
+}
+async function _medResCitas(ownerId, periodo, params) {
+  var estados = (Array.isArray(params.estados) && params.estados.length) ? params.estados : ['agendada', 'cumplida'];
+  try {
+    var out = {};
+    for (var i = 0; i < estados.length; i++) {
+      var r = await supabase.from('citas').select('id', { count: 'exact', head: true }).eq('user_id', ownerId).eq('estado', estados[i]).gte('fecha_hora', periodo.desde.toISOString()).lte('fecha_hora', periodo.hasta.toISOString());
+      if (r.error) return null;
+      out[estados[i]] = r.count || 0;
+    }
+    return { estados: out };
+  } catch (e) { return null; }
+}
+// PARCIAL, documentado (limitacion (c) de migracion-reportes-v2.sql): agrupa por el asesor ACTUAL
+// del lead, no por quien lo tenia AL MOMENTO del cierre (lead_estados_historial no guarda eso).
+async function _medUsrCerrados(ownerId, periodo, leadsPorConvId) {
+  try {
+    var r = await supabase.from('lead_estados_historial').select('conversation_id').eq('user_id', ownerId).eq('estado_nuevo', 'cerrado').gte('created_at', periodo.desde.toISOString()).lte('created_at', periodo.hasta.toISOString()).limit(10000);
+    if (r.error) return null; // tabla ausente (migracion-historial-estados.sql sin correr)
+    var out = {};
+    (r.data || []).forEach(function (row) {
+      var e = leadsPorConvId[row.conversation_id];
+      var k = (e && e.c.asesor_id) ? e.c.asesor_id : 'sin_asignar';
+      out[k] = (out[k] || 0) + 1;
+    });
+    return { grupos: out, aproximado: true };
+  } catch (e) { return null; }
+}
+// CORRIDA-DIFF: necesitan la corrida ANTERIOR del MISMO informe (misma alcance/asesor). Sin ella,
+// null ("sin comparacion"), NUNCA cero (cero seria mentir: no es que no hubo pases, es que no hay
+// con que compararlo).
+function _medUsrDerivadosRecibidos(leadsPorConvId, corridaAnteriorPorConv) {
+  if (!corridaAnteriorPorConv) return null;
+  var out = {};
+  Object.keys(leadsPorConvId).forEach(function (convId) {
+    var actual = leadsPorConvId[convId];
+    var previo = corridaAnteriorPorConv[convId];
+    if (!previo) return; // lead nuevo en esta corrida: entro directo, no hubo "pase"
+    var antes = previo.asesor_id || null, ahora = actual.c.asesor_id || null;
+    if (ahora && ahora !== antes) out[ahora] = (out[ahora] || 0) + 1;
+  });
+  return { grupos: out };
+}
+function _medPtsCambiosBanda(leadsPorConvId, corridaAnteriorPorConv, cortes) {
+  if (!corridaAnteriorPorConv) return null;
+  var subieron = 0, bajaron = 0, igual = 0;
+  var orden = { frio: 0, tibio: 1, caliente: 2, urgente: 3 };
+  Object.keys(leadsPorConvId).forEach(function (convId) {
+    var actual = leadsPorConvId[convId];
+    var previo = corridaAnteriorPorConv[convId];
+    if (!previo || !previo.banda) return;
+    var bandaAhora = _repBandaDe(actual.score, cortes);
+    var a = orden[previo.banda], b = orden[bandaAhora];
+    if (a == null || b == null) return;
+    if (b > a) subieron++; else if (b < a) bajaron++; else igual++;
+  });
+  return { subieron: subieron, bajaron: bajaron, igual: igual };
+}
+
+// MEDIDORES QUE SOLO TIENEN SENTIDO A NIVEL CUENTA.
+// Estos cinco NO se calculan sobre el array de leads en memoria: van a la base filtrando por ownerId
+// (citas, propiedades consultadas, decisiones de la IA, absorcion, total de mensajes). Con los datos que
+// hay NO se pueden rebanar por asesor.
+// En un reporte "solo tus leads" salian con los numeros de TODA la empresa. Dos problemas de una: numeros
+// mentirosos (el peor: mensajes de la cuenta entera divididos por los leads de una persona -> "625 mensajes
+// por lead") y, mas grave, datos del negocio completo en el celular de cada empleado.
+// Se OMITEN en los reportes por usuario, con una nota que lo explica. En el reporte de la cuenta salen normal.
+const REP_MEDIDORES_SOLO_CUENTA = {
+  cal_msgs_por_lead: 1, cal_ia_derivo_vs_resolvio: 1, res_propiedades: 1, res_citas: 1, res_absorcion: 1,
+};
+
+// ── DISPATCH — corre UN medidor. `ctx` trae todo lo que cualquier medidor podria necesitar.
+async function _repCalcularUnMedidor(id, params, ctx) {
+  // FAIL-CLOSED: sin alcance resuelto se asume 'usuario' (lo mas restrictivo). Antes de mandarle a alguien
+  // datos que no le corresponden, mejor no mandarle ese medidor.
+  if (REP_MEDIDORES_SOLO_CUENTA[id] && ctx.alcance !== 'cuenta') return null;
+  switch (id) {
+    case 'vol_total': return _medVolTotal(ctx.leads);
+    case 'vol_por_estado': return _medVolPorEstado(ctx.leads, params);
+    case 'vol_nuevos': return _medVolNuevos(ctx.leadsPeriodo);
+    case 'vol_por_canal': return _medVolPorCanal(ctx.leads);
+    case 'vol_sin_asignar': return _medVolSinAsignar(ctx.leads);
+    case 'usr_leads': return _medUsrLeads(ctx.leads);
+    case 'usr_urgentes': return _medUsrUrgentes(ctx.leads, params);
+    case 'usr_sin_tocar': return _medUsrSinTocar(ctx.leads, params);
+    case 'usr_derivados_recibidos': return _medUsrDerivadosRecibidos(ctx.leadsPorConvId, ctx.corridaAnteriorPorConv);
+    case 'usr_cerrados': return await _medUsrCerrados(ctx.ownerId, ctx.periodo, ctx.leadsPorConvId);
+    case 'cal_primera_respuesta': return _medCalPrimeraRespuesta(ctx.leadsPeriodo, params, ctx.colFaltan);
+    case 'cal_msgs_por_lead': return await _medCalMsgsPorLead(ctx.ownerId, ctx.periodo, ctx.leadsPeriodo.length);
+    case 'cal_ia_derivo_vs_resolvio': return await _medCalIaDerivoVsResolvio(ctx.ownerId, ctx.periodo);
+    case 'res_motivos_perdida': return ctx.colFaltan ? null : _medResMotivosPerdida(ctx.leads);
+    case 'res_propiedades': return await _medResPropiedades(ctx.ownerId, params);
+    case 'res_citas': return await _medResCitas(ctx.ownerId, ctx.periodo, params);
+    case 'res_absorcion': return await _medResAbsorcion(ctx.ownerId, ctx.rubro);
+    case 'pts_distribucion_banda': return _medPtsDistribucionBanda(ctx.leads, params);
+    case 'pts_promedio': return _medPtsPromedio(ctx.leads);
+    case 'pts_cambios_banda': return _medPtsCambiosBanda(ctx.leadsPorConvId, ctx.corridaAnteriorPorConv, (params && params.cortes) || null);
+    default: return undefined; // id desconocido -> el generador lo anota y lo saltea
+  }
+}
+
+// ── CONTEXTO BASE — vista + filtros_extra, catalogos auxiliares (rubro/etiquetas/departamentos/
+// asesores) y el dataset (UNA sola vez: se reusa para 'cuenta' y para cada 'usuario').
+async function _repPrepararContexto(ownerId, informe) {
+  var notas = [];
+  var filtros = {}, vistaNombre = informe.vista_nombre || null;
+  if (informe.vista_id) {
+    try {
+      var rv = await supabase.from('pipeline_vistas').select('nombre, filtros, archivada').eq('id', informe.vista_id).eq('user_id', ownerId).maybeSingle();
+      if (rv.error) notas.push('No se pudo leer la vista (' + rv.error.message + '); se uso "todo".');
+      else if (rv.data) { filtros = Object.assign({}, rv.data.filtros || {}); vistaNombre = rv.data.nombre; if (rv.data.archivada) notas.push('La vista "' + rv.data.nombre + '" esta archivada; se uso igual.'); }
+      else notas.push('La vista del informe ya no existe; se uso "todo".');
+    } catch (eV) { notas.push('Error leyendo la vista: ' + (eV && eV.message)); }
+  }
+  if (informe.filtros_extra && typeof informe.filtros_extra === 'object') filtros = Object.assign({}, filtros, informe.filtros_extra);
+
+  var rubro = 'inmobiliaria';
+  try { var rb = await supabase.from('business_settings').select('rubro').eq('user_id', ownerId).maybeSingle(); if (rb.data && rb.data.rubro) rubro = normalizarRubro(rb.data.rubro); } catch (eR) {}
+  var etqNombrePorId = {};
+  try { var re = await supabase.from('business_settings').select('etiquetas').eq('user_id', ownerId).maybeSingle(); (re.data && Array.isArray(re.data.etiquetas) ? re.data.etiquetas : []).forEach(function (x) { if (x && x.id) etqNombrePorId[x.id] = x.nombre || ''; }); } catch (eE) {}
+  var deptoNombrePorId = {};
+  try { var rd = await supabase.from('departamentos').select('id, nombre').eq('user_id', ownerId); (rd.data || []).forEach(function (d) { deptoNombrePorId[d.id] = d.nombre; }); } catch (eD) {}
+  var asesorNombrePorId = {};
+  // EL ENVIO (Diego 2026-08-02) agrega estos dos mapas sobre la MISMA query que ya traia el motor
+  // (no se agrega ninguna consulta nueva): telefono para mandarle a cada asesor SU reporte
+  // (asesores.whatsapp_notif, el mismo campo que ya usan las notificaciones push/WA existentes) y
+  // el opt-out (asesores.recibe_reportes, migracion-reportes-v2.sql seccion 3.c). Ausente/NULL ->
+  // se trata como "recibe" (default true, documentado en la migracion).
+  var asesorTelPorId = {};
+  var asesorRecibeReportesPorId = {};
+  try { var ra = await supabase.from('asesores').select('id, nombre, usuario, whatsapp_notif, recibe_reportes').eq('admin_id', ownerId); (ra.data || []).forEach(function (a) { asesorNombrePorId[a.id] = a.nombre || a.usuario || '—'; asesorTelPorId[a.id] = (a.whatsapp_notif != null && String(a.whatsapp_notif).trim()) ? String(a.whatsapp_notif).trim() : null; asesorRecibeReportesPorId[a.id] = (a.recibe_reportes === false) ? false : true; }); } catch (eA) {}
+
+  var ds = await _repObtenerLeads(ownerId, filtros, rubro, etqNombrePorId, deptoNombrePorId);
+  if (ds.truncado) notas.push('La cuenta tiene mas de ' + REP_CAP_LEADS + ' conversaciones: este informe corrio sobre una MUESTRA (las mas recientes), no sobre el total.');
+  if (ds.colFaltan) notas.push('Faltan columnas de migracion-reportes-e3.sql (motivo_perdida / primera_respuesta_ms): esos medidores salen sin datos.');
+  var periodo = _repResolverPeriodo(informe);
+
+  return { filtros: filtros, vistaNombre: vistaNombre, rubro: rubro, etqNombrePorId: etqNombrePorId, deptoNombrePorId: deptoNombrePorId, asesorNombrePorId: asesorNombrePorId, asesorTelPorId: asesorTelPorId, asesorRecibeReportesPorId: asesorRecibeReportesPorId, ds: ds, periodo: periodo, notas: notas };
+}
+
+// ── CORRE LOS MEDIDORES sobre UN subconjunto de leads (la cuenta entera, o los de un asesor) +
+// resuelve la comparacion si el informe la pide.
+async function _repCorrerInformeParaLeads(ownerId, informe, leadsSubset, periodo, notasBase, opts) {
+  var notas = notasBase.slice();
+  var pedidos = Array.isArray(informe.medidores) ? informe.medidores : [];
+  var medidoresValidos = [];
+  pedidos.forEach(function (m) {
+    if (!m || !REP_CATALOGO[m.id]) { if (m && m.id) notas.push('Medidor desconocido, salteado: ' + m.id); return; }
+    medidoresValidos.push({ id: m.id, params: _repParamsDe(m) });
+  });
+
+  var necesitaAnterior = medidoresValidos.some(function (m) { return REP_CATALOGO[m.id].tipo === 'corrida_diff'; }) || (informe.comparar_con && informe.comparar_con !== 'nada');
+  var corridaAnterior = null, corridaAnteriorPorConv = null;
+  if (necesitaAnterior && informe.id) {
+    try {
+      var qAnt = supabase.from('reportes_corridas').select('id, datos, generada_at').eq('informe_id', informe.id).eq('alcance', opts.alcance);
+      qAnt = opts.asesorId ? qAnt.eq('asesor_id', opts.asesorId) : qAnt.is('asesor_id', null);
+      var rc = await qAnt.order('generada_at', { ascending: false }).limit(1);
+      if (!rc.error && rc.data && rc.data[0]) {
+        corridaAnterior = rc.data[0];
+        var rl = await supabase.from('reportes_corrida_leads').select('conversation_id, asesor_id, banda').eq('corrida_id', corridaAnterior.id).limit(REP_CAP_LEADS + 100);
+        if (!rl.error) { corridaAnteriorPorConv = {}; (rl.data || []).forEach(function (row) { if (row.conversation_id) corridaAnteriorPorConv[row.conversation_id] = { asesor_id: row.asesor_id, banda: row.banda }; }); }
+      }
+    } catch (eCA) { /* sin corrida anterior -> primera corrida de este informe */ }
+  }
+  if (necesitaAnterior && !corridaAnteriorPorConv) notas.push('Sin corrida anterior de este informe: los medidores que comparan (derivados recibidos, cambios de banda, comparacion de estado) salen sin datos esta primera vez.');
+
+  var leadsPeriodo = leadsSubset.filter(function (e) { var t = new Date(e.c.created_at).getTime(); return !isNaN(t) && t >= periodo.desde.getTime() && t <= periodo.hasta.getTime(); });
+  var leadsPorConvId = {}; leadsSubset.forEach(function (e) { leadsPorConvId[e.c.id] = e; });
+  // `alcance` viaja en el ctx porque hay 5 medidores que consultan la base POR CUENTA y no se pueden
+  // rebanar por asesor: en un reporte por usuario se omiten (ver REP_MEDIDORES_SOLO_CUENTA).
+  var ctx = { leads: leadsSubset, leadsPeriodo: leadsPeriodo, leadsPorConvId: leadsPorConvId, periodo: periodo, ownerId: ownerId, rubro: opts.rubro, colFaltan: opts.colFaltan, corridaAnteriorPorConv: corridaAnteriorPorConv, alcance: opts.alcance };
+  if (opts.alcance !== 'cuenta') {
+    var _omitidos = medidoresValidos.filter(function (m) { return REP_MEDIDORES_SOLO_CUENTA[m.id]; });
+    if (_omitidos.length) notas.push('Este reporte es solo de tus leads, asi que se omiten los medidores que son del negocio entero (citas, propiedades consultadas, decisiones de la IA, absorcion y mensajes por lead).');
+  }
+
+  var datos = {};
+  for (var i = 0; i < medidoresValidos.length; i++) {
+    var m = medidoresValidos[i], res;
+    try { res = await _repCalcularUnMedidor(m.id, m.params, ctx); }
+    catch (eMed) { res = null; notas.push('Error calculando ' + m.id + ': ' + (eMed && eMed.message)); }
+    if (res === undefined) { notas.push('Medidor no implementado: ' + m.id); continue; }
+    datos[m.id] = (res === null) ? { params: m.params, disponible: false } : Object.assign({ params: m.params, disponible: true }, res);
+  }
+
+  // COMPARACION (item 5 del pedido: "mismo calculo, otro rango, y la diferencia"). Los medidores
+  // de tipo 'periodo' SI se recalculan de verdad con el rango anterior (son eventos con timestamp
+  // propio: es honesto). Los de tipo 'estado' reflejan el ESTADO ACTUAL de la base y no se puede
+  // "consultar el pasado" sin haberlo guardado -> se comparan contra la corrida ANTERIOR guardada
+  // de este mismo informe (si existe). Sin corrida anterior, sin comparacion (nunca se inventa un 0).
+  var comparacion = null;
+  if (informe.comparar_con && informe.comparar_con !== 'nada') {
+    var periodoAnt = (informe.comparar_con === 'mes_pasado') ? _repMesPasado(periodo) : _repPeriodoAnterior(periodo);
+    var leadsPeriodoAnt = leadsSubset.filter(function (e) { var t = new Date(e.c.created_at).getTime(); return !isNaN(t) && t >= periodoAnt.desde.getTime() && t <= periodoAnt.hasta.getTime(); });
+    var ctxAnt = Object.assign({}, ctx, { leadsPeriodo: leadsPeriodoAnt, periodo: periodoAnt });
+    comparacion = { periodo: { desde: periodoAnt.desde.toISOString(), hasta: periodoAnt.hasta.toISOString() }, tipo: informe.comparar_con, datos: {} };
+    for (var j = 0; j < medidoresValidos.length; j++) {
+      var m2 = medidoresValidos[j], cat = REP_CATALOGO[m2.id];
+      if (cat.tipo === 'periodo') {
+        var r2; try { r2 = await _repCalcularUnMedidor(m2.id, m2.params, ctxAnt); } catch (e2) { r2 = null; }
+        comparacion.datos[m2.id] = (r2 == null) ? { disponible: false } : Object.assign({ disponible: true }, r2);
+      } else if (cat.tipo === 'estado' && corridaAnterior && corridaAnterior.datos && corridaAnterior.datos[m2.id]) {
+        comparacion.datos[m2.id] = corridaAnterior.datos[m2.id];
+      }
+      // corrida_diff no lleva comparacion adicional: ya es un diff en si mismo.
+    }
+  }
+
+  return { datos: datos, comparacion: comparacion, notas: notas, leads: leadsSubset, totalLeads: leadsSubset.length, corridaAnteriorId: (corridaAnterior ? corridaAnterior.id : null) };
+}
+
+// ── ORQUESTADOR — arma el "lote": SIEMPRE la corrida 'cuenta' (base de "pantalla" y de "dueño"),
+// y ademas una corrida 'usuario' por cada asesor CON LEADS si el destino pide "cada_usuario". El
+// dataset se trae UNA sola vez (arriba) y las rebanadas por asesor son en memoria (barato).
+async function _repGenerarLote(ownerId, informe) {
+  var ctxBase = await _repPrepararContexto(ownerId, informe);
+  var resultados = [];
+  var rCuenta = await _repCorrerInformeParaLeads(ownerId, informe, ctxBase.ds.leads, ctxBase.periodo, ctxBase.notas, { alcance: 'cuenta', asesorId: null, rubro: ctxBase.rubro, colFaltan: ctxBase.ds.colFaltan });
+  resultados.push({ alcance: 'cuenta', asesorId: null, asesorNombre: null, resultado: rCuenta });
+
+  var destino = informe.destino || 'pantalla';
+  if (destino === 'cada_usuario' || destino === 'dueno_y_cada_usuario') {
+    var porAsesor = {};
+    ctxBase.ds.leads.forEach(function (e) { var k = e.c.asesor_id; if (k) { if (!porAsesor[k]) porAsesor[k] = []; porAsesor[k].push(e); } });
+    var ids = Object.keys(porAsesor);
+    for (var i = 0; i < ids.length; i++) {
+      var asId = ids[i];
+      var rU = await _repCorrerInformeParaLeads(ownerId, informe, porAsesor[asId], ctxBase.periodo, ctxBase.notas, { alcance: 'usuario', asesorId: asId, rubro: ctxBase.rubro, colFaltan: ctxBase.ds.colFaltan });
+      resultados.push({ alcance: 'usuario', asesorId: asId, asesorNombre: ctxBase.asesorNombrePorId[asId] || '—', resultado: rU });
+    }
+  }
+  return { ctxBase: ctxBase, resultados: resultados };
+}
+
+// ── FORMATEADOR A TEXTO — legible en un celular, MISMO estilo (*negrita*/_cursiva_) que
+// generarReporteAdmin() (el reporte diario viejo), para que los dos se vean parecidos.
+var REP_LABEL_MEDIDOR = {
+  vol_total: 'Total de leads', vol_por_estado: 'Por estado', vol_nuevos: 'Nuevos en el periodo',
+  vol_por_canal: 'Por canal', vol_sin_asignar: 'Sin asignar', usr_leads: 'Leads por usuario',
+  usr_urgentes: 'Urgentes por usuario', usr_sin_tocar: 'Sin tocar por usuario',
+  usr_derivados_recibidos: 'Derivados recibidos', usr_cerrados: 'Cerrados en el periodo',
+  cal_primera_respuesta: 'Tiempo de 1a respuesta', cal_msgs_por_lead: 'Mensajes por lead',
+  cal_ia_derivo_vs_resolvio: 'La IA: derivo vs. resolvio sola', res_motivos_perdida: 'Motivos de perdida',
+  res_propiedades: 'Propiedades mas consultadas', res_citas: 'Citas', res_absorcion: 'Absorcion',
+  pts_distribucion_banda: 'Distribucion por banda', pts_promedio: 'Puntaje promedio',
+  pts_cambios_banda: 'Cambios de banda'
+};
+function _repFmtDur(ms) { var min = Math.round(ms / 60000); if (min < 60) return min + ' min'; return Math.floor(min / 60) + 'h ' + (min % 60) + 'm'; }
+function _repFmtNombre(k, asesorNombrePorId) { if (!k || k === 'sin_asignar' || k === 'sin') return 'Sin asignar'; return asesorNombrePorId[k] || k; }
+function _repFormatearTexto(informe, resultado, asesorNombrePorId, alcanceLabel) {
+  var L = [];
+  L.push('*Reporte: ' + (informe.nombre || 'Pipeline') + '*');
+  if (alcanceLabel) L.push('_' + alcanceLabel + '_');
+  L.push('');
+  var datos = resultado.datos || {};
+  var comp = (resultado.comparacion && resultado.comparacion.datos) || null;
+  function delta(id, valorActual) {
+    if (!comp || !comp[id] || comp[id].disponible === false || comp[id].valor == null) return '';
+    var d = valorActual - comp[id].valor;
+    return ' (' + (d >= 0 ? '+' + d : d) + ' vs. periodo anterior)';
+  }
+  Object.keys(datos).forEach(function (id) {
+    var d = datos[id];
+    var label = REP_LABEL_MEDIDOR[id] || id;
+    if (!d || d.disponible === false) { L.push(label + ': sin datos'); return; }
+    if (id === 'vol_total' || id === 'vol_nuevos' || id === 'vol_sin_asignar' || id === 'pts_promedio') {
+      L.push(label + ': ' + d.valor + delta(id, d.valor));
+    } else if (id === 'vol_por_estado') {
+      L.push(label + ':'); Object.keys(d.estados || {}).forEach(function (k) { L.push('  ' + k + ': ' + d.estados[k]); });
+    } else if (id === 'vol_por_canal') {
+      L.push(label + ':'); Object.keys(d.canales || {}).forEach(function (k) { L.push('  ' + k + ': ' + d.canales[k]); });
+    } else if (id === 'usr_leads' || id === 'usr_urgentes' || id === 'usr_sin_tocar' || id === 'usr_derivados_recibidos' || id === 'usr_cerrados') {
+      L.push(label + ':'); Object.keys(d.grupos || {}).forEach(function (k) { L.push('  ' + _repFmtNombre(k, asesorNombrePorId) + ': ' + d.grupos[k]); });
+    } else if (id === 'cal_primera_respuesta') {
+      L.push(label + ': ' + (d.muestras ? (_repFmtDur(d.promedio_ms) + ' promedio (mediana ' + _repFmtDur(d.mediana_ms) + ', ' + d.muestras + ' muestras)') : 'sin muestras'));
+    } else if (id === 'cal_msgs_por_lead') {
+      L.push(label + ': ' + d.valor + ' (' + d.mensajes + ' mensajes / ' + d.leads + ' leads)');
+    } else if (id === 'cal_ia_derivo_vs_resolvio') {
+      L.push(label + ': derivo ' + d.derivo + ' / resolvio sola ' + d.resolvio_sola + ' (total ' + d.total + ')');
+    } else if (id === 'res_motivos_perdida') {
+      L.push(label + ':'); Object.keys(d.motivos || {}).forEach(function (k) { L.push('  ' + k + ': ' + d.motivos[k]); });
+    } else if (id === 'res_propiedades') {
+      L.push(label + ':'); (d.propiedades || []).forEach(function (p) { L.push('  ' + p.label + ': ' + p.n); });
+    } else if (id === 'res_citas') {
+      L.push(label + ':'); Object.keys(d.estados || {}).forEach(function (k) { L.push('  ' + k + ': ' + d.estados[k]); });
+    } else if (id === 'res_absorcion') {
+      L.push(label + ': ' + d.vendidas_total + ' unidades vendidas' + (d.sin_timestamp ? (' (' + d.sin_timestamp + ' sin fecha)') : ''));
+    } else if (id === 'pts_distribucion_banda') {
+      L.push(label + ':'); Object.keys(d.bandas || {}).forEach(function (k) { L.push('  ' + k + ': ' + d.bandas[k]); });
+    } else if (id === 'pts_cambios_banda') {
+      L.push(label + ': subieron ' + d.subieron + ' / bajaron ' + d.bajaron + ' / igual ' + d.igual);
+    } else {
+      L.push(label + ': ' + JSON.stringify(d));
+    }
+  });
+  if (resultado.notas && resultado.notas.length) { L.push(''); L.push('_(' + resultado.notas.join(' · ') + ')_'); }
+  L.push(''); L.push('Generado: ' + new Date().toLocaleString('es-AR'));
+  return L.join(String.fromCharCode(10));
+}
+
+// ── GUARDAR LA CORRIDA — datos congelados + POR QUIEN estaba asignado cada lead en ese momento
+// (reportes_corrida_leads: el punto de Diego, ver migracion-reportes-v2.sql seccion 3.b). Si el
+// insert de la corrida falla (tabla ausente: migracion sin correr), se devuelve ok:false sin
+// romper nada mas -- el llamador igual tiene los datos para mostrar/mandar.
+async function _repGuardarCorrida(ownerId, informe, loteId, alcance, asesorId, asesorNombre, periodo, resultado, origen, guardaDetalle, asesorNombrePorId, deptoNombrePorId, filtrosUsados) {
+  var fila = {
+    user_id: ownerId, informe_id: informe.id || null, informe_nombre: informe.nombre || null,
+    lote_id: loteId, alcance: alcance, asesor_id: asesorId || null, asesor_nombre: asesorNombre || null,
+    periodo_desde: periodo.desde.toISOString(), periodo_hasta: periodo.hasta.toISOString(), periodo_tipo: informe.periodo_tipo || 'dia',
+    datos: resultado.datos || {},
+    config_snapshot: { medidores: informe.medidores, filtros: filtrosUsados || null, agrupar_por: informe.agrupar_por, formato: informe.formato },
+    comparacion: resultado.comparacion || null, origen: origen || 'manual',
+    formato: 'texto', // imagen/pdf DEGRADAN a texto: no hay generador de imagen en el servidor (ver reporte final)
+    total_leads: resultado.totalLeads || 0
+  };
+  var ins = await supabase.from('reportes_corridas').insert(fila).select('id').single();
+  if (ins.error || !ins.data) return { ok: false, error: ins.error && ins.error.message };
+  var corridaId = ins.data.id;
+  if (guardaDetalle && Array.isArray(resultado.leads) && resultado.leads.length) {
+    var filas = resultado.leads.slice(0, REP_CAP_LEADS).map(function (e) {
+      var c = e.c;
+      var creadoEnPeriodo = (function () { var t = new Date(c.created_at).getTime(); return !isNaN(t) && t >= periodo.desde.getTime() && t <= periodo.hasta.getTime(); })();
+      return {
+        corrida_id: corridaId, user_id: ownerId, conversation_id: c.id,
+        asesor_id: c.asesor_id || null, asesor_nombre: c.asesor_id ? (asesorNombrePorId[c.asesor_id] || null) : null,
+        departamento_id: c.departamento_id || null, departamento_nombre: c.departamento_id ? (deptoNombrePorId[c.departamento_id] || null) : null,
+        estado: c.status || 'en_conversacion', puntaje: e.score, banda: e.banda, temperatura: c.temperatura || null,
+        canal: c.channel || null, interes: e.interes.key || null, interes_inferido: e.interes.origen === 'texto',
+        dias_sin_tocar: e.dias, creado_en_periodo: creadoEnPeriodo
+      };
+    });
+    for (var i = 0; i < filas.length; i += 500) { // lotes de 500: limite prudente por request
+      try { await supabase.from('reportes_corrida_leads').insert(filas.slice(i, i + 500)); } catch (eIns) { /* best-effort: la corrida ya quedo guardada igual */ }
+    }
+  }
+  return { ok: true, corridaId: corridaId };
+}
+
+// ============================================================================
+// ===== EL ENVIO (Diego 2026-08-02) — a demanda + a cada usuario + programado ===
+// ----------------------------------------------------------------------------
+// Lo unico que agrega esta seccion sobre el motor de arriba: MANDAR de verdad. Es la parte
+// mas peligrosa de toda la feature (un bug aca manda WhatsApp reales a telefonos reales), asi
+// que hay UN SOLO punto de envio real (_repEnviarLote) usado tanto por el endpoint a demanda
+// como por el cron: nunca hay dos caminos que puedan divergir en las salvaguardas.
+//
+// Ante cualquier duda el criterio es MANDAR DE MENOS: saltear y dejarlo anotado en el detalle,
+// nunca reintentar a ciegas ni inventar un destinatario.
+// ============================================================================
+
+// Tope duro de mensajes de reportes por CUENTA por dia (dueno + cada usuario suman al mismo
+// contador). Protege contra un informe mal configurado, o varios informes programados a la
+// misma hora, mandando de mas. Es un PISO DE SEGURIDAD del sistema, no una opcion de pantalla:
+// constante fija a proposito. Ajustable aca si Diego lo pide.
+var REP_CRON_TOPE_DIARIO_CUENTA = 40;
+
+// Fecha LOCAL (offset de Argentina, o el que traiga el informe) en formato YYYY-MM-DD. MISMO
+// criterio que usa el cron legado (enviarReportesProgramados, ~L10069) para el dedupe diario.
+function _repHoyLocalStr(offsetHoras) {
+  var off = (typeof offsetHoras === 'number' && isFinite(offsetHoras)) ? offsetHoras : -3;
+  return new Date(Date.now() + off * 60 * 60 * 1000).toISOString().substring(0, 10);
+}
+
+// SALVAGUARDA COMPARTIDA por a-demanda y por cron. null = OK para enviar; string = motivo por
+// el que se frena. Reusa debeBloquearAcceso(), la MISMA funcion que ya usa el resto del sistema
+// para cortar WhatsApp saliente -- no se inventa un segundo criterio de bloqueo.
+async function _repCuentaBloqueadaParaEnvio(ownerId) {
+  if (_pausaGlobal === true) return 'kill-switch global activo';
+  try {
+    var bs = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', ownerId).maybeSingle();
+    if (bs && !bs.error && bs.data) {
+      if (bs.data.eliminado_at) return 'la cuenta esta en la papelera';
+      if (bs.data.crm_pausado === true) return 'la cuenta esta pausada';
+    }
+  } catch (eB) { /* columna ausente / error -> no se puede confirmar por esta via; sigue al chequeo de suscripcion */ }
+  try { if (await debeBloquearAcceso(ownerId)) return 'suscripcion inactiva / cuenta bloqueada'; } catch (eS) { /* fail-open, igual que el resto del sistema */ }
+  return null;
+}
+
+// El numero del DUEÑO para ESTE envio. NULL en el informe (default) = se reusa el canal que YA
+// funciona (business_settings.reportes_config.whatsapp, el mismo que manda el reporte diario
+// viejo). NO se inventa un canal nuevo (pedido explicito de la tarea).
+async function _repResolverNumeroDueno(ownerId, informe) {
+  if (informe && informe.destino_whatsapp) return String(informe.destino_whatsapp).replace(/[^0-9]/g, '');
+  try {
+    var bs = await supabase.from('business_settings').select('reportes_config').eq('user_id', ownerId).maybeSingle();
+    var cfg = (bs.data && bs.data.reportes_config) || null;
+    return (cfg && cfg.whatsapp) ? String(cfg.whatsapp).replace(/[^0-9]/g, '') : null;
+  } catch (e) { return null; }
+}
+
+// Contador PERSISTIDO de envios de reportes de HOY (business_settings.reportes_envios_hoy/
+// _fecha, migracion-reportes-envio.sql, SIN CORRER). Asi el tope diario sobrevive un reinicio
+// del server (si solo viviera en memoria, un restart a mitad de dia resetearia el contador y
+// se podria superar el tope real). DEFENSIVO: columna ausente -> el contador da SIEMPRE 0 (el
+// tope deja de poder hacerse cumplir entre reinicios hasta que la migracion corra, pero eso NO
+// bloquea el envio -- ausencia de columna no es motivo para frenar reportes).
+async function _repTopeDiarioLeer(ownerId, hoyStr) {
+  try {
+    var r = await supabase.from('business_settings').select('reportes_envios_hoy, reportes_envios_fecha').eq('user_id', ownerId).maybeSingle();
+    if (r.error || !r.data) return 0;
+    var fecha = r.data.reportes_envios_fecha ? String(r.data.reportes_envios_fecha).slice(0, 10) : null;
+    return (fecha === hoyStr) ? (r.data.reportes_envios_hoy || 0) : 0;
+  } catch (e) { return 0; }
+}
+async function _repTopeDiarioSumar(ownerId, hoyStr, usadoAntes, incremento) {
+  if (!incremento) return; // nada que persistir: no se gasto el tope
+  try { await supabase.from('business_settings').update({ reportes_envios_hoy: usadoAntes + incremento, reportes_envios_fecha: hoyStr }).eq('user_id', ownerId); } catch (e) { /* columna ausente: el envio ya salio, solo se pierde el contador persistido (degradacion, no bloqueo) */ }
+}
+
+// ── EL UNICO PUNTO QUE MANDA WHATSAPP DE VERDAD ──────────────────────────────────────────────
+// Toma un lote YA GENERADO (_repGenerarLote) y lo manda segun informe.destino:
+//   dueno                -> el resultado 'cuenta' al numero del dueno.
+//   cada_usuario         -> el resultado 'usuario' de cada asesor a SU whatsapp_notif.
+//   dueno_y_cada_usuario -> las dos cosas.
+//   pantalla             -> no llama a esta funcion (el caller corta antes).
+// incluir_sin_asignar (migracion-reportes-v2.sql, hasta ahora sin consumir): con destino
+// 'cada_usuario' a secas, si es true (default) el dueno IGUAL recibe el resultado 'cuenta'
+// (todos los leads, incluidos los sin asignar) para que esa deuda no quede sin que nadie la vea;
+// si es false, el envio queda estrictamente "a cada uno lo suyo" y nadie ve los sin asignar.
+// Reusa enviarWhatsapp()/nombreInstancia() -- EXACTO el canal que ya usa el reporte diario viejo.
+// Si un asesor no tiene whatsapp_notif cargado (o recibe_reportes=false) se SALTEA: NO rompe el
+// envio de los demas, y queda anotado en el detalle devuelto (auditable).
+async function _repEnviarLote(ownerId, informe, lote, origen, topeRestante) {
+  var detalle = [];
+  var intentos = 0; // solo cuenta llamadas REALES a enviarWhatsapp (para el tope diario)
+  var instancia = nombreInstancia(ownerId);
+  var destino = informe.destino || 'pantalla';
+  var enviarDueno = (destino === 'dueno' || destino === 'dueno_y_cada_usuario' || (destino === 'cada_usuario' && informe.incluir_sin_asignar !== false));
+  var enviarUsuarios = (destino === 'cada_usuario' || destino === 'dueno_y_cada_usuario');
+  var quedan = (typeof topeRestante === 'number' && isFinite(topeRestante)) ? topeRestante : Infinity;
+
+  var rCuenta = null;
+  for (var k = 0; k < lote.resultados.length; k++) { if (lote.resultados[k].alcance === 'cuenta') { rCuenta = lote.resultados[k]; break; } }
+
+  if (enviarDueno && rCuenta) {
+    if (quedan <= 0) {
+      detalle.push({ destino: 'dueno', ok: false, error: 'Tope diario de envios de la cuenta alcanzado; se saltea' });
+    } else {
+      var numDueno = await _repResolverNumeroDueno(ownerId, informe);
+      if (!numDueno) {
+        detalle.push({ destino: 'dueno', telefono: null, ok: false, error: 'Sin numero configurado (destino_whatsapp del informe, o reportes_config.whatsapp de la cuenta)' });
+      } else {
+        var alcanceLabel = (destino === 'cada_usuario') ? 'Resumen de toda la cuenta (incluye leads sin asignar)' : null;
+        var texto = _repFormatearTexto(informe, rCuenta.resultado, lote.ctxBase.asesorNombrePorId, alcanceLabel);
+        var ok = false;
+        intentos++; quedan--;
+        try { ok = await enviarWhatsapp(instancia, numDueno, texto); } catch (eEnv) { ok = false; }
+        detalle.push({ destino: 'dueno', telefono: numDueno, ok: !!ok, error: ok ? null : 'El envio no se confirmo (ver instancia de WhatsApp / logs de enviarWhatsapp)' });
+      }
+    }
+  }
+
+  if (enviarUsuarios) {
+    var resultadosUsuario = lote.resultados.filter(function (r) { return r.alcance === 'usuario'; });
+    for (var i = 0; i < resultadosUsuario.length; i++) {
+      var r = resultadosUsuario[i];
+      var tel = (lote.ctxBase.asesorTelPorId && lote.ctxBase.asesorTelPorId[r.asesorId]) || null;
+      var recibe = lote.ctxBase.asesorRecibeReportesPorId ? (lote.ctxBase.asesorRecibeReportesPorId[r.asesorId] !== false) : true;
+      if (!recibe) { detalle.push({ destino: 'usuario', asesor_id: r.asesorId, asesor_nombre: r.asesorNombre, ok: false, error: 'Usuario con recibe_reportes=false (opt-out): se saltea' }); continue; }
+      if (!tel) { detalle.push({ destino: 'usuario', asesor_id: r.asesorId, asesor_nombre: r.asesorNombre, ok: false, error: 'Sin whatsapp_notif cargado: se saltea, no rompe el envio de los demas' }); continue; }
+      if (quedan <= 0) { detalle.push({ destino: 'usuario', asesor_id: r.asesorId, asesor_nombre: r.asesorNombre, telefono: tel, ok: false, error: 'Tope diario de envios de la cuenta alcanzado; se saltea' }); continue; }
+      var textoU = _repFormatearTexto(informe, r.resultado, lote.ctxBase.asesorNombrePorId, 'Solo tus leads — ' + (r.asesorNombre || ''));
+      var okU = false;
+      intentos++; quedan--;
+      try { okU = await enviarWhatsapp(instancia, tel, textoU); } catch (eEnvU) { okU = false; }
+      detalle.push({ destino: 'usuario', asesor_id: r.asesorId, asesor_nombre: r.asesorNombre, telefono: tel, ok: !!okU, error: okU ? null : 'El envio no se confirmo (ver instancia de WhatsApp / logs de enviarWhatsapp)' });
+    }
+  }
+
+  var enviosOk = detalle.filter(function (d) { return d.ok; }).length;
+  return { enviosOk: enviosOk, enviosFallidos: (detalle.length - enviosOk), intentos: intentos, detalle: detalle };
+}
+
+// Guarda la corrida de CADA alcance del lote (igual que generar-ahora) + el detalle de a quien
+// se le mando (reportes_corridas.enviado/enviado_at/enviado_a), cruzando por alcance/asesor_id
+// contra el detalle que devolvio _repEnviarLote. Compartido por el endpoint a demanda y el cron.
+async function _repGuardarLoteEnviado(ownerId, informe, loteId, lote, envio, origen) {
+  if (informe.guarda_historial === false) return [];
+  var out = [];
+  for (var i = 0; i < lote.resultados.length; i++) {
+    var r = lote.resultados[i];
+    var deEste = envio.detalle.filter(function (d) { return (r.alcance === 'cuenta' && d.destino === 'dueno') || (r.alcance === 'usuario' && d.destino === 'usuario' && d.asesor_id === r.asesorId); });
+    var guardado = await _repGuardarCorrida(ownerId, informe, loteId, r.alcance, r.asesorId, r.asesorNombre, lote.ctxBase.periodo, r.resultado, origen, informe.guarda_detalle_leads !== false, lote.ctxBase.asesorNombrePorId, lote.ctxBase.deptoNombrePorId, lote.ctxBase.filtros);
+    if (guardado.ok && deEste.length) {
+      try { await supabase.from('reportes_corridas').update({ enviado: deEste.some(function (d) { return d.ok; }), enviado_at: new Date().toISOString(), enviado_a: deEste }).eq('id', guardado.corridaId); } catch (eU2) {}
+    }
+    out.push({ alcance: r.alcance, asesor_id: r.asesorId, corrida_id: guardado.corridaId || null });
+  }
+  return out;
+}
+
+// ============================================================================
+// ===== ENDPOINTS — informes / corridas / generar-ahora =======================
+// ----------------------------------------------------------------------------
+// Reportes es pantalla del DUEÑO (mismo criterio que la RLS de reportes_informes en
+// migracion-reportes-v2.sql: "al asesor lo sirve el backend ya recortado"). Estos endpoints
+// exigen ser el dueño; un asesor recibe 403 (no hay lectura recortada para asesores en esta
+// entrega -- lo suyo es recibir SU reporte por WhatsApp con destino='cada_usuario', no la pantalla).
+// ============================================================================
+
+var REP_ENUM = {
+  agrupar_por: ['ninguno', 'usuario', 'estado', 'departamento', 'interes'],
+  periodo_tipo: ['dia', 'semana', 'mes', 'rango_fijo', 'rango_relativo'],
+  comparar_con: ['nada', 'periodo_anterior', 'mes_pasado'],
+  destino: ['pantalla', 'dueno', 'cada_usuario', 'dueno_y_cada_usuario'],
+  formato: ['texto', 'imagen', 'pdf'],
+  frecuencia: ['manual', 'diario', 'semanal', 'mensual']
+};
+function _repEnum(val, campo, def) { var permitidos = REP_ENUM[campo]; return (permitidos && permitidos.indexOf(val) !== -1) ? val : def; }
+
+// Arma la fila a insertar/actualizar desde el body. SIN CHECK duro en la base (criterio del
+// proyecto, ver migracion-reportes-v2.sql decision #8): el backend valida contra la lista y cae
+// al default ante un valor desconocido, para que un valor nuevo del front no rompa el guardado.
+function _repInformeDesdeBody(b) {
+  b = b || {};
+  var out = {};
+  if (b.nombre !== undefined) out.nombre = String(b.nombre || '').trim().slice(0, 200);
+  if (b.descripcion !== undefined) out.descripcion = b.descripcion ? String(b.descripcion).slice(0, 2000) : null;
+  if (b.activo !== undefined) out.activo = b.activo === true;
+  if (b.vista_id !== undefined) out.vista_id = b.vista_id || null;
+  if (b.vista_nombre !== undefined) out.vista_nombre = b.vista_nombre ? String(b.vista_nombre).slice(0, 200) : null;
+  if (b.filtros_extra !== undefined) out.filtros_extra = (b.filtros_extra && typeof b.filtros_extra === 'object') ? b.filtros_extra : {};
+  if (b.medidores !== undefined) out.medidores = Array.isArray(b.medidores) ? b.medidores.filter(function (m) { return m && REP_CATALOGO[m.id]; }) : [];
+  if (b.agrupar_por !== undefined) out.agrupar_por = _repEnum(b.agrupar_por, 'agrupar_por', 'ninguno');
+  if (b.periodo_tipo !== undefined) out.periodo_tipo = _repEnum(b.periodo_tipo, 'periodo_tipo', 'dia');
+  if (b.periodo_desde !== undefined) out.periodo_desde = b.periodo_desde || null;
+  if (b.periodo_hasta !== undefined) out.periodo_hasta = b.periodo_hasta || null;
+  if (b.periodo_dias !== undefined) out.periodo_dias = (b.periodo_dias != null) ? Math.max(1, parseInt(b.periodo_dias, 10) || 7) : null;
+  if (b.comparar_con !== undefined) out.comparar_con = _repEnum(b.comparar_con, 'comparar_con', 'nada');
+  if (b.destino !== undefined) out.destino = _repEnum(b.destino, 'destino', 'pantalla');
+  if (b.destino_whatsapp !== undefined) out.destino_whatsapp = b.destino_whatsapp ? String(b.destino_whatsapp).replace(/[^0-9]/g, '') : null;
+  if (b.incluir_sin_asignar !== undefined) out.incluir_sin_asignar = b.incluir_sin_asignar !== false;
+  if (b.formato !== undefined) out.formato = _repEnum(b.formato, 'formato', 'texto');
+  if (b.frecuencia !== undefined) out.frecuencia = _repEnum(b.frecuencia, 'frecuencia', 'manual');
+  if (b.hora !== undefined) { var h = parseInt(b.hora, 10); out.hora = (isFinite(h) && h >= 0 && h <= 23) ? h : 9; }
+  if (b.dia_semana !== undefined) { var ds = parseInt(b.dia_semana, 10); out.dia_semana = (isFinite(ds) && ds >= 0 && ds <= 6) ? ds : null; }
+  if (b.dia_mes !== undefined) { var dm = parseInt(b.dia_mes, 10); out.dia_mes = (isFinite(dm) && dm >= 1 && dm <= 28) ? dm : null; }
+  if (b.tz_offset_horas !== undefined) { var tz = parseInt(b.tz_offset_horas, 10); out.tz_offset_horas = isFinite(tz) ? tz : -3; }
+  if (b.guarda_historial !== undefined) out.guarda_historial = b.guarda_historial !== false;
+  if (b.guarda_detalle_leads !== undefined) out.guarda_detalle_leads = b.guarda_detalle_leads !== false;
+  return out;
+}
+
+app.get('/api/reportes/informes', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede ver los informes' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    var q = await supabase.from('reportes_informes').select('*').eq('user_id', du.ownerId).eq('archivado', false).order('nombre');
+    if (q.error) return res.status(500).json({ error: q.error.message });
+    return res.json({ ok: true, informes: q.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.post('/api/reportes/informes', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede crear informes' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    var fila = _repInformeDesdeBody(req.body);
+    if (!fila.nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    fila.user_id = du.ownerId; fila.creado_por = du.asesorId || null;
+    var ins = await supabase.from('reportes_informes').insert(fila).select('*').single();
+    if (ins.error) return res.status(400).json({ error: ins.error.message });
+    return res.json({ ok: true, informe: ins.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.put('/api/reportes/informes/:id', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede editar informes' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    var fila = _repInformeDesdeBody(req.body);
+    fila.updated_at = new Date().toISOString();
+    var upd = await supabase.from('reportes_informes').update(fila).eq('id', req.params.id).eq('user_id', du.ownerId).select('*').maybeSingle();
+    if (upd.error) return res.status(400).json({ error: upd.error.message });
+    if (!upd.data) return res.status(404).json({ error: 'Informe no encontrado' });
+    return res.json({ ok: true, informe: upd.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.delete('/api/reportes/informes/:id', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede borrar informes' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    // BORRADO SUAVE (decision #5 del modelo de datos): las corridas referencian informe_id con
+    // on delete set null, asi que un borrado fisico dejaria el historial huerfano. Archivar alcanza.
+    var upd = await supabase.from('reportes_informes').update({ activo: false, archivado: true, updated_at: new Date().toISOString() }).eq('id', req.params.id).eq('user_id', du.ownerId).select('id').maybeSingle();
+    if (upd.error) return res.status(400).json({ error: upd.error.message });
+    if (!upd.data) return res.status(404).json({ error: 'Informe no encontrado' });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+app.get('/api/reportes/corridas', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede ver el historial' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    var q = supabase.from('reportes_corridas').select('*').eq('user_id', du.ownerId).order('generada_at', { ascending: false }).limit(200);
+    if (req.query.informe_id) q = q.eq('informe_id', String(req.query.informe_id));
+    if (req.query.asesor_id) q = q.eq('asesor_id', String(req.query.asesor_id));
+    if (req.query.desde) q = q.gte('generada_at', String(req.query.desde));
+    if (req.query.hasta) q = q.lte('generada_at', String(req.query.hasta));
+    var r = await q;
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    return res.json({ ok: true, corridas: r.data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Borra por RANGO DE FECHAS (requisito de Diego: "se borra por rango de fechas"), o una sola por
+// id. El detalle lead-por-lead se va solo por el CASCADE de corrida_id (ver migracion-reportes-v2.sql).
+app.delete('/api/reportes/corridas', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede borrar historial' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    var b = req.body || {};
+    if (b.id) {
+      var d1 = await supabase.from('reportes_corridas').delete().eq('id', String(b.id)).eq('user_id', du.ownerId);
+      if (d1.error) return res.status(400).json({ error: d1.error.message });
+      return res.json({ ok: true });
+    }
+    if (!b.desde || !b.hasta) return res.status(400).json({ error: 'Falta desde/hasta (o id para borrar una sola corrida)' });
+    var d2 = await supabase.from('reportes_corridas').delete().eq('user_id', du.ownerId).gte('generada_at', String(b.desde)).lte('generada_at', String(b.hasta));
+    if (d2.error) return res.status(400).json({ error: d2.error.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GENERAR AHORA — corre el informe y devuelve los datos. NUNCA manda WhatsApp (eso queda para
+// cuando un humano toca el boton de enviar, con el flag prendido -- fuera de esta tarea). Por
+// default GUARDA la corrida (respeta guarda_historial/guarda_detalle_leads del informe); body
+// { guardar:false } permite una vista previa sin dejar rastro en el historial.
+app.post('/api/reportes/informes/:id/generar-ahora', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede generar informes' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+    var rInf = await supabase.from('reportes_informes').select('*').eq('id', req.params.id).eq('user_id', du.ownerId).maybeSingle();
+    if (rInf.error) return res.status(500).json({ error: rInf.error.message });
+    if (!rInf.data) return res.status(404).json({ error: 'Informe no encontrado' });
+    var informe = rInf.data;
+    var guardar = (req.body && req.body.guardar === false) ? false : (informe.guarda_historial !== false);
+
+    var lote = await _repGenerarLote(du.ownerId, informe);
+    var loteId = crypto.randomUUID();
+    var salida = [];
+    for (var i = 0; i < lote.resultados.length; i++) {
+      var r = lote.resultados[i];
+      var alcanceLabel = (r.alcance === 'usuario') ? ('Solo tus leads — ' + (r.asesorNombre || '')) : null;
+      var textoWA = _repFormatearTexto(informe, r.resultado, lote.ctxBase.asesorNombrePorId, alcanceLabel);
+      var guardado = null;
+      if (guardar) {
+        guardado = await _repGuardarCorrida(du.ownerId, informe, loteId, r.alcance, r.asesorId, r.asesorNombre, lote.ctxBase.periodo, r.resultado, 'manual', informe.guarda_detalle_leads !== false, lote.ctxBase.asesorNombrePorId, lote.ctxBase.deptoNombrePorId, lote.ctxBase.filtros);
+      }
+      salida.push({ alcance: r.alcance, asesor_id: r.asesorId, asesor_nombre: r.asesorNombre, datos: r.resultado.datos, comparacion: r.resultado.comparacion, notas: r.resultado.notas, total_leads: r.resultado.totalLeads, texto: textoWA, corrida_id: (guardado ? guardado.corridaId : null) });
+    }
+    if (guardar) { try { await supabase.from('reportes_informes').update({ ultima_corrida_at: new Date().toISOString() }).eq('id', informe.id); } catch (eU) {} }
+    return res.json({ ok: true, guardado: guardar, lote_id: loteId, periodo: { desde: lote.ctxBase.periodo.desde.toISOString(), hasta: lote.ctxBase.periodo.hasta.toISOString() }, resultados: salida });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ENVIAR AHORA — "mandarmelo ahora". Genera el informe Y lo manda de VERDAD por WhatsApp, segun
+// el destino configurado (dueno / cada_usuario / dueno_y_cada_usuario). Con destino='pantalla'
+// no hay a quien mandarle (nadie configurado): 400, no se inventa un destinatario. Pasa por las
+// MISMAS salvaguardas que el cron (_repCuentaBloqueadaParaEnvio + tope diario persistido de la
+// cuenta): un click de mas no puede saltarse la proteccion contra flood.
+app.post('/api/reportes/informes/:id/enviar-ahora', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req); if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var du = await _duenoOAsesor(uid); if (!du.esDueno) return res.status(403).json({ error: 'Solo el dueño puede enviar informes' });
+    if (!(await reportesV2Activo(du.ownerId))) return res.status(409).json({ error: 'gated', reportes_v2: false });
+
+    var motivoBloqueo = await _repCuentaBloqueadaParaEnvio(du.ownerId);
+    if (motivoBloqueo) return res.status(403).json({ error: 'No se puede enviar: ' + motivoBloqueo });
+
+    var rInf = await supabase.from('reportes_informes').select('*').eq('id', req.params.id).eq('user_id', du.ownerId).maybeSingle();
+    if (rInf.error) return res.status(500).json({ error: rInf.error.message });
+    if (!rInf.data) return res.status(404).json({ error: 'Informe no encontrado' });
+    var informe = rInf.data;
+    if ((informe.destino || 'pantalla') === 'pantalla') return res.status(400).json({ error: 'Este informe tiene destino "pantalla" (no manda a nadie). Cambia el destino a "dueño" o "cada usuario" para poder enviarlo.' });
+
+    var lote = await _repGenerarLote(du.ownerId, informe);
+    var loteId = crypto.randomUUID();
+
+    var hoyStr = _repHoyLocalStr(informe.tz_offset_horas);
+    var usadoAntes = await _repTopeDiarioLeer(du.ownerId, hoyStr);
+    var restante = Math.max(0, REP_CRON_TOPE_DIARIO_CUENTA - usadoAntes);
+    var envio = await _repEnviarLote(du.ownerId, informe, lote, 'manual', restante);
+    if (envio.intentos > 0) await _repTopeDiarioSumar(du.ownerId, hoyStr, usadoAntes, envio.intentos);
+
+    var corridas = await _repGuardarLoteEnviado(du.ownerId, informe, loteId, lote, envio, 'manual');
+    try { await supabase.from('reportes_informes').update({ ultima_corrida_at: new Date().toISOString() }).eq('id', informe.id); } catch (eU) {}
+
+    return res.json({ ok: true, lote_id: loteId, envios_ok: envio.enviosOk, envios_fallidos: envio.enviosFallidos, detalle: envio.detalle, corridas: corridas });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// PROGRAMADO — cron de "Reportes completos". MISMO patron y MISMA granularidad que el cron
+// legado (enviarReportesProgramados, ~L10061): revisa cada hora, compara SOLO la hora
+// configurada, offset fijo Argentina salvo que el informe traiga tz_offset_horas propio.
+// Gateado DOS VECES: reportes_v2 de la cuenta (columna ausente -> [] -> return, 0 trabajo en las
+// 6 cuentas vivas hoy) Y activo=true + frecuencia<>'manual' del informe (tabla ausente -> [] ->
+// return). Dedupe por reportes_informes.ultimo_envio_fecha (columna persistida: un reinicio del
+// server NO reenvia lo de hoy). Tope diario por cuenta persistido (reportes_envios_hoy/_fecha).
+async function enviarReportesV2Programados() {
+  try {
+    var cuentasIds = [];
+    try {
+      var rb = await supabase.from('business_settings').select('user_id').eq('reportes_v2', true);
+      if (rb.error) return; // columna ausente / error -> flag OFF en todos lados -> nada que hacer
+      cuentasIds = (rb.data || []).map(function (r) { return r.user_id; }).filter(Boolean);
+    } catch (eB) { return; }
+    if (!cuentasIds.length) return;
+
+    var informes = [];
+    try {
+      var ri = await supabase.from('reportes_informes').select('*').in('user_id', cuentasIds).eq('activo', true).eq('archivado', false).neq('frecuencia', 'manual');
+      if (ri.error) return; // tabla ausente (migracion sin correr) -> nada que hacer
+      informes = ri.data || [];
+    } catch (eI) { return; }
+    if (!informes.length) return;
+
+    // Cache por cuenta DENTRO de esta sola corrida del cron: si una cuenta tiene varios informes
+    // a la misma hora, el chequeo de pausa/suscripcion y el contador de tope se piden una vez.
+    var bloqueoPorCuenta = {};
+    var usadoHoyPorCuenta = {};
+
+    for (var i = 0; i < informes.length; i++) {
+      var informe = informes[i];
+      try {
+        var offset = (informe.tz_offset_horas != null && isFinite(informe.tz_offset_horas)) ? informe.tz_offset_horas : -3;
+        var ahora = new Date(Date.now() + offset * 60 * 60 * 1000);
+        var hoyStr = ahora.toISOString().substring(0, 10);
+        var diaSemana = ahora.getUTCDay();
+        var diaMes = ahora.getUTCDate();
+        var hora = ahora.getUTCHours();
+        var horaCfg = (informe.hora != null && isFinite(informe.hora)) ? informe.hora : 9;
+        if (hora !== horaCfg) continue;
+
+        // "Ya se mando hoy" -- dedupe que SOBREVIVE un reinicio del server (a diferencia de un
+        // Set en memoria): la columna es persistida, no se pierde con un restart de Railway.
+        var yaHoy = informe.ultimo_envio_fecha ? String(informe.ultimo_envio_fecha).slice(0, 10) : null;
+        if (yaHoy === hoyStr) continue;
+
+        var toca = false;
+        if (informe.frecuencia === 'diario') toca = true;
+        else if (informe.frecuencia === 'semanal') { var diaCfg = (informe.dia_semana != null) ? informe.dia_semana : 1; toca = (diaSemana === diaCfg); }
+        else if (informe.frecuencia === 'mensual') { var diaMesCfg = (informe.dia_mes != null && informe.dia_mes >= 1 && informe.dia_mes <= 28) ? informe.dia_mes : 1; toca = (diaMes === diaMesCfg); }
+        if (!toca) continue;
+
+        if ((informe.destino || 'pantalla') === 'pantalla') continue; // nadie configurado -> nada que mandar
+
+        var ownerId = informe.user_id;
+        if (bloqueoPorCuenta[ownerId] === undefined) bloqueoPorCuenta[ownerId] = await _repCuentaBloqueadaParaEnvio(ownerId);
+        if (bloqueoPorCuenta[ownerId]) continue; // pausada / papelera / sin suscripcion -> NO se manda nada
+
+        var lote = await _repGenerarLote(ownerId, informe);
+        var loteId = crypto.randomUUID();
+
+        if (usadoHoyPorCuenta[ownerId] === undefined) usadoHoyPorCuenta[ownerId] = await _repTopeDiarioLeer(ownerId, hoyStr);
+        var usadoAntes = usadoHoyPorCuenta[ownerId];
+        var restante = Math.max(0, REP_CRON_TOPE_DIARIO_CUENTA - usadoAntes);
+
+        var envio = await _repEnviarLote(ownerId, informe, lote, 'cron', restante);
+        if (envio.intentos > 0) { usadoHoyPorCuenta[ownerId] = usadoAntes + envio.intentos; await _repTopeDiarioSumar(ownerId, hoyStr, usadoAntes, envio.intentos); }
+
+        await _repGuardarLoteEnviado(ownerId, informe, loteId, lote, envio, 'cron');
+
+        // Marca de "ya se mando" -- SIEMPRE que se llego a intentar (aunque el envio real fallara):
+        // reintentar cada hora contra un numero roto o una config incompleta no arregla nada, y
+        // asi se evita un bucle de intentos durante todo el dia. El detalle queda igual guardado
+        // en la corrida para que el dueño vea que fallo.
+        try { await supabase.from('reportes_informes').update({ ultimo_envio_fecha: hoyStr, ultima_corrida_at: new Date().toISOString() }).eq('id', informe.id); } catch (eM) {}
+      } catch (eInf) { /* seguir con el siguiente informe */ }
+    }
+  } catch (e) { /* silencioso, igual que el resto de los crons del archivo */ }
+}
 
 // Desregistrar (baja) un token FCM: p.ej. al cerrar sesion o revocar notificaciones en un dispositivo.
 // Borra el token del usuario autenticado. Se filtra por user_id + token para que nadie borre tokens ajenos.

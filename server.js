@@ -27764,6 +27764,409 @@ app.get('/api/propiedades', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// ===== VISIBILIDAD DE LEADS EN EL SERVIDOR (Diego 2026-08-01, auditoria de seguridad) =====
+// ----------------------------------------------------------------------------
+// HOY (verificado leyendo el front) el UNICO recorte real de "que leads ve un asesor" pasa en el
+// NAVEGADOR: conversaciones/page.tsx:2380 filtra en memoria DESPUES de que los datos completos (telefono,
+// presupuesto, notas) ya viajaron por HTTP para leads que ni siquiera le corresponden al asesor. Estos
+// endpoints resuelven la visibilidad EN EL SERVIDOR: un asesor comun nunca recibe una fila fuera de su
+// scope. Reusan, sin modificarlos, los helpers que YA existen: esAdministrador() (~L2110) y el patron de
+// scoping (ownerId/soloAsesorId/esAdmin) copiado en GET /api/citas (~L27775) y /api/conversaciones/timeline.
+//
+// TODO gateado por el flag por-cuenta `visibilidad_server_v1` (business_settings, mismo patron DEFENSIVO
+// que pipeline_filtros_v1 en /api/ui-flags): con el flag OFF (default) estos endpoints devuelven 409
+// "gated" y el front (que hoy no los llama) sigue leyendo Supabase directo -- BYTE-IDENTICO a hoy. La
+// EXCEPCION es GET /api/leads/scope: es de solo-lectura/diagnostico y a proposito NO esta gateado, porque
+// sirve para F0 -- comparar EN VIVO lo que el servidor calcularia contra lo que hoy hace el front, SIN
+// prender nada todavia.
+//
+// NO TOCA: el panel Maestro, el motor de reparto/derivacion, los estados ni el prompt de la IA. El reparto
+// usa usuario_departamento.modo para decidir A QUIEN se asigna un lead nuevo; esto decide QUIEN puede LEER
+// un lead ya existente. Son cosas distintas y no comparten codigo (salvo los dos helpers de lectura de
+// arriba, que esta seccion NO modifica).
+// ============================================================================
+
+// Flag por-cuenta (mismo patron DEFENSIVO EXACTO que repartoV2Activo/pipeline_filtros_v1): columna
+// ausente / error / false -> OFF (los endpoints de /api/leads/* devuelven 409 "gated", nada nuevo corre).
+async function visibilidadServerV1Activo(ownerId) {
+  try {
+    if (!ownerId) return false;
+    const { data, error } = await supabase.from('business_settings').select('visibilidad_server_v1').eq('user_id', ownerId).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.visibilidad_server_v1 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// Resuelve el SCOPE de lectura/escritura de leads de quien hace el pedido (por el JWT, nunca por un
+// parametro del request). Devuelve:
+//   { authUserId, ownerId, asesorId, esAdmin, modo: 'todos'|'propias'|'error', deptoIds: [] }
+//   'todos'   -> el DUENO de la cuenta, o un asesor con visibilidad 'generales' (o rol legacy
+//                'administrador', via esAdministrador()): ve TODO el tenant, igual que hoy.
+//   'propias' -> cualquier OTRO caso. IMPORTANTE: en v1 esto incluye TANTO visibilidad=['propias'] COMO
+//                visibilidad=['departamento']. La visibilidad 'departamento' esta guardada en la base
+//                (ver _camposUsuarioNuevos ~L17182) pero HOY NO SE APLICA EN NINGUN LADO del front: un
+//                asesor con 'departamento' ve exactamente lo mismo que uno con 'propias' (verificado por
+//                grep, 0 usos como criterio de lectura). Si esta v1 lo implementara de una, todo usuario
+//                que hoy tenga 'departamento' cargado ampliaria DE GOLPE su visibilidad al departamento
+//                entero sin que Diego lo haya pedido (riesgo de "ampliacion de visibilidad por rebote").
+//                Por eso, A PROPOSITO, v1 trata 'departamento' == 'propias'. deptoIds queda [] sin resolver
+//                (no se usa _equipoDepartamentosDe en v1). El modo 'departamento' de verdad es una FASE
+//                APARTE, con su propio flag, y consultando antes a Diego cuantos usuarios tienen ese valor
+//                cargado (lo responde un SELECT).
+//   'error'   -> FAIL-CLOSED: no se pudo leer la fila de `asesores` de quien pide. El caller debe cortar
+//                con 403 (nunca asumir 'todos' ante una falla: ante la duda, MENOS datos).
+async function _scopeLeadsDe(req) {
+  const authUserId = await verificarUsuario(req);
+  if (!authUserId) return null;
+  let ownerId = authUserId, asesorId = null, esAdmin = true;
+  try {
+    const r = await supabase.from('asesores').select('id, admin_id, rol, visibilidad').eq('auth_user_id', authUserId).maybeSingle();
+    if (r.error) return { authUserId: authUserId, ownerId: ownerId, asesorId: null, esAdmin: false, modo: 'error', deptoIds: [] };
+    const ase = r.data;
+    if (ase) {
+      if (ase.admin_id) ownerId = ase.admin_id;
+      esAdmin = esAdministrador(ase);
+      if (!esAdmin) asesorId = ase.id;
+    }
+  } catch (e) {
+    return { authUserId: authUserId, ownerId: ownerId, asesorId: null, esAdmin: false, modo: 'error', deptoIds: [] };
+  }
+  return { authUserId: authUserId, ownerId: ownerId, asesorId: asesorId, esAdmin: esAdmin, modo: (esAdmin ? 'todos' : 'propias'), deptoIds: [] };
+}
+
+// Aplica el scope de leads a una query de `conversations` YA construida (con su .select() ya puesto).
+// SIEMPRE aisla por tenant (.eq user_id = ownerId). En modo 'todos' no restringe mas alla del tenant.
+//
+// EN MODO 'propias' VE LO SUYO **Y TAMBIEN LO QUE NO ES DE NADIE** (Diego 2026-08-02).
+// Por que, que es lo que importa entender aca: la visibilidad esta para taparle a un vendedor los leads
+// DE OTRO VENDEDOR, no los que estan libres. Los leads sin asignar son la DEUDA DEL EQUIPO: si nadie los
+// ve, nadie los agarra, y vuelven los leads varados que ya nos costaron caro. Buena parte de la cola de
+// recontacto no tiene asesor: con un `asesor_id = yo` estricto, un vendedor abria Recontactos y veia CERO.
+// El recorte sigue siendo fail-closed para lo que importa: si `asesorId` no se pudo resolver, no se
+// devuelve nada (no se cae a "ve todo").
+function _aplicarScopeLeads(query, scope) {
+  let q = query.eq('user_id', scope.ownerId);
+  if (scope.modo === 'propias') {
+    // Sin asesorId resuelto no hay con que comparar -> mejor no devolver nada que devolver la cartera entera.
+    if (!scope.asesorId) return q.eq('asesor_id', '00000000-0000-0000-0000-000000000000');
+    // (asesor_id = yo) OR (asesor_id IS NULL). El .or() se combina con AND contra el .eq('user_id') de
+    // arriba, asi que el aislamiento por cuenta NO se afloja: user_id = mio AND (mio OR sin asignar).
+    q = q.or('asesor_id.eq.' + scope.asesorId + ',asesor_id.is.null');
+  }
+  return q;
+}
+
+// F0: DIAGNOSTICO, NO gateado por el flag a proposito (solo lectura, barato: 1 query a `asesores`). Sirve
+// para comparar EN VIVO -- ANTES de prender visibilidad_server_v1 -- lo que el servidor calcularia contra
+// lo que hoy hace el front en memoria (esAdminRol/vistaAdmin, conversaciones/page.tsx:2369-2371).
+app.get('/api/leads/scope', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(500).json({ error: 'No se pudo resolver la visibilidad (fail-closed)' });
+    return res.json({ ok: true, modo: scope.modo, asesor_id: scope.asesorId, departamento_ids: scope.deptoIds, es_admin: scope.esAdmin });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Columnas EXPLICITAS -- NUNCA select('*') -- para que un lead fuera de scope jamas pueda salir con
+// telefono/presupuesto/notas. VERIFICADO por grep sobre el front (conversaciones/page.tsx: SELECT_CONVS
+// ~L974 + los `selected.*`/`conv.*` que la pantalla lee); NO VERIFICADO contra el esquema real de Supabase
+// en vivo (no tengo acceso a la base desde aca). Si la base tuviera una columna mas que el front use y no
+// este en esta lista, el endpoint la omite -- fail-closed (falta antes que sobra), pero puede necesitar un
+// ajuste una vez confirmado el esquema real.
+//
+// AMPLIADO (Diego 2026-08-01, conversion de las 5 pantallas): se agregaron las 8 columnas de recontacto_*
+// / horario_habitual que necesita app/recontactos/page.tsx (load() + openDetail()). Estas SI estan
+// verificadas contra el esquema real -- de forma indirecta pero solida: recontactos/page.tsx:127 hace HOY
+// `select('*')` sobre `conversations` en produccion y lee esas columnas del resultado, asi que existen en
+// la base (un select('*') que no fuera a explotar ya estaria roto en prod). Igual, primer uso real de esta
+// lista ampliada tiene que pasar por el F1 manual (probar /api/leads a mano) antes de prender el flag en
+// ninguna cuenta: si me equivoque en un nombre, PostgREST rechaza el select ENTERO (falla las 5 pantallas
+// a la vez, no solo Recontactos) -- por eso ESTO HAY QUE PROBARLO ANTES de tocar el flag en produccion.
+const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, admin_tomo_por, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual';
+const LEADS_COLS_CONTACT = 'contacts(name, nombre_manual, phone, channel, interest, budget, foto_url, about)';
+const LEADS_SELECT = LEADS_COLS_CONV + ', ' + LEADS_COLS_CONTACT;
+
+const LEADS_ESTADOS_VALIDOS = ['nuevo', 'en_conversacion', 'interesado', 'listo_humano', 'recontacto', 'cerrado'];
+const LEADS_TEMPS_VALIDAS = ['frio', 'tibio', 'caliente'];
+
+function _leadsCsv(v) {
+  return String(v == null ? '' : v).split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+}
+
+// GET /api/leads -- la lista, recortada por scope, con TODOS los filtros/orden/paginado que hoy hace el
+// front en memoria (conversaciones/page.tsx:2409-2433). Keyset por (orden, id): NUNCA offset/.range() (con
+// updated_at moviendose todo el tiempo, .range() saltea y repite filas -- ver punto 5 del estudio previo).
+app.get('/api/leads', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await visibilidadServerV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'visibilidad_server_v1 desactivado' });
+
+    const qp = req.query || {};
+    const limit = Math.min(Math.max(parseInt(qp.limit, 10) || 200, 1), 500); // tope duro 500 (PostgREST corta en 1000 igual)
+    const ordenCol = (qp.orden === 'created_at') ? 'created_at' : 'updated_at'; // default updated_at (misma razon que el front: conversaciones/page.tsx:1006-1015)
+    const dirAsc = (qp.dir === 'asc');
+
+    let q = _aplicarScopeLeads(supabase.from('conversations').select(LEADS_SELECT), scope);
+
+    // ---- incluir_recontacto: excluidos por default (MISMO criterio EXACTO que filtrarNoRecontacto del
+    // front, conversaciones/page.tsx:978), salvo que el caller los pida explicito o los este filtrando. ----
+    const estadoCsv = _leadsCsv(qp.estado).filter(function (s) { return LEADS_ESTADOS_VALIDOS.indexOf(s) >= 0; });
+    const quiereRecontacto = (qp.incluir_recontacto === '1') || estadoCsv.indexOf('recontacto') >= 0;
+    if (!quiereRecontacto) q = q.or('status.neq.recontacto,status.is.null');
+    if (estadoCsv.length) q = q.in('status', estadoCsv);
+
+    // ---- temperatura (csv, 'sin' = sin temperatura cargada / null) ----
+    const tempCsv = _leadsCsv(qp.temperatura);
+    if (tempCsv.length) {
+      const tempVals = tempCsv.filter(function (t) { return LEADS_TEMPS_VALIDAS.indexOf(t) >= 0; });
+      const tempQuiereSin = tempCsv.indexOf('sin') >= 0;
+      const tOr = [];
+      if (tempVals.length) tOr.push('temperatura.in.(' + tempVals.join(',') + ')');
+      if (tempQuiereSin) tOr.push('temperatura.is.null');
+      if (tOr.length) q = q.or(tOr.join(','));
+    }
+
+    // ---- asesor_id (csv, 'sin' = sin asignar / null) ----
+    const aseCsv = _leadsCsv(qp.asesor_id);
+    if (aseCsv.length) {
+      const aseIds = aseCsv.filter(function (a) { return a !== 'sin'; });
+      const aseQuiereSin = aseCsv.indexOf('sin') >= 0;
+      const aOr = [];
+      if (aseIds.length) aOr.push('asesor_id.in.(' + aseIds.join(',') + ')');
+      if (aseQuiereSin) aOr.push('asesor_id.is.null');
+      if (aOr.length) q = q.or(aOr.join(','));
+    }
+
+    // ---- etiqueta (csv, 'sin' = sin etiquetas). NO VERIFICADO contra el TIPO real de la columna en la
+    // base (se asume array nativo de Postgres -> operador `ov`/overlaps). Si fuera jsonb este filtro no
+    // matchea el operador y PostgREST devuelve error -> 500 con mensaje claro (fail-open a la
+    // disponibilidad: mejor un error visible que una lista vacia silenciosa). Probar antes de F3. ----
+    const etqCsv = _leadsCsv(qp.etiqueta);
+    if (etqCsv.length) {
+      const etqIds = etqCsv.filter(function (e) { return e !== 'sin'; });
+      const etqQuiereSin = etqCsv.indexOf('sin') >= 0;
+      const eOr = [];
+      if (etqIds.length) eOr.push('etiquetas.ov.{' + etqIds.join(',') + '}');
+      if (etqQuiereSin) { eOr.push('etiquetas.is.null'); eOr.push('etiquetas.eq.{}'); }
+      if (eOr.length) q = q.or(eOr.join(','));
+    }
+
+    // ---- canal (csv, columna conversations.channel -- la misma que muestra la pill del listado) ----
+    const canalCsv = _leadsCsv(qp.canal);
+    if (canalCsv.length) q = q.in('channel', canalCsv);
+
+    // ---- ai (0|1) ----
+    if (qp.ai === '0' || qp.ai === '1') q = q.eq('ai_enabled', qp.ai === '1');
+
+    // ---- q: texto libre (nombre / nombre_manual / telefono / last_message -- MISMOS campos que
+    // filtroBusqueda en el front, conversaciones/page.tsx:2386-2392; la fecha formateada queda AFUERA:
+    // no tiene equivalente SQL directo, era un match de string ya formateado en el navegador). Filtrar un
+    // recurso embebido (contacts.*) dentro de un .or() depende de la version de PostgREST desplegada --
+    // NO VERIFICADO en vivo, probar antes de F3. ----
+    const texto = String(qp.q || '').trim();
+    if (texto) {
+      const likeVal = '*' + texto.replace(/[%,()*]/g, ' ').trim() + '*';
+      const soloNum = texto.replace(/[^0-9]/g, '');
+      const qOr = ['last_message.ilike.' + likeVal, 'contacts.name.ilike.' + likeVal, 'contacts.nombre_manual.ilike.' + likeVal];
+      if (soloNum) qOr.push('contacts.phone.ilike.*' + soloNum + '*');
+      q = q.or(qOr.join(','));
+    }
+
+    // ---- KEYSET real: cursor="<valor_de_ordenCol>|<id>". Nunca offset (ver comentario arriba). ----
+    const cursor = String(qp.cursor || '').trim();
+    if (cursor) {
+      const partes = cursor.split('|');
+      const curVal = partes[0], curId = partes[1];
+      const curValOk = curVal && !isNaN(Date.parse(curVal));
+      const curIdOk = curId && /^[a-zA-Z0-9-]+$/.test(curId); // solo uuid/alfanumerico -- nunca se interpola texto libre en el filtro
+      if (!curValOk || !curIdOk) return res.status(400).json({ error: 'cursor invalido' });
+      q = dirAsc
+        ? q.or(ordenCol + '.gt.' + curVal + ',and(' + ordenCol + '.eq.' + curVal + ',id.gt.' + curId + ')')
+        : q.or(ordenCol + '.lt.' + curVal + ',and(' + ordenCol + '.eq.' + curVal + ',id.lt.' + curId + ')');
+    }
+
+    q = q.order(ordenCol, { ascending: dirAsc, nullsFirst: false }).order('id', { ascending: dirAsc }).limit(limit);
+
+    const r = await q;
+    // FAIL-OPEN a la disponibilidad (regla dura del pedido): un error de base es un 500 con mensaje claro,
+    // NUNCA una lista vacia silenciosa que el equipo confunda con "no hay leads".
+    if (r.error) return res.status(500).json({ error: r.error.message });
+
+    const leads = r.data || [];
+    let next_cursor = null;
+    if (leads.length === limit) {
+      const ult = leads[leads.length - 1];
+      const valUlt = ult && ult[ordenCol];
+      if (valUlt && ult.id) next_cursor = valUlt + '|' + ult.id;
+    }
+    return res.json({ ok: true, leads: leads, next_cursor: next_cursor });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/leads/contadores -- reemplaza los ~12 count(exact,head) repartidos entre dashboard/conversaciones/
+// recontactos. count con head:true NO tiene el tope de 1000 filas (no trae filas), asi que es seguro incluso
+// con cuentas grandes. Recortado por el MISMO scope que la lista.
+app.get('/api/leads/contadores', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await visibilidadServerV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'visibilidad_server_v1 desactivado' });
+
+    function base() { return _aplicarScopeLeads(supabase.from('conversations').select('id', { count: 'exact', head: true }), scope); }
+    let huboError = false;
+    async function cnt(q) {
+      try { const r = await q; if (r && r.error) { huboError = true; return 0; } return (r && typeof r.count === 'number') ? r.count : 0; }
+      catch (e) { huboError = true; return 0; }
+    }
+    const ESTADOS = ['en_conversacion', 'interesado', 'listo_humano', 'recontacto', 'cerrado'];
+    const [total, ...porEstadoArr] = await Promise.all([base()].concat(ESTADOS.map(function (s) { return base().eq('status', s); })).map(cnt));
+    const por_estado = {};
+    ESTADOS.forEach(function (s, i) { por_estado[s] = porEstadoArr[i]; });
+    const interesado_sin_asesor = await cnt(base().eq('status', 'interesado').is('asesor_id', null));
+    // Fail-open a la disponibilidad: si algun count fallo, error claro en vez de numeros que mienten.
+    if (huboError) return res.status(500).json({ error: 'No se pudieron calcular todos los contadores (error de base)' });
+    return res.json({ ok: true, total: total, por_estado: por_estado, recontacto: por_estado.recontacto || 0, interesado_sin_asesor: interesado_sin_asesor });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/leads/uno?conversation_id= -- fila completa (mismas columnas que la lista), 403 si esta fuera
+// del scope de quien pide (o no existe -- nunca se distingue, para no revelar si un id ajeno existe).
+// Reemplaza el deep-link directo a Supabase de conversaciones/page.tsx:390 y 4541.
+app.get('/api/leads/uno', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await visibilidadServerV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'visibilidad_server_v1 desactivado' });
+
+    const convId = String((req.query && req.query.conversation_id) || '').trim();
+    if (!convId) return res.status(400).json({ error: 'Falta conversation_id' });
+    const r = await _aplicarScopeLeads(supabase.from('conversations').select(LEADS_SELECT).eq('id', convId), scope).maybeSingle();
+    if (r.error) return res.status(500).json({ error: r.error.message });
+    if (!r.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
+    return res.json({ ok: true, lead: r.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/leads/mensajes?conversation_id=&antes_de=&limit= -- mensajes del chat con el MISMO gate de scope
+// que /api/leads/uno. Sin esto, el recorte de la lista se saltea escribiendo un conversation_id a mano y
+// leyendo `messages` directo (conversaciones/page.tsx:1528/1541 hoy leen por RLS de tenant, no de lead).
+app.get('/api/leads/mensajes', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await visibilidadServerV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'visibilidad_server_v1 desactivado' });
+
+    const convId = String((req.query && req.query.conversation_id) || '').trim();
+    if (!convId) return res.status(400).json({ error: 'Falta conversation_id' });
+    const chk = await _aplicarScopeLeads(supabase.from('conversations').select('id').eq('id', convId), scope).maybeSingle();
+    if (chk.error || !chk.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
+
+    const limit = Math.min(Math.max(parseInt((req.query && req.query.limit) || '80', 10) || 80, 1), 300);
+    const antesDe = (req.query && req.query.antes_de) ? String(req.query.antes_de).trim() : '';
+    let mq = supabase.from('messages').select('id, conversation_id, role, content, enviado_por, created_at').eq('conversation_id', convId).order('created_at', { ascending: false }).limit(limit);
+    if (antesDe && !isNaN(Date.parse(antesDe))) mq = mq.lt('created_at', antesDe);
+    const mr = await mq;
+    if (mr.error) return res.status(500).json({ error: mr.error.message });
+    const mensajes = (mr.data || []).slice().reverse(); // cronologico ascendente para pintar el chat de arriba a abajo
+    return res.json({ ok: true, mensajes: mensajes });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Campos que POST /api/leads/actualizar puede escribir (whitelist, no blacklist: lo que no esta ESTRICTAMENTE
+// aca se ignora en silencio). asesor_id/departamento_id quedan AFUERA a proposito: esa reasignacion ya tiene
+// su propio endpoint (/api/conversaciones/asignar) con concurrencia optimista + reglas de reparto/R1/R4;
+// duplicar esa logica aca las desincroniza. motivo_perdida tampoco entra: vive en /api/conversations/cerrar.
+const LEADS_ACTUALIZAR_STATUS_OK = LEADS_ESTADOS_VALIDOS;
+const LEADS_ACTUALIZAR_TEMP_OK = LEADS_TEMPS_VALIDAS;
+
+// POST /api/leads/actualizar { conversation_id, cambios:{ status?, temperatura?, etiquetas?, nota_asesor?,
+// ai_enabled? } } -- UNA sola puerta de escritura para lo que hoy el front actualiza escribiendo DIRECTO a
+// Supabase (status: page.tsx:1965, temperatura: 2042, etiquetas: 2052, ai_enabled: 2120). Chequea el MISMO
+// scope que la lectura (un asesor 'propias' no puede tocar leads ajenos) y reusa, sin modificarlos, los
+// efectos laterales que YA existen: registrarCambioEstadoConv + registrarCambioEstado (mismos que usa
+// /api/conversations/cerrar) y _tempConDecayParaConv + temperaturaPorEstado para la temperatura automatica
+// del cambio de estado (mismo mapa que usa toda la app).
+app.post('/api/leads/actualizar', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await visibilidadServerV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'visibilidad_server_v1 desactivado' });
+
+    const b = req.body || {};
+    const conversation_id = String(b.conversation_id || '').trim();
+    if (!conversation_id) return res.status(400).json({ error: 'Falta conversation_id' });
+    const cambios = (b.cambios && typeof b.cambios === 'object') ? b.cambios : {};
+
+    // 1) Leer la conversacion actual DENTRO del scope (si esta fuera, ni siquiera se sabe que estado tenia).
+    const convR = await _aplicarScopeLeads(supabase.from('conversations').select('id, user_id, asesor_id, status, temperatura').eq('id', conversation_id), scope).maybeSingle();
+    if (convR.error) return res.status(500).json({ error: convR.error.message });
+    const conv = convR.data;
+    if (!conv) return res.status(403).json({ error: 'Este lead no te pertenece o no existe' });
+
+    // 2) Armar el update SOLO con la whitelist. Cualquier otra clave de `cambios` se ignora en silencio.
+    const upd = {};
+    let statusCambio = false;
+    if (Object.prototype.hasOwnProperty.call(cambios, 'status')) {
+      const s = String(cambios.status || '').trim();
+      if (LEADS_ACTUALIZAR_STATUS_OK.indexOf(s) < 0) return res.status(400).json({ error: 'status invalido' });
+      if (s !== (conv.status || null)) { upd.status = s; statusCambio = true; }
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'temperatura')) {
+      const tp = String(cambios.temperatura || '').trim();
+      if (LEADS_ACTUALIZAR_TEMP_OK.indexOf(tp) < 0) return res.status(400).json({ error: 'temperatura invalida' });
+      upd.temperatura = tp;
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'etiquetas')) {
+      if (!Array.isArray(cambios.etiquetas)) return res.status(400).json({ error: 'etiquetas debe ser un array' });
+      upd.etiquetas = cambios.etiquetas.filter(function (x) { return typeof x === 'string' && x.trim(); }).slice(0, 50);
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'nota_asesor')) {
+      upd.nota_asesor = String(cambios.nota_asesor == null ? '' : cambios.nota_asesor).slice(0, 10000);
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'ai_enabled')) {
+      upd.ai_enabled = cambios.ai_enabled === true;
+    }
+    if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nada para actualizar' });
+
+    // 3) Mismos efectos automaticos que hoy hace el front al cambiar el estado a mano (changeStatus,
+    // conversaciones/page.tsx:1965), SOLO si el caller no los mando explicitos:
+    //    - temperatura: mapa temperaturaPorEstado + el decay gateado (_tempConDecayParaConv, mismo helper
+    //      que usa /api/conversations/cerrar -- con el flag temp_decay_v2 OFF es la propuesta tal cual).
+    //    - ai_enabled: recontacto prende la IA, listo_humano la apaga (igual que el front hoy).
+    if (statusCambio && !Object.prototype.hasOwnProperty.call(cambios, 'temperatura')) {
+      try { upd.temperatura = await _tempConDecayParaConv(conversation_id, temperaturaPorEstado(upd.status), scope.ownerId); } catch (eT) {}
+    }
+    if (statusCambio && !Object.prototype.hasOwnProperty.call(cambios, 'ai_enabled')) {
+      if (upd.status === 'recontacto') upd.ai_enabled = true;
+      else if (upd.status === 'listo_humano') upd.ai_enabled = false;
+    }
+    upd.updated_at = new Date().toISOString();
+
+    // 4) ESCRITURA re-scopeada a nivel DB (defensa en profundidad, ademas del chequeo del paso 1).
+    const updR = await _aplicarScopeLeads(supabase.from('conversations').update(upd).eq('id', conversation_id), scope);
+    if (updR.error) return res.status(500).json({ error: 'No se pudo actualizar: ' + updR.error.message });
+
+    // 5) Historial -- SOLO si cambio el estado, fire-and-forget, MISMOS helpers que /api/conversations/cerrar.
+    if (statusCambio) {
+      try { registrarCambioEstadoConv(conversation_id, conv.status || null, upd.status, 'Un usuario', 'actualizado desde /api/leads/actualizar', scope.ownerId).catch(function () {}); } catch (eHE) {}
+      try { registrarCambioEstado({ conversation_id: conversation_id, user_id: scope.ownerId, estado_anterior: conv.status || null, estado_nuevo: upd.status, origen: 'humano', actor_auth_uid: scope.authUserId || null, motivo: 'actualizado desde el panel (vista server)' }).catch(function () {}); } catch (eLEH) {}
+    }
+
+    return res.json({ ok: true, cambios: upd });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+// ============================================================================
+// ===== FIN VISIBILIDAD DE LEADS EN EL SERVIDOR =====
+// ============================================================================
+
 // ===== CITAS / AGENDA (nativo, sin Google) =====
 // Account-scoped por JWT (service key bypassa RLS): el dueno ve TODAS las citas de su cuenta; el asesor comun
 // solo las suyas; el asesor 'administrador' ve todas. Las crea el agente (al agendar) o se cargan a mano aca.
@@ -32201,6 +32604,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _pev = await supabase.from('business_settings').select('pipeline_exportar_v1').eq('user_id', user_id).maybeSingle();
       if (_pev && _pev.data) pipeline_exportar_v1 = _pev.data.pipeline_exportar_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // visibilidad_server_v1 (Diego 2026-08-01, auditoria de seguridad): gate de los endpoints /api/leads/*
+    // que resuelven en el SERVIDOR la visibilidad de leads (ver seccion VISIBILIDAD DE LEADS EN EL SERVIDOR).
+    // Query SEPARADA y defensiva: columna ausente / error -> false = el front sigue leyendo Supabase directo,
+    // BYTE-IDENTICO a hoy. 0 tokens de IA: es un recorte de lectura/escritura, no llama a ningun modelo.
+    var visibilidad_server_v1 = false;
+    try {
+      var _vsv = await supabase.from('business_settings').select('visibilidad_server_v1').eq('user_id', user_id).maybeSingle();
+      if (_vsv && _vsv.data) visibilidad_server_v1 = _vsv.data.visibilidad_server_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
     // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
     // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
     // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
@@ -32232,8 +32644,8 @@ app.get('/api/ui-flags', async function(req, res){
         if (_ceh && _ceh >= 1 && _ceh <= 168) cita_escalada_horas = _ceh;
       }
     } catch (e) { /* columnas ausentes / error -> defaults */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================

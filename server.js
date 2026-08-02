@@ -2288,24 +2288,30 @@ async function repartoV2Activo(user_id, bs) {
 // siempre. Y el modo de fallar es el peor: NO da error, NO avisa, simplemente los leads se acumulan.
 // Un default OFF obliga a acordarse de prender esto en cada cuenta nueva. Nadie se acuerda.
 //
-// COMO SE APAGA: poniendo derivacion_v3 = false EXPLICITAMENTE en esa cuenta. Ausente / null / columna
-// inexistente / error de base -> ON (el comportamiento bueno).
-// EXCEPCION: las cuentas CONGELADAS (Raices Meta Test) quedan afuera de este rollout, como de todos.
+// ENCENDIDA EN TODAS LAS CUENTAS, sin mirar la columna. La UNICA excepcion es que la cuenta este CONGELADA.
+//
+// POR QUE SE IGNORA EL VALOR GUARDADO (y no basta con "ON salvo false explicito"): la columna se creo con
+// DEFAULT false, asi que TODA cuenta creada despues de esa migracion tiene un false EXPLICITO guardado —
+// indistinguible de "el dueño lo apago a proposito". Andres Galdames es exactamente ese caso: con el criterio
+// anterior seguia apagada, y el lead Cris volvio a escribir y otra vez no derivo.
+// El arreglo de raiz es la migracion (migracion-derivacion-v3-default-on.sql, ESCRITA Y SIN CORRER porque
+// Supabase lleva horas caido). Mientras tanto, el codigo manda.
+//
+// LO QUE SE PIERDE, dicho claro: hoy NO hay forma de apagar v3 en una cuenta puntual salvo congelandola.
+// Es a proposito y es temporal: Diego pidio "prende V3 en todas las cuentas" y ninguna cuenta viva necesita
+// tenerla apagada. Cuando la migracion corra, se puede volver a "ON salvo false explicito" y recuperar el
+// interruptor por cuenta (el git log de este archivo tiene esa version).
 async function derivacionV3Activo(user_id, bs) {
   try {
-    // Congelada -> se comporta como hasta hoy, sin importar el default (regla fija del proyecto).
+    // Congelada -> se comporta como hasta hoy. Unica excepcion, y es regla fija del proyecto.
     if (bs && bs.congelada === true) return false;
-    // Solo se confia en el `bs` ya cargado si trae LAS DOS cosas. Si trae derivacion_v3 pero no sabemos si la
-    // cuenta esta congelada, se consulta igual: con el default en ON, dar por buena una fila incompleta podria
-    // prender la rotacion en una cuenta congelada (Meta Test), que es justo lo que no debe pasar.
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_v3') && Object.prototype.hasOwnProperty.call(bs, 'congelada')) {
-      return bs.derivacion_v3 !== false;
-    }
+    // Si el bs cargado ya dice que NO esta congelada, alcanza: no hace falta ir a la base.
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'congelada')) return true;
     if (!user_id) return true;
-    const { data, error } = await supabase.from('business_settings').select('derivacion_v3, congelada').eq('user_id', user_id).maybeSingle();
-    if (error) return true;                       // columna ausente / error -> ON (default nuevo)
+    const { data, error } = await supabase.from('business_settings').select('congelada').eq('user_id', user_id).maybeSingle();
+    if (error) return true;                       // error de base -> ON (es peor un lead varado)
     if (data && data.congelada === true) return false;
-    return !(data && data.derivacion_v3 === false); // solo un false EXPLICITO lo apaga
+    return true; // no congelada -> ON. El valor guardado de derivacion_v3 ya no se mira (ver el comentario).
   } catch (e) { return true; } // ante cualquier fallo, ON: es peor un lead varado que una derivacion de mas
 }
 

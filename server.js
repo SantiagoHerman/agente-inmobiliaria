@@ -27836,11 +27836,24 @@ async function _scopeLeadsDe(req) {
 }
 
 // Aplica el scope de leads a una query de `conversations` YA construida (con su .select() ya puesto).
-// SIEMPRE aisla por tenant (.eq user_id = ownerId). En modo 'propias' ademas exige asesor_id = el propio
-// (FAIL-CLOSED: ante cualquier duda, MENOS datos). En modo 'todos' no restringe mas alla del tenant.
+// SIEMPRE aisla por tenant (.eq user_id = ownerId). En modo 'todos' no restringe mas alla del tenant.
+//
+// EN MODO 'propias' VE LO SUYO **Y TAMBIEN LO QUE NO ES DE NADIE** (Diego 2026-08-02).
+// Por que, que es lo que importa entender aca: la visibilidad esta para taparle a un vendedor los leads
+// DE OTRO VENDEDOR, no los que estan libres. Los leads sin asignar son la DEUDA DEL EQUIPO: si nadie los
+// ve, nadie los agarra, y vuelven los leads varados que ya nos costaron caro. Buena parte de la cola de
+// recontacto no tiene asesor: con un `asesor_id = yo` estricto, un vendedor abria Recontactos y veia CERO.
+// El recorte sigue siendo fail-closed para lo que importa: si `asesorId` no se pudo resolver, no se
+// devuelve nada (no se cae a "ve todo").
 function _aplicarScopeLeads(query, scope) {
   let q = query.eq('user_id', scope.ownerId);
-  if (scope.modo === 'propias') q = q.eq('asesor_id', scope.asesorId);
+  if (scope.modo === 'propias') {
+    // Sin asesorId resuelto no hay con que comparar -> mejor no devolver nada que devolver la cartera entera.
+    if (!scope.asesorId) return q.eq('asesor_id', '00000000-0000-0000-0000-000000000000');
+    // (asesor_id = yo) OR (asesor_id IS NULL). El .or() se combina con AND contra el .eq('user_id') de
+    // arriba, asi que el aislamiento por cuenta NO se afloja: user_id = mio AND (mio OR sin asignar).
+    q = q.or('asesor_id.eq.' + scope.asesorId + ',asesor_id.is.null');
+  }
   return q;
 }
 

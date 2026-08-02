@@ -14633,6 +14633,421 @@ function asesorDisponibleAhora(asesor, bs) {
   } catch (e) { return true; }
 }
 
+// ===== PASO 1 (Diego 2026-08-02, caso Eduardo/Andrea, cuenta Anton) =====
+// FUNCION AISLADA: TODAVIA NADIE LA LLAMA. Es SOLO informativa: sirve, a futuro, para decidir QUE TEXTO
+// mostrarle al lead cuando no hay nadie disponible ahora (en vez de "en un momento te atiende alguien" cuando
+// en realidad faltan horas). NO decide ni reemplaza el reparto real: elegirAsesorParaDepartamento /
+// elegirAsesorActivo + el reloj revisarRotacionDerivacionV3 (cada 90s) siguen siendo los que asignan, exactamente
+// igual que hoy. Esta funcion no se toca ni se llama desde ahi.
+//
+// REGLA INNEGOCIABLE (la que mas le preocupa al dueño): ante CUALQUIER duda, dato faltante, columna ausente
+// o formato raro -> proximo=null con un motivo legible. NUNCA tirar una excepcion. NUNCA inventar una hora:
+// un "no se la hora" es un resultado correcto; una hora equivocada es el peor resultado posible (el lead
+// queda esperando algo que no va a pasar).
+//
+// DOS PREGUNTAS DISTINTAS, tratadas A PROPOSITO distinto (no es un bug, es la razon de ser de esta funcion):
+//   - "¿hay alguien AHORA?"   -> reusa asesorDisponibleAhora TAL CUAL (defensivo: ante horario faltante = TRUE,
+//     igual que hoy usa el reparto real; no se toca ese comportamiento).
+//   - "¿CUANDO entra el proximo?" -> si el horario no esta cargado o es raro, NO se puede saber -> null. Ausencia
+//     de horario NO se lee como "24-7" para este calculo (seria inventar), ni como "nunca" (tambien seria inventar):
+//     simplemente no se sabe, y eso se declara en `motivo`.
+//
+// PERTENENCIA A DEPTO: mismo criterio que elegirAsesorParaDepartamento (server.js ~3805): tabla
+// usuario_departamento, se cuenta modo='recibe' o null/legacy; se EXCLUYE 'visualiza'. Sin deptoId, se usa
+// TODOS los asesores activos-no-IA de la cuenta. OJO: ese camino "cuenta entera" es el analogo informativo de
+// elegirAsesorActivo, pero ESE picker real HOY NO mira horarios (ver estudio previo, riesgo #9) -> sin depto,
+// esta funcion puede decir "no hay nadie hasta manana" mientras el sistema, sin mirar horario, deriva igual.
+// Documentado a proposito: no se puede alinear sin cambiar elegirAsesorActivo, que esta fuera de este paso.
+//
+// EXCLUSIONES (a proposito):
+//   - activo=false            -> no cuenta (dado de baja no abre horario).
+//   - es_ia=true               -> no cuenta (un bot no es "un asesor que te atiende"; ver riesgo #7).
+//   - rol='administrador'      -> no cuenta (mismo criterio que el reparto automatico, FIX #2 server.js ~3832).
+//   - disponibilidad NOT IN ('conectado', null, '') -> no cuenta ('pausa'/'no_recibe' no van a atender aunque
+//     el horario diga que "entran" a tal hora; prometer esa hora mentiria igual, ver riesgo #5).
+//
+// Devuelve { hay_ahora, proximo, asesor_nombre, motivo }:
+//   hay_ahora=true  -> ya hay alguien disponible ahora mismo; no hace falta prometer una hora.
+//   proximo=Date    -> nadie ahora, pero se sabe con certeza cuando entra el PRIMERO (el minimo entre todos
+//                      los candidatos calculables).
+//   proximo=null    -> no se pudo calcular con certeza (`motivo` explica por que). NUNCA es una hora adivinada.
+async function proximoTurnoDisponible(ownerId, deptoId) {
+  const sinCalcular = function (motivo) { return { hay_ahora: false, proximo: null, asesor_nombre: null, motivo: motivo }; };
+  try {
+    if (!ownerId) return sinCalcular('sin_owner_id');
+
+    // 1) Universo de asesores candidatos (mismo criterio de pertenencia que el picker real).
+    let idsPermitidos = null; // null = sin filtro de depto (cuenta entera)
+    if (deptoId) {
+      let membres = null;
+      try {
+        const rm = await supabase.from('usuario_departamento').select('asesor_id, modo').eq('departamento_id', deptoId);
+        if (rm.error) throw rm.error;
+        membres = rm.data;
+      } catch (eModo) {
+        // columna `modo` ausente u otro error: reintentar sin ella (legacy = todos reciben).
+        const rm2 = await supabase.from('usuario_departamento').select('asesor_id').eq('departamento_id', deptoId);
+        membres = (rm2.data || []).map(function (m) { return { asesor_id: m.asesor_id, modo: null }; });
+      }
+      idsPermitidos = (membres || [])
+        .filter(function (m) { return m.modo == null || m.modo === 'recibe'; }) // excluir 'visualiza'
+        .map(function (m) { return m.asesor_id; });
+      if (!idsPermitidos.length) return sinCalcular('depto_sin_miembros_que_reciben');
+    }
+
+    // 2) Asesores de la cuenta (activos, sin admins). El horario se evalua abajo, dia por dia.
+    let ases = null;
+    try {
+      let q = supabase.from('asesores')
+        .select('id, nombre, disponibilidad, horario_modo, horario_json, es_ia')
+        .eq('admin_id', ownerId)
+        .eq('activo', true)
+        .or('rol.is.null,rol.neq.administrador');
+      if (idsPermitidos) q = q.in('id', idsPermitidos);
+      const r = await q;
+      if (r.error) throw r.error;
+      ases = r.data;
+    } catch (eHor) {
+      // Columnas horario_*/es_ia ausentes u otro error: sin esos datos no hay con que calcular. NO asumir
+      // "24-7" ni ningun otro default (riesgo #10 del estudio: supabase-js devuelve columna inexistente
+      // como error en la respuesta, no como excepcion; por eso el try/catch explicito).
+      return sinCalcular('faltan_columnas_horario');
+    }
+    if (!Array.isArray(ases)) return sinCalcular('error_consulta_asesores');
+
+    // Solo HUMANOS activos que reciben. es_ia queda afuera a proposito (ver comentario de exclusiones arriba).
+    const candidatos = ases.filter(function (a) {
+      if (a.es_ia === true) return false;
+      return a.disponibilidad === 'conectado' || a.disponibilidad == null || a.disponibilidad === '';
+    });
+    if (!candidatos.length) return sinCalcular('sin_asesores_elegibles');
+
+    // 3) ¿Hay alguien AHORA? Reusa asesorDisponibleAhora TAL CUAL (comportamiento actual, no se toca).
+    let bsCuenta = null;
+    try {
+      const { data: bsd } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', ownerId).maybeSingle();
+      bsCuenta = bsd || null;
+    } catch (eBs) { bsCuenta = null; }
+    const disponibleAhora = candidatos.find(function (a) { return asesorDisponibleAhora(a, bsCuenta); });
+    if (disponibleAhora) {
+      return { hay_ahora: true, proximo: null, asesor_nombre: disponibleAhora.nombre || null, motivo: 'hay_asesor_ahora' };
+    }
+
+    // 4) Nadie ahora: barrer HACIA ADELANTE (hasta 7 dias) el horario EFECTIVO de cada candidato, y quedarse
+    // con la apertura FUTURA mas cercana entre todos. `_horarioEfectivoAsesor` decide, por candidato, si su
+    // modo tiene un horario proyectable (ver mas abajo: 24-7 y json/oficina vacios NO son proyectables).
+    const AHORA = Date.now();
+    let algunoCalculable = false;
+    let minimo = null; // { ts, nombre }
+    for (const a of candidatos) {
+      const horarioEfectivo = _horarioEfectivoAsesor(a, bsCuenta);
+      if (!horarioEfectivo) continue; // sin horario proyectable para este candidato -> se ignora, no se inventa
+      algunoCalculable = true;
+      for (let d = 0; d <= 7; d++) {
+        const tsDia = AHORA + d * 24 * 60 * 60000;
+        // Todas las aperturas validas del dia AR de tsDia (no solo la primera: un turno cortado -ej 09-13 y
+        // 16-20- necesita la de las 16 si "ahora" cae entre franjas; ver riesgo de usar solo _aperturaOficinaMs).
+        const aperturasFuturas = _aperturasDelDiaMs(horarioEfectivo, tsDia).filter(function (ts) { return ts > AHORA; });
+        if (!aperturasFuturas.length) continue; // ese dia esta cerrado, o ya paso su franja -> seguir al dia siguiente
+        const primeraDelDia = Math.min.apply(null, aperturasFuturas);
+        if (minimo == null || primeraDelDia < minimo.ts) minimo = { ts: primeraDelDia, nombre: a.nombre || null };
+        break; // ya encontramos la apertura futura mas cercana de ESTE asesor; los dias siguientes son mas tarde
+      }
+    }
+    if (!algunoCalculable) return sinCalcular('sin_horario_calculable'); // ningun candidato tiene horario cargado que se pueda proyectar
+    if (!minimo) return sinCalcular('sin_apertura_en_7_dias'); // barrimos 7 dias y nadie abre: algo esta mal cargado, no se afirma nada
+
+    return { hay_ahora: false, proximo: new Date(minimo.ts), asesor_nombre: minimo.nombre, motivo: 'proximo_calculado' };
+  } catch (e) {
+    return sinCalcular('error_inesperado');
+  }
+}
+
+// Helper de proximoTurnoDisponible: para el asesor `a`, devuelve el horario (mismo shape que consumen
+// dentroHorarioOficinaEn/_aperturaOficinaMs: dias con `franjas` o legacy desde/hasta) que hay que proyectar
+// hacia adelante, o null si en su modo actual NO hay un horario CALCULABLE. Distinto adrede de
+// asesorDisponibleAhora: esa pregunta "¿esta disponible ahora?" y ante dato faltante responde TRUE (no bloquear
+// el reparto); esta responde "¿cuando entra?" y ante dato faltante responde null (no se puede saber, y adivinar
+// seria mentirle al lead — riesgos #1 y #2 del estudio previo).
+//   - '24-7'/'24_7'/'24/7'      -> siempre disponible: no existe un "proximo" que calcular (ya se resolvio como
+//                                   hay_ahora=true antes de llegar aca; si de todos modos llega, no es calculable).
+//   - 'personalizado'/'custom'  -> requiere horario_json cargado y NO VACIO (un `{}` es un caso real post-cambio
+//                                   de modo, ver riesgo #2: sin dias cargados no hay nada que proyectar).
+//   - 'oficina' (default)       -> requiere business_settings.horario_oficina cargado y NO VACIO.
+function _horarioEfectivoAsesor(a, bsCuenta) {
+  try {
+    const modo = (a && a.horario_modo) || 'oficina';
+    if (modo === '24-7' || modo === '24_7' || modo === '24/7') return null;
+    if (modo === 'personalizado' || modo === 'custom') {
+      if (a.horario_json && typeof a.horario_json === 'object' && Object.keys(a.horario_json).length) return a.horario_json;
+      return null;
+    }
+    const ho = bsCuenta && bsCuenta.horario_oficina;
+    if (!ho || typeof ho !== 'object' || !Object.keys(ho).length) return null;
+    return ho;
+  } catch (e) { return null; }
+}
+
+// Helper de proximoTurnoDisponible: TODAS las aperturas (ms UTC) del dia AR al que pertenece `tsMs`, para un
+// horario dado. A diferencia de `_aperturaOficinaMs` (que da SOLO la PRIMERA franja del dia, pensada para
+// arrancar el reloj de la escalada de citas), este barrido necesita TAMBIEN las franjas siguientes: en un dia
+// con turno cortado (ej. 09-13 y 16-20) con "ahora" cayendo a las 13:30, el proximo turno es a las 16, no al
+// dia siguiente. Mismo idioma B (getUTC*, Date.UTC + 3h) y mismos defaults que dentroHorarioOficinaEn/
+// _aperturaOficinaMs. Devuelve un array (puede venir vacio si el dia esta cerrado o sin franjas validas).
+// NO cubre el cruce de medianoche hacia el dia SIGUIENTE (ver riesgo #4 del estudio: dentroHorarioOficinaEn
+// evalua el dia por getDay() de "ahora", asi que una franja nocturna cargada en el dia D solo se detecta
+// mientras "ahora" siga siendo el dia D; si el cruce ya paso la medianoche, `asesorDisponibleAhora` ya lo
+// habria detectado como hay_ahora=true ANTES de llegar a este barrido, asi que el caso peligroso -prometer una
+// hora ya vigente- esta cubierto; lo que NO cubre es proyectar ese cruce como apertura de un dia futuro).
+function _aperturasDelDiaMs(horario, tsMs) {
+  try {
+    if (!horario || typeof horario !== 'object') return [];
+    const ar = new Date(tsMs - 3 * 60 * 60000); // wall-clock AR via getUTC*
+    const dias = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
+    const cfg = horario[dias[ar.getUTCDay()]];
+    // El dia TIENE que ser un objeto. Si viene un texto suelto (ej. "9 a 18", cargado a mano o por una
+    // importacion vieja) pasaba los controles de abajo, no encontraba `franjas`, y caia al fallback legacy
+    // 09:00-18:00: o sea, SE INVENTABA UNA HORA. Eso es exactamente lo que no puede pasar — el lead recibiria
+    // "te contactan a las 9" para un dia en que nadie abre. Ante un formato que no entendemos: no afirmar nada.
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return [];
+    if (cfg.cerrado || cfg.atiende === false) return [];
+    const aMin = function (str, fallback) {
+      const s = String(str == null ? '' : str).trim();
+      if (!s) return (fallback == null) ? null : fallback;
+      const p = s.split(':'); const h = Number(p[0]); const m = (p.length > 1) ? Number(p[1]) : 0;
+      if (!Number.isFinite(h) || h < 0 || h > 23 || !Number.isFinite(m) || m < 0 || m > 59) return (fallback == null) ? null : fallback;
+      return h * 60 + m;
+    };
+    const msDeMinutos = function (min) {
+      return Date.UTC(ar.getUTCFullYear(), ar.getUTCMonth(), ar.getUTCDate(), Math.floor(min / 60), min % 60, 0, 0) + 3 * 60 * 60000;
+    };
+    const out = [];
+    if (Array.isArray(cfg.franjas)) {
+      for (let k = 0; k < cfg.franjas.length; k++) {
+        const f = cfg.franjas[k];
+        if (!f) continue;
+        const desde = aMin(f.desde, null);
+        const hasta = aMin(f.hasta, null);
+        if (desde == null || hasta == null || desde === hasta) continue; // dato faltante o largo cero => no cuenta
+        out.push(msDeMinutos(desde));
+      }
+    } else {
+      const d2 = aMin(cfg.desde, 9 * 60), h2 = aMin(cfg.hasta, 18 * 60);
+      if (d2 != null && h2 != null && d2 !== h2) out.push(msDeMinutos(d2));
+    }
+    return out;
+  } catch (e) { return []; }
+}
+
+// GET /api/diagnostico/proximo-turno?departamento_id=<uuid opcional> -> SOLO LECTURA, SOLO DIAGNOSTICO.
+// Prueba proximoTurnoDisponible() de forma AISLADA: esta ruta no la llama nadie mas, no escribe nada, no
+// dispara reparto ni mensajes. Requiere sesion valida (verificarUsuario); resuelve el dueño de la cuenta a
+// partir del uid igual que el resto de los endpoints (asesor -> admin_id; dueño -> su propio uid). Si se pasa
+// departamento_id, se valida que pertenezca a ESTA cuenta (evita fugas de datos de horario entre tenants).
+app.get('/api/diagnostico/proximo-turno', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    const departamentoId = (req.query && req.query.departamento_id) ? String(req.query.departamento_id).trim() : null;
+    if (departamentoId) {
+      const { data: dep } = await supabase.from('departamentos').select('id').eq('id', departamentoId).eq('user_id', ownerId).maybeSingle();
+      if (!dep) return res.status(404).json({ error: 'Departamento no encontrado en esta cuenta' });
+    }
+    const resultado = await proximoTurnoDisponible(ownerId, departamentoId);
+    return res.json({
+      ok: true,
+      hay_ahora: resultado.hay_ahora,
+      proximo: resultado.proximo ? resultado.proximo.toISOString() : null,
+      asesor_nombre: resultado.asesor_nombre,
+      motivo: resultado.motivo
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'error' });
+  }
+});
+
+// ============================================================================
+// GET /api/diagnostico/salud-derivacion  -> SOLO LECTURA. SOLO DIAGNOSTICO.
+//
+// PARA QUE: hoy nadie puede contestar "¿esta cuenta puede derivar un lead, si o no?" sin abrir la base a
+// mano. El incidente de Andres Galdames (46 conversaciones, 0 derivaciones, 6 semanas sin que nadie se
+// entere) es exactamente eso: el sistema YA sabia que el pool estaba vacio -- lo calculaba en cada mensaje
+// y tiraba el dato. Esta ruta hace la MISMA pregunta que se hace el reparto, pero de forma estatica y
+// mirable, SIN esperar a que entre un lead.
+//
+// NO LA LLAMA NADIE: ningun cron, ningun webhook, ningun front. Se consulta a mano. No escribe una sola
+// fila, no dispara reparto, no manda mensajes, no gasta un token de IA. Apagarla = borrar este bloque.
+//
+// AISLAMIENTO: verificarUsuario + _resolverOwnerId (asesor -> admin_id; dueño -> su uid), igual que el
+// resto. Todo se filtra por ownerId: no hay forma de mirar otra cuenta.
+//
+// LAS COLUMNAS SE PRUEBAN DE VERDAD, no se asumen: se pide la columna y se mira el `error` de la RESPUESTA.
+// supabase-js NO tira excepcion cuando una columna no existe (gotcha ya documentado en este archivo ~3894):
+// devuelve error en el objeto. Un try/catch NO alcanza. Esto importa mucho aca: el dedupe del aviso
+// "sin asesor" es un compare-and-set sobre conversations.derivacion_aviso_dueno, y si esa columna NO
+// existe, el CAS devuelve data=null -> el codigo concluye "ya avise" -> NO AVISA NUNCA, en ninguna cuenta.
+// O sea: si columnas.conversations.derivacion_aviso_dueno viene en false, el aviso de hoy no llega tarde,
+// no existe.
+// ============================================================================
+async function _colExiste(tabla, columna) {
+  try {
+    const r = await supabase.from(tabla).select(columna).limit(1);
+    return !r.error; // error en la RESPUESTA (no excepcion) = la columna no esta
+  } catch (e) { return false; }
+}
+
+app.get('/api/diagnostico/salud-derivacion', async (req, res) => {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const ownerId = await _resolverOwnerId(uid);
+    if (!ownerId) return res.status(400).json({ error: 'No se pudo resolver la cuenta' });
+
+    // --- 1) Flags de la cuenta (los que cambian que camino de derivacion corre) -----------------------
+    let bs = null;
+    try {
+      const r = await supabase.from('business_settings')
+        .select('congelada, reparto_v2, derivacion_v4, whatsapp_contacto, horario_oficina')
+        .eq('user_id', ownerId).maybeSingle();
+      bs = r.error ? null : r.data;
+    } catch (eBs) { bs = null; }
+
+    // --- 2) ¿Existen las columnas de las que depende el aviso? ----------------------------------------
+    const columnas = {
+      conversations: {
+        derivacion_rotando: await _colExiste('conversations', 'derivacion_rotando'),
+        derivacion_aviso_dueno: await _colExiste('conversations', 'derivacion_aviso_dueno'),
+        derivacion_sin_nadie_desde: await _colExiste('conversations', 'derivacion_sin_nadie_desde'),
+        motivo_perdida: await _colExiste('conversations', 'motivo_perdida')
+      },
+      business_settings: {
+        derivacion_aviso_dueno_min: await _colExiste('business_settings', 'derivacion_aviso_dueno_min')
+      }
+    };
+
+    // --- 3) Departamentos: el estado REAL del reparto, depto por depto -------------------------------
+    // estadoDeptoParaReparto es la MISMA funcion que usa la derivacion (y es solo lectura: su picker,
+    // elegirAsesorParaDepartamento, no escribe nada). proximoTurnoDisponible agrega el "¿y cuando?".
+    let departamentos = [];
+    try {
+      const rd = await supabase.from('departamentos')
+        .select('id, nombre, es_default, recibe_fallback')
+        .eq('user_id', ownerId).eq('activo', true);
+      const deps = (rd && !rd.error && Array.isArray(rd.data)) ? rd.data : [];
+      for (const d of deps) {
+        let estado = null, turno = null;
+        try { const e = await estadoDeptoParaReparto(ownerId, d.id); estado = e && e.estado ? e.estado : null; } catch (eE) { estado = null; }
+        try { turno = await proximoTurnoDisponible(ownerId, d.id); } catch (eT) { turno = null; }
+        departamentos.push({
+          id: d.id,
+          nombre: d.nombre,
+          es_default: d.es_default === true,
+          recibe_fallback: d.recibe_fallback === true,
+          estado: estado, // asignable | todos_pausa | sin_miembros | solo_no_recibe
+          // 'sin_miembros' y 'solo_no_recibe' son ESTRUCTURALES: no se destraban solos, no vuelve nadie.
+          estructural: (estado === 'sin_miembros' || estado === 'solo_no_recibe'),
+          hay_alguien_ahora: turno ? turno.hay_ahora === true : null,
+          proximo_turno: (turno && turno.proximo) ? turno.proximo.toISOString() : null,
+          proximo_turno_motivo: turno ? turno.motivo : null,
+          proximo_turno_asesor: turno ? turno.asesor_nombre : null
+        });
+      }
+    } catch (eD) { departamentos = []; }
+
+    // --- 4) Chequeo ESTATICO de la cuenta: ¿hay UN solo usuario elegible para el reparto? -------------
+    // Esto es lo que nadie mira hoy: los 46 leads de Galdames eran 46 sintomas de UNA causa de
+    // configuracion que estaba ahi desde el alta. Mismo filtro que los pickers: activo, no IA, no admin.
+    let plantel = { total: null, elegibles: null, administradores: null, ia: null, en_pausa: null };
+    try {
+      const ra = await supabase.from('asesores')
+        .select('id, rol, es_ia, disponibilidad, activo')
+        .eq('admin_id', ownerId).eq('activo', true);
+      if (ra && !ra.error && Array.isArray(ra.data)) {
+        const t = ra.data;
+        plantel.total = t.length;
+        plantel.administradores = t.filter(function (a) { return a.rol === 'administrador'; }).length;
+        plantel.ia = t.filter(function (a) { return a.es_ia === true; }).length;
+        plantel.en_pausa = t.filter(function (a) { return a.disponibilidad === 'pausa' || a.disponibilidad === 'no_recibe'; }).length;
+        plantel.elegibles = t.filter(function (a) {
+          return a.rol !== 'administrador' && a.es_ia !== true && a.disponibilidad !== 'no_recibe';
+        }).length;
+      }
+    } catch (eP) { /* queda en null: "no se pudo leer", distinto de cero */ }
+
+    // --- 5) Leads rotando SIN asesor ahora mismo (los trabados) ---------------------------------------
+    let leads_rotando = [];
+    if (columnas.conversations.derivacion_rotando) {
+      try {
+        const rl = await supabase.from('conversations')
+          .select('id, status, ai_enabled, departamento_id, updated_at, created_at')
+          .eq('user_id', ownerId).is('asesor_id', null).eq('derivacion_rotando', true)
+          .order('updated_at', { ascending: true }).limit(200);
+        if (rl && !rl.error && Array.isArray(rl.data)) {
+          const ahora = Date.now();
+          leads_rotando = rl.data.map(function (c) {
+            const t = c.updated_at ? Date.parse(c.updated_at) : NaN;
+            return {
+              id: c.id, status: c.status, ai_enabled: c.ai_enabled !== false,
+              departamento_id: c.departamento_id || null,
+              horas_rotando: isNaN(t) ? null : Math.round((ahora - t) / 3600000)
+            };
+          });
+        }
+      } catch (eL) { leads_rotando = []; }
+    }
+
+    // --- 6) ¿Por donde puede llegar un aviso? ---------------------------------------------------------
+    // Una cuenta sin whatsapp_contacto y sin device_tokens es SORDA: ninguna alarma le llega y nada lo
+    // detecta. whatsapp_contacto no es obligatorio al dar de alta la cuenta, asi que esto pasa de verdad.
+    let tokensDueno = null;
+    try {
+      const rt = await supabase.from('device_tokens').select('token').eq('user_id', ownerId);
+      tokensDueno = (rt && !rt.error && Array.isArray(rt.data)) ? rt.data.length : null;
+    } catch (eTk) { tokensDueno = null; }
+    const whatsappCargado = !!(bs && bs.whatsapp_contacto && String(bs.whatsapp_contacto).trim());
+
+    // --- 7) Resumen: la respuesta corta a "¿esta cuenta puede derivar?" -------------------------------
+    const deptosAsignables = departamentos.filter(function (d) { return d.estado === 'asignable'; }).length;
+    const deptosEstructurales = departamentos.filter(function (d) { return d.estructural; }).length;
+    const sorda = !whatsappCargado && !tokensDueno;
+    // "Como Galdames" = ningun depto puede asignar Y no es por horario: no hay a quien derivar, nunca.
+    const comoGaldames = departamentos.length > 0 && deptosAsignables === 0 && deptosEstructurales === departamentos.length;
+
+    return res.json({
+      ok: true,
+      cuenta: {
+        owner_id: ownerId,
+        congelada: !!(bs && bs.congelada === true),
+        reparto_v2: !!(bs && bs.reparto_v2 === true),
+        derivacion_v4: !!(bs && bs.derivacion_v4 === true),
+        horario_oficina_cargado: !!(bs && bs.horario_oficina)
+      },
+      columnas: columnas,
+      plantel: plantel,
+      departamentos: departamentos,
+      leads_rotando: leads_rotando,
+      canales_aviso: {
+        whatsapp_negocio_cargado: whatsappCargado,
+        device_tokens_dueno: tokensDueno,
+        cuenta_sorda: sorda
+      },
+      resumen: {
+        deptos_total: departamentos.length,
+        deptos_asignables: deptosAsignables,
+        deptos_estructurales: deptosEstructurales,
+        leads_trabados: leads_rotando.length,
+        // Si esta en false, el aviso "no hay nadie" NO SALE NUNCA (ver comentario del encabezado).
+        aviso_sin_asesor_puede_salir: columnas.conversations.derivacion_aviso_dueno,
+        cuenta_sorda: sorda,
+        como_galdames: comoGaldames
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : 'error' });
+  }
+});
+
 // Plantillas variadas de primer recontacto (anti-baneo: nunca el mismo texto).
 function mensajeRecontacto(nombre, esPrimerContacto, empresa, agentName) {
   const n = nombre ? (' ' + nombre) : '';
@@ -22228,6 +22643,39 @@ async function recuperarHistorialLead(instancia, telefono, chatsCache) {
     return out;
   } catch (e) { console.error('Error recuperando historial de lead:', e && e.message); return []; }
 }
+// POST /api/whatsapp/importar-leads/preview — PASO PREVIO a importar (Diego, pedido 2026-08-02: "ANTES de
+// importar, mostrar cuantos del archivo son NUEVOS y cuantos YA EXISTEN por telefono" -- sin esto la primera
+// importacion grande duplica la base y parte el historial de cada persona, y deshacerlo es carisimo). Recibe
+// los telefonos YA normalizados por el front (normalizarTelefono de ImportarContactos.tsx) y SOLO LEE: mismo
+// criterio de match que el paso 2) de POST /api/whatsapp/importar-leads de abajo (telefono exacto, sin
+// filtrar por channel). No gateado por contactos_v1 a proposito: este componente se usa tambien en
+// Recontactos e Importar Leads, que no son parte de esa feature.
+app.post('/api/whatsapp/importar-leads/preview', async function (req, res) {
+  try {
+    const user_id = req.body && req.body.user_id;
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (_uidToken !== user_id) return res.status(403).json({ error: 'Identidad no coincide' });
+    if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
+    const telefonosRaw = (req.body && req.body.telefonos) || [];
+    if (!Array.isArray(telefonosRaw)) return res.status(400).json({ error: 'telefonos debe ser un array' });
+    const telefonos = Array.from(new Set(telefonosRaw.map(function (t) { return String(t || '').replace(/[^0-9]/g, ''); }).filter(function (t) { return t && t.length >= 8; })));
+    if (!telefonos.length) return res.json({ ok: true, total: 0, nuevos: 0, existentes: 0 });
+
+    const LOTE = 500;
+    const existentesSet = {};
+    for (let i = 0; i < telefonos.length; i += LOTE) {
+      const lote = telefonos.slice(i, i + LOTE);
+      try {
+        const { data } = await supabase.from('contacts').select('phone').eq('user_id', user_id).in('phone', lote);
+        (data || []).forEach(function (c) { if (c && c.phone) existentesSet[String(c.phone)] = 1; });
+      } catch (e) {}
+    }
+    const existentes = Object.keys(existentesSet).length;
+    return res.json({ ok: true, total: telefonos.length, nuevos: telefonos.length - existentes, existentes: existentes });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/whatsapp/importar-leads', async function(req, res) {
   try {
     const user_id = req.body && req.body.user_id;
@@ -22238,21 +22686,29 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     if (!user_id) return res.status(400).json({ error: 'Falta user_id' });
     const leadsRaw = (req.body && req.body.leads) || [];
     if (!Array.isArray(leadsRaw) || leadsRaw.length === 0) return res.status(400).json({ error: 'No hay leads para importar' });
+    // "Actualizar los que ya estan" (Diego): si viene en true, a los telefonos que YA EXISTIAN se les pisa el
+    // nombre con el del CSV. Default false = comportamiento de SIEMPRE (los existentes se saltean, byte-identico
+    // a como funcionaba este endpoint antes de este cambio).
+    const actualizarExistentes = (req.body && req.body.actualizarExistentes) === true;
 
     // Categoria de recontacto: 'frio' (nunca escrito) o 'viejo' ("ya le escribieron"). "viejo" ademas marca la
     // conversacion como TIBIO (ya contactado), no frio. Se acepta por body (aplica a todos) o por-lead.
     const _normCat = function (c) { return (c === 'viejo') ? 'viejo' : 'frio'; };
     const catBody = (req.body && req.body.categoria != null) ? _normCat(req.body.categoria) : 'frio';
 
-    // 1) Normalizar + DEDUP por telefono dentro del request.
+    // 1) Normalizar + DEDUP por telefono dentro del request. `nombre` (con fallback a tel) es SOLO para crear
+    // contactos nuevos (siempre hace falta algo para mostrar); `nombreCsv` es el nombre CRUDO tal cual vino en
+    // el archivo (puede venir vacio) y es el UNICO que se usa para actualizar un contacto EXISTENTE -- si se
+    // usara el fallback-a-telefono ahi, un CSV sin columna de nombre le pisaria el nombre real a gente que ya
+    // estaba cargada con su numero de telefono.
     const porTel = {}; let invalidos = 0;
     for (const lead of leadsRaw) {
       const tel = String((lead && lead.telefono) || '').replace(/[^0-9]/g, '');
       if (!tel || tel.length < 8) { invalidos++; continue; }
-      if (!porTel[tel]) porTel[tel] = { nombre: (lead && lead.nombre) || tel, categoria: (lead && lead.categoria != null) ? _normCat(lead.categoria) : catBody };
+      if (!porTel[tel]) porTel[tel] = { nombre: (lead && lead.nombre) || tel, nombreCsv: String((lead && lead.nombre) || '').trim(), categoria: (lead && lead.categoria != null) ? _normCat(lead.categoria) : catBody };
     }
     const telefonos = Object.keys(porTel);
-    if (!telefonos.length) return res.json({ ok: true, total: leadsRaw.length, unicos: 0, creados: 0, yaExistian: 0, enRecontacto: 0, invalidos: invalidos });
+    if (!telefonos.length) return res.json({ ok: true, total: leadsRaw.length, unicos: 0, creados: 0, yaExistian: 0, enRecontacto: 0, actualizados: 0, invalidos: invalidos });
 
     // Helper: procesar en lotes de N (una query por lote, no una por lead -> no se cuelga con miles).
     const LOTE = 500;
@@ -22264,6 +22720,7 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
       try { const { data } = await supabase.from('contacts').select('id, phone').eq('user_id', user_id).in('phone', lote);
         (data || []).forEach(function (c) { if (c && c.phone) idPorTel[String(c.phone)] = c.id; }); } catch (e) {}
     });
+    const existentesTel = telefonos.filter(function (t) { return !!idPorTel[t]; }); // ya estaban ANTES de este import
 
     // 3) Contactos NUEVOS: bulk insert por lotes.
     const nuevosTel = telefonos.filter(function (t) { return !idPorTel[t]; });
@@ -22273,6 +22730,23 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
       try { const { data, error } = await supabase.from('contacts').insert(filas).select('id, phone');
         if (!error && Array.isArray(data)) { data.forEach(function (c) { if (c && c.phone) { idPorTel[String(c.phone)] = c.id; creados++; } }); } } catch (e) {}
     });
+
+    // 3b) Actualizar EXISTENTES (opt-in): solo pisa `name` (no `nombre_manual`, para no tapar un nombre que el
+    // equipo ya haya editado a mano) y SOLO si el CSV trajo un nombre real para ese telefono (nombreCsv no
+    // vacio) -- si el archivo no tenia columna de nombre, no hay nada bueno para escribir y se deja como esta.
+    // No existe upsert masivo con valor distinto por fila sin un unique constraint en (user_id, phone) [ver
+    // memoria duplicados-conversaciones-y-rescate: esa migracion esta pausada], asi que se hace una query por
+    // telefono, en paralelo dentro de cada lote (no en serie, para no colgarse con archivos grandes).
+    let actualizados = 0;
+    if (actualizarExistentes && existentesTel.length) {
+      await porLotes(existentesTel, async function (lote) {
+        await Promise.all(lote.map(async function (t) {
+          const nombreCsv = porTel[t].nombreCsv;
+          if (!nombreCsv) return;
+          try { const r = await supabase.from('contacts').update({ name: nombreCsv }).eq('user_id', user_id).eq('phone', t); if (!r.error) actualizados++; } catch (e) {}
+        }));
+      });
+    }
 
     // 4) Conversaciones: solo para contactos SIN conversacion. Primero detectar cuales ya tienen.
     const contactIds = telefonos.map(function (t) { return idPorTel[t]; }).filter(Boolean);
@@ -22305,7 +22779,7 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
 
     // NOTA: se saco la recuperacion de historial via Evolution (era 1 llamada HTTP por lead, en serie, sin timeout ->
     // colgaba el import con archivos grandes). El historial, si hace falta, se puede recuperar despues por-lead.
-    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, invalidos: invalidos });
+    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -28237,6 +28711,484 @@ app.post('/api/leads/actualizar', async function (req, res) {
 // ===== FIN VISIBILIDAD DE LEADS EN EL SERVIDOR =====
 // ============================================================================
 
+// ============================================================================
+// ===== CONTACTOS (Diego 2026-08-02) — agenda de TODOS los contactos, no solo los que escribieron =====
+// ----------------------------------------------------------------------------
+// PROBLEMA QUE RESUELVE: Conversaciones solo muestra a quien escribio por WhatsApp. Un contacto importado por
+// CSV que nunca escribio es HOY invisible en el panel (existe en `contacts`, sin fila en `conversations`).
+//
+// GATEADO por `contactos_v1` (business_settings, MISMO patron defensivo EXACTO que visibilidad_server_v1 /
+// pipeline_filtros_v1): columna ausente / error -> false, y estos endpoints devuelven 409 "gated". Con el flag
+// OFF el resto del sistema queda BYTE-IDENTICO a hoy (el front de hoy no llama a nada de esto).
+//
+// VISIBILIDAD: un contacto es tan sensible como una conversacion (nombre/telefono/presupuesto) -> se reusa
+// SIN modificarlo el mismo _scopeLeadsDe() de la seccion de arriba (mismo authUserId/ownerId/asesorId/modo).
+// La diferencia de fondo es que `contacts` NO tiene asesor_id (el asesor vive en `conversations`), asi que el
+// scope 'propias' no se puede aplicar con un simple .eq/.or como en _aplicarScopeLeads: hace falta resolver,
+// aparte, que contactos estan asignados a OTRO asesor (para excluirlos) via la tabla `conversations`. Ver
+// _contactosDeOtroAsesor mas abajo.
+//
+// GOTCHA CRITICO (Diego, pedido original): PostgREST corta en 1000 filas pase lo que pase con .limit(). Anton
+// tiene 1.202 contactos. El listado pagina por KEYSET real (cursor por `id`, nunca offset/.range()) y la
+// busqueda de texto va SIEMPRE al servidor (nunca se filtra sobre "lo que ya se bajo" en el navegador). Los
+// helpers que resuelven filtros via `conversations` (_paginarPorId) tambien paginan de VERDAD en tandas de
+// 1000 en vez de asumir que la primera tanda es todo -- y cortan con error (fail-closed) en vez de devolver
+// una lista truncada en silencio si superan un tope de seguridad (50.000 filas).
+//
+// NO TOCA: Conversaciones, el motor de reparto/derivacion, el prompt de la IA ni el Maestro. GET
+// /api/conversaciones/timeline (~L13312) NO se modifica; /api/contactos/uno replica sus mismas queries
+// (mismas tablas/columnas/orden/limite) en vez de refactorizarlo, a proposito, para no tocar ese endpoint.
+//
+// CERO IA: todo esto son consultas a la base, ningun llamado a un modelo.
+// ============================================================================
+
+// Flag por-cuenta (mismo patron defensivo EXACTO que visibilidadServerV1Activo): columna ausente / error ->
+// false (los endpoints de /api/contactos/* devuelven 409 "gated", nada nuevo corre).
+async function contactosV1Activo(ownerId) {
+  try {
+    if (!ownerId) return false;
+    const { data, error } = await supabase.from('business_settings').select('contactos_v1').eq('user_id', ownerId).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.contactos_v1 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
+// Pagina TODA una consulta en tandas de 1000 (NUNCA offset — GOTCHA de arriba: PostgREST corta en 1000 pase lo
+// que pase con .limit()). El keyset es por `id` (columna unica y totalmente ordenable, sirve aunque sea UUID:
+// no hace falta que sea cronologico, solo estable). `queryFactory(afterId)` debe devolver la query YA armada
+// con sus filtros + `.order('id',{ascending:true}).limit(1000)` + `.gt('id', afterId)` si afterId no es null.
+// Corta con {ok:false} si supera 50 tandas (50.000 filas): FAIL-CLOSED -- mejor un error visible al caller que
+// silenciar datos a mitad de camino (es EXACTAMENTE el error que este gotcha pide evitar).
+async function _paginarPorId(queryFactory) {
+  try {
+    var out = []; var afterId = null; var iter = 0;
+    while (true) {
+      iter++;
+      var r = await queryFactory(afterId);
+      if (r.error) return { ok: false, error: r.error.message };
+      var data = r.data || [];
+      out = out.concat(data);
+      if (data.length < 1000) break;
+      afterId = data[data.length - 1].id;
+      if (iter >= 50) return { ok: false, error: 'demasiadas filas para paginar de forma segura (tope 50.000)' };
+    }
+    return { ok: true, rows: out };
+  } catch (e) { return { ok: false, error: e && e.message }; }
+}
+
+// contact_ids que tienen conversacion Y matchean (opcionalmente) estado/asesor. Sin filtros -> TODOS los
+// contact_ids con alguna conversacion (sirve para el filtro "con conversacion" a secas). asesorCsv acepta
+// 'sin' (asesor_id IS NULL), MISMO criterio que el csv de asesor_id de GET /api/leads.
+async function _contactosConConversacionQueMatchean(ownerId, estadosCsv, asesorCsv) {
+  var r = await _paginarPorId(function (afterId) {
+    var q = supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId).not('contact_id', 'is', null);
+    if (estadosCsv && estadosCsv.length) q = q.in('status', estadosCsv);
+    if (asesorCsv && asesorCsv.length) {
+      var aseIds = asesorCsv.filter(function (a) { return a !== 'sin'; });
+      var quiereSin = asesorCsv.indexOf('sin') >= 0;
+      var orParts = [];
+      if (aseIds.length) orParts.push('asesor_id.in.(' + aseIds.join(',') + ')');
+      if (quiereSin) orParts.push('asesor_id.is.null');
+      if (orParts.length) q = q.or(orParts.join(','));
+    }
+    q = q.order('id', { ascending: true }).limit(1000);
+    if (afterId) q = q.gt('id', afterId);
+    return q;
+  });
+  if (!r.ok) return r;
+  return { ok: true, ids: Array.from(new Set(r.rows.map(function (x) { return x.contact_id; }).filter(Boolean))) };
+}
+
+// contact_ids asignados a un asesor DISTINTO del que pide (para el scope 'propias': lo que es de otro asesor
+// nunca se ve, sea cual sea el filtro pedido). MISMO criterio de fondo que _aplicarScopeLeads (mio + sin
+// asignar SI se ven; de otro NO), pero expresado como exclusion porque `contacts` no tiene asesor_id.
+async function _contactosDeOtroAsesor(ownerId, miAsesorId) {
+  var r = await _paginarPorId(function (afterId) {
+    var q = supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId)
+      .not('asesor_id', 'is', null).neq('asesor_id', miAsesorId).not('contact_id', 'is', null)
+      .order('id', { ascending: true }).limit(1000);
+    if (afterId) q = q.gt('id', afterId);
+    return q;
+  });
+  if (!r.ok) return r;
+  return { ok: true, ids: Array.from(new Set(r.rows.map(function (x) { return x.contact_id; }).filter(Boolean))) };
+}
+
+// Columnas EXPLICITAS de `contacts` -- confirmadas por grep sobre el uso real en este archivo (memoria del
+// lead / cargar-manual / renombrar): name, nombre_manual, phone, interest, budget, notes, channel,
+// perfil_comprador. `created_at` se PIDE pero de forma DEFENSIVA (ver CONTACTOS_COLS_BASE): no encontre un uso
+// existente que confirme que la columna existe en todas las cuentas.
+const CONTACTOS_COLS_FULL = 'id, name, nombre_manual, phone, interest, budget, notes, channel, perfil_comprador, created_at';
+const CONTACTOS_COLS_BASE = 'id, name, nombre_manual, phone, interest, budget, notes, channel, perfil_comprador';
+
+function _esColumnaAusente(err) {
+  if (!err) return false;
+  var m = String((err && (err.message || err.details || err.hint)) || '').toLowerCase();
+  return (err.code === 'PGRST204') || (m.indexOf('column') >= 0 && (m.indexOf('does not exist') >= 0 || m.indexOf('schema cache') >= 0 || m.indexOf('could not find') >= 0));
+}
+
+// GET /api/contactos — listado paginado de VERDAD (keyset por id), busqueda de texto y filtros en el SERVIDOR.
+app.get('/api/contactos', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await contactosV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'contactos_v1 desactivado' });
+
+    const qp = req.query || {};
+    const limit = Math.min(Math.max(parseInt(qp.limit, 10) || 50, 1), 100);
+    const dirAsc = (qp.dir === 'asc');
+
+    // Scope 'propias': sin asesorId resuelto no hay con que comparar -> mejor no devolver nada (fail-closed,
+    // MISMO criterio que _aplicarScopeLeads).
+    let idsExcluirScope = [];
+    if (scope.modo === 'propias') {
+      if (!scope.asesorId) return res.json({ ok: true, contactos: [], next_cursor: null });
+      const rEx = await _contactosDeOtroAsesor(scope.ownerId, scope.asesorId);
+      if (!rEx.ok) return res.status(500).json({ error: rEx.error });
+      idsExcluirScope = rEx.ids;
+    }
+
+    // ---- filtros que necesitan mirar `conversations` (con/sin conversacion, estado, asesor) ----
+    const estadoCsv = _leadsCsv(qp.estado).filter(function (s) { return LEADS_ESTADOS_VALIDOS.indexOf(s) >= 0; });
+    const asesorCsv = _leadsCsv(qp.asesor_id);
+    const conConv = String(qp.con_conversacion || '');
+
+    let idsRequeridos = null;      // null = sin filtro; array = contacts.id TIENE que estar adentro
+    let idsSinConversacion = null; // solo se llena si con_conversacion=0 (ids A EXCLUIR = los que SI tienen conversacion)
+    if (conConv === '0') {
+      const r = await _contactosConConversacionQueMatchean(scope.ownerId, [], []);
+      if (!r.ok) return res.status(500).json({ error: r.error });
+      idsSinConversacion = r.ids;
+    } else if (conConv === '1' || estadoCsv.length || asesorCsv.length) {
+      const r = await _contactosConConversacionQueMatchean(scope.ownerId, estadoCsv, asesorCsv);
+      if (!r.ok) return res.status(500).json({ error: r.error });
+      idsRequeridos = r.ids;
+    }
+    if (idsRequeridos != null && !idsRequeridos.length) return res.json({ ok: true, contactos: [], next_cursor: null });
+
+    // ---- armar la query de `contacts`, con fallback DEFENSIVO de columnas (created_at puede no existir) ----
+    function _build(cols) {
+      let q = supabase.from('contacts').select(cols).eq('user_id', scope.ownerId);
+
+      // texto libre: nombre / nombre_manual / telefono / notas — EN EL SERVIDOR (nunca sobre lo ya bajado).
+      const texto = String(qp.q || '').trim();
+      if (texto) {
+        const likeVal = '*' + texto.replace(/[%,()*]/g, ' ').trim() + '*';
+        const soloNum = texto.replace(/[^0-9]/g, '');
+        const orParts = ['name.ilike.' + likeVal, 'nombre_manual.ilike.' + likeVal, 'notes.ilike.' + likeVal];
+        if (soloNum) orParts.push('phone.ilike.*' + soloNum + '*');
+        q = q.or(orParts.join(','));
+      }
+
+      const canalCsv = _leadsCsv(qp.canal);
+      if (canalCsv.length) q = q.in('channel', canalCsv);
+
+      // presupuesto cargado: usa contacts.budget (columna confirmada por el pedido), no el de `conversations`.
+      if (qp.presupuesto === '1') q = q.not('budget', 'is', null).neq('budget', '');
+
+      if (idsRequeridos != null) q = q.in('id', idsRequeridos);
+      if (idsSinConversacion != null && idsSinConversacion.length) q = q.not('id', 'in', '(' + idsSinConversacion.join(',') + ')');
+      if (idsExcluirScope.length) q = q.not('id', 'in', '(' + idsExcluirScope.join(',') + ')');
+
+      // KEYSET real por `id` (nunca offset — GOTCHA de arriba).
+      const cursor = String(qp.cursor || '').trim();
+      if (cursor) q = dirAsc ? q.gt('id', cursor) : q.lt('id', cursor);
+
+      return q.order('id', { ascending: dirAsc }).limit(limit);
+    }
+
+    let r = await _build(CONTACTOS_COLS_FULL);
+    if (r.error && _esColumnaAusente(r.error)) r = await _build(CONTACTOS_COLS_BASE);
+    if (r.error) return res.status(500).json({ error: r.error.message });
+
+    const contactos = r.data || [];
+    const pageIds = contactos.map(function (c) { return c.id; });
+
+    // ---- enriquecer SOLO la pagina actual (acotada a `limit`, nunca toda la tabla) con su conversacion ----
+    let convPorContacto = {};
+    if (pageIds.length) {
+      const rc = await supabase.from('conversations').select('id, contact_id, status, asesor_id, temperatura, updated_at')
+        .eq('user_id', scope.ownerId).in('contact_id', pageIds);
+      if (!rc.error) (rc.data || []).forEach(function (c) { convPorContacto[c.contact_id] = c; });
+    }
+    const asesorIds = Array.from(new Set(Object.keys(convPorContacto).map(function (k) { return convPorContacto[k].asesor_id; }).filter(Boolean)));
+    let nombreAsesor = {};
+    if (asesorIds.length) {
+      const ra = await supabase.from('asesores').select('id, nombre').in('id', asesorIds);
+      (ra.data || []).forEach(function (a) { nombreAsesor[a.id] = a.nombre; });
+    }
+
+    const filas = contactos.map(function (c) {
+      const conv = convPorContacto[c.id] || null;
+      return {
+        id: c.id,
+        nombre: c.nombre_manual || c.name || null,
+        telefono: c.phone || null,
+        interes: c.interest || null,
+        presupuesto: c.budget || null,
+        origen: c.channel || null,
+        fecha_alta: (Object.prototype.hasOwnProperty.call(c, 'created_at') ? c.created_at : null),
+        conversation_id: conv ? conv.id : null,
+        estado_conversacion: conv ? conv.status : null,
+        temperatura: conv ? conv.temperatura : null,
+        asesor_id: conv ? conv.asesor_id : null,
+        asesor_nombre: (conv && conv.asesor_id) ? (nombreAsesor[conv.asesor_id] || null) : null
+      };
+    });
+
+    let next_cursor = null;
+    if (contactos.length === limit) next_cursor = contactos[contactos.length - 1].id;
+    return res.json({ ok: true, contactos: filas, next_cursor: next_cursor });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/contactos/contadores — chips (total, con conversacion, sin conversacion), recortados por el MISMO
+// scope que el listado. count con head:true no tiene el tope de 1000 filas (no trae filas).
+app.get('/api/contactos/contadores', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await contactosV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'contactos_v1 desactivado' });
+
+    let idsExcluirScope = [];
+    if (scope.modo === 'propias') {
+      if (!scope.asesorId) return res.json({ ok: true, total: 0, con_conversacion: 0, sin_conversacion: 0 });
+      const rEx = await _contactosDeOtroAsesor(scope.ownerId, scope.asesorId);
+      if (!rEx.ok) return res.status(500).json({ error: rEx.error });
+      idsExcluirScope = rEx.ids;
+    }
+
+    let qTotal = supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('user_id', scope.ownerId);
+    if (idsExcluirScope.length) qTotal = qTotal.not('id', 'in', '(' + idsExcluirScope.join(',') + ')');
+    const totalR = await qTotal;
+    if (totalR.error) return res.status(500).json({ error: totalR.error.message });
+    const total = totalR.count || 0;
+
+    // con_conversacion: contar `conversations` (1 fila ~ 1 contacto, por el indice unico user_id+contact_id de
+    // migracion-contactos-unique.sql) del tenant, con el MISMO recorte de scope que _aplicarScopeLeads.
+    let qCon = supabase.from('conversations').select('id', { count: 'exact', head: true }).eq('user_id', scope.ownerId).not('contact_id', 'is', null);
+    if (scope.modo === 'propias' && scope.asesorId) qCon = qCon.or('asesor_id.eq.' + scope.asesorId + ',asesor_id.is.null');
+    const conR = await qCon;
+    if (conR.error) return res.status(500).json({ error: conR.error.message });
+    const con_conversacion = conR.count || 0;
+
+    return res.json({ ok: true, total: total, con_conversacion: con_conversacion, sin_conversacion: Math.max(0, total - con_conversacion) });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/contactos/uno?id= — todo lo que el sistema sabe de un contacto: sus datos, su conversacion (si
+// tiene), citas, mensajes de sistema (pases), decisiones de la IA, historial de estados y reservas.
+// 403 si esta fuera de alcance o no existe (nunca se distingue, para no revelar si un id ajeno existe).
+// Replica las mismas queries de GET /api/conversaciones/timeline (~L13312) A PROPOSITO, sin tocar ese endpoint
+// (restriccion dura: no tocar Conversaciones) -- mismas tablas/columnas/orden/limite de 200.
+app.get('/api/contactos/uno', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await contactosV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'contactos_v1 desactivado' });
+
+    const contactId = String((req.query && req.query.id) || '').trim();
+    if (!contactId) return res.status(400).json({ error: 'Falta id' });
+
+    let rc = await supabase.from('contacts').select(CONTACTOS_COLS_FULL).eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
+    if (rc.error && _esColumnaAusente(rc.error)) rc = await supabase.from('contacts').select(CONTACTOS_COLS_BASE).eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
+    if (rc.error) return res.status(500).json({ error: rc.error.message });
+    if (!rc.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
+    const contacto = rc.data;
+
+    // Conversacion (si tiene), YA recortada por el mismo scope de lectura que /api/leads/uno.
+    const convR = await _aplicarScopeLeads(supabase.from('conversations').select(LEADS_COLS_CONV).eq('contact_id', contactId), scope).maybeSingle();
+    if (convR.error) return res.status(500).json({ error: convR.error.message });
+    // 403 SOLO si el contacto tiene una conversacion pero quedo fuera del scope (es de otro asesor). Si NO
+    // tiene conversacion no hay nada que scopear -- se muestra igual (mismo criterio 'propias': lo que no es
+    // de nadie se ve, es deuda del equipo).
+    let tieneConv = false;
+    try { const chk = await supabase.from('conversations').select('id').eq('contact_id', contactId).eq('user_id', scope.ownerId).maybeSingle(); tieneConv = !!(chk && chk.data); } catch (eChk) {}
+    if (tieneConv && !convR.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
+    const conv = convR.data || null;
+    const convId = conv ? conv.id : null;
+
+    var citas = [];
+    try {
+      var orC = ['contact_id.eq.' + contactId];
+      if (convId) orC.push('conversation_id.eq.' + convId);
+      var qCit = supabase.from('citas').select('id, fecha_hora, fecha_fin, tipo, titulo, estado, notas, lead_nombre, asesor_id, origen, unidad, lugar')
+        .eq('user_id', scope.ownerId).or(orC.join(',')).order('fecha_hora', { ascending: true }).limit(200);
+      if (scope.modo === 'propias' && scope.asesorId) qCit = qCit.eq('asesor_id', scope.asesorId);
+      var rCit = await qCit;
+      if (!rCit.error) citas = rCit.data || [];
+    } catch (eCit) { citas = []; }
+
+    var pases = [];
+    if (convId) {
+      try {
+        var rp = await supabase.from('messages').select('id, content, created_at').eq('user_id', scope.ownerId).eq('conversation_id', convId).eq('role', 'sistema').order('created_at', { ascending: true }).limit(200);
+        if (!rp.error) pases = (rp.data || []).filter(function (m) { return m && typeof m.content === 'string' && m.content.indexOf('🔁') >= 0; });
+      } catch (eP) { pases = []; }
+    }
+
+    var decisiones = [];
+    if (convId) {
+      try {
+        var rd = await supabase.from('ia_decisiones')
+          .select('id, created_at, origen, mensaje_lead, mensaje_truncado, clasificador_corrio, estado_previo, estado_propuesto, estado_despues, estado_aplicado, motivo_no_aplicado, bloqueo_interesado, tools, pidio_area, deducido, fuera_alcance, derivo, derivo_camino, derivo_motivo, departamento_id, departamento_texto, ia_respondio')
+          .eq('user_id', scope.ownerId).eq('conversation_id', convId).order('created_at', { ascending: true }).limit(200);
+        if (!rd.error) decisiones = rd.data || [];
+      } catch (eDec) { decisiones = []; }
+    }
+
+    var estados = [];
+    if (convId) {
+      try {
+        var re = await supabase.from('lead_estados_historial').select('id, created_at, estado_anterior, estado_nuevo, origen, actor_asesor_id, motivo')
+          .eq('user_id', scope.ownerId).eq('conversation_id', convId).order('created_at', { ascending: true }).limit(200);
+        if (!re.error) estados = re.data || [];
+      } catch (eEst) { estados = []; }
+    }
+
+    var reservas = [];
+    try {
+      var orR = ['contact_id.eq.' + contactId];
+      if (convId) orR.push('conversation_id.eq.' + convId);
+      var rr = await supabase.from('dev_reservas')
+        .select('id, created_at, updated_at, development_id, unit_id, contact_id, conversation_id, estado, monto_sena, moneda, comprobante_url, motivo_caida, notas')
+        .eq('user_id', scope.ownerId).or(orR.join(',')).order('created_at', { ascending: true }).limit(200);
+      if (!rr.error) reservas = rr.data || [];
+    } catch (eRes) { reservas = []; }
+
+    return res.json({
+      ok: true,
+      contacto: {
+        id: contacto.id,
+        nombre: contacto.nombre_manual || contacto.name || null,
+        telefono: contacto.phone || null,
+        interes: contacto.interest || null,
+        presupuesto: contacto.budget || null,
+        nota: contacto.notes || null,
+        origen: contacto.channel || null,
+        perfil_comprador: contacto.perfil_comprador || null,
+        fecha_alta: (Object.prototype.hasOwnProperty.call(contacto, 'created_at') ? contacto.created_at : null)
+      },
+      conversacion: conv,
+      citas: citas,
+      pases: pases,
+      decisiones: decisiones,
+      estados: estados,
+      reservas: reservas
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/contactos — alta manual { nombre, telefono, interes?, presupuesto?, nota? }. MISMO criterio de
+// permiso EXACTO que POST /api/contactos/cargar-manual (~L17756): administrador siempre puede; asesor comun
+// necesita puede_cargar_contacto===true; dueno "puro" (sin fila en asesores) puede si es el tenant. Los 3
+// fallbacks defensivos de columna se repiten IDENTICOS a proposito (misma resiliencia ante migraciones a medio
+// correr). DIFERENCIA con cargar-manual: esto NO crea una conversacion (es un contacto de agenda, no un lead
+// "listo para humano"); cargar-manual sigue siendo el camino para eso desde Conversaciones.
+app.post('/api/contactos', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+
+    let ase = null;
+    try { const r = await supabase.from('asesores').select('id, admin_id, nombre, rol, visibilidad, puede_cargar_contacto').eq('auth_user_id', uid).maybeSingle(); if (!r.error && r.data) ase = r.data; } catch (e1) {}
+    if (!ase) { try { const r2 = await supabase.from('asesores').select('id, admin_id, nombre, rol, visibilidad').eq('auth_user_id', uid).maybeSingle(); if (!r2.error && r2.data) ase = r2.data; } catch (e2) {} }
+    if (!ase) { try { const r3 = await supabase.from('asesores').select('id, admin_id, nombre, rol').eq('auth_user_id', uid).maybeSingle(); if (!r3.error && r3.data) ase = r3.data; } catch (e3) {} }
+
+    let ownerId;
+    if (ase && ase.admin_id) {
+      const _esAdmin = esAdministrador(ase);
+      if (!_esAdmin && ase.puede_cargar_contacto !== true) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+      ownerId = ase.admin_id;
+    } else {
+      let esDueno = false;
+      try { const { data: _bsOwner, error: _eBsOwner } = await supabase.from('business_settings').select('user_id').eq('user_id', uid).maybeSingle(); if (!_eBsOwner && _bsOwner && _bsOwner.user_id) esDueno = true; } catch (eOwner) {}
+      if (!esDueno) return res.status(403).json({ error: 'No tenes permiso para cargar contactos' });
+      ownerId = uid;
+    }
+
+    if (!(await contactosV1Activo(ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'contactos_v1 desactivado' });
+
+    const b = req.body || {};
+    const nombre = (b.nombre != null) ? String(b.nombre).trim().slice(0, 200) : '';
+    const telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+    const interes = (b.interes != null) ? String(b.interes).trim().slice(0, 500) : '';
+    const presupuesto = (b.presupuesto != null) ? String(b.presupuesto).trim().slice(0, 300) : '';
+    const nota = (b.nota != null) ? String(b.nota).trim().slice(0, 10000) : '';
+
+    // OJO DUPLICADOS (Diego): buscar por TELEFONO SOLO (sin filtrar por channel), MISMO criterio que
+    // /api/contactos/cargar-manual, para encontrar cualquier contacto existente de ese numero sea cual sea su
+    // canal de origen. Si existe, NO se crea otro: se devuelve el existente con ya_existia=true.
+    const ex = await supabase.from('contacts').select('id, name, nombre_manual, phone, interest, budget, notes, channel').eq('user_id', ownerId).eq('phone', telefono).maybeSingle();
+    if (ex.error) return res.status(500).json({ error: ex.error.message });
+    if (ex.data) return res.json({ ok: true, ya_existia: true, contacto: ex.data });
+
+    const payloadFull = { user_id: ownerId, name: nombre, nombre_manual: nombre, phone: telefono, channel: 'manual' };
+    if (interes) payloadFull.interest = interes;
+    if (presupuesto) payloadFull.budget = presupuesto;
+    if (nota) payloadFull.notes = nota;
+    let ins = await supabase.from('contacts').insert(payloadFull).select('id, name, nombre_manual, phone, interest, budget, notes, channel').single();
+    if (ins.error) {
+      // DEFENSIVO: si alguna columna (nombre_manual/interest/budget/notes) faltara, reintentar con lo minimo.
+      ins = await supabase.from('contacts').insert({ user_id: ownerId, name: nombre, phone: telefono, channel: 'manual' }).select('id, name, phone, channel').single();
+    }
+    if (ins.error) return res.status(500).json({ error: 'No se pudo crear el contacto' });
+    return res.json({ ok: true, ya_existia: false, contacto: ins.data });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// PATCH /api/contactos/:id — editar datos + nota. Whitelist ESTRICTA: cualquier otra clave del body se
+// ignora en silencio (mismo criterio que POST /api/leads/actualizar). phone/channel/user_id quedan AFUERA a
+// proposito (identidad/tenant del contacto, no se editan aca).
+app.patch('/api/contactos/:id', async function (req, res) {
+  try {
+    const scope = await _scopeLeadsDe(req);
+    if (!scope) return res.status(401).json({ error: 'No autorizado' });
+    if (scope.modo === 'error') return res.status(403).json({ error: 'No se pudo resolver la visibilidad del usuario' });
+    if (!(await contactosV1Activo(scope.ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'contactos_v1 desactivado' });
+
+    const contactId = String(req.params.id || '').trim();
+    if (!contactId) return res.status(400).json({ error: 'Falta id' });
+
+    const rc = await supabase.from('contacts').select('id').eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
+    if (rc.error) return res.status(500).json({ error: rc.error.message });
+    if (!rc.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
+
+    // Scope 'propias': si el contacto tiene conversacion y es de OTRO asesor, no se puede editar.
+    if (scope.modo === 'propias') {
+      if (!scope.asesorId) return res.status(403).json({ error: 'No se pudo resolver la visibilidad (fail-closed)' });
+      const chk = await supabase.from('conversations').select('id, asesor_id').eq('user_id', scope.ownerId).eq('contact_id', contactId).maybeSingle();
+      if (chk.error) return res.status(500).json({ error: chk.error.message });
+      if (chk.data && chk.data.asesor_id && chk.data.asesor_id !== scope.asesorId) return res.status(403).json({ error: 'Este contacto no te pertenece' });
+    }
+
+    const b = req.body || {};
+    const cambios = (b.cambios && typeof b.cambios === 'object') ? b.cambios : b;
+    const upd = {};
+    if (Object.prototype.hasOwnProperty.call(cambios, 'nombre')) {
+      const v = String(cambios.nombre == null ? '' : cambios.nombre).trim().slice(0, 200);
+      if (!v) return res.status(400).json({ error: 'El nombre no puede quedar vacio' });
+      upd.nombre_manual = v;
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'interes')) upd.interest = String(cambios.interes == null ? '' : cambios.interes).slice(0, 500);
+    if (Object.prototype.hasOwnProperty.call(cambios, 'presupuesto')) upd.budget = String(cambios.presupuesto == null ? '' : cambios.presupuesto).slice(0, 300);
+    if (Object.prototype.hasOwnProperty.call(cambios, 'nota')) upd.notes = String(cambios.nota == null ? '' : cambios.nota).slice(0, 10000);
+    if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nada para actualizar' });
+
+    const updR = await supabase.from('contacts').update(upd).eq('id', contactId).eq('user_id', scope.ownerId);
+    if (updR.error) return res.status(500).json({ error: 'No se pudo actualizar: ' + updR.error.message });
+    return res.json({ ok: true, cambios: upd });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+// ============================================================================
+// ===== FIN CONTACTOS =====
+// ============================================================================
+
 // ===== CITAS / AGENDA (nativo, sin Google) =====
 // Account-scoped por JWT (service key bypassa RLS): el dueno ve TODAS las citas de su cuenta; el asesor comun
 // solo las suyas; el asesor 'administrador' ve todas. Las crea el agente (al agendar) o se cargan a mano aca.
@@ -32723,8 +33675,16 @@ app.get('/api/ui-flags', async function(req, res){
         if (_ceh && _ceh >= 1 && _ceh <= 168) cita_escalada_horas = _ceh;
       }
     } catch (e) { /* columnas ausentes / error -> defaults */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+    // contactos_v1 (Diego 2026-08-02): gate del menu/pantalla nueva Contactos (listado+ficha+import/alta manual).
+    // Query SEPARADA y defensiva: columna ausente / error -> false = el menu NO aparece, BYTE-IDENTICO a hoy.
+    // migracion-contactos-v1.sql escrita y SIN CORRER. 0 tokens de IA: son consultas a la base, ninguna llama a un modelo.
+    var contactos_v1 = false;
+    try {
+      var _ctv = await supabase.from('business_settings').select('contactos_v1').eq('user_id', user_id).maybeSingle();
+      if (_ctv && _ctv.data) contactos_v1 = _ctv.data.contactos_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================

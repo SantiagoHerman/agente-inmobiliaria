@@ -23978,15 +23978,14 @@ async function _leerLotesDePlano(url, user_id, maxTokens, deep) {
     ] }]
   });
   try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'scraper_vision', PRECIO_SCRAPE_VISION); } catch (e) {}
-  // COBRO DEL SCRAPER (Diego 2026-08-01: "mientras descuente mensajes por el uso no hay problema").
-  // Esto gasta VISION, lo mas caro del sistema, y hasta hoy NO sumaba al contador -> dentroDelTopeIA leia un
-  // numero que nunca se movia y este gasto no se frenaba nunca. Ahora suma 1 mensaje por CADA plano leido,
-  // mismo patron que _scrapeAlojamientoProfundo. Best-effort: si el cobro falla, el scrapeo sigue.
-  // QUEDA ANOTADO EL RIESGO QUE ESTO ABRE: el cron revisarScrapingsDesarrollo dispara solo y puede gastar
-  // hasta 6 mensajes por emprendimiento por ciclo. En una cuenta con varios emprendimientos en auto_scrape,
-  // eso come cupo del plan y, si lo agota, la IA DEJA DE CONTESTARLE A LOS LEADS. Hoy es teorico: se verifico
-  // en la base que NINGUN development tiene auto_scrape=true. Si algun dia se prende, hay que revisarlo.
-  try { if (user_id && SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch (eCobVision) {}
+  // AGUJERO CONOCIDO (auditoria 2026-08-01), A PROPOSITO SIN TAPAR TODAVIA: esto gasta VISION (lo mas caro
+  // del sistema) y NO suma al contador de cupo (registrarUsoIA), asi que dentroDelTopeIA lee un numero que
+  // nunca se mueve y este gasto no se frena nunca.
+  // Se PROBO taparlo con `registrarUsoIA(user_id, 1)` aca y se REVIRTIO: el cron revisarScrapingsDesarrollo
+  // corre solo y gasta hasta 6 mensajes por emprendimiento por ciclo, asi que cobrarlo puede comerse el cupo
+  // del plan y dejar a la IA SIN CONTESTARLE A LOS LEADS. Cobrar el gasto no puede costar mas caro que el
+  // agujero. Falta la decision del dueño: o el cron queda exento y se cobra solo lo que dispara una persona,
+  // o se cobra todo pero con un cupo aparte que no toque el del plan.
   var t = (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : '';
   return _parseJsonObjetoDefensivo(t);
 }
@@ -24076,10 +24075,10 @@ async function _scrapeDesarrolloProfundo(url, user_id, opts) {
   }
   // Costo -> panel (best-effort, con el precio del MODELO usado)
   try { if (iaResp && iaResp.usage) await registrarUsoTokens(user_id, iaResp.usage, 'scraper_desarrollo', PRECIO_SCRAPE_DESARROLLO); } catch (eTok) {}
-  // COBRO, LA OTRA MITAD DEL DE _leerLotesDePlano (ver alla el comentario largo y el riesgo del cron).
-  // Esta es la extraccion principal (Sonnet, "todo, no parte"): 1 mensaje de cupo. La lectura de los planos
-  // se cuenta aparte, adentro de _leerLotesDePlano, porque son llamadas distintas y cada una gasta.
-  try { if (user_id && SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch (eCobDesarrollo) {}
+  // AGUJERO CONOCIDO, LA OTRA MITAD DEL DE _leerLotesDePlano (ver el comentario largo alla): esta extraccion
+  // tampoco suma al contador de cupo, asi que el tope de la cuenta no se mueve por el scraper de desarrollo.
+  // Tambien se probo taparlo y se revirtio por el mismo motivo: lo dispara un cron, y cobrarlo puede dejar a
+  // la IA sin contestarle a los leads. Se tapan los dos juntos, cuando el dueño decida como.
 
   var txt = (iaResp && iaResp.content && iaResp.content[0] && iaResp.content[0].text) ? iaResp.content[0].text : '';
   var parsed = _parseJsonObjetoDefensivo(txt);

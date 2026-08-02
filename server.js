@@ -2277,21 +2277,36 @@ async function repartoV2Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
-// ===== DERIVACION v3: FLAG POR-CUENTA derivacion_v3 (mismo patron defensivo que repartoV2Activo) =====
-// GATE del comportamiento NUEVO de derivacion "Sonnet decide + rotacion + el que escribe atiende". Con el flag
-// OFF (default: false / ausente / null / columna inexistente / cualquier error) -> comportamiento ACTUAL EXACTO:
-// la tool derivar_a_humano NO se ofrece al agente, el webhook NO evalua pidioDerivar, el cron de rotacion hace
-// early-return, y el camino clasificador(Haiku) -> derivarAHumano queda BYTE-IDENTICO al de hoy. TRUE -> se ofrece
-// la tool + se activa la rotacion. FAIL-SAFE: si la columna todavia no existe en prod, el .select devuelve error
-// -> tratamos como OFF. Reusa un bs ya cargado si trae la propiedad (evita una query extra por mensaje).
+// ===== DERIVACION v3: derivacion_v3 — AHORA ENCENDIDA POR DEFECTO (Diego 2026-08-02) =====
+// GATE del comportamiento "la IA decide derivar + rotacion + el que escribe atiende". Ofrece la tool
+// derivar_a_humano al agente y activa la rotacion.
+//
+// POR QUE CAMBIA EL DEFAULT (era false). Diego: "prende V3 en todas las cuentas".
+// El 2026-08-02 se encontro la cuenta Andres Galdames con 46 conversaciones y CERO derivaciones: se dio de
+// alta DESPUES del rollout donde se prendio el flag a mano, asi que nacio sin el. La IA le prometia al lead
+// "te paso con un asesor" y no tenia la herramienta para hacerlo -> el lead quedaba en Interesado para
+// siempre. Y el modo de fallar es el peor: NO da error, NO avisa, simplemente los leads se acumulan.
+// Un default OFF obliga a acordarse de prender esto en cada cuenta nueva. Nadie se acuerda.
+//
+// COMO SE APAGA: poniendo derivacion_v3 = false EXPLICITAMENTE en esa cuenta. Ausente / null / columna
+// inexistente / error de base -> ON (el comportamiento bueno).
+// EXCEPCION: las cuentas CONGELADAS (Raices Meta Test) quedan afuera de este rollout, como de todos.
 async function derivacionV3Activo(user_id, bs) {
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_v3')) return bs.derivacion_v3 === true;
-    if (!user_id) return false;
-    const { data, error } = await supabase.from('business_settings').select('derivacion_v3').eq('user_id', user_id).maybeSingle();
-    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
-    return !!(data && data.derivacion_v3 === true);
-  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+    // Congelada -> se comporta como hasta hoy, sin importar el default (regla fija del proyecto).
+    if (bs && bs.congelada === true) return false;
+    // Solo se confia en el `bs` ya cargado si trae LAS DOS cosas. Si trae derivacion_v3 pero no sabemos si la
+    // cuenta esta congelada, se consulta igual: con el default en ON, dar por buena una fila incompleta podria
+    // prender la rotacion en una cuenta congelada (Meta Test), que es justo lo que no debe pasar.
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_v3') && Object.prototype.hasOwnProperty.call(bs, 'congelada')) {
+      return bs.derivacion_v3 !== false;
+    }
+    if (!user_id) return true;
+    const { data, error } = await supabase.from('business_settings').select('derivacion_v3, congelada').eq('user_id', user_id).maybeSingle();
+    if (error) return true;                       // columna ausente / error -> ON (default nuevo)
+    if (data && data.congelada === true) return false;
+    return !(data && data.derivacion_v3 === false); // solo un false EXPLICITO lo apaga
+  } catch (e) { return true; } // ante cualquier fallo, ON: es peor un lead varado que una derivacion de mas
 }
 
 // ===== DERIVACION v4: FLAG POR-CUENTA derivacion_v4 (mismo patron defensivo que derivacionV3Activo) =====
@@ -27888,7 +27903,13 @@ app.get('/api/leads/scope', async function (req, res) {
 // lista ampliada tiene que pasar por el F1 manual (probar /api/leads a mano) antes de prender el flag en
 // ninguna cuenta: si me equivoque en un nombre, PostgREST rechaza el select ENTERO (falla las 5 pantallas
 // a la vez, no solo Recontactos) -- por eso ESTO HAY QUE PROBARLO ANTES de tocar el flag en produccion.
-const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, admin_tomo_por, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual';
+// AMPLIADO (Diego 2026-08-02): se agrego `respaldo_derivado` -- la usa detectarRespaldoDerivado() del front
+// (conversaciones/page.tsx:1710) para el popup "Respaldo fallo IA". Verificacion INDIRECTA igual que el resto
+// de las columnas aditivas de este SELECT: el front hoy hace `select('*')` sobre `conversations` en produccion
+// (SELECT_CONVS, page.tsx:974) y lee esa columna del resultado -- el popup es una feature YA DESPLEGADA
+// (respaldo_v2, 2026-06-26), asi que la columna existe en la base compartida. Igual, primer uso de esta lista
+// tiene que pasar por el F1 manual (ver comentario grande arriba) antes de tocar el flag en produccion.
+const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, admin_tomo_por, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual, respaldo_derivado';
 const LEADS_COLS_CONTACT = 'contacts(name, nombre_manual, phone, channel, interest, budget, foto_url, about)';
 const LEADS_SELECT = LEADS_COLS_CONV + ', ' + LEADS_COLS_CONTACT;
 
@@ -28074,9 +28095,29 @@ app.get('/api/leads/mensajes', async function (req, res) {
 
     const limit = Math.min(Math.max(parseInt((req.query && req.query.limit) || '80', 10) || 80, 1), 300);
     const antesDe = (req.query && req.query.antes_de) ? String(req.query.antes_de).trim() : '';
-    let mq = supabase.from('messages').select('id, conversation_id, role, content, enviado_por, created_at').eq('conversation_id', convId).order('created_at', { ascending: false }).limit(limit);
-    if (antesDe && !isNaN(Date.parse(antesDe))) mq = mq.lt('created_at', antesDe);
-    const mr = await mq;
+    // AMPLIADO (Diego 2026-08-02): las 6 columnas originales alcanzaban para texto plano, pero el chat
+    // (conversaciones/page.tsx:3960-4104) pinta ~19 columnas mas: fotos/audios/videos (media_url, media_tipo),
+    // reacciones, respuestas citadas (responde_a_wa_id, cita_texto), pauta de Meta, traduccion (content_original,
+    // idioma), tildes de entrega (estado_envio, estado_entrega, wa_message_id), autoria (autor_asesor_id,
+    // autor_nombre), ubicacion (latitud, longitud), origen y borrado. Sin esto, convertir esta pantalla rompia
+    // TODO eso en silencio (los campos llegan undefined, no error). Lista verificada contra los INSERT/UPDATE
+    // reales del webhook y de los endpoints de mensajes (grep sobre server.js), no contra el esquema en vivo.
+    const MSG_COLS_FULL = 'id, conversation_id, role, content, content_original, idioma, enviado_por, created_at, media_url, media_tipo, wa_message_id, responde_a_wa_id, cita_texto, pauta_meta, latitud, longitud, autor_asesor_id, autor_nombre, estado_envio, estado_entrega, reacciones, origen, borrado';
+    const MSG_COLS_BASE = 'id, conversation_id, role, content, enviado_por, created_at'; // las 6 de siempre, comportamiento previo
+    function _mBuild(cols) {
+      let q = supabase.from('messages').select(cols).eq('conversation_id', convId).order('created_at', { ascending: false }).limit(limit);
+      if (antesDe && !isNaN(Date.parse(antesDe))) q = q.lt('created_at', antesDe);
+      return q;
+    }
+    let mr = await _mBuild(MSG_COLS_FULL);
+    // DEFENSIVO -- mismo patron EXACTO que usa el resto del archivo (ver _insertMensajeConAutor / insert entrante
+    // ~L11421-11426) para columnas aditivas que pueden no estar migradas todavia: si el error es de columna
+    // ausente, reintentar con las columnas base en vez de tirar 500 y dejar el chat sin mensajes.
+    if (mr.error) {
+      const _m = String((mr.error && (mr.error.message || mr.error.details || mr.error.hint)) || '').toLowerCase();
+      const _esColAusente = (mr.error.code === 'PGRST204') || (_m.indexOf('column') >= 0 && (_m.indexOf('does not exist') >= 0 || _m.indexOf('schema cache') >= 0 || _m.indexOf('could not find') >= 0));
+      if (_esColAusente) mr = await _mBuild(MSG_COLS_BASE);
+    }
     if (mr.error) return res.status(500).json({ error: mr.error.message });
     const mensajes = (mr.data || []).slice().reverse(); // cronologico ascendente para pintar el chat de arriba a abajo
     return res.json({ ok: true, mensajes: mensajes });
@@ -28089,11 +28130,15 @@ app.get('/api/leads/mensajes', async function (req, res) {
 // duplicar esa logica aca las desincroniza. motivo_perdida tampoco entra: vive en /api/conversations/cerrar.
 const LEADS_ACTUALIZAR_STATUS_OK = LEADS_ESTADOS_VALIDOS;
 const LEADS_ACTUALIZAR_TEMP_OK = LEADS_TEMPS_VALIDAS;
+// MISMA lista EXACTA que el <select> IDIOMAS del front (conversaciones/page.tsx:2714) -- si no matchea 1 a 1,
+// un idioma valido en el selector se rechazaria aca con 400.
+const LEADS_ACTUALIZAR_IDIOMA_OK = ['es', 'en', 'pt', 'fr', 'it', 'de', 'nl', 'ru', 'zh', 'ja', 'ko', 'ar', 'hi', 'tr', 'pl'];
 
 // POST /api/leads/actualizar { conversation_id, cambios:{ status?, temperatura?, etiquetas?, nota_asesor?,
-// ai_enabled? } } -- UNA sola puerta de escritura para lo que hoy el front actualiza escribiendo DIRECTO a
-// Supabase (status: page.tsx:1965, temperatura: 2042, etiquetas: 2052, ai_enabled: 2120). Chequea el MISMO
-// scope que la lectura (un asesor 'propias' no puede tocar leads ajenos) y reusa, sin modificarlos, los
+// ai_enabled?, presupuesto?, traductor_activo?, idioma_lead? } } -- UNA sola puerta de escritura para lo que
+// hoy el front actualiza escribiendo DIRECTO a Supabase (status: page.tsx:1965, temperatura: 2042, etiquetas:
+// 2052, nota_asesor: 2075, presupuesto: 2088, traductor_activo: 2099, idioma_lead: 2107, ai_enabled: 2120).
+// Chequea el MISMO scope que la lectura (un asesor 'propias' no puede tocar leads ajenos) y reusa, sin modificarlos, los
 // efectos laterales que YA existen: registrarCambioEstadoConv + registrarCambioEstado (mismos que usa
 // /api/conversations/cerrar) y _tempConDecayParaConv + temperaturaPorEstado para la temperatura automatica
 // del cambio de estado (mismo mapa que usa toda la app).
@@ -28137,6 +28182,21 @@ app.post('/api/leads/actualizar', async function (req, res) {
     }
     if (Object.prototype.hasOwnProperty.call(cambios, 'ai_enabled')) {
       upd.ai_enabled = cambios.ai_enabled === true;
+    }
+    // AMPLIADO (Diego 2026-08-02): 3 campos que el front ya escribe directo a Supabase sobre SU lead
+    // (presupuesto: page.tsx:2088, traductor_activo: 2099, idioma_lead: 2107) y que la whitelist original no
+    // cubria -- ver estudio previo, seccion "NO CUBIERTAS". Los tres son datos que un asesor legitimamente
+    // edita del lead que esta atendiendo; no tocan asesor_id/departamento_id/reparto.
+    if (Object.prototype.hasOwnProperty.call(cambios, 'presupuesto')) {
+      upd.presupuesto = String(cambios.presupuesto == null ? '' : cambios.presupuesto).slice(0, 300);
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'traductor_activo')) {
+      upd.traductor_activo = cambios.traductor_activo === true;
+    }
+    if (Object.prototype.hasOwnProperty.call(cambios, 'idioma_lead')) {
+      const idm = String(cambios.idioma_lead || '').trim();
+      if (LEADS_ACTUALIZAR_IDIOMA_OK.indexOf(idm) < 0) return res.status(400).json({ error: 'idioma_lead invalido' });
+      upd.idioma_lead = idm;
     }
     if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nada para actualizar' });
 

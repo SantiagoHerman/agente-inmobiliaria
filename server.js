@@ -31196,15 +31196,7 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
     var accion = (req.body && req.body.accion) ? String(req.body.accion) : '';
     if (accion === 'pausar' || accion === 'reactivar') {
       // Pausa TOTAL del cliente (cero tokens: ni transcribe ni traduce ni responde).
-      // LAS DOS COLUMNAS VAN JUNTAS (Diego 2026-08-02: "la pausa en maestro va por encima de la pausa en
-      // cliente"). `crm_pausado` es la de siempre: la leen ~48 lugares y NO se toco ninguno, para no mover
-      // el comportamiento. `pausa_de_maestro` es solo una MARCA de quien la puso: con ella prendida, el
-      // trigger de la base no deja que el cliente pase su pausa de activa a inactiva desde su panel.
-      // Al REACTIVAR se apagan las dos, si no el cliente quedaria trabado sin que nadie lo este frenando.
-      await supabase.from('business_settings').update({
-        crm_pausado: (accion === 'pausar'),
-        pausa_de_maestro: (accion === 'pausar'),
-      }).eq('user_id', uid);
+      await supabase.from('business_settings').update({ crm_pausado: (accion === 'pausar') }).eq('user_id', uid);
     } else if (accion === 'pausar_agente' || accion === 'reactivar_agente') {
       // Pausa SOLO el agente de ese cliente (no contesta), pero sigue transcribiendo/traduciendo para el humano.
       await supabase.from('business_settings').update({ agente_pausado: (accion === 'pausar_agente') }).eq('user_id', uid);

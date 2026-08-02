@@ -95,11 +95,6 @@
 -- editor) auth.role() da NULL -> con el COALESCE de abajo tambien pasa libre
 -- (no queremos que un arreglo manual tuyo se auto-revierta).
 
--- Columna nueva: marca de QUIEN puso la pausa. Nace en false = "no la puso el Maestro", que es el estado
--- de todas las cuentas hoy -> al correr esto NADIE queda trabado. Aditiva: ningun codigo existente la lee.
-alter table public.business_settings
-  add column if not exists pausa_de_maestro boolean not null default false;
-
 -- (SECURITY INVOKER a proposito, es el default: no necesita leer nada fuera
 -- de la fila OLD/NEW que ya trae el UPDATE, asi que no hace falta escalar
 -- privilegios. set search_path solo por higiene.)
@@ -113,19 +108,6 @@ begin
     new.eliminado_at := old.eliminado_at;
     new.congelada    := old.congelada;
     new.rubro        := old.rubro;
-    -- pausa_de_maestro es SOLO una marca de QUIEN puso la pausa. La escribe unicamente el Maestro.
-    new.pausa_de_maestro := old.pausa_de_maestro;
-
-    -- LA PAUSA DEL MAESTRO VA POR ENCIMA DE LA DEL CLIENTE (Diego 2026-08-02).
-    -- Ojo con lo que esto NO hace: `crm_pausado` NO se bloquea. Es la MISMA columna que usa el boton
-    -- "IA Activa/Pausada" del dueño en su panel (escribe directo por Supabase, sin backend); bloquearla
-    -- entera le rompia ese boton todos los dias, y en silencio. Ademas la leen ~48 lugares del backend:
-    -- separarla en dos columnas obligaba a tocarlos todos, con el riesgo de que a UNO se le escape la pausa.
-    -- Lo unico que se impide es DESTRABAR una pausa puesta por el Maestro. El dueño sigue pausando y
-    -- despausando lo suyo como siempre; si el freno lo puso el Maestro, toca el boton y no destraba.
-    if old.pausa_de_maestro is true and old.crm_pausado is true and new.crm_pausado is not true then
-      new.crm_pausado := old.crm_pausado;
-    end if;
   end if;
   return new;
 end;

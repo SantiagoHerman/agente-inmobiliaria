@@ -32221,7 +32221,7 @@ app.get('/api/maestro/cliente/:id', async function(req, res){
     var derivacion = nConv ? Math.round(stats.listo_humano / nConv * 100) : 0;
     var conversion = nConv ? Math.round(stats.cerrado / nConv * 100) : 0;
     var extraMovs = []; try { var em = await supabase.from('mensajes_extra_mov').select('cantidad, origen, nota, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(12); extraMovs = (em && em.data) || []; } catch (eEM) {}
-    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, email: emailUsuario, ui_moderno: B.ui_moderno === true, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
+    return res.json({ ok: true, empresa: B.company_name || null, rubro: B.rubro || null, email: emailUsuario, whatsapp_contacto: B.whatsapp_contacto || null, ui_moderno: B.ui_moderno === true, pausado: B.crm_pausado === true, agente_pausado: B.agente_pausado === true, cortesia: !!(S && S.cortesia === true), stats: stats, contactos: (cont.count || 0), ai_mensajes: (msgs.count || 0), propiedades: (props.count || 0), conocimiento: (kb.count || 0), asesores_total: asesoresTotal, asesores_activos: asesoresActivos, ultimo_login: ultimoLogin, ultima_actividad: ultimaActividad, whatsapp: wa, derivacion_pct: derivacion, conversion_pct: conversion, limites: limites, override: ov, config: config, alta: altaFecha, ultimo_backup: ultimoBackup, backups_count: backupsCount, nota: nota, mensajes_extra: (S && S.mensajes_extra) || 0, extra_movs: extraMovs, suscripcion: S });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -32628,6 +32628,19 @@ app.post('/api/maestro/cliente/:id/credenciales', async function(req, res){
     var b = req.body || {};
     var nuevoEmail = (b.email ? String(b.email) : '').trim().toLowerCase();
     var nuevaClave = (b.password ? String(b.password) : '').trim();
+    // NUMERO DEL DUEÑO (business_settings.whatsapp_contacto) — Diego 2026-08-03: poder editarlo desde el
+    // Maestro para CUALQUIER cuenta, las de hoy y las futuras. Es el numero donde llegan los avisos y al que
+    // la IA le PREGUNTA antes de derivar cuando no sabe. NO es el de Reportes (reportes_config.whatsapp), que
+    // va por su lado: cambiar este NO cambia aquel.
+    // Se guarda SOLO CON DIGITOS a proposito: el backend reconoce al dueño comparando la COLA del numero
+    // contra el que llega de WhatsApp. Un "0" o un "15" adelante rompe esa coincidencia, el dueño deja de ser
+    // reconocido y la IA lo atiende como si fuera un cliente, en silencio (ya paso, ver ~L11157).
+    // Enviar cadena vacia BORRA el numero (deja la cuenta sin canal de avisos): es explicito, no un descuido.
+    var tieneWa = Object.prototype.hasOwnProperty.call(b, 'whatsapp_contacto');
+    var nuevoWa = tieneWa ? String(b.whatsapp_contacto == null ? '' : b.whatsapp_contacto).replace(/[^0-9]/g, '').replace(/^0+/, '') : null;
+    if (tieneWa && nuevoWa && (nuevoWa.length < 10 || nuevoWa.length > 15)) {
+      return res.status(400).json({ error: 'El numero tiene que tener entre 10 y 15 digitos, con codigo de pais y sin 0 ni 15 adelante' });
+    }
     var patch = {};
     if (nuevoEmail) {
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(nuevoEmail)) return res.status(400).json({ error: 'Email invalido' });
@@ -32637,15 +32650,25 @@ app.post('/api/maestro/cliente/:id/credenciales', async function(req, res){
       if (nuevaClave.length < 6) return res.status(400).json({ error: 'La clave debe tener al menos 6 caracteres' });
       patch.password = nuevaClave;
     }
-    if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nada para actualizar: manda un email nuevo y/o una clave nueva' });
-    var r = await supabase.auth.admin.updateUserById(uid, patch);
-    if (r.error) {
-      var m = String((r.error && r.error.message) || '');
-      if (/already|registered|exists|duplicate/i.test(m)) return res.status(400).json({ error: 'Ese email ya esta en uso por otra cuenta' });
-      return res.status(400).json({ error: m || 'No se pudo actualizar' });
+    if (!Object.keys(patch).length && !tieneWa) return res.status(400).json({ error: 'Nada para actualizar: manda un email nuevo, una clave nueva y/o el numero del dueño' });
+    // El numero va a business_settings, NO a Auth: es una tabla distinta y se guarda aparte. Se hace PRIMERO
+    // para no dejar el email/clave cambiados y el numero sin guardar si esto falla.
+    if (tieneWa) {
+      var rw = await supabase.from('business_settings').update({ whatsapp_contacto: nuevoWa || null }).eq('user_id', uid);
+      if (rw && rw.error) return res.status(400).json({ error: 'No se pudo guardar el numero: ' + rw.error.message });
     }
-    try { await supabase.from('admin_audit').insert({ accion: 'editar_credenciales', target_user_id: uid, detalle: JSON.stringify({ cambio_email: !!nuevoEmail, cambio_clave: !!nuevaClave }) }); } catch(eA){}
-    return res.json({ ok: true, email: (r.data && r.data.user && r.data.user.email) || nuevoEmail || null });
+    var emailFinal = null;
+    if (Object.keys(patch).length) {
+      var r = await supabase.auth.admin.updateUserById(uid, patch);
+      if (r.error) {
+        var m = String((r.error && r.error.message) || '');
+        if (/already|registered|exists|duplicate/i.test(m)) return res.status(400).json({ error: 'Ese email ya esta en uso por otra cuenta' });
+        return res.status(400).json({ error: m || 'No se pudo actualizar' });
+      }
+      emailFinal = (r.data && r.data.user && r.data.user.email) || nuevoEmail || null;
+    }
+    try { await supabase.from('admin_audit').insert({ accion: 'editar_credenciales', target_user_id: uid, detalle: JSON.stringify({ cambio_email: !!nuevoEmail, cambio_clave: !!nuevaClave, cambio_whatsapp: !!tieneWa }) }); } catch(eA){}
+    return res.json({ ok: true, email: emailFinal, whatsapp_contacto: tieneWa ? (nuevoWa || null) : undefined });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

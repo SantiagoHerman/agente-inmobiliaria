@@ -16234,7 +16234,6 @@ async function revisarAvisosInternos() {
       _slaCandidatas = _sc || [];
     } catch (eSlaQ) { _slaCandidatas = []; }
     const _slaCfgCache = {};      // _avisosConfig por ownerId
-    const _slaHorarioCache = {};  // horario_oficina por ownerId (undefined = no leido aun)
     for (let i = 0; i < _slaCandidatas.length; i++) {
       const conv = _slaCandidatas[i];
       const ownerId = conv.user_id;
@@ -16259,14 +16258,15 @@ async function revisarAvisosInternos() {
       if (!_ult || _ult.role !== 'contact' || !_ult.created_at) continue; // ya respondieron (o sin datos)
       const anchorMs = new Date(_ult.created_at).getTime();
       if (!anchorMs) continue;
-      // Regla de horario evaluada SOBRE EL ANCHOR. Sin horario cargado => no filtra => se avisa siempre (decision dueno).
-      if (!(ownerId in _slaHorarioCache)) {
-        let _ho = null;
-        try { const { data: _bs } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', ownerId).maybeSingle(); _ho = _bs && _bs.horario_oficina ? _bs.horario_oficina : null; } catch (eHo) { _ho = null; }
-        _slaHorarioCache[ownerId] = _ho;
-      }
-      const _horario = _slaHorarioCache[ownerId];
-      if (_horario && !dentroHorarioOficinaEn(_horario, anchorMs)) continue; // la espera empezo fuera de horario
+      // SLA 24/7 (Diego 2026-08-03): "no importa el horario o el dia. Si alguien escribe a las 23hs el dueño o
+      // la administracion se tienen que enterar por mas que el usuario no trabaje o este pausado".
+      //
+      // ACA HABIA UN FILTRO DE HORARIO, Y ESTABA ROTO ADEMAS DE NO CORRESPONDER. Evaluaba el horario de oficina
+      // SOBRE EL ANCHOR (el momento en que escribio el lead), no sobre AHORA. Como el lead ya escribio y esta
+      // esperando, ese momento NUNCA cambia: un lead que escribio un sabado 21:00 quedaba marcado "fuera de
+      // horario" PARA SIEMPRE y no escalaba el lunes, ni nunca. No avisaba tarde: no avisaba jamas. Y como ya
+      // tiene asesor asignado, tampoco aparecia en "necesita atencion". Se perdia entero, en silencio.
+      // Estaba PRENDIDO en Anton (la unica cuenta con la escalada activa y horario cargado).
       const esperaMin = Math.floor((ahoraMs - anchorMs) / 60000);
       // Resolver el escalon MAS ALTO alcanzado (p3 > p2 > p1). Cada uno se dispara una sola vez.
       const _p1 = cfg.sla_humano.paso1, _p2 = cfg.sla_humano.paso2, _p3 = cfg.sla_humano.paso3;
@@ -28389,7 +28389,18 @@ app.get('/api/leads/scope', async function (req, res) {
 // (SELECT_CONVS, page.tsx:974) y lee esa columna del resultado -- el popup es una feature YA DESPLEGADA
 // (respaldo_v2, 2026-06-26), asi que la columna existe en la base compartida. Igual, primer uso de esta lista
 // tiene que pasar por el F1 manual (ver comentario grande arriba) antes de tocar el flag en produccion.
-const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, admin_tomo_por, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual, respaldo_derivado';
+// FIX 2026-08-03 (bug real en produccion: la ficha de Contactos devolvia 500 y no abria).
+// SE SACARON `admin_tomo_por` y `respaldo_derivado`: NO EXISTEN en la tabla `conversations` (verificado
+// contra information_schema, son las 2 unicas de las 35 que faltan). PostgREST rechaza el SELECT ENTERO por
+// una columna inexistente, asi que la ficha fallaba completa.
+// POR QUE NADIE LO VIO ANTES: el comentario de arriba dice que estas columnas se verificaron "de forma
+// INDIRECTA" -- se asumio que existian porque el front hace select('*') y las lee. Esa comprobacion no puede
+// funcionar: con select('*'), una columna que NO existe se lee como `undefined`, exactamente igual que una
+// que existe y vale null/false. La verificacion indirecta no distingue "no esta" de "esta vacia".
+// Los dos campos se ESCRIBEN best-effort en otros lados (ya estan envueltos en try/catch justamente porque
+// pueden no existir), asi que sacarlos de la LECTURA no cambia ningun comportamiento.
+// SI ALGUN DIA SE CORRE LA MIGRACION QUE LAS AGREGA: volver a sumarlas aca, y recien ahi el front las recibe.
+const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual';
 const LEADS_COLS_CONTACT = 'contacts(name, nombre_manual, phone, channel, interest, budget, foto_url, about)';
 const LEADS_SELECT = LEADS_COLS_CONV + ', ' + LEADS_COLS_CONTACT;
 

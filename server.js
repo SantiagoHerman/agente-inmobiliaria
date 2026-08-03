@@ -28819,7 +28819,12 @@ async function _contactosDeOtroAsesor(ownerId, miAsesorId) {
 // perfil_comprador. `created_at` se PIDE pero de forma DEFENSIVA (ver CONTACTOS_COLS_BASE): no encontre un uso
 // existente que confirme que la columna existe en todas las cuentas.
 const CONTACTOS_COLS_FULL = 'id, name, nombre_manual, phone, interest, budget, notes, channel, perfil_comprador, created_at';
-const CONTACTOS_COLS_BASE = 'id, name, nombre_manual, phone, interest, budget, notes, channel, perfil_comprador';
+// BASE = SOLO columnas confirmadas en la tabla. FIX 2026-08-03: antes esta lista tambien traia
+// `perfil_comprador`, que NO existe en `contacts` (verificado en la base: es la unica de las 10 que falta).
+// Como estaba en las DOS listas, el fallback no degradaba nada -- fallaban las dos y el listado devolvia 500
+// ("No se pudo cargar el listado"), mientras los contadores andaban bien porque no piden esa columna.
+// Una lista de respaldo que repite la columna sospechosa no es un respaldo.
+const CONTACTOS_COLS_BASE = 'id, name, nombre_manual, phone, interest, budget, notes, channel';
 
 function _esColumnaAusente(err) {
   if (!err) return false;

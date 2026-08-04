@@ -34196,8 +34196,15 @@ app.get('/api/ui-flags', async function(req, res){
       var _ctv = await supabase.from('business_settings').select('contactos_v1').eq('user_id', user_id).maybeSingle();
       if (_ctv && _ctv.data) contactos_v1 = _ctv.data.contactos_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+    // fichas_v1 (Diego 2026-08-04): gate del PANEL de Fichas del cliente dentro de la ficha del contacto.
+    // Query SEPARADA y defensiva para que, si la columna faltara, NO tire abajo los flags de arriba.
+    var fichas_v1 = false;
+    try {
+      var _fv = await supabase.from('business_settings').select('fichas_v1').eq('user_id', user_id).maybeSingle();
+      if (_fv && _fv.data) fichas_v1 = _fv.data.fichas_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, fichas_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================
@@ -38513,6 +38520,19 @@ async function _duenoDelUid(uid) {
   } catch (e) { return uid; }
 }
 
+// Flag por-cuenta `fichas_v1` (mismo patron DEFENSIVO EXACTO que contactos_v1 / visibilidad_server_v1):
+// columna ausente / error / false -> OFF. Con OFF estos endpoints devuelven 409 "gated" y el panel de
+// Fichas no se dibuja: el sistema queda byte-identico a como estaba antes de esta feature.
+// Es el interruptor para apagar la pantalla en segundos SIN un deploy.
+async function fichasV1Activo(ownerId) {
+  try {
+    if (!ownerId) return false;
+    const { data, error } = await supabase.from('business_settings').select('fichas_v1').eq('user_id', ownerId).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> OFF
+    return !!(data && data.fichas_v1 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
 // Campos ESTRUCTURADOS que el sistema usa para actuar. Todo lo demas va a `datos` (jsonb).
 var _FICHA_CAMPOS = ['contact_id', 'tipo', 'estado', 'property_id', 'conversation_id', 'desde', 'hasta',
   'proximo_vencimiento', 'zonas', 'presupuesto', 'moneda', 'tipo_propiedad', 'ambientes', 'dormitorios',
@@ -38536,6 +38556,7 @@ app.get('/api/fichas', async function (req, res) {
     var uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
     var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
     var q = supabase.from('fichas').select('*').eq('user_id', dueno).order('created_at', { ascending: false });
     if (req.query && req.query.contact_id) q = q.eq('contact_id', String(req.query.contact_id));
     if (req.query && req.query.estado) q = q.eq('estado', String(req.query.estado));
@@ -38553,6 +38574,7 @@ app.post('/api/fichas', async function (req, res) {
     var uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
     var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
     var b = (req.body && typeof req.body === 'object') ? req.body : {};
     if (!b.contact_id) return res.status(400).json({ error: 'Falta el contacto' });
     if (!b.tipo) return res.status(400).json({ error: 'Falta el tipo de ficha' });
@@ -38575,6 +38597,7 @@ app.patch('/api/fichas/:id', async function (req, res) {
     var uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
     var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
     var upd = _fichaDesdeBody((req.body && typeof req.body === 'object') ? req.body : {});
     delete upd.contact_id; // una ficha NO cambia de dueño: si se equivocaron, se borra y se crea otra
     upd.updated_at = new Date().toISOString();
@@ -38590,6 +38613,7 @@ app.delete('/api/fichas/:id', async function (req, res) {
     var uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado' });
     var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
     var { error } = await supabase.from('fichas').delete().eq('id', req.params.id).eq('user_id', dueno);
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ ok: true });

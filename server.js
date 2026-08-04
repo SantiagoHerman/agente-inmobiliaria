@@ -2338,6 +2338,27 @@ async function derivacionV4Activo(user_id, bs) {
   } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
 }
 
+// ===== DERIVACION UNIFICADA — FASE 1 (PLAN-DERIVACION-UNIFICADA.md, Diego 2026-08-04) =====
+// Flag por-cuenta `derivacion_unificada_v1`, DEFAULT OFF. Con el flag ON, la rotacion (v3) DEJA DE
+// ELEGIR A QUIEN y le pregunta a la v2 (derivarAHumano con setStatus:false). Regla acordada:
+// "la v2 decide A QUIEN, la v3 decide QUE PASA DESPUES" -- asi no pueden volver a separarse.
+//
+// Con el flag OFF: comportamiento de hoy, byte-identico (la v3 sigue con su propio picker).
+// Mismo patron defensivo EXACTO que derivacionV3Activo / derivacionV4Activo / repartoV2Activo:
+// columna ausente / null / false / cualquier error -> OFF. Nunca rompe.
+//
+// OJO AL PRENDERLO: cambia A QUIEN se le ofrece el lead (mas correcto, pero distinto). Se prende
+// PRIMERO en la cuenta de prueba, se verifica el caso real, y recien despues en las demas.
+async function derivacionUnificadaActiva(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'derivacion_unificada_v1')) return bs.derivacion_unificada_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('derivacion_unificada_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
+    return !!(data && data.derivacion_unificada_v1 === true);
+  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+}
+
 // ============================================================================
 // ===== REDISENO DERIVACION 2026-07-24 (Diego): 5 FLAGS NUEVOS, TODOS DEFAULT OFF =====
 // Mismo patron defensivo EXACTO que derivacionV4Activo/repartoV2Activo: columna ausente / null / false / cualquier
@@ -5188,12 +5209,57 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (_deptoId && _deptoId !== (_cv.departamento_id || null) && (!_cv.departamento_id || _hintResolvio)) {
       try { await supabase.from('conversations').update({ departamento_id: _deptoId, departamento_manual: false }).eq('id', convId); } catch (eUD) { try { await supabase.from('conversations').update({ departamento_id: _deptoId }).eq('id', convId); } catch (eUD2) {} }
     }
-    // Elegir un usuario DISPONIBLE. Con depto -> picker por departamento; sin depto -> pool general (cobertura).
+    // ========================================================================================
+    // FASE 1 del PLAN-DERIVACION-UNIFICADA (Diego 2026-08-04): LA V3 DEJA DE ELEGIR A QUIEN.
+    //
+    // REGLA DE ORO ACORDADA: "la v2 decide A QUIEN, la v3 decide QUE PASA DESPUES". No se pisan
+    // porque no se superponen. Antes de esto habia DOS criterios distintos para elegir persona y
+    // se fueron separando; copiar uno dentro del otro repetiria la causa, asi que la v3 PREGUNTA.
+    //
+    // COMO: derivarAHumano con setStatus:false ya hace exactamente lo que la rotacion necesita --
+    // resuelve el area, aplica la ESCALERA (depto -> fallback -> aviso al dueño), respeta HORARIOS
+    // y membresia, y asigna -- SIN tocar status ni ai_enabled. Ese modo ya se usa en 5 lugares del
+    // sistema, no es nuevo. Por eso NO hace falta tocar derivarAHumano: la v3 la llama.
+    // push:false y resumen:false porque de eso se encarga la v3 (_notificarRotacionV3).
+    //
+    // QUE ARREGLA, con casos reales:
+    //  - Se cae el POOL GENERAL (elegirAsesorActivo), que NO miraba horarios, NO exigia pertenecer
+    //    a un departamento y NO excluia usuarios IA. De ahi salieron los 189 pases de Benjamin
+    //    (rebotando entre Valentina un domingo cerrado y Nicolas, un bot sin departamentos) y la
+    //    derivacion de hoy en Anton al mismo Nicolas.
+    //  - Se cae tambien el salto al pool cuando el area que dijo la IA se descarta por falta de
+    //    respaldo: ahora, sin depto valido, derivarAHumano cae al es_default (criterio v2) en vez
+    //    de repartir a ciegas.
+    //  - La v3 pasa a tener la ESCALERA que no tenia: si el area no tiene a nadie, va al depto de
+    //    fallback y, si ahi tampoco, AVISA. Antes se quedaba esperando en silencio (caso Cris).
+    //
+    // LO QUE NO CAMBIA: el estado. El lead sigue quedando en 'interesado' con la IA cubriendo
+    // (setStatus:false), que es el diseño acordado -- "rotar es OFRECER, no asignar; se lo queda
+    // el que escribe". El reloj, las marcas y el pase a listo_humano siguen igual.
+    //
+    // GATEADO por derivacion_unificada_v1 (default OFF): con el flag apagado corre el camino de
+    // hoy, byte-identico. Revertir = apagar el flag.
+    // ========================================================================================
     let _asesor = null;
-    if (_deptoId) {
-      try { const _est = await estadoDeptoParaReparto(ownerId, _deptoId); if (_est && _est.estado === 'asignable') _asesor = _est.asesor; } catch (eE) {}
+    let _unificada = false;
+    try { _unificada = await derivacionUnificadaActiva(ownerId); } catch (eU) { _unificada = false; }
+    if (_unificada) {
+      // El depto ya quedo persistido arriba (si el hint resolvio uno), asi que derivarAHumano lo toma
+      // de la conv; si no hay, aplica su propio criterio (es_default) y despues la escalera.
+      try { _asesor = await derivarAHumano(convId, ownerId, 'rotacion_v3', { setStatus: false, push: false, resumen: false }); } catch (eDU) { _asesor = null; }
+      // La ESCALERA de la v2 puede MOVER el lead al depto de fallback (escribe conversations.departamento_id).
+      // Si eso paso, la rotacion tiene que sellar el depto NUEVO, no el viejo: si no, el reloj seguiria
+      // ofreciendo en el area original -- justo la que ya sabemos que no tiene a nadie. Re-leemos.
+      try {
+        const { data: _cvD } = await supabase.from('conversations').select('departamento_id').eq('id', convId).maybeSingle();
+        if (_cvD && _cvD.departamento_id && _cvD.departamento_id !== _deptoId) _deptoId = _cvD.departamento_id;
+      } catch (eReDep) { /* nos quedamos con el depto que teniamos: comportamiento previo */ }
     } else {
-      try { _asesor = await elegirAsesorActivo(ownerId); } catch (ePa) { _asesor = null; }
+      if (_deptoId) {
+        try { const _est = await estadoDeptoParaReparto(ownerId, _deptoId); if (_est && _est.estado === 'asignable') _asesor = _est.asesor; } catch (eE) {}
+      } else {
+        try { _asesor = await elegirAsesorActivo(ownerId); } catch (ePa) { _asesor = null; }
+      }
     }
     // Referencia del lead para los avisos (nombre del contacto o telefono; 0 tokens).
     let _leadRef = opts.leadRef || null;

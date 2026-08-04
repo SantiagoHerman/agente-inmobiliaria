@@ -7217,7 +7217,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // direccion TEXTUAL (?q=direccion, NO lat/lng, asi el pin default del tema/Miami nunca entra al link);
     // aproximada (sin altura) -> sin link (solo el texto de direccion que ya va arriba).
     var _linkMaps = (_iaUbicacionOn && _dirEsExacta(p)) ? (' | ubicacion Maps: https://www.google.com/maps?q=' + encodeURIComponent(_dirProp)) : '';
-    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + _linkMaps + ((_iaUbicacionOn && p.referencias_zona) ? ' | cerca: ' + p.referencias_zona : '') + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
+    // AHORRO DE TOKENS (Diego 2026-08-04): el "cerca: playa a 400 m; supermercado a 200 m..." SALIO de
+    // aca. Viajaba en la linea de CADA propiedad, en el prompt de CADA mensaje: ~50 tokens por propiedad.
+    // Con el arreglo de geolocalizacion pasaban de 17 a ~250 las propiedades con ese dato -> ~12.500
+    // tokens extra por prompt (~USD 4-5/mes solo en Anton). Ahora se consulta A PEDIDO con la tool
+    // `que_hay_cerca`, que ademas solo entra al prompt cuando el lead pregunta por el tema. El dato es
+    // el MISMO (sale de referencias_zona, ya calculado al geocodificar): cambia cuando se paga, no que.
+    return '- ' + enc + (carac ? ' (' + carac + ')' : '') + (_dirProp ? ' | direccion: ' + _dirProp : '') + _linkMaps + ' | ' + (p.type||'') + ' | ambientes: ' + (p.rooms||'-') + ' | capacidad: ' + (p.capacity||'-') + (p.dormitorios ? ' | dormitorios: ' + p.dormitorios : '') + (p.banos ? ' | banos: ' + p.banos : '') + (p.cocheras ? ' | cocheras: ' + p.cocheras : '') + (p.superficie_cubierta ? ' | m2 cubiertos: ' + p.superficie_cubierta : '') + (p.superficie_total ? ' | m2 totales: ' + p.superficie_total : '') + (p.expensas ? ' | expensas: $' + p.expensas : '') + (p.apto_credito ? ' | apto credito' : '') + (p.antiguedad ? ' | antiguedad: ' + p.antiguedad : '') + (p.orientacion ? ' | orientacion: ' + p.orientacion : '') + ' | ' + (ops.length ? ops.join(' ; ') : 'sin operacion activa') + (p.amenities ? ' | amenities: ' + p.amenities : '') + (p.link ? ' | link: ' + p.link : '') + fotosTxt;
   }).join(String.fromCharCode(10));
   }
 
@@ -7323,7 +7329,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           const _cab = '* EMPRENDIMIENTO: ' + (d.nombre || 'Sin nombre') + (d.tipo ? ' (' + d.tipo + ')' : '') +
             (d.zona ? ' | zona: ' + d.zona : '') +
             (_dirDev ? ' | direccion: ' + _dirDev : '') + _linkMapsDev +
-            ((_iaUbicacionOn && d.referencias_zona) ? ' | cerca: ' + d.referencias_zona : '') +
+            // El "cerca:" salio de aca por tokens -> ahora se consulta con la tool `que_hay_cerca` (ver ~7220).
             (d.estado_obra ? ' | obra: ' + (_ESTADO_OBRA_TXT[d.estado_obra] || d.estado_obra) : '') +
             (d.avance_pct ? ' | avance: ' + d.avance_pct + '%' : '') +
             (d.fecha_entrega ? ' | entrega estimada: ' + d.fecha_entrega : '') +
@@ -8039,6 +8045,19 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     });
   }
 
+  // QUE HAY CERCA (gated ia_ubicacion + tema). Reemplaza al "cerca: ..." que antes viajaba pegado a la linea de
+  // CADA propiedad en el prompt de CADA mensaje (~50 tokens x propiedad; con la geolocalizacion arreglada eran
+  // ~250 propiedades = ~12.500 tokens por prompt). El dato es EL MISMO: sale de referencias_zona, que ya se
+  // calculo UNA vez al geocodificar. Lo unico que cambia es CUANDO se paga: ahora solo si el lead pregunta.
+  // Doble compuerta: el flag de ubicacion Y que el mensaje hable del tema -> si no, ni la definicion entra.
+  if (_iaUbicacionOn && _pideTema(['cerca', 'cerca de', 'alrededor', 'barrio', 'zona', 'playa', 'mar', 'supermercado', 'farmacia', 'colectivo', 'transporte', 'tren', 'subte', 'estacion', 'escuela', 'colegio', 'hospital', 'banco', 'que hay'])) {
+    toolsAgente.push({
+      name: 'que_hay_cerca',
+      description: 'Usala cuando el lead pregunta QUE HAY CERCA de una propiedad (ej: "esta cerca del mar?", "hay supermercado?", "que tiene alrededor?", "a cuanto queda la estacion?"). Devuelve los lugares mas cercanos ya medidos (playa, costa, estacion de tren, subte, parada de colectivo, supermercado, farmacia, escuela, banco, hospital) con su distancia. Si la tool no devuelve nada, decile que no tenes el dato de esa propiedad y ofrecele averiguarlo: NUNCA inventes que hay cerca ni a que distancia.',
+      input_schema: { type: 'object', properties: { id_propiedad: { type: 'string', description: 'Numero o id de la propiedad del inventario sobre la que pregunta el lead.' } }, required: ['id_propiedad'] }
+    });
+  }
+
   // RAG DE INVENTARIO (gated ia_rag_v1): tools buscar_inventario + ficha_inventario. ADITIVO: solo se agregan con
   // _ragActivo (flag ON + rubro propiedades + inventario cargado) => con el flag OFF NO se agregan y el prompt/flujo
   // son BYTE-IDENTICOS al actual. Van en el prefijo CACHEADO junto al resto de las definiciones de tools. El filtro
@@ -8511,6 +8530,31 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         }
       } catch (eGe) { console.error('tool normalizar_direccion_ar:', eGe && eGe.message); _resGeoTxt = 'No se pudo normalizar la direccion ahora. Segui la conversacion sin inventar el partido ni la localidad.'; }
       _out.texto = _resGeoTxt;
+    }
+    else if (_nombre === 'que_hay_cerca') {
+      // Lee referencias_zona (ya calculado al geocodificar): 0 llamadas externas, 0 costo extra.
+      // Busca en el inventario YA cargado en memoria; si no lo encuentra ahi, va a la base por id/numero.
+      let _cercaTxt = '';
+      try {
+        const _idc = (_in && _in.id_propiedad != null) ? String(_in.id_propiedad).trim() : '';
+        let _prop = null;
+        if (_idc && Array.isArray(properties)) {
+          _prop = properties.find(function (p) { return String(p.id) === _idc || String(p.numero) === _idc; }) || null;
+        }
+        if (!_prop && _idc) {
+          try {
+            const { data: _pDb } = await supabase.from('properties').select('title, numero, referencias_zona').eq('user_id', user_id).or('numero.eq.' + _idc + ',id.eq.' + _idc).maybeSingle();
+            if (_pDb) _prop = _pDb;
+          } catch (eDbC) { _prop = null; }
+        }
+        if (_prop && _prop.referencias_zona) {
+          _cercaTxt = 'Cerca de ' + (_prop.title || ('la propiedad ' + _idc)) + ': ' + _prop.referencias_zona + '. Contale SOLO lo que figura aca, con esas distancias; no agregues lugares que no esten en la lista.';
+        } else {
+          // Sin dato: NUNCA inventar. Puede ser que la propiedad todavia no se geocodifico.
+          _cercaTxt = 'No hay datos de que hay cerca de esa propiedad. Decile que no lo tenes a mano y ofrecele averiguarlo; no inventes lugares ni distancias.';
+        }
+      } catch (eC) { _cercaTxt = 'No se pudo consultar que hay cerca ahora. Segui la conversacion sin inventar lugares ni distancias.'; }
+      _out.texto = _cercaTxt;
     }
     else if (_nombre === 'distancia_viaje') {
       let _resOsrmTxt = '';
@@ -20775,6 +20819,14 @@ async function referenciasZonaOSM(lat, lng) {
       'node(around:800,' + lat + ',' + lng + ')[shop~"^(supermarket|bakery|convenience|greengrocer|butcher|kiosk)$"];' +
       'node(around:1200,' + lat + ',' + lng + ')[highway=bus_stop];' +
       'nwr(around:2500,' + lat + ',' + lng + ')[natural=beach];' +
+      // TREN / SUBTE / COSTA (pedido de Diego 2026-08-04): faltaban los tres. En Gesell la playa
+      // alcanza para "esta cerca del mar", pero en CABA/GBA lo que define una propiedad es a que
+      // distancia esta la estacion. La costa va aparte de la playa: hay orilla sin playa tagueada.
+      'nwr(around:3000,' + lat + ',' + lng + ')[railway=station];' +
+      'nwr(around:3000,' + lat + ',' + lng + ')[railway=halt];' +
+      'nwr(around:1500,' + lat + ',' + lng + ')[station=subway];' +
+      'nwr(around:1500,' + lat + ',' + lng + ')[railway=subway_entrance];' +
+      'way(around:3000,' + lat + ',' + lng + ')[natural=coastline];' +
       ');out tags center 60;';
     var r = await fetchScrape('https://overpass-api.de/api/interpreter', {
       method: 'POST',
@@ -20785,14 +20837,21 @@ async function referenciasZonaOSM(lat, lng) {
     var d = await r.json();
     var els = Array.isArray(d.elements) ? d.elements : [];
     if (!els.length) return '';
-    var TIPO_ES = { supermarket: 'supermercado', cafe: 'cafe', restaurant: 'restaurante', pharmacy: 'farmacia', bank: 'banco', school: 'escuela', hospital: 'hospital', fuel: 'estacion de servicio', bakery: 'panaderia', convenience: 'almacen', greengrocer: 'verduleria', butcher: 'carniceria', kiosk: 'kiosco', bus_stop: 'parada de colectivo', beach: 'playa' };
+    var TIPO_ES = { supermarket: 'supermercado', cafe: 'cafe', restaurant: 'restaurante', pharmacy: 'farmacia', bank: 'banco', school: 'escuela', hospital: 'hospital', fuel: 'estacion de servicio', bakery: 'panaderia', convenience: 'almacen', greengrocer: 'verduleria', butcher: 'carniceria', kiosk: 'kiosco', bus_stop: 'parada de colectivo', beach: 'playa', tren: 'estacion de tren', subte: 'subte', costa: 'la costa' };
     var mejorPorTipo = {};
     els.forEach(function (e) {
       var t = e.tags || {};
       var la = (e.lat != null) ? e.lat : (e.center && e.center.lat);
       var lo = (e.lon != null) ? e.lon : (e.center && e.center.lon);
       if (la == null || lo == null) return;
-      var clase = (t.natural === 'beach') ? 'beach' : ((t.highway === 'bus_stop') ? 'bus_stop' : (t.shop || t.amenity));
+      // El orden importa: subte ANTES que tren, porque una boca de subte tambien viene tagueada
+      // como railway y si no, se anunciaria como "estacion de tren".
+      var clase =
+        (t.station === 'subway' || t.railway === 'subway_entrance' || t.subway === 'yes') ? 'subte' :
+        (t.railway === 'station' || t.railway === 'halt') ? 'tren' :
+        (t.natural === 'coastline') ? 'costa' :
+        (t.natural === 'beach') ? 'beach' :
+        (t.highway === 'bus_stop') ? 'bus_stop' : (t.shop || t.amenity);
       var etiq = TIPO_ES[clase];
       if (!etiq) return;
       var km = haversineKm(Number(lat), Number(lng), Number(la), Number(lo));
@@ -21101,6 +21160,14 @@ var _GEO_CALLE_CACHE = new Map();
 async function _geoCalleOSM(nombre, ciudad) {
   var clave = _normGeoTexto(String(ciudad || '') + '|' + String(nombre || ''));
   if (_GEO_CALLE_CACHE.has(clave)) return _GEO_CALLE_CACHE.get(clave);
+  // SIN CIUDAD NO SE GEOCODIFICA. Antes, si `ciudad` venia vacia, el filtro de abajo dejaba
+  // pasar cualquier resultado del pais: "Paseo 133" podia caer en cualquier provincia. Preferimos
+  // no ubicar a ubicar mal — una propiedad en la provincia equivocada es peor que una sin mapa.
+  if (!String(ciudad || '').trim()) { _GEO_CALLE_CACHE.set(clave, null); return null; }
+  // Y LA CALLE NO PUEDE SER LA CIUDAD. Si en `direccion` cargaron el nombre del pueblo
+  // ("Villa Gesell"), no es una direccion: es la localidad. Sin esto se guardaba un punto
+  // cualquiera del pueblo como si fuera el domicilio de la propiedad.
+  if (_normGeoTexto(String(nombre)) === _normGeoTexto(String(ciudad))) { _GEO_CALLE_CACHE.set(clave, null); return null; }
   var res = null;
   try {
     await _osmThrottle();
@@ -21118,7 +21185,24 @@ async function _geoCalleOSM(nombre, ciudad) {
         // Medido el 2026-08-04. Hay que exigir que la localidad ESTRUCTURADA sea la nuestra.
         var ciuN = _normGeoTexto(String(ciudad || ''));
         var ok = arr.filter(function (x) {
-          if (!ciuN) return true;
+          // (a) NO PUEDE SER UNA CIUDAD, UN BARRIO NI UN LIMITE. Nominatim devuelve tambien lugares:
+          //     buscar "Villa Gesell" o "Zona Sur" como si fueran calles traia el PUEBLO entero y se
+          //     guardaba como si fuera la direccion de la propiedad.
+          //     OJO: NO alcanza con exigir category='highway'. Cuando la direccion tiene ALTURA
+          //     ("Avenida Corrientes 1500") Nominatim devuelve el punto del portal, que viene como
+          //     'place'/'building', no como 'highway' — con la lista blanca, Corrientes 1500 no
+          //     ubicaba (medido 2026-08-04). Por eso se rechaza por lista NEGRA: fuera lo que es
+          //     una localidad o un limite administrativo, adentro todo lo demas.
+          var cat = String(x.category || x.class || '').toLowerCase();
+          var tip = String(x.type || '').toLowerCase();
+          var LUGARES = ['city', 'town', 'village', 'hamlet', 'suburb', 'neighbourhood', 'quarter',
+                         'municipality', 'state', 'province', 'county', 'region', 'locality',
+                         'administrative', 'island', 'archipelago', 'borough', 'district'];
+          if (cat === 'boundary') return false;
+          if (cat === 'place' && LUGARES.indexOf(tip) >= 0) return false;
+          // (b) TIENE QUE ESTAR EN NUESTRA CIUDAD, por el campo ESTRUCTURADO. Que el nombre de la
+          //     ciudad aparezca en el texto NO alcanza: hay calles llamadas "Villa Gesell" en otros
+          //     pueblos, y "140 y playa" daba un punto en CORDOBA que pasaba el filtro (2026-08-04).
           var ad = x.address || {};
           var candidatos = [ad.city, ad.town, ad.village, ad.municipality, ad.suburb, ad.county];
           for (var q = 0; q < candidatos.length; q++) {

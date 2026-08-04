@@ -1494,9 +1494,30 @@ async function _registrarUsoIAUna(user_id) {
 //     usado_antes := ua; usado_despues := ua + cabe; extra_antes := ea; extra_despues := ea - del_extra;
 //     return next;
 //   end $$;
-async function registrarUsoIA(user_id, cantidad) {
+// AUDITORIA DE COBROS (Diego 2026-08-04). Hasta hoy se descontaba del plan sin dejar rastro de POR QUE:
+// `ia_uso` registra las LLAMADAS a la IA, no los COBROS, y el cobro no es 1 a 1 (el scraper cobra 3 por
+// corrida, la vision 1 por propiedad, una respuesta 1 + extras). Resultado: un cliente pregunta a donde
+// se le fueron 232 mensajes y no habia forma de contestarle con datos — habia que reconstruirlo a mano.
+// Ahora cada descuento deja una fila con MOTIVO, CANTIDAD y MOMENTO.
+// Best-effort y aparte del cobro: si esto falla, el cobro igual se hace (nunca al reves).
+async function _registrarCobroPlan(user_id, cantidad, motivo, detalle) {
+  try {
+    if (!user_id) return;
+    await supabase.from('ia_cobros').insert({
+      user_id: user_id,
+      cantidad: cantidad,
+      motivo: motivo || 'sin_motivo',
+      detalle: detalle || null
+    });
+  } catch (e) { /* tabla ausente / error: no romper el cobro */ }
+}
+
+// `motivo` dice EN QUE se fue el mensaje ('respuesta_agente', 'scraper_lista', 'scraper_ficha',
+// 'clasificar_fotos', 'recontacto', 'reporte', ...). `detalle` es opcional y da contexto legible.
+async function registrarUsoIA(user_id, cantidad, motivo, detalle) {
   var _n = (typeof cantidad === 'number' && cantidad >= 1) ? Math.floor(cantidad) : 1;
   if (_n < 1) _n = 1;
+  _registrarCobroPlan(user_id, _n, motivo, detalle); // fire-and-forget: no demora el cobro
   try {
     if (!SUBSCRIPTIONS_ENABLED || !user_id) return;
     const sub = await getSubscription(user_id);
@@ -4929,7 +4950,7 @@ async function derivarAHumano(convId, user_id, motivo, opts) {
         const _res = await generarResumenConversacion(convId, user_id);
         if (_res) {
           await supabase.from('conversations').update({ summary: _res }).eq('id', convId);
-          try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch (eCobRes) {}
+          try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1, 'reserva'); } catch (eCobRes) {}
         }
       } catch (eR) {}
     }
@@ -10503,7 +10524,7 @@ async function responderConsultaAdmin(user_id, pregunta) {
     const sys = 'Sos el asistente de reportes de un CRM inmobiliario. El ADMINISTRADOR te hace una consulta por WhatsApp. Responde SOLO con los datos provistos (el JSON de abajo), en espanol rioplatense, claro y conciso, en formato WhatsApp (texto plano, podes usar *negrita* y saltos de linea, sin tablas). Si te piden un dato que no esta en los datos, deci que no lo tenes disponible. Nunca inventes numeros.';
     const r = await anthropic.messages.create({ model: MODELO_CLIENTE, max_tokens: 700, system: sys, messages: [{ role: 'user', content: 'Datos actuales del CRM:\n' + JSON.stringify(datos, null, 1) + '\n\nConsulta del administrador: ' + pregunta }] });
     try { if (user_id && r && r.usage) await registrarUsoTokens(user_id, r.usage, 'reporte_admin'); } catch(e){}
-    try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1); } catch(eCobRep){}
+    try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1, 'reporte'); } catch(eCobRep){}
     return (r && r.content && r.content[0] && r.content[0].text) ? r.content[0].text : 'No pude generar el reporte.';
   } catch (e) { console.error('responderConsultaAdmin:', e && e.message); return 'No pude generar el reporte en este momento.'; }
 }
@@ -12013,7 +12034,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               // base 1 (YA cobraba, SIEMPRE). Con cobrar_todo_v2 ON: +1 si tradujo, +1 si uso tool, +1 si el lead mando audio.
               var _extraResp = 0;
               try { if (await cobrarTodoV2Activo(user_id)) { _extraResp = (resultado.huboTraduccion ? 1 : 0) + (resultado.usoTool ? 1 : 0) + ((typeof tipoMediaEntrante !== 'undefined' && tipoMediaEntrante === 'audio') ? 1 : 0); } } catch (eFlag) {}
-              await registrarUsoIA(user_id, 1 + _extraResp);
+              await registrarUsoIA(user_id, 1 + _extraResp, 'respuesta_agente');
             } catch (e) {} }
             // FOTOS: si la IA pidio mandar foto(s), enviarlas DESPUES del texto. Aislado en try/catch:
             // si una foto falla, NO afecta el flujo de texto ya enviado.
@@ -16630,7 +16651,7 @@ async function enviarRecontactosPendientes() {
       await _updConvMensaje({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
-      try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(conv.user_id)) await registrarUsoIA(conv.user_id, 1 + (idiomaRec ? 1 : 0)); } catch (eCobRec) {}
+      try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(conv.user_id)) await registrarUsoIA(conv.user_id, 1 + (idiomaRec ? 1 : 0), 'recontacto'); } catch (eCobRec) {}
       console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
       enviados++;
       if (enviados >= RECONTACTO_CAP) break; // tope por tanda: el resto sale en las proximas corridas (cada 15 min)
@@ -17208,7 +17229,7 @@ async function _enviarRecontactosV2(ahoraMs) {
         await _updConvMensaje({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
         await supabase.from('recontactos').insert({ user_id: uid, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
         await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
-        try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(uid)) await registrarUsoIA(uid, 1 + (idiomaRec ? 1 : 0)); } catch (eCob) {}
+        try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(uid)) await registrarUsoIA(uid, 1 + (idiomaRec ? 1 : 0), 'recontacto'); } catch (eCob) {}
 
         enviadosCuenta++;
         if (categoria === 'frio') friosEnviadosTanda++;
@@ -20044,7 +20065,7 @@ async function _equipoRespuestaIaInterna(ownerId, thread, otroAuthId) {
 
     if (!respuesta) return;
     // COBRO v2: 1 mensaje por DM contestado del asistente interno (Haiku). Solo si hubo respuesta real.
-    try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 1); } catch (eCobEq) {}
+    try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 1, 'mensaje_equipo'); } catch (eCobEq) {}
 
     // 6) Insertar la respuesta como mensaje del usuario IA. leido_por arranca con la IA (ya "leyo" lo suyo).
     //    NO se manda push FCM a la IA (no tiene device); el front la vera al refrescar el hilo.
@@ -22527,7 +22548,7 @@ app.get('/api/scrape/lista', async function(req, res) {
       for (var hk = 0; hk < htmlsListado.length; hk++) { if ((htmlsListado[hk] || '').length > (htmlIA || '').length) htmlIA = htmlsListado[hk]; }
       var iaItems = await listarUrlsIA(htmlIA, base, user_id);
       if (iaItems.length > 0) {
-        try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 3); } catch (eCobScr) {}
+        try { if (SUBSCRIPTIONS_ENABLED && user_id && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 3, 'scraper_listado', 'lectura del listado de la web'); } catch (eCobScr) {}
         return res.json({ ok: true, total: iaItems.length, urls: iaItems, plataforma: 'ia', estrategia: 'ia' });
       }
     } catch (e) { /* nada mas que probar */ }
@@ -22867,7 +22888,7 @@ app.post('/api/clasificar-fotos', async (req, res) => {
       for (let j = 0; j < parciales.length; j++) resultados.push(parciales[j]);
     }
     // COBRO v2: 1 mensaje POR PROPIEDAD (no por foto), solo si se clasifico al menos 1 foto NUEVA (las cacheadas no pagan).
-    try { if (SUBSCRIPTIONS_ENABLED && _uid && urlsNuevas.length > 0 && await cobrarTodoV2Activo(_uid)) await registrarUsoIA(_uid, 1); } catch (eCobFoto) {}
+    try { if (SUBSCRIPTIONS_ENABLED && _uid && urlsNuevas.length > 0 && await cobrarTodoV2Activo(_uid)) await registrarUsoIA(_uid, 1, 'clasificar_fotos', 'analisis de fotos al cargarlas al inventario'); } catch (eCobFoto) {}
     // Opcional: si viene property_id, persistir el catalogo en properties.images (no rompe si falla).
     if (property_id) {
       try {
@@ -23492,7 +23513,7 @@ async function obtenerAlojamientosUniversal(base, sitio, ownerId, permitirIA) {
       var ia = await _alojamientosIA(htmlIA, base, ownerId);
       if (ia.length) {
         // Cobro al cliente: descuenta de SUS mensajes (igual que el scraper de inventario). Gateado por suscripcion.
-        try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3); } catch (eCob) {}
+        try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3, 'scraper_ficha', 'lectura de una ficha de propiedad'); } catch (eCob) {}
         ia._estrategia = 'ia'; return ia;
       }
     } catch (e) {}
@@ -23759,7 +23780,7 @@ async function _scrapeAlojamientoCompleto(base, sitio, ownerId, permitirIA) {
     var _tot = complejos.reduce(function (a, c) { return a + ((Array.isArray(c.unidades) ? c.unidades.length : 0)); }, 0);
     if (complejos.length || _tot) {
       estrategia = 'ia';
-      try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3); } catch (eCob) {}
+      try { if (SUBSCRIPTIONS_ENABLED && ownerId && await cobrarTodoV2Activo(ownerId)) await registrarUsoIA(ownerId, 3, 'scraper_ficha', 'lectura de una ficha de propiedad'); } catch (eCob) {}
     }
   }
   if (!complejos.length) complejos = [{ nombre: '', unidades: [] }];

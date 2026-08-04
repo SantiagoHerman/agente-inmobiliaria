@@ -21157,8 +21157,8 @@ function _geoCallesDeDireccion(direccion, entreCalles) {
 // Geometria de UNA calle segun OSM. Cache en memoria por (ciudad|calle): la misma calle se
 // repite en decenas de propiedades y asi se le pega a Nominatim UNA sola vez por proceso.
 var _GEO_CALLE_CACHE = new Map();
-async function _geoCalleOSM(nombre, ciudad) {
-  var clave = _normGeoTexto(String(ciudad || '') + '|' + String(nombre || ''));
+async function _geoCalleOSM(nombre, ciudad, provincia) {
+  var clave = _normGeoTexto(String(provincia || '') + '|' + String(ciudad || '') + '|' + String(nombre || ''));
   if (_GEO_CALLE_CACHE.has(clave)) return _GEO_CALLE_CACHE.get(clave);
   // SIN CIUDAD NO SE GEOCODIFICA. Antes, si `ciudad` venia vacia, el filtro de abajo dejaba
   // pasar cualquier resultado del pais: "Paseo 133" podia caer en cualquier provincia. Preferimos
@@ -21204,6 +21204,21 @@ async function _geoCalleOSM(nombre, ciudad) {
           //     ciudad aparezca en el texto NO alcanza: hay calles llamadas "Villa Gesell" en otros
           //     pueblos, y "140 y playa" daba un punto en CORDOBA que pasaba el filtro (2026-08-04).
           var ad = x.address || {};
+          // (c) Y SI SABEMOS LA PROVINCIA, TIENE QUE COINCIDIR. Es el filtro que cierra el caso de los
+          //     nombres repetidos: en Argentina hay decenas de "San Martin", "Belgrano", "Rivadavia".
+          //     Sin provincia cargada este chequeo no corre (no rechazamos por un dato que no tenemos).
+          var provN = _normGeoTexto(String(provincia || ''));
+          if (provN) {
+            var st = _normGeoTexto(String(ad.state || ad.region || ''));
+            // CABA aparece como "Ciudad Autonoma de Buenos Aires": contiene "buenos aires" y matchearia
+            // con la PROVINCIA de Buenos Aires, que es otra cosa. Se comparan en los dos sentidos y se
+            // trata CABA aparte.
+            var esCABA = function (s) { return s.indexOf('ciudad autonoma') >= 0 || s === 'caba'; };
+            if (st) {
+              if (esCABA(provN) !== esCABA(st)) return false;
+              if (!esCABA(provN) && st.indexOf(provN) < 0 && provN.indexOf(st) < 0) return false;
+            }
+          }
           var candidatos = [ad.city, ad.town, ad.village, ad.municipality, ad.suburb, ad.county];
           for (var q = 0; q < candidatos.length; q++) {
             if (candidatos[q] && _normGeoTexto(String(candidatos[q])).indexOf(ciuN) >= 0) return true;
@@ -21260,12 +21275,12 @@ function _geoEsquina(a, b) {
 
 // Ubicar una direccion: esquina exacta si se puede, si no un punto sobre la calle principal.
 // Devuelve { lat, lng, precision: 'esquina' | 'calle' } o null.
-async function _geoUbicarDireccion(direccion, entreCalles, ciudad) {
+async function _geoUbicarDireccion(direccion, entreCalles, ciudad, provincia) {
   var calles = _geoCallesDeDireccion(direccion, entreCalles);
   if (!calles.length) return null;
-  var a = await _geoCalleOSM(calles[0], ciudad);
+  var a = await _geoCalleOSM(calles[0], ciudad, provincia);
   if (calles.length > 1) {
-    var b = await _geoCalleOSM(calles[1], ciudad);
+    var b = await _geoCalleOSM(calles[1], ciudad, provincia);
     var esq = _geoEsquina(a, b);
     if (esq) return { lat: esq.lat, lng: esq.lng, precision: 'esquina' };
   }
@@ -21286,15 +21301,22 @@ async function geocodificarPendientes() {
 
     var procesarTabla = async function (tabla, colActiva) {
       if (presupuesto <= 0) return;
-      var q = await supabase.from(tabla).select('id, user_id, direccion, entre_calles, ciudad, lat, lng, geo_ref').in('user_id', uids).not('direccion', 'is', null).eq(colActiva, true).limit(400);
+      // SELECT DEFENSIVO con `provincia`: si la migracion todavia no corrio, esa columna no existe y
+      // PostgREST rechaza el select ENTERO (y devuelve el error EN LA RESPUESTA, no lanzando) -> sin
+      // este reintento se cortaba TODA la geocodificacion. Se reintenta sin provincia: se geocodifica
+      // igual, solo que sin ese filtro. Mismo patron que el select del inventario (~7035).
+      var q = await supabase.from(tabla).select('id, user_id, direccion, entre_calles, ciudad, provincia, lat, lng, geo_ref').in('user_id', uids).not('direccion', 'is', null).eq(colActiva, true).limit(400);
+      if (q.error) {
+        q = await supabase.from(tabla).select('id, user_id, direccion, entre_calles, ciudad, lat, lng, geo_ref').in('user_id', uids).not('direccion', 'is', null).eq(colActiva, true).limit(400);
+      }
       if (q.error || !q.data) return; // columnas ausentes (migracion sin correr) -> no romper
       for (var i = 0; i < q.data.length && presupuesto > 0; i++) {
         var f = q.data[i];
         if (!f.direccion || !String(f.direccion).trim()) continue;
-        var refAct = _normGeoTexto(_GEO_REF_VERSION + '|' + String(f.direccion) + '|' + String(f.entre_calles || '') + '|' + String(f.ciudad || ''));
+        var refAct = _normGeoTexto(_GEO_REF_VERSION + '|' + String(f.direccion) + '|' + String(f.entre_calles || '') + '|' + String(f.ciudad || '') + '|' + String(f.provincia || ''));
         if (f.geo_ref === refAct) continue; // ya intentada esta direccion (con o sin exito): no repagar
         presupuesto--;
-        var g = await _geoUbicarDireccion(f.direccion, f.entre_calles, f.ciudad);
+        var g = await _geoUbicarDireccion(f.direccion, f.entre_calles, f.ciudad, f.provincia);
         var upd = { geo_ref: refAct };
         if (g && g.lat != null) {
           upd.lat = g.lat; upd.lng = g.lng;
@@ -21318,7 +21340,7 @@ async function geocodificarPendientes() {
           var refH = _normGeoTexto(_GEO_REF_VERSION + '|' + String(a.direccion) + '|' + String(a.entre_calles || '') + '|' + String(a.ciudad || ''));
           if (a.geo_ref === refH) continue;
           presupuesto--;
-          var gH = await _geoUbicarDireccion(a.direccion, a.entre_calles, a.ciudad);
+          var gH = await _geoUbicarDireccion(a.direccion, a.entre_calles, a.ciudad, a.provincia);
           var aNew = Object.assign({}, a, { geo_ref: refH });
           if (gH && gH.lat != null) {
             aNew.lat = gH.lat; aNew.lng = gH.lng;
@@ -38260,6 +38282,32 @@ async function _migracionDireccionDefensiva() {
   }
 }
 setTimeout(_migracionDireccionDefensiva, 11 * 1000);
+
+// PROVINCIA (Diego 2026-08-04). Sin ella el geocodificador solo podia validar por CIUDAD, y en
+// Argentina hay decenas de "San Martin", "Belgrano", "Rivadavia": una propiedad podia terminar en
+// la provincia equivocada (medido: "140 y playa, Villa Gesell" daba un punto en CORDOBA).
+// Default "Buenos Aires" en lo que ya existe, y el dueño lo cambia desde un desplegable (no se
+// tipea: el error de tipeo es justo lo que rompe la validacion).
+// El UPDATE toca SOLO las filas en NULL, asi que es idempotente: corre en cada boot y despues de la
+// primera vez no cambia nada. Una fila nueva que llegue sin provincia queda en Buenos Aires en el
+// proximo arranque, que es el default acordado.
+async function _migracionProvinciaDefensiva() {
+  const stmts = [
+    "ALTER TABLE properties ADD COLUMN IF NOT EXISTS provincia text;",
+    "ALTER TABLE developments ADD COLUMN IF NOT EXISTS provincia text;",
+    "UPDATE properties SET provincia = 'Buenos Aires' WHERE provincia IS NULL;",
+    "UPDATE developments SET provincia = 'Buenos Aires' WHERE provincia IS NULL;",
+    "NOTIFY pgrst, 'reload schema';"
+  ];
+  for (const sql of stmts) {
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql: sql });
+      if (error) console.log('[migracion provincia] fallo (' + error.message + '). Correr a mano: ' + sql);
+      else console.log('[migracion provincia] OK: ' + sql.slice(0, 60));
+    } catch (e) { console.log('[migracion provincia] no se pudo via RPC. Correr a mano en Supabase: ' + sql); }
+  }
+}
+setTimeout(_migracionProvinciaDefensiva, 14 * 1000);
 
 // ============================================================================
 // ===== WHATSAPP CLOUD API (oficial de Meta) — MODULO NUEVO, 100% ADITIVO =====

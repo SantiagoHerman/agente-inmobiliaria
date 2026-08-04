@@ -5976,6 +5976,59 @@ async function verificarNumeroWA(instancia, numero) {
   } catch (e) { console.error('verificarNumeroWA error:', e && e.message); return { existe: false, error: (e && e.message) || 'error' }; }
 }
 
+// ===== NUMERO CANONICO DE WHATSAPP — fix "el 9 argentino" (Diego 2026-08-04) =====
+// PROBLEMA MEDIDO: el dueno carga el celular AR a mano SIN el 9 (541169406800). El identificador REAL de
+// WhatsApp lleva el 9 (5491169406800). Cuando el lead contesta, el webhook busca por telefono EXACTO
+// (~2224), no encuentra este contacto y CREA OTRO: el historial queda partido y la IA arranca de cero
+// como si nunca hubieran hablado. Medido sobre 1335 contactos: 6 duplicados, uno TRIPLICADO.
+//
+// NO ADIVINAMOS EL 9 POR REGLA DE PREFIJO. Un FIJO argentino con WhatsApp Business NO lo lleva, y hay 46
+// contactos con la forma 549-11-4XXXXXXX, el mismo bloque de 8 digitos que usan los fijos de Capital: el 9
+// es el unico discriminador y no se puede deducir. Meterselo a un fijo significa mandarle los datos del
+// cliente al celular de un desconocido.
+//
+// SE LO PREGUNTAMOS A WHATSAPP. verificarNumeroWA (arriba) ya devuelve el JID canonico y hasta hoy se
+// descartaba en /api/contactos/verificar-numero (~12882). /chat/whatsappNumbers es una CONSULTA: no manda
+// ningun mensaje, no gasta nada, 0 tokens de IA.
+//
+// BEST-EFFORT DURO: ante CUALQUIER duda devuelve el numero tal cual vino -> comportamiento byte-identico
+// al de hoy. No puede empeorar nada.
+async function telefonoCanonicoWA(ownerId, soloDigitos) {
+  var d = String(soloDigitos == null ? '' : soloDigitos).replace(/[^0-9]/g, '');
+  try {
+    if (process.env.TELEFONO_CANONICO_OFF === '1') return d;  // interruptor sin deploy, por si molesta en vivo
+    if (!d || d.length < 12) return d;                        // sin codigo de pais no hay nada que canonizar
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) return d;            // Evolution apagado -> como hoy
+    var instancia = nombreInstancia(ownerId);
+    if (!instancia) return d;
+    var _jid = function (r) { return (r && r.jid) ? String(r.jid).replace(/@.*$/, '').replace(/[^0-9]/g, '') : ''; };
+    // GUARDA: solo aceptamos un JID que sea EL MISMO numero, con o sin el 9. Si Evolution devuelve otra cosa
+    // nos quedamos con lo tipeado. NUNCA guardamos un numero ajeno por confiar en una respuesta rara.
+    var _mismo = function (a, b) {
+      if (!a || !b) return false;
+      if (a === b) return true;
+      if (a.indexOf('549') === 0 && b.indexOf('54') === 0 && b.indexOf('549') !== 0) return a === '549' + b.slice(2);
+      if (b.indexOf('549') === 0 && a.indexOf('54') === 0 && a.indexOf('549') !== 0) return b === '549' + a.slice(2);
+      return false;
+    };
+    // 1) Preguntamos por el numero TAL CUAL lo tipeo el dueno. Si WhatsApp lo reconoce, el JID que devuelve
+    //    ES el identificador real: para un MOVIL AR viene con el 9; para un FIJO viene sin el 9 y queda igual.
+    var r1 = await verificarNumeroWA(instancia, d);
+    if (r1 && !r1.error && r1.existe === true) {
+      var j1 = _jid(r1);
+      return _mismo(j1, d) ? j1 : d;
+    }
+    // 2) No figura y es AR sin el 9 -> probamos la variante CON 9 (mismo patron que ya usa
+    //    /api/asesores/validar-whatsapp ~18002). Si esa existe, ese es el numero real.
+    if (d.indexOf('54') === 0 && d.indexOf('549') !== 0) {
+      var conNueve = '549' + d.slice(2);
+      var r2 = await verificarNumeroWA(instancia, conNueve);
+      if (r2 && !r2.error && r2.existe === true) return conNueve;
+    }
+    return d;
+  } catch (e) { return d; }  // cualquier error -> el numero tipeado, como hoy
+}
+
 // ===== SOPORTE: subir una imagen (data URL base64) al bucket 'media', carpeta soporte/ =====
 // Reusa el patron de subirMediaAStorage (buffer -> supabase.storage 'media' -> publicUrl), pero la
 // fuente es una data URL que manda el cliente o el Maestro (no Evolution). Defensivo: si algo falla,
@@ -18134,9 +18187,13 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
     const b = req.body || {};
     const nombre = (b.nombre != null) ? String(b.nombre).trim() : '';
     // Normalizar el telefono IGUAL que el resto del codigo: solo digitos (la columna `phone` guarda digitos).
-    const telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
+    let telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
     if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
     if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+    // FIX "el 9 argentino" (2026-08-04): guardamos el numero REAL de WhatsApp, no el que se tipeo. Si el
+    // contacto nace con un numero distinto al que despues trae el webhook, el lead entra como contacto NUEVO
+    // y el historial queda partido. Best-effort: ante cualquier duda deja el numero tal cual (ver ~5978).
+    telefono = await telefonoCanonicoWA(ownerId, telefono);
 
     const canal = 'whatsapp';
 
@@ -29537,9 +29594,13 @@ app.post('/api/contactos', async function (req, res) {
 
     const b = req.body || {};
     const nombre = (b.nombre != null) ? String(b.nombre).trim().slice(0, 200) : '';
-    const telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
+    let telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
     if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
     if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+    // FIX "el 9 argentino" (2026-08-04): guardamos el numero REAL de WhatsApp, no el que se tipeo. Si el
+    // contacto nace con un numero distinto al que despues trae el webhook, el lead entra como contacto NUEVO
+    // y el historial queda partido. Best-effort: ante cualquier duda deja el numero tal cual (ver ~5978).
+    telefono = await telefonoCanonicoWA(ownerId, telefono);
     const interes = (b.interes != null) ? String(b.interes).trim().slice(0, 500) : '';
     const presupuesto = (b.presupuesto != null) ? String(b.presupuesto).trim().slice(0, 300) : '';
     const nota = (b.nota != null) ? String(b.nota).trim().slice(0, 10000) : '';

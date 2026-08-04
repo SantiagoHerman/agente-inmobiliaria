@@ -7979,7 +7979,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     let _deptosTool = [];
     try {
       if (user_id) {
-        const { data: _ddT } = await supabase.from('departamentos').select('nombre, criterio_derivacion').eq('user_id', user_id).eq('activo', true);
+        // ORDEN FIJO (2026-08-04): sin ORDER BY, Postgres NO garantiza el orden de las filas, y ese orden
+        // cambia solo con el mantenimiento interno de la tabla. Como este texto arma la description de la
+        // tool derivar_a_humano, y las tools viajan ANTES del punto de cache del prompt, un orden distinto
+        // producia una HUELLA distinta con los MISMOS departamentos -> Anthropic no reusaba el cache y
+        // cobraba la escritura de nuevo (~USD 0,07 cada vez). Es el mismo motivo por el que el indice de
+        // inventario lleva .order('id') desde el 31/07. Medido: escrituras de cache con delta 0 tokens.
+        const { data: _ddT } = await supabase.from('departamentos').select('nombre, criterio_derivacion').eq('user_id', user_id).eq('activo', true).order('nombre');
         _deptosTool = (_ddT || []).filter(function (d) { return d && d.nombre; });
       }
     } catch (eDT) { _deptosTool = []; }

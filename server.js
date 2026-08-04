@@ -22856,6 +22856,19 @@ app.post('/api/clasificar-fotos', async (req, res) => {
     const urls = Array.isArray(body.urls) ? body.urls.filter(function(u){ return typeof u === 'string' && u.trim(); }) : [];
     const property_id = body.property_id;
     if (!urls.length) return res.status(400).json({ error: 'Falta urls (array de strings)' });
+
+    // CONFIRMACION DE GASTO (Diego 2026-08-04). Mismo patron que /api/scrape/lista (~22539), que ya
+    // lo tenia bien. Este endpoint NO preguntaba: analizaba las fotos con IA y descontaba del plan
+    // sin que el dueño supiera. Medido en Andres Galdames: 108 analisis de foto entre el 1 y el 3 de
+    // agosto, de una importacion que despues se cancelo — pago por algo que tiro.
+    // Ahora, sin ia_ok, devuelve cuanto va a costar y NO ejecuta nada. El front pregunta y, si el
+    // dueño acepta, vuelve a llamar con ia_ok:true.
+    // Cobra 1 por PROPIEDAD (no por foto), solo si hay al menos una foto nueva: por eso el costo que
+    // se anuncia es 1, no urls.length. Decir un numero mas alto del que se cobra tambien es mentir.
+    const _iaOkFotos = (body.ia_ok === true) || (req.query && String(req.query.ia_ok) === 'true');
+    if (!_iaOkFotos) {
+      return res.json({ ok: true, necesita_ia: true, costo_mensajes: 1, fotos: urls.length, resultados: [] });
+    }
     // CACHE DE VISION: si la propiedad YA tiene categoria guardada para una URL, no la re-clasificamos (no se
     // re-paga la vision). Solo se clasifican las URLs nuevas/sin categoria -> re-importar cuesta casi $0 en fotos ya hechas.
     const yaClasif = {};
@@ -23244,6 +23257,18 @@ app.post('/api/scrape/universal', async function(req, res) {
     var limite = req.body.limite ? parseInt(req.body.limite, 10) : null;
     if (!sitio) return res.status(400).json({ error: 'Falta la url del sitio' });
     if (!sitio.startsWith('http')) sitio = 'https://' + sitio;
+
+    // CONFIRMACION DE GASTO (Diego 2026-08-04). Mismo patron que /api/scrape/lista (~22539), que ya
+    // lo tenia. Este endpoint NO preguntaba: leia las fichas con IA y descontaba del plan sin que el
+    // dueño supiera cuanto iba a gastar. Medido en Andres Galdames: 50 lecturas de ficha el 1 de
+    // agosto, de una importacion que despues se cancelo — pago por un inventario que nunca se guardo.
+    // Sin ia_ok devuelve el costo y NO ejecuta nada; el front pregunta y, si acepta, vuelve con
+    // ia_ok:true. `limite` es lo que el dueño eligio importar, asi que viaja en la respuesta para
+    // que el aviso pueda decir sobre cuantas propiedades se va a trabajar.
+    var _iaOkScr = (req.body && req.body.ia_ok === true) || (req.query && String(req.query.ia_ok) === 'true');
+    if (!_iaOkScr) {
+      return res.json({ ok: true, necesita_ia: true, costo_mensajes: 3, limite: limite, total: 0, propiedades: [] });
+    }
 
     // restringir al dominio propio del tenant (anti-scrape de competencia / explosion de costo IA)
     const _perm = await scrapeUrlPermitida(user_id, sitio);

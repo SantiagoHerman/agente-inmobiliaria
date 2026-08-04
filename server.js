@@ -38356,6 +38356,69 @@ async function _migracionProvinciaDefensiva() {
 setTimeout(_migracionProvinciaDefensiva, 14 * 1000);
 
 // ============================================================================
+// CONSUMO POR CLIENTE (Maestro) — "¿en qué se fueron los mensajes?"
+// ----------------------------------------------------------------------------
+// Nace de un caso real: un cliente pregunto a donde se le fueron 232 mensajes y no
+// habia con que contestarle. `ia_uso` guarda las LLAMADAS a la IA; `ia_cobros`
+// (2026-08-04) guarda los COBROS con su motivo. No son lo mismo y por eso van los dos:
+//   - cobros  -> cuantos MENSAJES DEL PLAN se descontaron y por que  (esto se le muestra al cliente)
+//   - llamadas-> cuantas veces trabajo la IA y cuanto costo en dolares (esto NO se le muestra)
+// El front elige que columnas exporta, justamente para poder mandar el "en que se fue"
+// sin mostrar el costo por mensaje.
+// ============================================================================
+app.get('/api/maestro/consumo', async function (req, res) {
+  try {
+    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var uid = req.query && req.query.user_id ? String(req.query.user_id) : '';
+    if (!uid) return res.status(400).json({ error: 'Falta user_id' });
+    // Rango: por defecto los ultimos 30 dias. `desde`/`hasta` en YYYY-MM-DD.
+    var desde = (req.query && req.query.desde) ? String(req.query.desde) : null;
+    var hasta = (req.query && req.query.hasta) ? String(req.query.hasta) : null;
+    var _d = desde ? new Date(desde + 'T00:00:00Z') : new Date(Date.now() - 30 * 24 * 3600 * 1000);
+    // `hasta` es INCLUSIVO para el que lo lee: "hasta el 4" tiene que traer todo el dia 4.
+    var _h = hasta ? new Date(hasta + 'T23:59:59Z') : new Date();
+
+    var out = { ok: true, desde: _d.toISOString(), hasta: _h.toISOString(), cobros: [], por_motivo: [], llamadas: [], aviso: null };
+
+    // COBROS: el detalle que se le puede mostrar al cliente.
+    var qc = await supabase.from('ia_cobros').select('created_at, cantidad, motivo, detalle')
+      .eq('user_id', uid).gte('created_at', _d.toISOString()).lte('created_at', _h.toISOString())
+      .order('created_at', { ascending: false }).limit(5000);
+    if (qc.error) out.aviso = 'El registro de cobros todavia no existe o no tiene datos de ese periodo.';
+    else out.cobros = qc.data || [];
+
+    // Resumen por motivo, que es lo que contesta la pregunta de una: "en que se fueron".
+    var acum = {};
+    (out.cobros || []).forEach(function (c) {
+      var k = c.motivo || 'sin_motivo';
+      if (!acum[k]) acum[k] = { motivo: k, mensajes: 0, veces: 0 };
+      acum[k].mensajes += (Number(c.cantidad) || 0);
+      acum[k].veces += 1;
+    });
+    out.por_motivo = Object.keys(acum).map(function (k) { return acum[k]; }).sort(function (a, b) { return b.mensajes - a.mensajes; });
+    out.total_mensajes = out.por_motivo.reduce(function (s, x) { return s + x.mensajes; }, 0);
+
+    // LLAMADAS + costo en dolares: uso INTERNO. Va aparte para que el front pueda no exportarlo.
+    var ql = await supabase.from('ia_uso').select('created_at, etiqueta, cost_usd')
+      .eq('user_id', uid).gte('created_at', _d.toISOString()).lte('created_at', _h.toISOString())
+      .limit(20000);
+    if (!ql.error && ql.data) {
+      var acl = {};
+      ql.data.forEach(function (u) {
+        var k = u.etiqueta || 'sin_etiqueta';
+        if (!acl[k]) acl[k] = { etiqueta: k, llamadas: 0, costo_usd: 0 };
+        acl[k].llamadas += 1;
+        acl[k].costo_usd += (Number(u.cost_usd) || 0);
+      });
+      out.llamadas = Object.keys(acl).map(function (k) { acl[k].costo_usd = Math.round(acl[k].costo_usd * 10000) / 10000; return acl[k]; })
+        .sort(function (a, b) { return b.llamadas - a.llamadas; });
+      out.costo_usd_total = Math.round(out.llamadas.reduce(function (s, x) { return s + x.costo_usd; }, 0) * 10000) / 10000;
+    }
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// ============================================================================
 // FICHAS DEL CLIENTE — ENDPOINTS
 // ----------------------------------------------------------------------------
 // El TENANT es siempre el DUEÑO de la cuenta, no el uid del que llama: un asesor

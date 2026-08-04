@@ -38310,6 +38310,165 @@ async function _migracionProvinciaDefensiva() {
 setTimeout(_migracionProvinciaDefensiva, 14 * 1000);
 
 // ============================================================================
+// FICHAS DEL CLIENTE — ENDPOINTS
+// ----------------------------------------------------------------------------
+// El TENANT es siempre el DUEÑO de la cuenta, no el uid del que llama: un asesor
+// tiene su propio auth uid, y sus fichas son de la cuenta, no suyas. Mismo criterio
+// que convPerteneceAUsuario (~515) y que todos los gates de suscripcion.
+// ============================================================================
+async function _duenoDelUid(uid) {
+  try {
+    if (!uid) return null;
+    var a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
+    if (a && a.data && a.data.admin_id) return a.data.admin_id; // es asesor -> el dueño es su admin
+    return uid;                                                 // no es asesor -> es el dueño
+  } catch (e) { return uid; }
+}
+
+// Campos ESTRUCTURADOS que el sistema usa para actuar. Todo lo demas va a `datos` (jsonb).
+var _FICHA_CAMPOS = ['contact_id', 'tipo', 'estado', 'property_id', 'conversation_id', 'desde', 'hasta',
+  'proximo_vencimiento', 'zonas', 'presupuesto', 'moneda', 'tipo_propiedad', 'ambientes', 'dormitorios',
+  'asesor_id', 'notas'];
+
+function _fichaDesdeBody(body) {
+  var out = {};
+  _FICHA_CAMPOS.forEach(function (k) {
+    if (body[k] === undefined) return;
+    var v = body[k];
+    // '' -> null: un campo vacio del formulario NO es un dato, y una fecha '' rompe el insert.
+    out[k] = (typeof v === 'string' && v.trim() === '') ? null : v;
+  });
+  if (body.datos && typeof body.datos === 'object' && !Array.isArray(body.datos)) out.datos = body.datos;
+  return out;
+}
+
+// LISTAR las fichas de un contacto (o todas las de la cuenta si no se pasa contact_id).
+app.get('/api/fichas', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    var q = supabase.from('fichas').select('*').eq('user_id', dueno).order('created_at', { ascending: false });
+    if (req.query && req.query.contact_id) q = q.eq('contact_id', String(req.query.contact_id));
+    if (req.query && req.query.estado) q = q.eq('estado', String(req.query.estado));
+    var { data, error } = await q;
+    // Tabla ausente (migracion sin correr) -> lista vacia, NO un 500 que rompa la pantalla.
+    if (error) return res.json({ ok: true, fichas: [], aviso: 'La tabla de fichas todavia no existe.' });
+    return res.json({ ok: true, fichas: data || [] });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// CREAR una ficha. Lo unico obligatorio: de quien es y que es. El resto se puede completar despues
+// (regla del plan: pocos campos obligatorios, o la ficha queda vacia porque cargarla cuesta).
+app.post('/api/fichas', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    var b = (req.body && typeof req.body === 'object') ? req.body : {};
+    if (!b.contact_id) return res.status(400).json({ error: 'Falta el contacto' });
+    if (!b.tipo) return res.status(400).json({ error: 'Falta el tipo de ficha' });
+    var fila = _fichaDesdeBody(b);
+    fila.user_id = dueno;
+    fila.creado_por = fila.creado_por || 'humano';
+    // UNA FICHA NUEVA NO CREA UN CONTACTO NUEVO (regla del plan §4): el contacto es uno solo, para
+    // siempre. Verificamos que el contacto sea de esta cuenta y cortamos si no.
+    var c = await supabase.from('contacts').select('id').eq('id', fila.contact_id).eq('user_id', dueno).maybeSingle();
+    if (!c || !c.data) return res.status(404).json({ error: 'Ese contacto no es de esta cuenta' });
+    var { data, error } = await supabase.from('fichas').insert(fila).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true, ficha: data });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// EDITAR una ficha. El .eq('user_id', dueno) es el candado: nadie edita la ficha de otra cuenta.
+app.patch('/api/fichas/:id', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    var upd = _fichaDesdeBody((req.body && typeof req.body === 'object') ? req.body : {});
+    delete upd.contact_id; // una ficha NO cambia de dueño: si se equivocaron, se borra y se crea otra
+    upd.updated_at = new Date().toISOString();
+    var { data, error } = await supabase.from('fichas').update(upd).eq('id', req.params.id).eq('user_id', dueno).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Ficha no encontrada' });
+    return res.json({ ok: true, ficha: data });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+app.delete('/api/fichas/:id', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    var { error } = await supabase.from('fichas').delete().eq('id', req.params.id).eq('user_id', dueno);
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// ============================================================================
+// FICHAS DEL CLIENTE (Diego 2026-08-04) — ver PLAN-FICHA-CLIENTE.md
+// ----------------------------------------------------------------------------
+// Una ficha = UNA cosa que el cliente quiere o tiene con la empresa, con su fecha
+// y su estado. Un contacto puede tener VARIAS activas al mismo tiempo: Juan vende
+// un departamento, busca comprar otro y alquila un tercero, y es una sola persona.
+// Hoy eso no se puede expresar: un contacto = una conversacion = un estado, asi que
+// si el cliente vuelve o se pisa lo anterior o se duplica.
+//
+// DECISION DE DISENO (§3 del plan): ESTRUCTURADO lo que el sistema necesita para
+// ACTUAR (tipo, fechas, y los criterios que permiten matchear), LIBRE todo lo demas.
+// Si se piden 40 campos obligatorios nadie carga nada y la ficha queda vacia; si es
+// todo texto libre, el sistema no puede hacer nada con eso — que es el problema de hoy.
+// Por eso los campos opcionales viven en `datos` (jsonb): sumar uno nuevo no necesita
+// migracion, y lo que no se carga se muestra como "sin cargar" en vez de desaparecer.
+//
+// ADITIVO: ninguna parte del sistema consulta esta tabla todavia. Crearla no cambia
+// nada de lo que hoy funciona.
+// RLS OBLIGATORIO desde el dia uno (regla dura: toda tabla nueva multi-tenant).
+async function _migracionFichasDefensiva() {
+  const stmts = [
+    "CREATE TABLE IF NOT EXISTS fichas (" +
+      "id uuid PRIMARY KEY DEFAULT gen_random_uuid(), " +
+      "user_id uuid NOT NULL, " +                       // tenant (dueño de la cuenta)
+      "contact_id uuid NOT NULL, " +                    // de quien es
+      "tipo text NOT NULL, " +                          // busca_comprar | tiene_en_venta | alquila | ...
+      "estado text NOT NULL DEFAULT 'activa', " +       // activa | publicada | cerrada | vencida
+      "property_id bigint, " +                          // sobre que propiedad (opcional)
+      "conversation_id uuid, " +                        // de donde salio (opcional)
+      "desde date, hasta date, proximo_vencimiento date, " +
+      // criterios estructurados: son los que permiten MATCHEAR sin adivinar sobre texto libre
+      "zonas text, presupuesto numeric, moneda text, tipo_propiedad text, " +
+      "ambientes integer, dormitorios integer, " +
+      "asesor_id uuid, creado_por text, " +             // 'humano' | 'ia'
+      "notas text, " +                                  // libre, SIN limite
+      "datos jsonb NOT NULL DEFAULT '{}'::jsonb, " +    // opcionales/extendidos (garante, deposito, ...)
+      "created_at timestamptz NOT NULL DEFAULT now(), " +
+      "updated_at timestamptz NOT NULL DEFAULT now()" +
+    ");",
+    "CREATE INDEX IF NOT EXISTS fichas_user_contacto_idx ON fichas (user_id, contact_id);",
+    "CREATE INDEX IF NOT EXISTS fichas_user_estado_idx ON fichas (user_id, estado);",
+    // Para los avisos por fecha (fase 2): buscar lo que vence sin recorrer toda la tabla.
+    "CREATE INDEX IF NOT EXISTS fichas_vencimiento_idx ON fichas (user_id, proximo_vencimiento) WHERE proximo_vencimiento IS NOT NULL;",
+    "ALTER TABLE fichas ENABLE ROW LEVEL SECURITY;",
+    // El front entra con el JWT del usuario: solo ve/toca las fichas de SU cuenta. El backend
+    // usa la service key y pasa por encima de RLS, como el resto del sistema.
+    "DROP POLICY IF EXISTS fichas_propias ON fichas;",
+    "CREATE POLICY fichas_propias ON fichas FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());",
+    "NOTIFY pgrst, 'reload schema';"
+  ];
+  for (const sql of stmts) {
+    try {
+      const { error } = await supabase.rpc('exec_sql', { sql: sql });
+      if (error) console.log('[migracion fichas] fallo (' + error.message + '). Correr a mano: ' + sql.slice(0, 80));
+      else console.log('[migracion fichas] OK: ' + sql.slice(0, 60));
+    } catch (e) { console.log('[migracion fichas] no se pudo via RPC. Correr a mano en Supabase: ' + sql.slice(0, 80)); }
+  }
+}
+setTimeout(_migracionFichasDefensiva, 17 * 1000);
+
+// ============================================================================
 // ===== WHATSAPP CLOUD API (oficial de Meta) — MODULO NUEVO, 100% ADITIVO =====
 // ============================================================================
 // REGLA MADRE de este bloque: NO toca NADA del camino actual de WhatsApp

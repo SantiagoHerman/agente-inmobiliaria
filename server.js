@@ -22863,11 +22863,16 @@ app.post('/api/clasificar-fotos', async (req, res) => {
     // agosto, de una importacion que despues se cancelo — pago por algo que tiro.
     // Ahora, sin ia_ok, devuelve cuanto va a costar y NO ejecuta nada. El front pregunta y, si el
     // dueño acepta, vuelve a llamar con ia_ok:true.
-    // Cobra 1 por PROPIEDAD (no por foto), solo si hay al menos una foto nueva: por eso el costo que
-    // se anuncia es 1, no urls.length. Decir un numero mas alto del que se cobra tambien es mentir.
+    // DOS NUMEROS DISTINTOS, y hay que decir los dos (corregido 2026-08-04):
+    //   - del CUPO DEL PLAN se descuenta 1 por PROPIEDAD (ver registrarUsoIA mas abajo).
+    //   - de la API de vision se paga 1 llamada POR FOTO. Medido: 108 fotos = 108 llamadas, una por
+    //     foto, sin repetir ninguna URL.
+    // La primera version de este aviso anunciaba solo "1 mensaje". En una subida de 14 fotos el dueno
+    // leia "consume 1" y se hacian 14 llamadas de vision. El numero del plan era correcto, pero el
+    // que le importa al bolsillo es la cantidad de fotos. Se devuelven los dos y el front dice ambos.
     const _iaOkFotos = (body.ia_ok === true) || (req.query && String(req.query.ia_ok) === 'true');
     if (!_iaOkFotos) {
-      return res.json({ ok: true, necesita_ia: true, costo_mensajes: 1, fotos: urls.length, resultados: [] });
+      return res.json({ ok: true, necesita_ia: true, costo_mensajes: 1, llamadas_ia: urls.length, fotos: urls.length, resultados: [] });
     }
     // CACHE DE VISION: si la propiedad YA tiene categoria guardada para una URL, no la re-clasificamos (no se
     // re-paga la vision). Solo se clasifican las URLs nuevas/sin categoria -> re-importar cuesta casi $0 en fotos ya hechas.
@@ -38366,9 +38371,16 @@ setTimeout(_migracionProvinciaDefensiva, 14 * 1000);
 // El front elige que columnas exporta, justamente para poder mandar el "en que se fue"
 // sin mostrar el costo por mensaje.
 // ============================================================================
-app.get('/api/maestro/consumo', async function (req, res) {
+// RUTA: /consumo/COBROS, no /consumo a secas. Ya existe un GET /api/maestro/consumo (~33146) que se
+// registra ANTES, y Express matchea por orden de registro: esta ruta, con el path duplicado, NUNCA
+// se ejecutaba. El front habria recibido la respuesta de la vieja (ranking/costo_usd, sin por_motivo)
+// creyendo que era esta. Detectado 2026-08-04 antes de que el front la consumiera.
+app.get('/api/maestro/consumo/cobros', async function (req, res) {
   try {
-    if (!maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    // Mismas guardas que las rutas hermanas (33148, 33270). Sin requiereSeccion, un empleado del
+    // Maestro SIN permiso de 'consumo' podia leer los cobros de cualquier cuenta pasando user_id.
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var uid = req.query && req.query.user_id ? String(req.query.user_id) : '';
     if (!uid) return res.status(400).json({ error: 'Falta user_id' });
     // Rango: por defecto los ultimos 30 dias. `desde`/`hasta` en YYYY-MM-DD.

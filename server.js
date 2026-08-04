@@ -21001,9 +21001,193 @@ function _fmtDuracionMin(seg) {
 }
 
 // CRON: geocodifica el inventario de las cuentas con ia_ubicacion ON (fail-closed: sin flag/columna
-// no hace NADA). Rellena lat/lng + referencias_zona + geo_ref. geo_ref = hash de direccion|ciudad:
+// no hace NADA). Rellena lat/lng + referencias_zona + geo_ref. geo_ref = hash de la direccion completa:
 // si el dueno cambia la direccion, se re-geocodifica sola; si no, cada fila se procesa UNA vez.
 // Presupuesto por corrida (30 filas) para respetar el 1 req/seg de Nominatim sin bloquear el proceso.
+//
+// ARREGLO 2026-08-04 (medido en Anton: 255 propiedades con direccion y solo 17 con coordenadas).
+// Eran dos cosas, las dos en este cron:
+//   1) Se buscaba SOLO con `direccion`, ignorando `entre_calles` — que se leia de la base y no se
+//      usaba nunca. "Avenida 2" no ubica nada en Villa Gesell; "Avenida 2 entre 20 y 21" ubica la
+//      esquina. El dato ya estaba cargado.
+//   2) Se llamaba a geocodificarOSM(), que es la busqueda ESTRUCTURADA a secas: si Nominatim no
+//      reconoce la calle devuelve el centro de la ciudad, eso se descartaba por ser precision
+//      'ciudad', y la fila quedaba marcada como "ya intentada" PARA SIEMPRE sin coordenadas.
+//      geocodificarTextoOSM() —que ya existia y se usaba solo para el texto libre de los leads—
+//      hace lo mismo pero, si eso falla, reintenta en BUSQUEDA LIBRE validando que la ciudad del
+//      resultado coincida (anti match en otra ciudad), y ademas cachea en geocode_cache para no
+//      volver a pegarle a Nominatim por lo mismo.
+// El hash lleva un prefijo de version: al cambiar, TODA fila ya marcada se re-geocodifica UNA vez
+// con el metodo nuevo y despues vuelve a quedar estable. Sin migracion y sin reintentos infinitos.
+var _GEO_REF_VERSION = 'v2';
+
+// ============================================================================
+// TRADUCTOR DE DIRECCIONES -> lo que OSM sabe leer.
+// ----------------------------------------------------------------------------
+// MEDIDO contra Nominatim con direcciones reales de Anton (2026-08-04):
+//     "Paseo 133 entre Av. 6 y 7, Villa Gesell"  -> SIN RESULTADO
+//     "Paseo 133 y Avenida 6, Villa Gesell"      -> SIN RESULTADO
+//     "Paseo 133, Villa Gesell"                  -> ubica
+//     "Avenida 3, Villa Gesell"                  -> ubica
+// O sea: OSM conoce perfectamente las calles, lo que NO sabe leer es la FRASE.
+// Por eso 238 propiedades quedaron sin coordenadas: se le mandaba la frase entera.
+//
+// La solucion: partir la direccion en las calles que la componen, pedir la GEOMETRIA
+// de cada una y CRUZARLAS en codigo -> eso da la esquina exacta. Verificado:
+//     Paseo 142 x Avenida 4 -> -37.286714, -56.996598
+// Si no se cruzan (OSM devuelve la calle partida en tramos y puede faltar el tramo
+// justo), cae al punto de la primera calle: peor precision pero sobre la calle correcta,
+// que es infinitamente mejor que nada. Sirve en cualquier ciudad, no solo Gesell, y es gratis.
+// ============================================================================
+
+// Palabras que aparecen en las direcciones pero NO son calles (no tiene sentido geocodificarlas).
+var _GEO_NO_ES_CALLE = ['playa', 'mar', 'costa', 'muelle', 'centro', 'zona', 'sur', 'norte', 'esquina', 'esq', 'frente', 'sn', 's/n'];
+
+// Abreviaturas -> nombre completo, que es como OSM las tiene tagueadas.
+function _geoNormalizarCalle(s) {
+  var t = String(s || '').trim().replace(/\s+/g, ' ');
+  if (!t) return '';
+  t = t.replace(/^av\.?\s+/i, 'Avenida ').replace(/^avda\.?\s+/i, 'Avenida ');
+  t = t.replace(/^bv\.?\s+/i, 'Boulevard ').replace(/^blv?d\.?\s+/i, 'Boulevard ');
+  t = t.replace(/^pje\.?\s+/i, 'Pasaje ').replace(/^psje\.?\s+/i, 'Pasaje ');
+  t = t.replace(/^gral\.?\s+/i, 'General ').replace(/^cnel\.?\s+/i, 'Coronel ');
+  // Primera letra de cada palabra en mayuscula: OSM guarda "Paseo 133", no "PASEO 133".
+  t = t.toLowerCase().replace(/(^|\s)([a-zñáéíóú])/g, function (m, a, b) { return a + b.toUpperCase(); });
+  return t.trim();
+}
+
+// Parte "PASEO 142 Y AV. 4 N° 3018 (ZONA MUELLE)" en ['Paseo 142', 'Avenida 4'].
+// Devuelve como maximo 2 calles: con 2 se saca la esquina, con 1 se ubica sobre la calle.
+function _geoCallesDeDireccion(direccion, entreCalles) {
+  var t = String(direccion || '').trim();
+  var ec = String(entreCalles || '').trim();
+  // La columna entre_calles a veces ya viene con la palabra ("entre 20 y 21") y a veces sin ella
+  // ("20 y 21"). Si no se saca, queda "entre entre 20 y 21" y el corte de abajo devuelve "Entre 20".
+  ec = ec.replace(/^\s*(entre|e\/)\s*/i, '').trim();
+  // Si la columna entre_calles esta cargada, es mas confiable que adivinar dentro del texto.
+  if (ec) t = t + ' entre ' + ec;
+  if (!t) return [];
+  t = t.replace(/\([^)]*\)/g, ' ');                     // (ZONA MUELLE)
+  t = t.replace(/\b(n[°ºo]|nro|nº)\.?\s*\d+/gi, ' ');   // N° 3018 / nro 1200
+  t = t.replace(/\s+/g, ' ').trim();
+
+  // 1) Cortar por el separador de "entre": lo de la izquierda es la calle principal.
+  var principal = t, resto = '';
+  var mEntre = t.split(/\s+entre\s+|\s+e\/\s*|\s+e\/|\s+entre\s*:/i);
+  if (mEntre.length > 1) { principal = mEntre[0]; resto = mEntre.slice(1).join(' y '); }
+  else {
+    // 2) Sin "entre": la direccion es una esquina ("Paseo 142 Y Av. 4", "Avenida 3 y Paseo 143").
+    var mY = t.split(/\s+y\s+|\s+esq\.?\s+|\s+esquina\s+|\s*\/\s*/i);
+    if (mY.length > 1) { principal = mY[0]; resto = mY.slice(1).join(' y '); }
+  }
+  // De "Av. 6 y 7" (las dos que encierran la cuadra) alcanza con la PRIMERA: define la esquina.
+  var segunda = resto ? resto.split(/\s+y\s+/i)[0] : '';
+
+  var util = function (x) {
+    var n = _geoNormalizarCalle(x);
+    if (!n) return '';
+    if (_GEO_NO_ES_CALLE.indexOf(n.toLowerCase()) >= 0) return '';
+    return n;
+  };
+  var out = [];
+  var a = util(principal); if (a) out.push(a);
+  var b = util(segunda); if (b && b !== a) out.push(b);
+  return out;
+}
+
+// Geometria de UNA calle segun OSM. Cache en memoria por (ciudad|calle): la misma calle se
+// repite en decenas de propiedades y asi se le pega a Nominatim UNA sola vez por proceso.
+var _GEO_CALLE_CACHE = new Map();
+async function _geoCalleOSM(nombre, ciudad) {
+  var clave = _normGeoTexto(String(ciudad || '') + '|' + String(nombre || ''));
+  if (_GEO_CALLE_CACHE.has(clave)) return _GEO_CALLE_CACHE.get(clave);
+  var res = null;
+  try {
+    await _osmThrottle();
+    // limit alto a proposito: OSM parte cada calle en varios tramos (way) y necesitamos TODOS
+    // para que el cruce con la otra calle encuentre el segmento donde realmente se tocan.
+    var url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=40&countrycodes=ar&addressdetails=1&polygon_geojson=1&q=' +
+      encodeURIComponent(String(nombre) + (ciudad ? ', ' + ciudad : '') + ', Argentina');
+    var r = await fetchScrape(url, { headers: { 'User-Agent': _OSM_UA } });
+    if (r.ok) {
+      var arr = await r.json();
+      if (Array.isArray(arr) && arr.length) {
+        // ANTI MATCH EN OTRA PROVINCIA. Validar que el nombre de la ciudad APAREZCA en el texto del
+        // resultado NO alcanza: hay calles llamadas "Villa Gesell" en otros pueblos, asi que
+        // "140, Villa Gesell" daba un resultado en CORDOBA (-32.42, -63.26) que pasaba el filtro.
+        // Medido el 2026-08-04. Hay que exigir que la localidad ESTRUCTURADA sea la nuestra.
+        var ciuN = _normGeoTexto(String(ciudad || ''));
+        var ok = arr.filter(function (x) {
+          if (!ciuN) return true;
+          var ad = x.address || {};
+          var candidatos = [ad.city, ad.town, ad.village, ad.municipality, ad.suburb, ad.county];
+          for (var q = 0; q < candidatos.length; q++) {
+            if (candidatos[q] && _normGeoTexto(String(candidatos[q])).indexOf(ciuN) >= 0) return true;
+          }
+          return false;
+        });
+        if (ok.length) {
+          var lineas = [];
+          ok.forEach(function (x) {
+            var g = x.geojson;
+            if (!g) return;
+            if (g.type === 'LineString') lineas.push(g.coordinates);
+            else if (g.type === 'MultiLineString') g.coordinates.forEach(function (c) { lineas.push(c); });
+          });
+          var p0 = ok[0];
+          res = { lineas: lineas, punto: { lat: parseFloat(p0.lat), lng: parseFloat(p0.lon) } };
+          if (isNaN(res.punto.lat) || isNaN(res.punto.lng)) res.punto = null;
+        }
+      }
+    }
+  } catch (e) { res = null; }
+  if (_GEO_CALLE_CACHE.size > 5000) _GEO_CALLE_CACHE.clear(); // tope de memoria
+  _GEO_CALLE_CACHE.set(clave, res);
+  return res;
+}
+
+// Cruce de dos segmentos (coordenadas [lng, lat]). Null si no se cortan DENTRO de los tramos.
+function _geoCruceSegmentos(p1, p2, p3, p4) {
+  var d = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0]);
+  if (Math.abs(d) < 1e-12) return null; // paralelos
+  var t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / d;
+  var u = ((p3[0] - p1[0]) * (p2[1] - p1[1]) - (p3[1] - p1[1]) * (p2[0] - p1[0])) / d;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+  return { lng: p1[0] + t * (p2[0] - p1[0]), lat: p1[1] + t * (p2[1] - p1[1]) };
+}
+
+// La esquina donde se cruzan dos calles, o null.
+function _geoEsquina(a, b) {
+  if (!a || !b || !a.lineas || !b.lineas) return null;
+  for (var i = 0; i < a.lineas.length; i++) {
+    var la = a.lineas[i];
+    for (var k = 0; k + 1 < la.length; k++) {
+      for (var j = 0; j < b.lineas.length; j++) {
+        var lb = b.lineas[j];
+        for (var m = 0; m + 1 < lb.length; m++) {
+          var c = _geoCruceSegmentos(la[k], la[k + 1], lb[m], lb[m + 1]);
+          if (c) return c;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// Ubicar una direccion: esquina exacta si se puede, si no un punto sobre la calle principal.
+// Devuelve { lat, lng, precision: 'esquina' | 'calle' } o null.
+async function _geoUbicarDireccion(direccion, entreCalles, ciudad) {
+  var calles = _geoCallesDeDireccion(direccion, entreCalles);
+  if (!calles.length) return null;
+  var a = await _geoCalleOSM(calles[0], ciudad);
+  if (calles.length > 1) {
+    var b = await _geoCalleOSM(calles[1], ciudad);
+    var esq = _geoEsquina(a, b);
+    if (esq) return { lat: esq.lat, lng: esq.lng, precision: 'esquina' };
+  }
+  if (a && a.punto) return { lat: a.punto.lat, lng: a.punto.lng, precision: 'calle' };
+  return null;
+}
 var _geocodEnCurso = false;
 async function geocodificarPendientes() {
   if (_geocodEnCurso) return;
@@ -21023,12 +21207,12 @@ async function geocodificarPendientes() {
       for (var i = 0; i < q.data.length && presupuesto > 0; i++) {
         var f = q.data[i];
         if (!f.direccion || !String(f.direccion).trim()) continue;
-        var refAct = _normGeoTexto(String(f.direccion) + '|' + String(f.ciudad || ''));
+        var refAct = _normGeoTexto(_GEO_REF_VERSION + '|' + String(f.direccion) + '|' + String(f.entre_calles || '') + '|' + String(f.ciudad || ''));
         if (f.geo_ref === refAct) continue; // ya intentada esta direccion (con o sin exito): no repagar
         presupuesto--;
-        var g = await geocodificarOSM(String(f.direccion), String(f.ciudad || ''));
+        var g = await _geoUbicarDireccion(f.direccion, f.entre_calles, f.ciudad);
         var upd = { geo_ref: refAct };
-        if (g && g.precision !== 'ciudad') {
+        if (g && g.lat != null) {
           upd.lat = g.lat; upd.lng = g.lng;
           var refs = await referenciasZonaOSM(g.lat, g.lng);
           if (refs) upd.referencias_zona = refs;
@@ -21047,12 +21231,12 @@ async function geocodificarPendientes() {
           var c = hq.data[j];
           var a = (c.atributos && typeof c.atributos === 'object') ? c.atributos : {};
           if (!a.direccion || !String(a.direccion).trim()) continue;
-          var refH = _normGeoTexto(String(a.direccion) + '|' + String(a.ciudad || ''));
+          var refH = _normGeoTexto(_GEO_REF_VERSION + '|' + String(a.direccion) + '|' + String(a.entre_calles || '') + '|' + String(a.ciudad || ''));
           if (a.geo_ref === refH) continue;
           presupuesto--;
-          var gH = await geocodificarOSM(String(a.direccion), String(a.ciudad || ''));
+          var gH = await _geoUbicarDireccion(a.direccion, a.entre_calles, a.ciudad);
           var aNew = Object.assign({}, a, { geo_ref: refH });
-          if (gH && gH.precision !== 'ciudad') {
+          if (gH && gH.lat != null) {
             aNew.lat = gH.lat; aNew.lng = gH.lng;
             var refsH = await referenciasZonaOSM(gH.lat, gH.lng);
             if (refsH) aNew.referencias_zona = refsH;

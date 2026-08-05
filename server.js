@@ -32768,7 +32768,10 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
           // fallo real de DB podia enmascararse (reintento sin snapshot exitoso -> ok), perdiendo en silencio el
           // snapshot que sirve para RESTAURAR el plan real al sacar la cortesia.
           var msgDar = String((upDar.error && upDar.error.message) || '').toLowerCase();
-          var esColumnaAusenteDar = msgDar.indexOf('snapshot_cortesia') !== -1 || msgDar.indexOf('column') !== -1 || msgDar.indexOf('does not exist') !== -1;
+          // AJUSTADO 2026-08-05 (espejo del de SACAR): exigir que el mensaje NOMBRE a snapshot_cortesia. Con el
+          // "|| indexOf('column')" de antes, cualquier error que mencionara una columna (ej. un NOT NULL) se
+          // trataba como "columna ausente" y se reintentaba a ciegas, perdiendo el snapshot en silencio.
+          var esColumnaAusenteDar = msgDar.indexOf('snapshot_cortesia') !== -1;
           if (updDar.snapshot_cortesia && esColumnaAusenteDar) {
             // La columna snapshot_cortesia no existe (migracion sin correr): reintentar SIN ella (la cortesia
             // se da igual, solo no se guarda el snapshot). Si el reintento TAMBIEN falla -> es un fallo real de DB.
@@ -32791,8 +32794,11 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
           // a) tiene MP real vigente -> la rige MP. Solo sacar cortesia y limpiar snapshot.
         } else if (snapPlanReal) {
           // b) el snapshot tiene un plan real -> RESTAURAR ese plan/estado (vuelve exactamente a como estaba).
-          updC.plan = snap.plan || null;
-          updC.status = snap.status || null;
+          // OJO: `plan` y `status` son NOT NULL en la tabla. Si el snapshot guardo null en alguno (cuenta que
+          // no tenia plan al momento de darle la cortesia), escribir null aborta el UPDATE entero con 23502 y
+          // la cortesia NO se saca. Por eso el fallback a valores validos en vez de null.
+          updC.plan = snap.plan || PLAN_SIN_SUSCRIPCION;
+          updC.status = snap.status || 'cancelled';
           updC.mp_preapproval_id = snap.mp_preapproval_id || null;
           updC.current_period_end = snap.current_period_end || null;
           // Durante la cortesia el contador del periodo siguio subiendo: lo reiniciamos LIMPIO (igual que el caso c)
@@ -32802,8 +32808,16 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
         } else {
           // c) nunca tuvo plan real (creada con cortesia) -> congelar (suspended -> paywall) y reiniciar el periodo
           // de pago LIMPIO (durante la cortesia el contador igual subia; evita avisos falsos de tope y "usado" inflado).
+          //
+          // BUG ARREGLADO 2026-08-05 (Diego: "le saco la cortesia con el boton y no hace nada"): aca habia
+          // `updC.plan = null`, pero la columna `plan` es NOT NULL. Postgres abortaba el UPDATE con 23502 y la
+          // cortesia quedaba PRENDIDA. Peor: el mensaje de ese error contiene la palabra "column" ("null value in
+          // column \"plan\"..."), asi que la guarda de abajo lo confundia con "la columna snapshot_cortesia no
+          // existe", reintentaba con el mismo plan=null y volvia a fallar. El boton no funcionaba para NINGUNA
+          // cuenta que cayera en este caso. `sin_plan` es el valor que el sistema ya usa para "se registro y no
+          // contrato" (PLAN_LIMITS.sin_plan, 0 mensajes) -> mismo efecto buscado, pero valido para la columna.
           updC.status = 'suspended';
-          updC.plan = null;
+          updC.plan = PLAN_SIN_SUSCRIPCION;
           updC.ai_messages_this_period = 0;
           updC.period_start = new Date().toISOString();
         }
@@ -32813,7 +32827,12 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
         var upSacar = await supabase.from('subscriptions').upsert(updC, { onConflict: 'user_id' });
         if (upSacar && upSacar.error) {
           var msgSacar = String((upSacar.error && upSacar.error.message) || '').toLowerCase();
-          var esColumnaAusente = msgSacar.indexOf('snapshot_cortesia') !== -1 || msgSacar.indexOf('column') !== -1 || msgSacar.indexOf('does not exist') !== -1;
+          // AJUSTADO 2026-08-05: antes bastaba con que el mensaje contuviera "column" para tratarlo como
+          // "la columna snapshot_cortesia no existe". Un NOT NULL de Postgres dice `null value in column "plan"`,
+          // que TAMBIEN contiene "column" -> se reintentaba a ciegas un UPDATE que volvia a fallar, y el error real
+          // quedaba enmascarado. Ahora se exige que el mensaje NOMBRE a snapshot_cortesia: es el unico caso en que
+          // reintentar sin esa key tiene sentido. Cualquier otro error es un fallo real -> _cortesiaFalloDB.
+          var esColumnaAusente = msgSacar.indexOf('snapshot_cortesia') !== -1;
           if (esColumnaAusente) {
             console.error('cortesia sacar upsert (columna ausente, reintento sin snapshot):', upSacar.error.message);
             var updSinSnap = Object.assign({}, updC); delete updSinSnap.snapshot_cortesia;

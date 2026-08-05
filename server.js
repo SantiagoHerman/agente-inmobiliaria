@@ -39022,6 +39022,20 @@ const CLOUD_API_GRAPH_VERSION = 'v25.0';
 //     (pegar el token en el panel) igual anda; solo el Embedded Signup queda deshabilitado.
 const CLOUD_API_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN || process.env.META_VERIFY_TOKEN || '';
 
+// ===== config_id del REGISTRO INSERTADO (Embedded Signup) =====
+// Creado en la consola de Meta el 2026-08-05 con el nombre "Raices - Registro insertado"
+// (Casos de uso -> Conectar en WhatsApp -> Administrador de registro insertado -> Crear configuracion).
+// Meta lo marca como "Caduca el: Nunca" y es el que genera el token de usuario del sistema; pide al
+// cliente los permisos whatsapp_business_management y whatsapp_business_messaging.
+//
+// ES DISTINTO de META_LOGIN_CONFIG_ID (~37420, "Raices - Conectar"), que es el de MESSENGER. Meta
+// avisa explicitamente que una configuracion de inicio de sesion NO se comparte entre usos: cada una
+// declara sus propios activos y permisos, y usar la de Messenger para el registro insertado no pide
+// los permisos de WhatsApp -> el alta del cliente saldria sin acceso a su WABA.
+//
+// Overridable por env por si se rehace la configuracion en la consola (el id cambia).
+const META_ES_CONFIG_ID = process.env.META_ES_CONFIG_ID || '1562398828709758';
+
 // ===== GATE por cuenta: business_settings.cloud_api_v1 =====
 // FAIL-CLOSED: ante CUALQUIER error (columna inexistente, sin migracion, red) -> false
 // => comportamiento ACTUAL EXACTO (Evolution). Mismo patron que iaUbicacionActivo /
@@ -40164,7 +40178,14 @@ app.get('/api/cloud-api/embedded-signup', async function(req, res) {
   try {
     const uid = await verificarUsuario(req);
     if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
-    return res.json({ ok: true, disponible: !!(META_APP_ID && META_APP_SECRET), app_id: META_APP_ID || null });
+    // config_id: lo necesita el front para lanzar el popup/enlace del registro insertado. NO es
+    // secreto (viaja en la URL que ve el cliente), a diferencia de META_APP_SECRET, que nunca sale.
+    return res.json({
+      ok: true,
+      disponible: !!(META_APP_ID && META_APP_SECRET),
+      app_id: META_APP_ID || null,
+      config_id: META_ES_CONFIG_ID || null
+    });
   } catch (e) { return res.status(500).json({ error: 'Error' }); }
 });
 

@@ -13745,16 +13745,76 @@ function _mtchMonedaCompatible(monedaProp, textoLead) {
 var MATCH_MIN_SCORE = 2;
 var MATCH_MAX_LEADS = 20000; // techo de leads a evaluar (paginado por chunks). Universo = leads CON conversacion.
 
-// Corre el matcher de UNA propiedad {zone,type,price} contra los leads CON conversacion (no cerrados)
-// del tenant. Devuelve [{ conversation_id, contact_id, lead, estado, score, motivos }] ordenado por score.
+// ===== FASE 3 (Diego 2026-08-05): el matcheo lee la FICHA, no el texto libre =====
+// Tipos de ficha que expresan DEMANDA (lo que el cliente BUSCA). Solo estos matchean contra una propiedad:
+// una ficha de "tiene en venta" o "es inquilino" dice lo que el cliente TIENE, no lo que quiere.
+var MATCH_FICHA_TIPOS_DEMANDA = ['busca_comprar', 'busca_alquilar', 'consulta_inversion', 'consulta'];
+
+// Score de UNA ficha de demanda contra la propiedad. Es el reemplazo ESTRUCTURADO del scoring por subcadena:
+// compara campo contra campo en vez de buscar el nombre de la zona adentro de lo que el lead escribio.
+// Suma DOS senales que el matcheo de texto nunca pudo mirar: ambientes y dormitorios.
+function _mtchScoreFicha(f, ctx) {
+  var score = 0, motivos = [];
+  // ZONA: la ficha guarda una lista ("Palermo, Belgrano, Villa Crespo"). Alcanza con que UNA encaje.
+  var zonas = String((f && f.zonas) || '').split(/[,;/]/).map(function (z) { return _mtchNorm(z).trim(); }).filter(Boolean);
+  if (zonas.length && (ctx.zonaP || ctx.tokP.length)) {
+    var exacta = ctx.zonaP && zonas.some(function (z) { return z === ctx.zonaP || ctx.zonaP.indexOf(z) >= 0 || z.indexOf(ctx.zonaP) >= 0; });
+    if (exacta) { score += 2; motivos.push('zona'); }
+    else if (zonas.some(function (z) { return ctx.tokP.some(function (t) { return z.indexOf(t) >= 0; }); })) { score += 1; motivos.push('zona~'); }
+  }
+  if (ctx.tipoP && f.tipo_propiedad) {
+    var tp = _mtchNorm(f.tipo_propiedad);
+    if (tp && (tp === ctx.tipoP || ctx.tipoP.indexOf(tp) >= 0 || tp.indexOf(ctx.tipoP) >= 0)) { score += 1; motivos.push('tipo'); }
+  }
+  // PRESUPUESTO: numero real contra numero real. La ficha guarda un TECHO ("hasta USD 185.000"), asi que la
+  // propiedad tiene que entrar por debajo (se tolera un 15% de estiramiento, que es como compra la gente).
+  // El piso de 0.5x evita el match absurdo de una propiedad de 60k contra un presupuesto de 500k.
+  // Si LOS DOS declaran moneda y no coinciden, no puntua; si alguno no la declara, se puntua igual (fail-open,
+  // mismo criterio que _mtchMonedaCompatible en el camino de texto).
+  if (ctx.precioP > 0 && typeof f.presupuesto === 'number' && f.presupuesto > 0) {
+    var monedaOk = !ctx.monedaP || !f.moneda || String(f.moneda) === ctx.monedaP;
+    if (monedaOk && ctx.precioP <= f.presupuesto * 1.15 && ctx.precioP >= f.presupuesto * 0.5) { score += 1; motivos.push('presupuesto'); }
+  }
+  if (ctx.ambP && f.ambientes && Number(f.ambientes) === ctx.ambP) { score += 1; motivos.push('ambientes'); }
+  if (ctx.dormP && f.dormitorios && Number(f.dormitorios) === ctx.dormP) { score += 1; motivos.push('dormitorios'); }
+  return { score: score, motivos: motivos };
+}
+
+// Corre el matcher de UNA propiedad contra los leads del tenant.
+// Devuelve [{ conversation_id, contact_id, lead, estado, score, motivos, por_ficha }] ordenado por score.
+//
+// QUIEN GANA (regla del plan §8): si el contacto tiene una ficha de demanda ACTIVA, manda la FICHA. Si no,
+// se usa el texto libre de siempre. Asi una cuenta sin fichas se comporta BYTE-IDENTICO a como se comportaba.
+//
+// 3B — LOS QUE NUNCA ESCRIBIERON: el universo historico eran solo los contactos CON conversacion no cerrada.
+// Un contacto con ficha cargada a mano (la cartera vieja de la oficina) era invisible. Ahora tambien entran,
+// con conversation_id = null. NO pueden ir a una Oportunidad (el motor de envio resuelve por conversacion),
+// asi que salen igual en la lista para que los trabaje una persona -- ver _ejecutarMatchingPropiedad.
 async function _matchLeadsParaPropiedad(ownerId, prop) {
   var out = [];
   try {
     var zonaP = _mtchNorm(prop && prop.zone), tipoP = _mtchNorm(prop && prop.type), tokP = _mtchTokensZona(prop && prop.zone);
     var _pm = _mtchPrecioMoneda(prop);
     var precioP = _pm.precio || 0, monedaP = _pm.moneda;
+    var ambP = Number(prop && prop.rooms) || 0, dormP = Number(prop && prop.dormitorios) || 0;
     if (!zonaP && !tipoP && !(precioP > 0) && !(tokP && tokP.length)) return []; // sin ninguna senal util -> no matchear
-    // 1) conversations del tenant (id, contact_id, status) PAGINADAS. Nos quedamos con la 1a conv NO cerrada por contacto.
+    var ctx = { zonaP: zonaP, tipoP: tipoP, tokP: tokP, precioP: precioP, monedaP: monedaP, ambP: ambP, dormP: dormP };
+
+    // 0) FICHAS de demanda activas del tenant, agrupadas por contacto. DEFENSIVO: si la tabla no existe todavia
+    // (migracion sin correr) o falla la query, quedamos sin fichas -> todo cae al camino de texto = como hoy.
+    var fichasPorContacto = {};
+    try {
+      var fq = await supabase.from('fichas').select('contact_id, tipo, estado, zonas, presupuesto, moneda, tipo_propiedad, ambientes, dormitorios')
+        .eq('user_id', ownerId).eq('estado', 'activa').in('tipo', MATCH_FICHA_TIPOS_DEMANDA);
+      if (fq && !fq.error) {
+        (fq.data || []).forEach(function (f) {
+          if (!f || !f.contact_id) return;
+          (fichasPorContacto[f.contact_id] = fichasPorContacto[f.contact_id] || []).push(f);
+        });
+      }
+    } catch (eF) { /* sin fichas -> comportamiento historico */ }
+
+    // 1) conversations del tenant PAGINADAS. Nos quedamos con la 1a conv NO cerrada por contacto.
     var convByContact = {};
     var from = 0, size = 1000, cap = 200000;
     while (from < cap) {
@@ -13765,27 +13825,56 @@ async function _matchLeadsParaPropiedad(ownerId, prop) {
       if (rows.length < size) break;
       from += size;
     }
-    var contactIds = Object.keys(convByContact);
+
+    // 2) UNIVERSO = los que tienen conversacion (como siempre) + los que tienen ficha de demanda (3B, nuevo).
+    var idsSet = {};
+    Object.keys(convByContact).forEach(function (id) { idsSet[id] = true; });
+    Object.keys(fichasPorContacto).forEach(function (id) { idsSet[id] = true; });
+    var contactIds = Object.keys(idsSet);
     if (!contactIds.length) return [];
     if (contactIds.length > MATCH_MAX_LEADS) contactIds = contactIds.slice(0, MATCH_MAX_LEADS);
-    // 2) contacts de esos ids (interest/budget/notes) por chunks. Score y filtro por umbral.
+
+    // 3) contacts por chunks. Score: FICHA si la tiene, texto libre si no.
     for (var i = 0; i < contactIds.length; i += 300) {
       var chunk = contactIds.slice(i, i + 300);
       var lq = await supabase.from('contacts').select('id, name, interest, budget, notes').eq('user_id', ownerId).in('id', chunk);
       if (lq && lq.error) continue;
       (lq && lq.data ? lq.data : []).forEach(function (l) {
-        var meta = convByContact[l.id]; if (!meta) return;
-        var texto = _mtchNorm((l.interest || '') + ' ' + (l.notes || '') + ' ' + (l.budget || ''));
-        if (!texto.trim()) return;
-        var score = 0; var motivos = [];
-        if (zonaP && texto.indexOf(zonaP) >= 0) { score += 2; motivos.push('zona'); }
-        else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
-        if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
-        if (precioP > 0 && _mtchMonedaCompatible(monedaP, (l.budget || '') + ' ' + (l.interest || ''))) {
-          var presup = _mtchNums((l.budget || '') + ' ' + (l.interest || ''));
-          if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
+        var meta = convByContact[l.id] || null;
+        var fichas = fichasPorContacto[l.id] || null;
+        var score = 0, motivos = [], porFicha = false;
+
+        if (fichas && fichas.length) {
+          // LA FICHA MANDA. Un contacto puede tener varias busquedas activas: vale la MEJOR.
+          porFicha = true;
+          fichas.forEach(function (f) {
+            var r = _mtchScoreFicha(f, ctx);
+            if (r.score > score) { score = r.score; motivos = r.motivos; }
+          });
+        } else {
+          // Sin ficha -> texto libre, EXACTAMENTE como hasta hoy (incluido que un contacto sin conversacion
+          // no participa: sin ficha no hay dato estructurado que lo justifique).
+          if (!meta) return;
+          var texto = _mtchNorm((l.interest || '') + ' ' + (l.notes || '') + ' ' + (l.budget || ''));
+          if (!texto.trim()) return;
+          if (zonaP && texto.indexOf(zonaP) >= 0) { score += 2; motivos.push('zona'); }
+          else if (tokP.some(function (t) { return texto.indexOf(t) >= 0; })) { score += 1; motivos.push('zona~'); }
+          if (tipoP && texto.indexOf(tipoP) >= 0) { score += 1; motivos.push('tipo'); }
+          if (precioP > 0 && _mtchMonedaCompatible(monedaP, (l.budget || '') + ' ' + (l.interest || ''))) {
+            var presup = _mtchNums((l.budget || '') + ' ' + (l.interest || ''));
+            if (presup.some(function (n) { return n >= precioP * 0.8 && n <= precioP * 1.3; })) { score += 1; motivos.push('presupuesto'); }
+          }
         }
-        if (score >= MATCH_MIN_SCORE) out.push({ conversation_id: meta.conversation_id, contact_id: l.id, lead: l.name || ('contacto ' + l.id), estado: meta.status, score: score, motivos: motivos.join('+') });
+
+        if (score >= MATCH_MIN_SCORE) out.push({
+          conversation_id: meta ? meta.conversation_id : null,
+          contact_id: l.id,
+          lead: l.name || ('contacto ' + l.id),
+          estado: meta ? meta.status : '',
+          score: score,
+          motivos: motivos.join('+'),
+          por_ficha: porFicha
+        });
       });
     }
     out.sort(function (a, b) { return b.score - a.score; });
@@ -13807,6 +13896,9 @@ async function _propMatchDesdeProperty(ownerId, propertyId) {
     // y _mtchPrecioMoneda cae al texto de `price` -> mismo comportamiento que hoy pero con la moneda leida.
     return { prop: {
       zone: p.zone, type: p.type, price: precio,
+      // FASE 3: ambientes y dormitorios son dos senales que el matcheo de texto NUNCA pudo usar (no habia de
+      // donde sacarlas del texto libre del lead). Con la ficha se comparan numero contra numero.
+      rooms: p.rooms, dormitorios: p.dormitorios,
       venta_activa: p.venta_activa, venta_precio: p.venta_precio, venta_moneda: p.venta_moneda,
       anual_activa: p.anual_activa, anual_precio: p.anual_precio, anual_moneda: p.anual_moneda,
       temporal_activa: p.temporal_activa, temporal_precio_dia: p.temporal_precio_dia, temporal_moneda: p.temporal_moneda
@@ -13825,12 +13917,33 @@ async function _propMatchDesdeUnidad(ownerId, developmentId, unitId) {
 }
 
 // Core reutilizable: corre el matcher y, si hay candidatos, crea/actualiza la oportunidad BORRADOR
-// + avisa al dueno. NO chequea el gate (el caller lo hace). Devuelve { candidatos, oportunidad_id, propiedad }.
+// + avisa al dueno. NO chequea el gate (el caller lo hace).
+// Devuelve { candidatos, oportunidad_id, propiedad, sin_conversacion, sin_conversacion_nombres }.
+//
+// FASE 3B: los candidatos SIN conversacion (cartera vieja cargada a mano, que nunca escribio) NO pueden ir a
+// la Oportunidad -- el motor de envio resuelve el universo por `conversations`, asi que un contacto sin
+// conversacion no tiene por donde recibir nada. En vez de tirarlos, salen nombrados en el aviso para que los
+// trabaje una persona. Mandarles algo automatico seria otro proyecto (y con riesgo de baneo).
 async function _ejecutarMatchingPropiedad(ownerId, prop, label) {
   var candidatos = await _matchLeadsParaPropiedad(ownerId, prop);
+  var sinConv = candidatos.filter(function (c) { return !c.conversation_id; });
   var convIds = candidatos.map(function (c) { return c.conversation_id; }).filter(Boolean);
   var seen = {}; convIds = convIds.filter(function (id) { if (seen[id]) return false; seen[id] = true; return true; });
-  if (!convIds.length) return { candidatos: 0, oportunidad_id: null, propiedad: label };
+  // Nombres de los que hay que contactar a mano (tope 5 en el aviso: es un aviso, no un listado).
+  var nombresSin = sinConv.slice(0, 5).map(function (c) { return c.lead; });
+  var textoSin = sinConv.length
+    ? (' Ademas hay ' + sinConv.length + ' con ficha que nunca escribieron (' + nombresSin.join(', ')
+       + (sinConv.length > nombresSin.length ? ' y ' + (sinConv.length - nombresSin.length) + ' mas' : '')
+       + '): a esos hay que contactarlos a mano.')
+    : '';
+  if (!convIds.length) {
+    // Nadie contactable por Oportunidad. Si igual hay fichas que matchean, se avisa: es justo el caso que la
+    // fase 3 vino a destrabar (la cartera que existia antes del sistema).
+    if (sinConv.length) {
+      try { await _postearAvisoInterno(ownerId, 'general', 'Hay ' + sinConv.length + ' cliente' + (sinConv.length === 1 ? '' : 's') + ' con ficha que matchean ' + label + '.' + textoSin); } catch (eAv0) {}
+    }
+    return { candidatos: 0, oportunidad_id: null, propiedad: label, sin_conversacion: sinConv.length, sin_conversacion_nombres: nombresSin };
+  }
   var nombreOp = ('Auto-match: ' + label).slice(0, 200);
   var oportunidad = null;
   // DEDUPE: si ya hay un BORRADOR de auto-match de ESTA propiedad, se actualizan sus custom_ids (no se apila).
@@ -13850,7 +13963,7 @@ async function _ejecutarMatchingPropiedad(ownerId, prop, label) {
     oportunidad = (ins && ins.data) ? ins.data : null;
   }
   // Aviso interno al dueno (canal "Todos"). Best-effort: nunca rompe. 0 IA.
-  var _txtOp = 'Hay ' + convIds.length + ' lead' + (convIds.length === 1 ? '' : 's') + ' que matchean ' + label + '. Quedo un borrador en Oportunidades: revisalo y lanzalo.';
+  var _txtOp = 'Hay ' + convIds.length + ' lead' + (convIds.length === 1 ? '' : 's') + ' que matchean ' + label + '. Quedo un borrador en Oportunidades: revisalo y lanzalo.' + textoSin;
   try {
     // FEATURE notif dirigidas [gated notif_solo_involucrado]: es GESTION -> con el flag ON el push va SOLO al dueno/admin
     // (los vendedores no lo reciben); el registro queda visible en el canal "Todos". Flag OFF -> BYTE-IDENTICO al actual.
@@ -13861,7 +13974,7 @@ async function _ejecutarMatchingPropiedad(ownerId, prop, label) {
       await _postearAvisoInterno(ownerId, 'general', _txtOp);
     }
   } catch (eAv) {}
-  return { candidatos: convIds.length, oportunidad_id: (oportunidad && oportunidad.id) ? oportunidad.id : null, propiedad: label };
+  return { candidatos: convIds.length, oportunidad_id: (oportunidad && oportunidad.id) ? oportunidad.id : null, propiedad: label, sin_conversacion: sinConv.length, sin_conversacion_nombres: nombresSin };
 }
 
 // POST /api/matching/propiedad { property_id } | { development_id, unit_id } -> genera oportunidad borrador.
@@ -13879,7 +13992,7 @@ app.post('/api/matching/propiedad', async function (req, res) {
     else return res.status(400).json({ error: 'Falta property_id (o development_id + unit_id)' });
     if (!resuelto) return res.status(404).json({ error: 'No se encontro la propiedad/unidad' });
     var r = await _ejecutarMatchingPropiedad(ownerId, resuelto.prop, resuelto.label);
-    return res.json({ ok: true, candidatos: r.candidatos, propiedad: r.propiedad, oportunidad_id: r.oportunidad_id });
+    return res.json({ ok: true, candidatos: r.candidatos, propiedad: r.propiedad, oportunidad_id: r.oportunidad_id, sin_conversacion: r.sin_conversacion || 0, sin_conversacion_nombres: r.sin_conversacion_nombres || [] });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

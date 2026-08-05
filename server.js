@@ -33460,8 +33460,10 @@ app.get('/api/maestro/anthropic/probe', async function (req, res) {
   try {
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
-    var KEY = process.env.ANTHROPIC_API_KEY || '';
-    if (!KEY) return res.json({ ok: false, error: 'No hay ANTHROPIC_API_KEY en el entorno' });
+    // OJO: en este proyecto la variable se llama ANTHROPIC_KEY (asi la usa todo el resto del server, ~L10095),
+    // NO el ANTHROPIC_API_KEY estandar. Se acepta el otro nombre por si algun dia se renombra.
+    var KEY = process.env.ANTHROPIC_KEY || process.env.ANTHROPIC_API_KEY || '';
+    if (!KEY) return res.json({ ok: false, error: 'No hay ANTHROPIC_KEY ni ANTHROPIC_API_KEY en el entorno' });
     var hoy = new Date().toISOString().slice(0, 10);
     var hace7 = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
     var candidatos = [

@@ -1258,11 +1258,31 @@ async function usoMensajesIA(user_id) {
 // ESTE orden de precedencia (byte-equivalente al gate): cortesia (ilimitado salvo override del Maestro),
 // grandfathering legacy (topeMensajesPlan), cap fijo del trial con tarjeta, y AMBOS overrides (nuevo > compat viejo).
 // Devuelve un numero, o Infinity = ILIMITADO. `plan` es el de planActual(user_id) (puede ser null/ignorado en cortesia).
+// El override de mensajes del Maestro, SOLO si es un tope real (> 0). Devuelve null si no hay.
+//
+// POR QUE EXIGE > 0 (incidente 2026-08-05, Anton): el formulario de limites del Maestro guardaba
+// `ai_messages: 0` como si fuera un tope valido, y ese cero PISA al plan -> la cuenta quedaba en
+// "0 de 0" aunque estuviera pagando Pro (900). Le paso a Diego tocando los limites mientras
+// depuraba otra cosa: dejo el campo en 0 y apago la cuenta de un cliente que paga, sin ningun aviso.
+//
+// El limite de USUARIOS ya exigia `> 0` para aplicarse (~_topeUsuariosDe): un `asesores: 0` guardado
+// es inerte. Era una ASIMETRIA silenciosa — mismo formulario, mismo cero, uno inofensivo y el otro
+// letal. Aca se empareja el criterio: **0 significa "sin tope especial", no "cero mensajes"**.
+//
+// Para dejar una cuenta sin mensajes existen los caminos explicitos (plan sin_plan, sacar la
+// cortesia, pausar el agente); NO un 0 escondido en un jsonb que nadie mira.
+function _overrideMsgs(limits_override) {
+  if (!limits_override || typeof limits_override !== 'object') return null;
+  const n = limits_override.ai_messages;
+  if (typeof n !== 'number' || !isFinite(n) || n <= 0) return null;
+  return n;
+}
+
 function topeEfectivoIA(sub, plan) {
   if (sub && sub.cortesia === true) {
     // Cortesia: por defecto ILIMITADO. PERO si el Maestro le puso un override de mensajes (limits_override.ai_messages),
     // ESE tope manda aun bajo cortesia (override > cortesia-ilimitado).
-    if (sub.limits_override && typeof sub.limits_override.ai_messages === 'number') return sub.limits_override.ai_messages;
+    if (_overrideMsgs(sub.limits_override) !== null) return _overrideMsgs(sub.limits_override);
     return Infinity; // sin override -> saldo ILIMITADO hasta que se le saque la cortesia
   }
   let tope = topeMensajesPlan(plan, sub); // grandfathering: clientes viejos conservan el tope legacy
@@ -1270,8 +1290,11 @@ function topeEfectivoIA(sub, plan) {
   // sin importar que plan eligio ni grandfathering. Recien tras el 1er pago real (webhook -> status 'active') se
   // libera el cupo del plan elegido. Un override del Maestro (si existe) sigue mandando sobre este cap.
   if (sub && sub.status === 'trial' && sub.trial_con_tarjeta === true) tope = PLAN_LIMITS.trial.ai_messages;
-  if (sub && sub.limits_override && typeof sub.limits_override.ai_messages === 'number') tope = sub.limits_override.ai_messages; // override por cliente (panel maestro)
-  else if (sub && typeof sub.ai_messages_limit_override === 'number') tope = sub.ai_messages_limit_override; // compat override viejo
+  const _ovNuevo = sub ? _overrideMsgs(sub.limits_override) : null;
+  const _ovViejo = (sub && typeof sub.ai_messages_limit_override === 'number' && sub.ai_messages_limit_override > 0)
+    ? sub.ai_messages_limit_override : null;
+  if (_ovNuevo !== null) tope = _ovNuevo;              // override por cliente (panel maestro)
+  else if (_ovViejo !== null) tope = _ovViejo;         // compat override viejo
   return tope;
 }
 
@@ -32862,11 +32885,37 @@ app.post('/api/maestro/cliente/:id/accion', async function(req, res){
       await supabase.from('business_settings').update({ agente_pausado: (accion === 'pausar_agente') }).eq('user_id', uid);
     } else if (accion === 'limite') {
       var lim = parseInt(req.body && req.body.ai_messages, 10);
-      if (!isNaN(lim)) await supabase.from('subscriptions').upsert({ user_id: uid, ai_messages_limit_override: lim }, { onConflict: 'user_id' });
+      // > 0: un 0 aca apagaba la cuenta en silencio (ver _overrideMsgs). 0 = "sin tope especial".
+      if (!isNaN(lim) && lim > 0) await supabase.from('subscriptions').upsert({ user_id: uid, ai_messages_limit_override: lim }, { onConflict: 'user_id' });
     } else if (accion === 'limites') {
       var ov = {};
-      ['ai_messages', 'asesores', 'contactos', 'propiedades'].forEach(function(k){ var v = req.body && req.body[k]; if (v === '' || v === null || typeof v === 'undefined') return; var n = parseInt(v, 10); if (!isNaN(n)) ov[k] = n; });
-      await supabase.from('subscriptions').upsert({ user_id: uid, limits_override: ov }, { onConflict: 'user_id' });
+      // Se ignoran los CEROS (y negativos): un tope de 0 no es un tope, es apagar la cuenta, y para eso
+      // estan los caminos explicitos. Es el mismo criterio que ya usaba el limite de usuarios.
+      // Guardar el formulario con 0 en mensajes dejaba al cliente en "0 de 0" pagando (Anton, 2026-08-05).
+      ['ai_messages', 'asesores', 'contactos', 'propiedades'].forEach(function(k){ var v = req.body && req.body[k]; if (v === '' || v === null || typeof v === 'undefined') return; var n = parseInt(v, 10); if (!isNaN(n) && n > 0) ov[k] = n; });
+      // MERGE, no reemplazo: antes esto pisaba el objeto entero, asi que guardar el formulario con un
+      // campo vacio BORRABA silenciosamente un override que otra pantalla habia puesto.
+      // FAIL-CLOSED al leer lo que ya habia. postgrest-js NO tira excepcion ante un error de red o de
+      // permisos: devuelve { data: null, error }. Con un try/catch a secas el error pasaba de largo,
+      // _ovPrev quedaba {} y el upsert de abajo BORRABA los overrides que este merge existe para
+      // proteger — o sea, el modo de falla era exactamente el que se queria evitar. Si no se puede
+      // leer el estado actual, no se escribe NADA y se avisa.
+      var _ovPrev = {};
+      var _sp = null;
+      try {
+        _sp = await supabase.from('subscriptions').select('limits_override').eq('user_id', uid).maybeSingle();
+      } catch (eOv) { _sp = { error: eOv }; }
+      if (!_sp || _sp.error) return res.status(503).json({ error: 'No se pudieron leer los limites actuales. No se guardo nada, probá de nuevo.' });
+      if (_sp.data && _sp.data.limits_override && typeof _sp.data.limits_override === 'object') _ovPrev = _sp.data.limits_override;
+      // Las claves que el formulario mando en 0/vacio se BORRAN (es como se saca un tope); las que no
+      // vinieron en el body se conservan.
+      var _ovFinal = Object.assign({}, _ovPrev);
+      ['ai_messages', 'asesores', 'contactos', 'propiedades'].forEach(function(k){
+        var vino = req.body && Object.prototype.hasOwnProperty.call(req.body, k);
+        if (!vino) return;
+        if (typeof ov[k] === 'number') _ovFinal[k] = ov[k]; else delete _ovFinal[k];
+      });
+      await supabase.from('subscriptions').upsert({ user_id: uid, limits_override: _ovFinal }, { onConflict: 'user_id' });
     } else if (accion === 'cargar_extra') {
       // SALDO EXTRA de mensajes (regalo o paquete comprado). Suma (o resta si es negativo) al pool y registra el
       // movimiento con su origen. Es el MISMO pool que persiste entre ciclos; solo cambia quien/por que lo carga.

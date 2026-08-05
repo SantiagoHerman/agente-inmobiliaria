@@ -17885,6 +17885,32 @@ async function _setDepartamentosUsuario(asesorId, adminId, departamentos) {
   }
 }
 
+// ===== TOPE DE USUARIOS: helpers compartidos (Diego 2026-08-05) =====
+// Antes el tope se resolvia y se contaba INLINE solo en /crear. Al sumar el chequeo en la REACTIVACION
+// (ver /api/asesores/acceso) hacia falta la misma cuenta en dos lados: se extrae aca para que no diverjan.
+//
+// Tope de usuarios de una cuenta: sale del plan vigente, salvo override del Maestro (manda si es > 0).
+// Infinity = el plan no limita.
+async function _topeUsuariosDe(admin_id) {
+  const _plan = await planActual(admin_id);
+  let tope = (PLAN_LIMITS[_plan] || PLAN_LIMITS[PLAN_SIN_SUSCRIPCION]).asesores;
+  try {
+    const { data: subA } = await supabase.from('subscriptions').select('limits_override').eq('user_id', admin_id).maybeSingle();
+    if (subA && subA.limits_override && typeof subA.limits_override.asesores === 'number' && subA.limits_override.asesores > 0) tope = subA.limits_override.asesores;
+  } catch (eLim) {}
+  return tope;
+}
+// Cuantos usuarios OCUPAN cupo hoy = los que NO estan desactivados.
+// BUG ARREGLADO 2026-08-05: antes se contaban TODAS las filas, activas o no. Un dueno en el tope que apagaba
+// a alguien para dar de alta a otro seguia comiendo "Maximo N usuarios" y parecia roto: desactivar no liberaba
+// nada, habia que BORRAR. Ahora un usuario apagado no ocupa lugar.
+// `activo` null/undefined cuenta como ACTIVO a proposito: es el mismo criterio con el que _asesoresSinAcceso
+// corta el acceso (solo bloquea con activo === false), asi que "ocupa cupo" == "puede entrar".
+async function _usuariosQueOcupanCupo(admin_id) {
+  const { data } = await supabase.from('asesores').select('id, activo').eq('admin_id', admin_id);
+  return (data || []).filter(function (a) { return a.activo !== false; }).length;
+}
+
 app.post('/api/asesores/crear', async (req, res) => {
   try {
     let { admin_id, nombre, usuario, clave, cargo, rol } = req.body || {};
@@ -17912,11 +17938,9 @@ app.post('/api/asesores/crear', async (req, res) => {
     const rolFinal = (rol === 'administrador') ? 'administrador' : ((rol === 'empleado') ? 'empleado' : 'asesor');
     // Limite de usuarios por admin: sale del plan vigente (PLAN_LIMITS[plan].asesores), salvo override por cliente
     // (limits_override.asesores, seteable desde el Maestro) que MANDA si es un numero > 0. Soporta Infinity (no bloquea).
-    const { data: existentes } = await supabase.from('asesores').select('id').eq('admin_id', admin_id);
-    const _planAse = await planActual(admin_id);
-    let topeAsesores = (PLAN_LIMITS[_planAse] || PLAN_LIMITS[PLAN_SIN_SUSCRIPCION]).asesores;
-    try { const { data: subA } = await supabase.from('subscriptions').select('limits_override').eq('user_id', admin_id).maybeSingle(); if (subA && subA.limits_override && typeof subA.limits_override.asesores === 'number' && subA.limits_override.asesores > 0) topeAsesores = subA.limits_override.asesores; } catch (eLim) {}
-    if (topeAsesores !== Infinity && existentes && existentes.length >= topeAsesores) return res.status(400).json({ error: 'Maximo ' + topeAsesores + ' usuarios' });
+    const topeAsesores = await _topeUsuariosDe(admin_id);
+    const _ocupados = await _usuariosQueOcupanCupo(admin_id);
+    if (topeAsesores !== Infinity && _ocupados >= topeAsesores) return res.status(400).json({ error: 'Maximo ' + topeAsesores + ' usuarios activos. Desactiva a otro para liberar un lugar.' });
     // El email interno se arma con el usuario (no se usa para login real, pero Auth lo requiere)
     // Obtener el email del admin para derivar el del asesor (emailAdmin + alias)
     const { data: adminData, error: errAdmin } = await supabase.auth.admin.getUserById(admin_id);
@@ -17983,6 +18007,17 @@ app.post('/api/asesores/acceso', async (req, res) => {
     // (auth_user_id === admin_id), desactivarla lo BANEARIA a el mismo (_setBanUsuario) y quedaria afuera de su
     // propia cuenta. Rechazamos con 400 antes de tocar nada.
     if (activo === false && ase.auth_user_id && ase.auth_user_id === admin_id) return res.status(400).json({ error: 'No podes desactivarte a vos mismo (sos el dueño de la cuenta)' });
+    // TOPE al REACTIVAR (Diego 2026-08-05). Va de la mano con que un usuario apagado ya no ocupe cupo: sin este
+    // chequeo quedaba un bypass — apagar 3, crear 3 nuevos, y volver a prender los 3 dejaba 6 activos en un plan
+    // de 3. El que se esta reactivando hoy esta en activo=false, asi que NO entra en la cuenta: por eso alcanza
+    // con "ocupados >= tope" para saber que no hay lugar para uno mas.
+    if (activo === true) {
+      const _topeU = await _topeUsuariosDe(admin_id);
+      if (_topeU !== Infinity) {
+        const _ocup = await _usuariosQueOcupanCupo(admin_id);
+        if (_ocup >= _topeU) return res.status(400).json({ error: 'Maximo ' + _topeU + ' usuarios activos. Desactiva a otro antes de reactivar este.' });
+      }
+    }
     const { error } = await supabase.from('asesores').update({ activo: activo, estado: activo ? 'activo' : 'pausa' }).eq('id', asesor_id).eq('admin_id', admin_id);
     if (error) return res.status(500).json({ error: error.message });
     if (ase.auth_user_id) {

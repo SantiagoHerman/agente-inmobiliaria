@@ -39681,6 +39681,21 @@ function _cloudApiVarsDeCuerpo(cuerpo) {
   } catch (e) { return 0; } // ante la duda: 0 -> no se bloquea el envio (lo dira Meta)
 }
 
+// Meta exige el nombre de la plantilla en MINUSCULAS y solo con [a-z0-9_]. Se NORMALIZA en vez de
+// rechazar: el error que devuelve Meta ("param name must match ...") no le dice nada al usuario, y
+// escribir "Promo Enero" en vez de "promo_enero" no es un error del usuario, es formato nuestro.
+function _cloudApiNombrePlantilla(v) {
+  try {
+    let s = String(v == null ? '' : v).trim().toLowerCase();
+    if (!s) return '';
+    // RegExp por string (no literal): el rango de tildes combinantes son caracteres INVISIBLES y
+    // un literal /[..]/ se corrompe al copiarse o al pasar por un editor. Asi queda explicito.
+    s = s.normalize('NFD').replace(new RegExp('[\\u0300-\\u036f]', 'g'), '');
+    s = s.replace(/[^a-z0-9_]+/g, '_').replace(/_{2,}/g, '_').replace(/^_+|_+$/g, '');
+    return s;
+  } catch (e) { return ''; }
+}
+
 // Enmascarar un token: solo los ultimos 4 (mismo criterio que /api/meta/credenciales, ~24677).
 function _cloudApiTokenMask(t) {
   try {
@@ -39994,6 +40009,105 @@ app.get('/api/cloud-api/plantillas', async function(req, res) {
     return res.json({ ok: true, plantillas: salidaConVars });
   } catch (e) {
     console.error('[cloud-api] GET plantillas:', e && e.message);
+    return res.status(500).json({ error: 'Error' });
+  }
+});
+
+// --- POST /api/cloud-api/plantillas -> body { nombre, categoria, idioma, cuerpo, ejemplos? } ---
+// POR QUE EXISTE: hasta ahora el panel solo LISTABA (GET). Crear una plantilla habia que hacerlo
+// en el Administrador de WhatsApp de Meta, y un cliente del CRM no entra ahi. Sin esto el
+// RECONTACTO MASIVO por WhatsApp oficial no tiene con que salir: fuera de la ventana de 24 h Meta
+// SOLO acepta plantillas aprobadas (ver _cloudApiErrorLegible / 131047), o sea que todo envio a un
+// lead que hace rato no escribe -- que es la definicion de recontacto -- depende de una plantilla.
+//
+// Meta: POST /<waba_id>/message_templates { name, language, category, components:[{type:'BODY',text}] }
+// La plantilla NACE EN PENDING y la aprueba Meta (de minutos a horas). No se puede enviar hasta
+// que quede APPROVED: por eso la respuesta devuelve el estado y el front lo muestra tal cual.
+app.post('/api/cloud-api/plantillas', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // Mismo criterio que el GET: usa el token del dueño contra Meta y escribe el cache. Solo dueño.
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede crear plantillas de la WhatsApp API oficial.' });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    const cfg = await _cloudApiConfigDeCuenta(dueno);
+    if (!cfg) return res.status(400).json({ error: 'No hay un numero conectado.' });
+    if (!cfg.waba_id) return res.status(400).json({ error: 'La conexion no tiene WABA ID cargado (hace falta para crear plantillas).' });
+
+    const b = req.body || {};
+    const nombre = _cloudApiNombrePlantilla(b.nombre);
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre de la plantilla.' });
+    if (nombre.length > 512) return res.status(400).json({ error: 'El nombre es demasiado largo (maximo 512 caracteres).' });
+
+    const categoria = String(b.categoria || '').trim().toUpperCase();
+    if (['MARKETING', 'UTILITY', 'AUTHENTICATION'].indexOf(categoria) === -1) {
+      return res.status(400).json({ error: 'Categoria invalida: tiene que ser MARKETING, UTILITY o AUTHENTICATION.' });
+    }
+    const idioma = String(b.idioma || '').trim() || 'es_AR';
+    const cuerpo = String(b.cuerpo == null ? '' : b.cuerpo).trim();
+    if (!cuerpo) return res.status(400).json({ error: 'Falta el texto de la plantilla.' });
+    if (cuerpo.length > 1024) return res.status(400).json({ error: 'El texto es demasiado largo (maximo 1024 caracteres).' });
+
+    // VARIABLES: si el cuerpo trae {{1}}, Meta EXIGE un ejemplo de cada una o rechaza con un codigo
+    // que no nombra el problema. Se chequea ANTES de llamar a Meta para poder decir la causa real.
+    const nVars = _cloudApiVarsDeCuerpo(cuerpo);
+    const ejemplos = Array.isArray(b.ejemplos)
+      ? b.ejemplos.map(function (x) { return String(x == null ? '' : x).trim(); }).filter(function (x) { return !!x; })
+      : [];
+    if (nVars > 0 && ejemplos.length < nVars) {
+      return res.status(400).json({
+        error: 'El texto usa ' + nVars + ' variable(s). Meta pide un ejemplo de cada una para poder aprobar la plantilla.',
+        variables: nVars
+      });
+    }
+
+    const componenteBody = { type: 'BODY', text: cuerpo };
+    // body_text es un array DE ARRAYS (un juego de ejemplos por cada fila); mandamos uno solo.
+    if (nVars > 0) componenteBody.example = { body_text: [ejemplos.slice(0, nVars)] };
+
+    let creada = null;
+    try {
+      const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(cfg.waba_id) + '/message_templates';
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + cfg.token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: nombre, language: idioma, category: categoria, components: [componenteBody] })
+      });
+      const j = await r.json().catch(function () { return null; });
+      if (!r.ok || !j || j.error) {
+        console.error('[cloud-api] crear plantilla fallo:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 300));
+        return res.status(400).json({ error: _cloudApiErrorLegible(j) });
+      }
+      creada = j;
+    } catch (e) {
+      console.error('[cloud-api] crear plantilla error:', e && e.message);
+      return res.status(502).json({ error: 'No se pudo contactar a Meta.' });
+    }
+
+    // Meta devuelve { id, status, category }. `category` puede venir CAMBIADA: Meta reclasifica sola
+    // (una "utility" con tono promocional vuelve como MARKETING, que cuesta plata) -> se guarda la
+    // que dice Meta, no la que pidio el usuario, y el front muestra esa.
+    const salida = {
+      nombre: nombre,
+      categoria: creada.category || categoria,
+      idioma: idioma,
+      estado_aprobacion: creada.status || 'PENDING',
+      cuerpo: cuerpo,
+      meta_template_id: creada.id ? String(creada.id) : null
+    };
+    // Cache best-effort, igual que el GET: si falla el upsert la plantilla YA existe en Meta y el
+    // proximo refresco la trae. No se le devuelve error al usuario por un problema de cache.
+    try {
+      await supabase.from('cloud_api_templates').upsert(
+        [Object.assign({ user_id: dueno, actualizado_at: new Date().toISOString() }, salida)],
+        { onConflict: 'user_id,nombre,idioma' }
+      );
+    } catch (e) { /* cache best-effort: no rompe la respuesta */ }
+
+    return res.json({ ok: true, plantilla: Object.assign({}, salida, { variables: nVars }) });
+  } catch (e) {
+    console.error('[cloud-api] POST plantillas:', e && e.message);
     return res.status(500).json({ error: 'Error' });
   }
 });

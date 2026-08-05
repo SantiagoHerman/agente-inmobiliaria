@@ -39233,12 +39233,39 @@ function _fichaTipoSugerido(rubro, texto) {
   } catch (e) { return ''; }
 }
 
+// Los numeros del texto CON su magnitud: "200 mil" -> 200000.
+// POR QUE NO ALCANZA `_ppNumeros`: esa funcion NO lee la magnitud, y no hay que tocarla -- la usa el
+// parseo de PRECIOS del inventario (~13757) y el de planes (~28346), donde el numero llega limpio de
+// una columna y meterle multiplicadores le cambiaria el significado a datos que hoy andan bien.
+// POR QUE HACE FALTA ACA: `contacts.budget` lo escribe la IA en TEXTO LIBRE y el propio prompt del
+// extractor (~9702) le PIDE ese formato -- el ejemplo textual es "hasta 200 mil pesos por mes". Sin
+// leer el "mil", esa ficha nace con presupuesto=200 en vez de 200000; y como el matcheo compara
+// numero contra numero, no coincide con NADA y no hay forma de darse cuenta de por que.
+function _fichaNumerosConMagnitud(txt) {
+  var out = [], m;
+  var s = String(txt == null ? '' : txt);
+  // El `\b` va DENTRO del grupo opcional a proposito: asi "200 milanesas" NO se lee como 200 mil
+  // (el grupo no matchea y el numero queda crudo), y "200 kg" no se lee como 200k.
+  // 'm' suelta queda AFUERA: en este dominio "m" es metros ("120 m2"), no millones.
+  var re = /(\d[\d.,]*)(?:\s*(millones|millon|palos|palo|lucas|luca|mil|k)\b)?/gi;
+  while ((m = re.exec(s)) !== null) {
+    if (!m[1]) continue;
+    var n = _ppANumero(String(m[1]).replace(/[.,]+$/, ''));
+    if (n == null) continue;
+    var mag = String(m[2] || '').toLowerCase();
+    if (mag === 'mil' || mag === 'k' || mag === 'luca' || mag === 'lucas') n = n * 1000;
+    else if (mag === 'millon' || mag === 'millones' || mag === 'palo' || mag === 'palos') n = n * 1000000;
+    out.push(n);
+  }
+  return out;
+}
+
 // `contacts.budget` es TEXTO LIBRE ("hasta 850 mil", "U$S 185.000", "entre 80 y 120 mil"). Se
 // precarga SOLO si el texto tiene UN numero inequivoco: con dos no se adivina cual es el techo, se
 // deja vacio y se le muestra el texto crudo a la persona. Mismo criterio que _mtchPrecioMoneda.
 function _fichaPresupuestoDeTexto(txt) {
   try {
-    var nums = _ppNumeros(String(txt == null ? '' : txt));
+    var nums = _fichaNumerosConMagnitud(txt);
     var uniq = nums.filter(function (v, i, a) { return a.indexOf(v) === i; });
     if (uniq.length !== 1) return { presupuesto: null, moneda: _ppMoneda(txt) };
     return { presupuesto: uniq[0], moneda: _ppMoneda(txt) };

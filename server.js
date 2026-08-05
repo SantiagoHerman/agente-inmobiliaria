@@ -33496,6 +33496,86 @@ app.get('/api/maestro/anthropic/probe', async function (req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// LECTURA REAL DEL SALDO (Diego 2026-08-05)
+// ----------------------------------------------------------------------------
+// El panel mostraba UN solo numero cargado a mano y estimaba el resto restando el consumo. El 2026-08-05 se
+// descubrio que ese numero eran 100 dolares que en realidad son el LIMITE DE GASTO MENSUAL de la consola, no
+// un saldo comprado: el panel decia US$ 99,16 restantes cuando quedaban US$ 7,46. Inflado en US$ 91,70, y
+// no habia forma de notarlo.
+//
+// Este endpoint registra cada lectura real GUARDANDO ADEMAS lo que estabamos estimando en ese momento, asi
+// el desvio queda medido solo, lectura a lectura. (En la primera medicion el calculo resulto MUY bueno:
+// agosto calculado US$ 10,62 contra US$ 10,71 reales = 0,9%. El que mentia era el ancla, no el medidor.)
+//
+// El "estimado previo" se calcula con la MISMA logica que /api/maestro/consumo: saldo_cargado menos lo
+// consumido desde saldo_fecha, con el mismo paginado y la misma salvaguarda anti-dato-corrupto.
+async function _estimadoSaldoActual() {
+  try {
+    var cfg = await supabase.from('superadmin_config').select('saldo_cargado, saldo_fecha').eq('id', 1).maybeSingle();
+    if (!cfg || !cfg.data || cfg.data.saldo_cargado == null || !cfg.data.saldo_fecha) return null;
+    var _l = await _consumoLeerIaUso(function (q) { return q.gte('created_at', cfg.data.saldo_fecha); });
+    var gastado = (_l.filas || []).reduce(function (a, r) { var c = Number(r.cost_usd) || 0; return (c > 10 || c < 0) ? a : a + c; }, 0);
+    return Math.round((Number(cfg.data.saldo_cargado) - gastado) * 100) / 100;
+  } catch (e) { return null; }
+}
+
+app.post('/api/maestro/saldo/lectura', async function (req, res) {
+  try {
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var b = req.body || {};
+    var real = Number(b.saldo_real);
+    if (!isFinite(real) || real < 0) return res.status(400).json({ error: 'Saldo invalido' });
+    var gastoMes = (b.gasto_mes != null && isFinite(Number(b.gasto_mes))) ? Number(b.gasto_mes) : null;
+
+    // 1) Que estabamos estimando ANTES de pisar el ancla. Es el corazon de la feature.
+    var estimado = await _estimadoSaldoActual();
+    var desvio = (estimado != null) ? (Math.round((estimado - real) * 100) / 100) : null;
+
+    // 2) Lo calculado para el mes en curso, para contrastar contra el "gastado" de la consola.
+    var calcMes = null;
+    try {
+      var ini = new Date(); ini.setUTCDate(1); ini.setUTCHours(0, 0, 0, 0);
+      var _lm = await _consumoLeerIaUso(function (q) { return q.gte('created_at', ini.toISOString()); });
+      calcMes = Math.round((_lm.filas || []).reduce(function (a, r) { var c = Number(r.cost_usd) || 0; return (c > 10 || c < 0) ? a : a + c; }, 0) * 100) / 100;
+    } catch (eM) {}
+
+    // 3) Guardar la lectura. DEFENSIVO: si la tabla no existe (migracion sin correr) NO se pierde el ancla:
+    // igual se actualiza saldo_cargado y se avisa que el historial no se guardo.
+    var guardado = true;
+    try {
+      var ins = await supabase.from('saldo_lecturas').insert({
+        saldo_real_usd: real, estimado_previo_usd: estimado, desvio_usd: desvio,
+        gasto_mes_usd: gastoMes, gasto_mes_calculado: calcMes,
+        nota: b.nota ? String(b.nota).slice(0, 500) : null
+      });
+      if (ins && ins.error) guardado = false;
+    } catch (eI) { guardado = false; }
+
+    // 4) Re-anclar: desde ahora el estimado parte del valor REAL.
+    await supabase.from('superadmin_config').update({ saldo_cargado: real, saldo_fecha: new Date().toISOString() }).eq('id', 1);
+
+    return res.json({
+      ok: true, saldo_real: real, estimado_previo: estimado, desvio_usd: desvio,
+      gasto_mes_real: gastoMes, gasto_mes_calculado: calcMes,
+      desvio_mes_pct: (gastoMes && calcMes) ? Math.round(Math.abs(gastoMes - calcMes) / gastoMes * 1000) / 10 : null,
+      historial_guardado: guardado
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// Historial de lecturas, para ver si el calculo se va desviando con el tiempo.
+app.get('/api/maestro/saldo/lecturas', async function (req, res) {
+  try {
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var { data, error } = await supabase.from('saldo_lecturas').select('*').order('leido_at', { ascending: false }).limit(24);
+    if (error) return res.json({ ok: true, lecturas: [], aviso: 'La tabla de lecturas todavia no existe.' });
+    return res.json({ ok: true, lecturas: data || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // Tres endpoints READ-ONLY para el Maestro, con el MISMO guard que /api/maestro/consumo
 // (MAESTRO_ENABLED + maestroAuth + requiereSeccion 'consumo').
 // DEGRADAN CON GRACIA: si las columnas ia_uso.conversation_id / ia_uso.turno_id todavia

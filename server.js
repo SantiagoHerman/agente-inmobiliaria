@@ -33445,6 +33445,55 @@ app.get('/api/maestro/consumo', async function(req, res){
 // ============================================================================
 // ===== MEDIDOR DE CONSUMO (2026-07-23): "cuanto costo ESTE lead / ESTE mensaje"
 // ============================================================================
+// ============================================================================
+// SONDA: existe algun endpoint OFICIAL de Anthropic que devuelva uso/costo con la clave que ya tenemos?
+// ----------------------------------------------------------------------------
+// Diego quiere un boton que LEA el gasto real en vez de cargarlo a mano. Antes de construir nada hay que
+// saber si se puede: la Admin API (usage_report / cost_report) existe, pero pide una ADMIN KEY y, segun lo
+// que vio Diego en su cuenta, plan Enterprise. Esta sonda lo responde con evidencia en vez de suponerlo:
+// prueba los endpoints oficiales con la clave del servidor y reporta que contesta cada uno.
+//
+// SOLO LECTURA y solo para el Maestro. NUNCA devuelve la clave ni parte de ella: solo el status HTTP y un
+// recorte del cuerpo. Si algun endpoint responde 200, el boton de lectura automatica es viable y lo armamos
+// sobre ese; si todos dan 401/403/404, no hay forma server-side y queda la lectura por el navegador de Diego.
+app.get('/api/maestro/anthropic/probe', async function (req, res) {
+  try {
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, 'consumo'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var KEY = process.env.ANTHROPIC_API_KEY || '';
+    if (!KEY) return res.json({ ok: false, error: 'No hay ANTHROPIC_API_KEY en el entorno' });
+    var hoy = new Date().toISOString().slice(0, 10);
+    var hace7 = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    var candidatos = [
+      { nombre: 'cost_report', url: 'https://api.anthropic.com/v1/organizations/cost_report?starting_at=' + hace7 + '&ending_at=' + hoy },
+      { nombre: 'usage_report/messages', url: 'https://api.anthropic.com/v1/organizations/usage_report/messages?starting_at=' + hace7 + '&ending_at=' + hoy },
+      { nombre: 'organizations/me', url: 'https://api.anthropic.com/v1/organizations/me' }
+    ];
+    var resultados = [];
+    for (var i = 0; i < candidatos.length; i++) {
+      var c = candidatos[i];
+      try {
+        var r = await fetch(c.url, { headers: { 'x-api-key': KEY, 'anthropic-version': '2023-06-01' } });
+        var txt = '';
+        try { txt = (await r.text()).slice(0, 400); } catch (eT) { txt = '(sin cuerpo)'; }
+        resultados.push({ endpoint: c.nombre, status: r.status, sirve: r.status === 200, respuesta: txt });
+      } catch (eC) {
+        resultados.push({ endpoint: c.nombre, status: null, sirve: false, respuesta: 'error de red: ' + ((eC && eC.message) || eC) });
+      }
+    }
+    var alguno = resultados.some(function (x) { return x.sirve; });
+    return res.json({
+      ok: true,
+      clave_presente: true,
+      hay_endpoint_util: alguno,
+      conclusion: alguno
+        ? 'Hay al menos un endpoint que responde 200: se puede armar el boton de lectura automatica.'
+        : 'Ningun endpoint oficial responde con esta clave. La lectura automatica server-side NO es posible; queda leer la pagina desde el navegador de Diego.',
+      resultados: resultados
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // Tres endpoints READ-ONLY para el Maestro, con el MISMO guard que /api/maestro/consumo
 // (MAESTRO_ENABLED + maestroAuth + requiereSeccion 'consumo').
 // DEGRADAN CON GRACIA: si las columnas ia_uso.conversation_id / ia_uso.turno_id todavia

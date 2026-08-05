@@ -13102,14 +13102,25 @@ async function _resolverOwnerId(uid) {
 // ASESOR termina operando CON LA IDENTIDAD DE SU JEFE. Eso alcanza para aislar tenants, pero NO para decidir
 // quien puede hacer que DENTRO de un tenant. Auditoria 2026-08-01: por eso cualquier asesor podia encolar un
 // envio masivo a TODOS los leads del negocio, o borrar una campaña en curso.
-// Devuelve { ownerId, esDueno }. FAIL-CLOSED: ante cualquier error se asume que NO es el dueño (se restringe).
+// Devuelve { ownerId, esDueno, indeterminado, motivo }.
+//
+// SON TRES ESTADOS, NO DOS. El tercero (indeterminado:true) existe porque "no pude preguntarle a la base" NO es lo
+// mismo que "pregunte y no es el titular". Con dos estados, un hipo de Supabase (red caida, RLS, timeout) justo en el
+// click se traducia en "no sos el titular": al DUEÑO le frenabamos la compra con un cartel que ademas le mentia, y el
+// tipo se iba pensando que el sistema no lo deja pagar. Perder una venta por un error transitorio es el peor final
+// posible de este candado.
+//
+// COMPATIBILIDAD (a proposito): en el caso indeterminado `esDueno` sigue viniendo en false. Asi los llamadores que solo
+// miran `esDueno` (oportunidades, informes) se restringen exactamente igual que hoy y no cambian de comportamiento; el
+// que quiera distinguir "no se pudo verificar" tiene que mirar `indeterminado` a proposito. Lo hacen los candados de
+// FACTURACION, que contestan 503 "reintenta" en vez de 403 "no te corresponde".
 async function _duenoOAsesor(uid) {
   try {
     const _a = await supabase.from('asesores').select('admin_id').eq('auth_user_id', uid).maybeSingle();
-    if (_a && _a.error) return { ownerId: uid, esDueno: false };
-    if (_a && _a.data && _a.data.admin_id) return { ownerId: _a.data.admin_id, esDueno: false };
-    return { ownerId: uid, esDueno: true }; // sin fila en asesores -> es el dueño
-  } catch (e) { return { ownerId: uid, esDueno: false }; }
+    if (_a && _a.error) return { ownerId: uid, esDueno: false, indeterminado: true, motivo: (_a.error.message || 'error de consulta a asesores') };
+    if (_a && _a.data && _a.data.admin_id) return { ownerId: _a.data.admin_id, esDueno: false, indeterminado: false };
+    return { ownerId: uid, esDueno: true, indeterminado: false }; // sin fila en asesores -> es el dueño
+  } catch (e) { return { ownerId: uid, esDueno: false, indeterminado: true, motivo: ((e && e.message) || 'excepcion consultando asesores') }; }
 }
 
 // Helper: resuelve el UNIVERSO de una oportunidad para un tenant (ownerId) segun
@@ -31459,14 +31470,25 @@ app.post('/api/probar-agente', async function(req, res) {
 // El DUEÑO es el uid que NO tiene fila en `asesores` con admin_id. OJO con el vocabulario: 'administrador' aca es un
 // ROL DE SUB-USUARIO, no el titular — por eso el mensaje dice "titular de la cuenta" y no "administrador".
 //
-// FAIL-CLOSED (heredado de _duenoOAsesor): ante error de red/tabla se asume que NO es el titular -> 403. Cortar un
-// checkout por un hipo de la base es recuperable (el titular reintenta y entra); dejar pasar un cobro atado al uid
-// equivocado, no: hay que ir a MercadoPago a devolver la plata.
+// NO FAIL-CLOSED CONTRA EL DUEÑO: si la consulta a `asesores` falla (red, RLS, timeout), _duenoOAsesor devuelve
+// indeterminado:true y NO se contesta 403. Se contesta 503 "probá de nuevo". Sigue sin dejar pasar el cobro (que es lo
+// caro de revertir: hay que ir a MercadoPago a devolver la plata), pero el mensaje que ve el titular es el correcto.
 //
 // NO ROMPE AL DUEÑO: un dueño no tiene fila en `asesores` -> _duenoOAsesor devuelve esDueno:true -> pasa igual que
 // hoy. El unico que cambia de comportamiento es el sub-usuario, que hoy llega hasta MercadoPago.
 function _msgSoloTitular(accion) {
   return 'Acceso restringido: solo el titular de la cuenta puede ' + accion + '. Pedile al titular que lo haga desde su usuario.';
+}
+
+// Respuesta cuando NO SE PUDO DETERMINAR si el que llama es el titular (no cuando se determino que no lo es).
+// POR QUE 503 y no 403: son dos cosas distintas para el que esta del otro lado. 403 dice "esto no te corresponde" —
+// si el que apreto era el dueño, le mentimos y le frenamos la venta creyendo que el sistema lo dejo afuera. 503 dice
+// "no pudimos chequear, reintenta en unos segundos" — y el dueño reintenta y entra. Que el usuario pueda distinguir
+// esos dos casos es exactamente el punto del candado. El console.error deja el rastro para poder ver despues si esto
+// pasa seguido (si pasa, el problema es la base, no los permisos).
+function _resp503SinVerificar(res, endpoint, uid, motivo) {
+  console.error('[CANDADO-TITULAR] ' + endpoint + ': no se pudo verificar si ' + String(uid || '?') + ' es el titular (' + (motivo || 'sin detalle') + ') -> 503 reintentable, NO se bloquea con 403');
+  return res.status(503).json({ error: 'No pudimos verificar tus permisos en este momento. Probá de nuevo en unos segundos.', reintentable: true });
 }
 
 // Estado del plan del tenant (para la pantalla "Mi plan" del frontend).
@@ -31606,6 +31628,7 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
     // CANDADO DE FACTURACION (ver el bloque de arriba): antes de tocar MercadoPago. Sin esto el sub-usuario llegaba
     // a pagar con su tarjeta un preapproval atado a SU uid, y la cuenta del titular quedaba igual de bloqueada.
     var _titCk = await _duenoOAsesor(user_id);
+    if (_titCk.indeterminado) return _resp503SinVerificar(res, 'POST /api/suscripcion/checkout', user_id, _titCk.motivo);
     if (!_titCk.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
@@ -31678,6 +31701,7 @@ app.post('/api/suscripcion/checkout-paypal', async function(req, res) {
     // MISMO CANDADO que el checkout de MercadoPago: este endpoint es el espejo en dolares y cobra igual de real.
     // Si solo se cerrara el de pesos, el agujero seguiria abierto por PayPal en cuanto se prenda.
     var _titPP = await _duenoOAsesor(user_id);
+    if (_titPP.indeterminado) return _resp503SinVerificar(res, 'POST /api/suscripcion/checkout-paypal', user_id, _titPP.motivo);
     if (!_titPP.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!paypalActivo()) return res.status(503).json({ error: 'El pago en dolares todavia no esta habilitado' });
     if (!paypalPlanesListos()) return res.status(503).json({ error: 'Los planes en dolares todavia no estan publicados' });
@@ -31743,6 +31767,7 @@ app.post('/api/suscripcion/aceptar-plan', async function(req, res) {
     // Un sub-usuario podia disparar eso sobre una fila que no es suya. Ademas, el 403 explica de verdad lo que pasa:
     // hasta hoy le contestaba "No tenes una prueba activa", justo abajo de la pantalla que le muestra la prueba.
     var _titAcep = await _duenoOAsesor(user_id);
+    if (_titAcep.indeterminado) return _resp503SinVerificar(res, 'POST /api/suscripcion/aceptar-plan', user_id, _titAcep.motivo);
     if (!_titAcep.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var sub = await getSubscription(user_id);
@@ -31799,6 +31824,7 @@ app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
     // CANDADO DE FACTURACION: cambiar de plan hace un PUT al preapproval y cambia el MONTO que se cobra todos los
     // meses. Es la decision de plata mas directa que hay en el panel; no es de un sub-usuario.
     var _titCam = await _duenoOAsesor(user_id);
+    if (_titCam.indeterminado) return _resp503SinVerificar(res, 'POST /api/suscripcion/cambiar-plan', user_id, _titCam.motivo);
     if (!_titCam.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
@@ -31893,6 +31919,26 @@ app.post('/api/webhook/mercadopago', async function(req, res) {
     if (!sus) return;
     var user_id = sus.external_reference || null; // lo seteamos al crear la suscripcion
     if (!user_id) return;
+    // ACREDITAR AL TITULAR, NO AL QUE APRETO EL BOTON.
+    // POR QUE: el candado del checkout impide que un sub-usuario GENERE un link nuevo, pero no mata los links que ya
+    // existen. Un preapproval creado ANTES de este deploy sigue vivo en MercadoPago con el uid del asesor adentro, y
+    // el dia que ese asesor pague, la fila de `subscriptions` que se activa es la del asesor: una fila que ningun gate
+    // del sistema mira. Resultado: plata cobrada de verdad y el titular igual de bloqueado. Resolvemos el titular aca,
+    // que es el ultimo lugar donde todavia se puede evitar.
+    // SI NO SE PUEDE VERIFICAR: se acredita al uid del preapproval, o sea IGUAL QUE HOY. Un pago que no entra a ningun
+    // lado es peor que un pago que entra donde entraba antes, y MercadoPago reintenta el webhook.
+    try {
+      var _titWh = await _duenoOAsesor(user_id);
+      if (_titWh.indeterminado) {
+        console.error('webhook mercadopago: no se pudo verificar si ' + user_id + ' es el titular (' + (_titWh.motivo || 'sin detalle') + ') -> se acredita al uid del preapproval, como hasta hoy');
+      } else if (!_titWh.esDueno && _titWh.ownerId && _titWh.ownerId !== user_id) {
+        console.error('webhook mercadopago: el preapproval ' + sus.id + ' vino a nombre del SUB-USUARIO ' + user_id + ' -> se acredita al titular ' + _titWh.ownerId);
+        crearNotifMaestro('pago_uid_equivocado', 'Pago acreditado al titular (venia de un sub-usuario)',
+          'Un pago de suscripcion llego con el uid de un SUB-USUARIO (' + user_id + ') en vez del titular (' + _titWh.ownerId + '). Es un link de pago viejo, de antes del candado. Se acredito al titular. Revisar con el cliente de quien es la tarjeta que quedo cobrando: es de un empleado, no del dueño.',
+          { ref_user_id: _titWh.ownerId, ref_id: sus.id, severidad: 'warning' }).catch(function(){});
+        user_id = _titWh.ownerId;
+      }
+    } catch (eTitWh) { console.error('webhook mercadopago: fallo resolviendo el titular -> se acredita al uid del preapproval:', eTitWh && eTitWh.message); }
     var estado = (sus.status === 'authorized') ? 'active' : (sus.status === 'paused' ? 'past_due' : (sus.status === 'cancelled' ? 'cancelled' : 'trial'));
     // Resolver el nivel del plan desde el preapproval_plan_id (planes globales)
     var planNivel = null;
@@ -32188,6 +32234,27 @@ async function procesarPagoRecarga(paymentId) {
     // DEDUPE (1/2): pre-check rapido para los reintentos SECUENCIALES de MP (cubre el caso comun aun sin indice unico).
     var yaProc = await supabase.from('mensajes_extra_mov').select('id').eq('nota', notaDedupe).limit(1);
     if (yaProc && yaProc.data && yaProc.data.length > 0) return; // ya procesado
+    // ACREDITAR AL TITULAR, NO AL QUE APRETO EL BOTON (mismo motivo que el webhook de suscripciones de arriba).
+    // Aca duele todavia mas rapido: los mensajes extra se DESCUENTAN de la fila del titular, asi que acreditarlos al uid
+    // del asesor es plata cobrada por mensajes que no aparecen en ningun lado. Y el external_reference
+    // 'recarga|<uid>|<cant>' viaja dentro de la preference: un link generado antes del candado lo sigue trayendo con el
+    // uid del asesor por mas que hoy no se pueda generar uno nuevo.
+    // VA DESPUES DEL DEDUPE a proposito: si no, cada reintento de MercadoPago (que son varios) volveria a avisarle al
+    // Maestro lo mismo. Y va ANTES de la marca para que la marca, el pool y la notif final queden todos contra el titular.
+    // SI NO SE PUEDE VERIFICAR: se acredita al uid que vino, o sea IGUAL QUE HOY. Un pago que no entra a ningun lado es
+    // peor que un pago que entra donde entraba antes.
+    try {
+      var _titRw = await _duenoOAsesor(uid);
+      if (_titRw.indeterminado) {
+        console.error('procesarPagoRecarga: no se pudo verificar si ' + uid + ' es el titular (' + (_titRw.motivo || 'sin detalle') + ') -> se acredita al uid del pago, como hasta hoy');
+      } else if (!_titRw.esDueno && _titRw.ownerId && _titRw.ownerId !== uid) {
+        console.error('procesarPagoRecarga: el pago ' + paymentId + ' vino a nombre del SUB-USUARIO ' + uid + ' -> se acredita al titular ' + _titRw.ownerId);
+        crearNotifMaestro('pago_uid_equivocado', 'Recarga acreditada al titular (venia de un sub-usuario)',
+          'Una recarga de mensajes llego con el uid de un SUB-USUARIO (' + uid + ') en vez del titular (' + _titRw.ownerId + '). Es un link de pago viejo, de antes del candado. Los mensajes se acreditaron al titular, que es donde se descuentan.',
+          { ref_user_id: _titRw.ownerId, ref_id: String(paymentId), severidad: 'warning' }).catch(function(){});
+        uid = _titRw.ownerId;
+      }
+    } catch (eTitRw) { console.error('procesarPagoRecarga: fallo resolviendo el titular -> se acredita al uid del pago:', eTitRw && eTitRw.message); }
     // DEDUPE (2/2) MARCA-PRIMERO: insertamos la marca ANTES de acreditar. Con el INDICE UNICO parcial sobre nota
     // ('recarga_mp:%') esto es el lock real contra notificaciones CONCURRENTES: el insert duplicado falla (23505) y NO se
     // acredita. Asi nunca queda "acreditado sin marca" (si la marca falla, no se acredita y MP reintenta).
@@ -32215,6 +32282,7 @@ app.post('/api/recarga/checkout', async function(req, res) {
     // tarjeta y el webhook los acreditaba contra SU uid (external_reference 'recarga|<uid>|<cant>') -> el cupo NO le
     // entraba a la cuenta del titular, que es donde se descuenta. Plata cobrada, mensajes que nunca aparecen.
     var _titRec = await _duenoOAsesor(user_id);
+    if (_titRec.indeterminado) return _resp503SinVerificar(res, 'POST /api/recarga/checkout', user_id, _titRec.motivo);
     if (!_titRec.esDueno) return res.status(403).json({ error: _msgSoloTitular('comprar mensajes extra'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var email = (req.body && req.body.email) ? String(req.body.email) : '';
@@ -36347,6 +36415,7 @@ app.post('/api/suscripcion/cancelar', async function(req, res){
     // CANDADO DE FACTURACION: dar de baja corta el cobro en MP/PayPal y deja la cuenta ENTERA en el paywall. Es el
     // boton que mas dolor causa si lo aprieta quien no debe: apaga el servicio de todo el equipo.
     var _titCan = await _duenoOAsesor(user_id);
+    if (_titCan.indeterminado) return _resp503SinVerificar(res, 'POST /api/suscripcion/cancelar', user_id, _titCan.motivo);
     if (!_titCan.esDueno) return res.status(403).json({ error: _msgSoloTitular('dar de baja la suscripcion'), solo_titular: true });
     var sub = await getSubscription(user_id);
     if (!sub) return res.status(400).json({ error: 'No tenes una suscripcion para cancelar' });

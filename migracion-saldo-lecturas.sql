@@ -32,8 +32,13 @@ CREATE TABLE IF NOT EXISTS saldo_lecturas (
 
 CREATE INDEX IF NOT EXISTS saldo_lecturas_fecha_idx ON saldo_lecturas (leido_at DESC);
 
--- Sin RLS a proposito: es una tabla del MAESTRO (no multi-tenant, no la toca ningun cliente).
--- El backend la lee y escribe con la service key, detras de maestroAuth + requiereSeccion('consumo').
+-- RLS OBLIGATORIO (regla dura del proyecto: TODA tabla nueva lo lleva).
+-- CORREGIDO 2026-08-05: este archivo decia originalmente "sin RLS a proposito, es una tabla del Maestro".
+-- Estaba MAL y Supabase lo marco al correrlo: sin RLS, cualquiera con la clave publica (que viaja en el
+-- front) podia leer las cifras de gasto real. Que la tabla no sea multi-tenant no la hace publica.
+-- Con RLS activo y SIN politicas, solo la service key (el backend) entra; la clave publica recibe [].
+-- Verificado en vivo el 2026-08-05: service key -> devuelve la fila; clave publica -> [].
+ALTER TABLE saldo_lecturas ENABLE ROW LEVEL SECURITY;
 
 NOTIFY pgrst, 'reload schema';
 

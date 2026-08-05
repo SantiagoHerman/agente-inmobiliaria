@@ -31443,6 +31443,32 @@ app.post('/api/probar-agente', async function(req, res) {
 // ===== SUSCRIPCIONES: estado, checkout y webhook de MercadoPago (FASE 1) =====
 // Inerte mientras no haya MERCADOPAGO_ACCESS_TOKEN / tabla subscriptions: responden 503 o vacio sin romper.
 
+// ===== CANDADO DE FACTURACION: los POST de suscripcion son SOLO del TITULAR (2026-08-05) =====
+// POR QUE ESTO ES PLATA Y NO COSMETICA: /api/suscripcion/checkout tomaba el uid de verificarUsuario y se lo pasaba
+// derecho a getSubscription() y a mpCrearSuscripcion(). Un SUB-USUARIO podia arrancar el checkout, MercadoPago le
+// creaba el preapproval CON SU uid y le cobraba SU tarjeta, y la cuenta del TITULAR seguia bloqueada, porque el pago
+// quedaba atado al uid equivocado. O sea: plata cobrada que no desbloquea nada y un cliente enojado.
+// Los otros POST (aceptar-plan, cambiar-plan, cancelar, recarga) tenian el mismo agujero del otro lado: operaban
+// sobre la fila de subscriptions del SUB-USUARIO (que no existe) y contestaban "No tenes una suscripcion activa para
+// cambiar" / "No tenes una prueba activa", contradiciendo lo que la MISMA pantalla le muestra arriba — porque el GET
+// si resuelve al dueño a proposito (ver el bloque de abajo).
+//
+// El GET /api/suscripcion NO se toca: que un usuario VEA el plan de su empresa esta bien.
+//
+// CRITERIO: el que ya usa el resto del sistema (_duenoOAsesor ~13106, mismo que _cloudApiEsDueno y _equipoIdentidad).
+// El DUEÑO es el uid que NO tiene fila en `asesores` con admin_id. OJO con el vocabulario: 'administrador' aca es un
+// ROL DE SUB-USUARIO, no el titular — por eso el mensaje dice "titular de la cuenta" y no "administrador".
+//
+// FAIL-CLOSED (heredado de _duenoOAsesor): ante error de red/tabla se asume que NO es el titular -> 403. Cortar un
+// checkout por un hipo de la base es recuperable (el titular reintenta y entra); dejar pasar un cobro atado al uid
+// equivocado, no: hay que ir a MercadoPago a devolver la plata.
+//
+// NO ROMPE AL DUEÑO: un dueño no tiene fila en `asesores` -> _duenoOAsesor devuelve esDueno:true -> pasa igual que
+// hoy. El unico que cambia de comportamiento es el sub-usuario, que hoy llega hasta MercadoPago.
+function _msgSoloTitular(accion) {
+  return 'Acceso restringido: solo el titular de la cuenta puede ' + accion + '. Pedile al titular que lo haga desde su usuario.';
+}
+
 // Estado del plan del tenant (para la pantalla "Mi plan" del frontend).
 app.get('/api/suscripcion', async function(req, res) {
   try {
@@ -31577,6 +31603,10 @@ app.post('/api/suscripcion/checkout', async function(req, res) {
   try {
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // CANDADO DE FACTURACION (ver el bloque de arriba): antes de tocar MercadoPago. Sin esto el sub-usuario llegaba
+    // a pagar con su tarjeta un preapproval atado a SU uid, y la cuenta del titular quedaba igual de bloqueada.
+    var _titCk = await _duenoOAsesor(user_id);
+    if (!_titCk.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
     var email = (req.body && req.body.email) ? String(req.body.email) : '';
@@ -31645,6 +31675,10 @@ app.post('/api/suscripcion/checkout-paypal', async function(req, res) {
   try {
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // MISMO CANDADO que el checkout de MercadoPago: este endpoint es el espejo en dolares y cobra igual de real.
+    // Si solo se cerrara el de pesos, el agujero seguiria abierto por PayPal en cuanto se prenda.
+    var _titPP = await _duenoOAsesor(user_id);
+    if (!_titPP.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!paypalActivo()) return res.status(503).json({ error: 'El pago en dolares todavia no esta habilitado' });
     if (!paypalPlanesListos()) return res.status(503).json({ error: 'Los planes en dolares todavia no estan publicados' });
     // Sin webhook id no podriamos verificar la firma => nunca activariamos la cuenta => el cliente pagaria
@@ -31705,6 +31739,11 @@ app.post('/api/suscripcion/aceptar-plan', async function(req, res) {
   try {
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // CANDADO DE FACTURACION: aceptar el plan CANCELA el preapproval del trial y CREA uno nuevo que cobra al toque.
+    // Un sub-usuario podia disparar eso sobre una fila que no es suya. Ademas, el 403 explica de verdad lo que pasa:
+    // hasta hoy le contestaba "No tenes una prueba activa", justo abajo de la pantalla que le muestra la prueba.
+    var _titAcep = await _duenoOAsesor(user_id);
+    if (!_titAcep.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var sub = await getSubscription(user_id);
     if (!sub) return res.status(400).json({ error: 'No tenes una prueba activa' });
@@ -31757,6 +31796,10 @@ app.post('/api/suscripcion/cambiar-plan', async function(req, res) {
   try {
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // CANDADO DE FACTURACION: cambiar de plan hace un PUT al preapproval y cambia el MONTO que se cobra todos los
+    // meses. Es la decision de plata mas directa que hay en el panel; no es de un sub-usuario.
+    var _titCam = await _duenoOAsesor(user_id);
+    if (!_titCam.esDueno) return res.status(403).json({ error: _msgSoloTitular('contratar o cambiar el plan'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var nivel = (req.body && req.body.plan) ? String(req.body.plan) : '';
     if (['basico','pro','premium','enterprise','personal'].indexOf(nivel) < 0) return res.status(400).json({ error: 'Plan invalido' });
@@ -32168,6 +32211,11 @@ app.post('/api/recarga/checkout', async function(req, res) {
   try {
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // CANDADO DE FACTURACION: la recarga es un PAGO UNICO real. Sin esto, un sub-usuario pagaba mensajes con su
+    // tarjeta y el webhook los acreditaba contra SU uid (external_reference 'recarga|<uid>|<cant>') -> el cupo NO le
+    // entraba a la cuenta del titular, que es donde se descuenta. Plata cobrada, mensajes que nunca aparecen.
+    var _titRec = await _duenoOAsesor(user_id);
+    if (!_titRec.esDueno) return res.status(403).json({ error: _msgSoloTitular('comprar mensajes extra'), solo_titular: true });
     if (!MP_TOKEN) return res.status(503).json({ error: 'MercadoPago no configurado todavia' });
     var email = (req.body && req.body.email) ? String(req.body.email) : '';
     var cant = parseInt(req.body && req.body.cantidad, 10);
@@ -36296,6 +36344,10 @@ app.post('/api/suscripcion/cancelar', async function(req, res){
   try{
     var user_id = await verificarUsuario(req);
     if (!user_id) return res.status(401).json({ error: 'No autorizado' });
+    // CANDADO DE FACTURACION: dar de baja corta el cobro en MP/PayPal y deja la cuenta ENTERA en el paywall. Es el
+    // boton que mas dolor causa si lo aprieta quien no debe: apaga el servicio de todo el equipo.
+    var _titCan = await _duenoOAsesor(user_id);
+    if (!_titCan.esDueno) return res.status(403).json({ error: _msgSoloTitular('dar de baja la suscripcion'), solo_titular: true });
     var sub = await getSubscription(user_id);
     if (!sub) return res.status(400).json({ error: 'No tenes una suscripcion para cancelar' });
     // Corta el cobro de la tarjeta en MP (best-effort: si falla, igual marcamos cancelled localmente).

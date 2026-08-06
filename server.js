@@ -6052,6 +6052,287 @@ async function telefonoCanonicoWA(ownerId, soloDigitos) {
   } catch (e) { return d; }  // cualquier error -> el numero tipeado, como hoy
 }
 
+// ============================================================================
+// IMPORTACION VERIFICADA (Diego 2026-08-06) — verificar contra WhatsApp ANTES de guardar
+// ----------------------------------------------------------------------------
+// POR QUE EXISTE: en Andres Galdames entro un contacto con el telefono `1165078185` — 10 digitos, SIN
+// codigo de pais, cuando todos los demas son `549...` de 13. Ese numero no puede coincidir NUNCA con un
+// WhatsApp real: el contacto quedo huerfano, sin poder tener conversacion jamas. Y en otra cuenta entraron
+// 44 contactos de la agenda del celular (escribanias, librerias, clubes) a una cola de recontacto sin que
+// nadie los mirara. La vista previa hasta hoy solo CONTABA nuevos vs existentes; ahora tiene que FILTRAR.
+//
+// LO QUE NO SABEMOS Y POR ESO ESTA ESCRITO ASI: `/chat/whatsappNumbers` recibe `{ numbers: [...] }` — el
+// campo es plural y es un array — pero TODO el codigo de hoy manda UNO SOLO (ver verificarNumeroWA ~5975).
+// NO ESTA VERIFICADO que Evolution procese mas de uno: las credenciales viven solo en Railway. Asi que el
+// helper de abajo MIDE la respuesta (cuantos resultados volvieron contra cuantos se mandaron) y, si el
+// servidor devuelve uno solo, cae automaticamente a uno-por-uno. La medicion se recuerda por instancia para
+// no re-probar en cada tanda.
+//
+// EL RIESGO REAL DEL MODO UNO-POR-UNO: a este cliente ya le banearon un numero por 50 mensajes en una
+// mañana. whatsappNumbers es una CONSULTA (no manda nada, no gasta tokens), pero sale por la MISMA sesion
+// de WhatsApp, y machacar el chequeo de presencia es justo el patron con el que WhatsApp banea a los
+// "validadores masivos de numeros". Por eso hay TOPE y PAUSA — ver las constantes de abajo.
+// 0 TOKENS DE IA: esto no llama a ningun modelo, es una consulta a Evolution + SELECTs.
+// ============================================================================
+
+// Tamaño de tanda. 20 y no 300: si Evolution NO soporta el array, la primera tanda es la que nos lo dice, y
+// queremos que esa sonda cueste poco. 20 tambien mantiene el request y el timeout chicos.
+const _WA_LOTE_TAM = 20;
+// Pausa entre tandas en modo LOTE. Corta a proposito: 20 numeros por consulta ya baja el ritmo real a
+// ~50 numeros/segundo-equivalente, muy lejos del patron de abuso.
+const _WA_LOTE_PAUSA_MS = 400;
+// TOPE modo LOTE: 600 numeros por ventana. Son 30 consultas HTTP: nada para Evolution.
+const _WA_LOTE_TOPE = 600;
+// TOPE modo UNO-POR-UNO: 60 consultas por ventana. CRITERIO: el incidente que ya le costo un numero baneado
+// a este cliente fueron ~50 acciones en una mañana. Nos quedamos en el MISMO orden de magnitud (no en 300)
+// aunque aca sean consultas y no mensajes, porque no tenemos forma de medir donde esta el limite real de
+// WhatsApp sin arriesgar el numero del cliente en produccion. Si el archivo tiene mas, el resto vuelve SIN
+// VERIFICAR y la pantalla NO lo deja importar: se importa de a partes. Preferimos que Diego importe en 5
+// tandas antes que perder el WhatsApp de una inmobiliaria.
+const _WA_UNO_TOPE = 60;
+// Pausa entre consultas individuales: 1,5s => ~40 por minuto. Un humano abriendo chats para ver si el
+// numero existe hace mas o menos eso; es un ritmo que no parece automatizado.
+const _WA_UNO_PAUSA_MS = 1500;
+// Ventana del tope. 10 minutos: una importacion normal entra entera; dos importaciones grandes seguidas se
+// frenan solas, que es exactamente lo que queremos.
+const _WA_VENTANA_MS = 10 * 60 * 1000;
+// Cache del resultado por numero. 30 min: cubre una importacion completa (verificar -> revisar -> importar)
+// y ademas hace que reintentar el MISMO archivo no vuelva a consumir presupuesto ni a molestar a WhatsApp.
+const _WA_CACHE_TTL_MS = 30 * 60 * 1000;
+
+var _waCacheNum = new Map();    // 'instancia|digitos' -> { existe, jid, ts }
+var _waSoportaLote = new Map(); // instancia -> true | false   (medido, no asumido)
+var _waVentana = new Map();     // instancia -> { desde, n }   (consumo de consultas por ventana)
+
+function _waPausa(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+function _waCacheGet(instancia, d) {
+  var k = instancia + '|' + d;
+  var v = _waCacheNum.get(k);
+  if (!v) return null;
+  if ((Date.now() - v.ts) > _WA_CACHE_TTL_MS) { _waCacheNum.delete(k); return null; }
+  return v;
+}
+function _waCacheSet(instancia, d, existe, jid) {
+  // Tope de memoria: el cache es una ayuda, no una base de datos. Si crece de mas se tira entero (la proxima
+  // importacion lo vuelve a llenar) — mejor eso que un Map que crece para siempre en un proceso 24x7.
+  if (_waCacheNum.size > 20000) _waCacheNum.clear();
+  _waCacheNum.set(instancia + '|' + d, { existe: !!existe, jid: jid || null, ts: Date.now() });
+}
+// Presupuesto de consultas por instancia y ventana. Devuelve cuantas se pueden gastar de las `pedidas`.
+function _waTomarCupo(instancia, pedidas, tope) {
+  var v = _waVentana.get(instancia);
+  var ahora = Date.now();
+  if (!v || (ahora - v.desde) > _WA_VENTANA_MS) { v = { desde: ahora, n: 0 }; _waVentana.set(instancia, v); }
+  var libre = tope - v.n;
+  if (libre <= 0) return 0;
+  var dar = Math.min(libre, pedidas);
+  v.n += dar;
+  return dar;
+}
+
+// Una consulta cruda a Evolution con N numeros. Devuelve { ok, items }. ok:false = NO PUDIMOS DETERMINAR
+// (Evolution apagado, timeout, respuesta rara) — el que llama tiene que BLOQUEAR, no asumir nada.
+async function _waConsultaCruda(instancia, numeros) {
+  try {
+    if (!EVOLUTION_URL || !EVOLUTION_KEY) { console.error('whatsappNumbers lote: falta EVOLUTION_URL/KEY'); return { ok: false }; }
+    if (!instancia || !Array.isArray(numeros) || !numeros.length) return { ok: false };
+    // Timeout propio: sin esto, una tanda colgada deja la importacion esperando para siempre.
+    const ctrl = new AbortController();
+    const to = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 25000);
+    let resp = null;
+    try {
+      resp = await fetch(EVOLUTION_URL + '/chat/whatsappNumbers/' + instancia, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
+        body: JSON.stringify({ numbers: numeros }),
+        signal: ctrl.signal
+      });
+    } finally { clearTimeout(to); }
+    let bodyTxt = ''; try { bodyTxt = await resp.text(); } catch (eTxt) {}
+    let body = null; try { body = bodyTxt ? JSON.parse(bodyTxt) : null; } catch (eJson) {}
+    if (!resp.ok || !Array.isArray(body)) {
+      console.error('whatsappNumbers lote respuesta inesperada:', resp && resp.status, (bodyTxt || '').slice(0, 250));
+      return { ok: false };
+    }
+    return { ok: true, items: body };
+  } catch (e) { console.error('_waConsultaCruda error:', e && e.message); return { ok: false }; }
+}
+
+// Machea un item de la respuesta contra los numeros que pedimos. MISMO criterio laxo que verificarNumeroWA
+// (~5993): el JID puede volver con o sin el 9 argentino, asi que se acepta que uno contenga al otro.
+function _waMachear(item, pendientes) {
+  var n = String((item && (item.number || item.jid)) || '').replace(/[^0-9]/g, '');
+  if (!n) return null;
+  for (var i = 0; i < pendientes.length; i++) {
+    var q = pendientes[i];
+    if (n === q || n.indexOf(q) >= 0 || q.indexOf(n) >= 0) return q;
+  }
+  return null;
+}
+
+// VERIFICACION EN LOTE con caida automatica a uno-por-uno.
+// Devuelve { modo:'lote'|'uno', caido:boolean, tope_alcanzado:boolean, resultados:{ digitos: {existe,jid} } }
+//   caido:true          -> Evolution no pudo determinar NADA: el endpoint responde 503 y se pide reintento.
+//   tope_alcanzado:true -> se gasto el cupo de la ventana; los numeros que faltan NO estan en `resultados`
+//                          y la pantalla los muestra como "sin verificar" (no importables).
+async function verificarNumerosWA(instancia, numerosRaw) {
+  var out = { modo: 'lote', caido: false, tope_alcanzado: false, resultados: {} };
+  try {
+    var vistos = {};
+    var todos = [];
+    (numerosRaw || []).forEach(function (x) {
+      var d = String(x == null ? '' : x).replace(/[^0-9]/g, '');
+      if (d && !vistos[d]) { vistos[d] = 1; todos.push(d); }
+    });
+    if (!todos.length) return out;
+    if (!instancia) { out.caido = true; return out; }
+
+    // 1) CACHE primero: no se le pregunta dos veces por el mismo numero dentro de la misma importacion.
+    var pendientes = [];
+    todos.forEach(function (d) {
+      var c = _waCacheGet(instancia, d);
+      if (c) out.resultados[d] = { existe: c.existe, jid: c.jid };
+      else pendientes.push(d);
+    });
+    if (!pendientes.length) return out;
+
+    var soporta = _waSoportaLote.get(instancia);
+    out.modo = (soporta === false) ? 'uno' : 'lote';
+
+    // 2) MODO LOTE (o sonda para averiguar si se puede).
+    if (soporta !== false) {
+      var cupo = _waTomarCupo(instancia, pendientes.length, _WA_LOTE_TOPE);
+      if (cupo <= 0) { out.tope_alcanzado = true; return out; }
+      if (cupo < pendientes.length) out.tope_alcanzado = true;
+      var aVerificar = pendientes.slice(0, cupo);
+      var huboAlgunaOk = false;
+      for (var i = 0; i < aVerificar.length; i += _WA_LOTE_TAM) {
+        var tanda = aVerificar.slice(i, i + _WA_LOTE_TAM);
+        var r = await _waConsultaCruda(instancia, tanda);
+        if (!r.ok) {
+          // Evolution no pudo determinar. Si NUNCA respondio bien, es caida -> bloquear (decision de Diego:
+          // "Servidor procesando, intente nuevamente", nunca importar sin verificar).
+          if (!huboAlgunaOk) { out.caido = true; return out; }
+          out.tope_alcanzado = true; // se corta ahi: lo que falta queda sin verificar y no se puede importar
+          return out;
+        }
+        huboAlgunaOk = true;
+        var items = Array.isArray(r.items) ? r.items : [];
+        // ¿Evolution proceso el array? AMBIGÜEDAD CONOCIDA: si devuelve 1 resultado para 20 numeros puede ser
+        // que ignore el array O que solo 1 de los 20 tenga WhatsApp. Ante la duda caemos a uno-por-uno: nos
+        // cuesta consultas de mas, pero NUNCA marca como "sin WhatsApp" a alguien que si lo tiene. Si devuelve
+        // 2 o mas para una tanda de mas de 2, damos por bueno el lote (y los que no volvieron son "no existe",
+        // que es como responde Baileys: omite los que no estan).
+        if (_waSoportaLote.get(instancia) !== true) {
+          if (tanda.length > 2 && items.length <= 1) {
+            _waSoportaLote.set(instancia, false);
+            console.log('[importacion verificada] Evolution NO procesa lotes en ' + instancia + ' (' + items.length + '/' + tanda.length + '): paso a uno-por-uno');
+            break; // el resto (incluida esta tanda) se resuelve abajo, uno por uno
+          }
+          _waSoportaLote.set(instancia, true);
+        }
+        var libres = tanda.slice();
+        items.forEach(function (it) {
+          var q = _waMachear(it, libres);
+          if (!q) return;
+          libres = libres.filter(function (x) { return x !== q; });
+          var existe = !!(it && (it.exists === true || it.exists === 'true'));
+          var jid = (it && it.jid) ? String(it.jid) : null;
+          out.resultados[q] = { existe: existe, jid: jid };
+          _waCacheSet(instancia, q, existe, jid);
+        });
+        // Los que no volvieron en la respuesta: Baileys omite los que no tienen cuenta -> existe:false.
+        libres.forEach(function (q) { out.resultados[q] = { existe: false, jid: null }; _waCacheSet(instancia, q, false, null); });
+        if ((i + _WA_LOTE_TAM) < aVerificar.length) await _waPausa(_WA_LOTE_PAUSA_MS);
+      }
+      if (_waSoportaLote.get(instancia) !== false) return out;
+      // Cayo a uno-por-uno a mitad de camino: devolvemos el cupo del lote que no llegamos a usar.
+      var vv = _waVentana.get(instancia);
+      if (vv) vv.n = Math.max(0, vv.n - cupo);
+      pendientes = pendientes.filter(function (d) { return !out.resultados[d]; });
+      out.modo = 'uno';
+    }
+
+    // 3) MODO UNO-POR-UNO: con TOPE y PAUSA (ver el comentario de las constantes: aca es donde se banea un numero).
+    var cupoUno = _waTomarCupo(instancia, pendientes.length, _WA_UNO_TOPE);
+    if (cupoUno < pendientes.length) out.tope_alcanzado = true;
+    if (cupoUno <= 0) return out;
+    var fallos = 0;
+    for (var k = 0; k < cupoUno; k++) {
+      var d1 = pendientes[k];
+      var r1 = await _waConsultaCruda(instancia, [d1]);
+      if (!r1.ok) {
+        fallos++;
+        // Si falla todo, es caida de Evolution -> bloquear. Un fallo suelto solo deja ese numero sin verificar.
+        if (fallos >= 3 && fallos === (k + 1)) { out.caido = true; return out; }
+      } else {
+        var it1 = (Array.isArray(r1.items) ? r1.items : [])[0] || null;
+        var ex1 = !!(it1 && (it1.exists === true || it1.exists === 'true'));
+        var jid1 = (it1 && it1.jid) ? String(it1.jid) : null;
+        out.resultados[d1] = { existe: ex1, jid: jid1 };
+        _waCacheSet(instancia, d1, ex1, jid1);
+      }
+      if (k < (cupoUno - 1)) await _waPausa(_WA_UNO_PAUSA_MS);
+    }
+    return out;
+  } catch (e) { console.error('verificarNumerosWA error:', e && e.message); out.caido = true; return out; }
+}
+
+// Clasifica UN telefono crudo de una planilla. NO consulta nada: es solo forma.
+//   clase 'ok'          -> ya trae codigo de pais, se usa tal cual
+//   clase 'corregible'  -> le falta el codigo de pais y SE PROPONE la correccion (1165078185 -> 5491165078185)
+//   clase 'mal_formado' -> muy corto, vacio o solo letras: no hay nada razonable que proponer
+// POR QUE SE PROPONE Y NO SE PIDE: nadie va a escribir bien el prefijo en 300 filas de una planilla, y el
+// caso medido (Galdames) entro justamente por ahi. La propuesta la aprueba el usuario en la pantalla.
+// El "9 argentino" NO se toca aca: eso lo resuelve telefonoCanonicoWA preguntandole a WhatsApp (~6019),
+// porque un fijo con WhatsApp Business no lo lleva y no se puede deducir del prefijo.
+function clasificarTelefonoImport(raw) {
+  var crudo = String(raw == null ? '' : raw).trim();
+  var conLetras = /[A-Za-z]/.test(crudo);
+  var s = crudo.replace(/[^0-9+]/g, '').replace(/^\+/, '').replace(/^00/, '');
+  var d = s.replace(/[^0-9]/g, '').replace(/^0+/, ''); // 011 4123-4567 -> 1141234567
+  if (!d) return { digitos: '', propuesto: '', clase: 'mal_formado', motivo: conLetras ? 'No es un numero' : 'Vacio' };
+  // Solo se rechaza por letras cuando ADEMAS no quedan digitos suficientes: una celda tipo "Juan 1165078185"
+  // trae un telefono real y bloquearla seria peor que dejarla pasar por la verificacion contra WhatsApp.
+  if (conLetras && d.length < 10) return { digitos: d, propuesto: '', clase: 'mal_formado', motivo: 'Tiene letras' };
+  if (d.indexOf('54') === 0) {
+    // Argentina: 54 + 10 (fijo) o 549 + 10 (movil). Cualquier otro largo es un numero incompleto.
+    if (d.length === 12 || d.length === 13) return { digitos: d, propuesto: d, clase: 'ok', motivo: '' };
+    return { digitos: d, propuesto: '', clase: 'mal_formado', motivo: 'Numero argentino incompleto' };
+  }
+  if (d.length === 10) return { digitos: d, propuesto: '549' + d, clase: 'corregible', motivo: 'Sin codigo de pais' };
+  if (d.length >= 11) return { digitos: d, propuesto: d, clase: 'ok', motivo: '' }; // otro pais, con su codigo
+  return { digitos: d, propuesto: '', clase: 'mal_formado', motivo: 'Muy corto / sin codigo de area' };
+}
+
+// RED DE CONTENCION DEL BACKEND (pedido 6 de Diego): "si la validacion vive solo en el formulario, el dia que
+// alguien pegue contra la API volvemos a lo mismo". Devuelve true si al numero le FALTA el codigo de pais.
+// Se aplica SOLO con el flag `importacion_verificada_v1` prendido -> con el flag apagado, byte-identico a hoy.
+function faltaCodigoPais(soloDigitos) {
+  var c = clasificarTelefonoImport(soloDigitos);
+  return c.clase !== 'ok';
+}
+
+// El numero fue verificado contra WhatsApp hace poco Y tiene cuenta. Lo usan los importadores para no dejar
+// entrar nada que la vista previa no haya confirmado recien (el cache lo llena /api/importacion/verificar-lote).
+// OJO: el cache vive EN MEMORIA del proceso. Si Railway reinicia entre la vista previa y el import, esto da
+// false y el importador pide volver a verificar. Es la falla en el lado seguro y es a proposito.
+function _waVerificadoOk(instancia, soloDigitos) {
+  var c = _waCacheGet(instancia, String(soloDigitos || '').replace(/[^0-9]/g, ''));
+  return !!(c && c.existe === true);
+}
+
+// Gate de la feature. MISMO patron defensivo que contactosV1Activo (~29650): columna ausente / error -> false.
+async function importacionVerificadaActiva(ownerId) {
+  try {
+    if (!ownerId) return false;
+    const { data, error } = await supabase.from('business_settings').select('importacion_verificada_v1').eq('user_id', ownerId).maybeSingle();
+    if (error) return false;
+    return !!(data && data.importacion_verificada_v1 === true);
+  } catch (e) { return false; }
+}
+
 // ===== SOPORTE: subir una imagen (data URL base64) al bucket 'media', carpeta soporte/ =====
 // Reusa el patron de subirMediaAStorage (buffer -> supabase.storage 'media' -> publicUrl), pero la
 // fuente es una data URL que manda el cliente o el Maestro (no Evolution). Defensivo: si algo falla,
@@ -13135,6 +13416,114 @@ app.post('/api/contactos/verificar-numero', async (req, res) => {
 });
 
 // ============================================================================
+// VISTA PREVIA VERIFICADA DE UNA IMPORTACION -> POST /api/importacion/verificar-lote
+// body: { telefonos: ["1165078185", "+54 9 11 ..."] }  (crudos, tal cual salen de la planilla)
+// resp: { ok, modo, tope_alcanzado, filas:[ { entrada, digitos, propuesto, clase, motivo,
+//                                            existe_wa, ya_existia, contacto_id, nombre_existente } ] }
+// clase (lo que Diego pidio ver ANTES de guardar nada):
+//   'listo'        -> WhatsApp CONFIRMADO
+//   'sin_whatsapp' -> el numero existe pero no tiene cuenta de WhatsApp
+//   'mal_formado'  -> sin codigo de pais irrecuperable, muy corto, o con letras
+//   'ya_existia'   -> ya esta en la base (el usuario elige actualizar o saltear)
+//   'no_verificado'-> se acabo el cupo de consultas de la ventana: NO se puede importar, hay que reintentar
+//
+// GATEADO por `importacion_verificada_v1` (default OFF -> 409): con el flag apagado esta pantalla no existe
+// y las importaciones se comportan EXACTAMENTE como hoy.
+// EVOLUTION CAIDO -> 503 "Servidor procesando, intente nuevamente" (decision de Diego): se BLOQUEA y se pide
+// reintento. Es lo CONTRARIO de lo que hace /api/contactos/verificar-numero (~13385), que devuelve 502 y el
+// front lo ignora "para no bloquear a ciegas". Aca importar sin verificar es justo lo que produjo el problema.
+// El front manda de a tandas para poder dibujar el progreso real ("verificando 120 de 300").
+// 0 TOKENS DE IA.
+// ============================================================================
+app.post('/api/importacion/verificar-lote', async function (req, res) {
+  try {
+    const _uidToken = await verificarUsuario(req);
+    if (!_uidToken) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // La instancia de WhatsApp es la del DUEÑO (multi-tenant): si el que pide es asesor, se resuelve su admin_id.
+    let ownerId = _uidToken;
+    try { const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', _uidToken).maybeSingle(); if (ase && ase.admin_id) ownerId = ase.admin_id; } catch (eA) {}
+
+    if (!(await importacionVerificadaActiva(ownerId))) return res.status(409).json({ ok: false, gated: true, error: 'importacion_verificada_v1 desactivado' });
+
+    const crudos = (req.body && req.body.telefonos) || [];
+    if (!Array.isArray(crudos)) return res.status(400).json({ error: 'telefonos debe ser un array' });
+    // Tope por request: la tanda tiene que entrar comoda dentro del timeout del navegador aun en el peor caso
+    // (modo uno-por-uno = 1,5s por numero). 40 x 1,5s = 60s. Mas que eso lo parte el front en varias tandas.
+    if (crudos.length > 40) return res.status(400).json({ error: 'Mandá de a 40 teléfonos como máximo por tanda' });
+    if (!crudos.length) return res.json({ ok: true, modo: 'lote', tope_alcanzado: false, filas: [] });
+
+    // 1) FORMA: clasificar sin consultar nada. Los mal formados ni siquiera llegan a WhatsApp.
+    const filas = crudos.map(function (x) {
+      const c = clasificarTelefonoImport(x);
+      return {
+        entrada: String(x == null ? '' : x),
+        digitos: c.digitos, propuesto: c.propuesto, clase: c.clase, motivo: c.motivo,
+        existe_wa: null, ya_existia: false, contacto_id: null, nombre_existente: null
+      };
+    });
+
+    // 2) YA EXISTEN: una sola query por tanda. Los que ya estan en la base NO se consultan contra WhatsApp --
+    //    ya son contactos del cliente, y cada consulta ahorrada es presupuesto que no gastamos contra WhatsApp.
+    const candidatos = Array.from(new Set(filas.filter(function (f) { return f.clase !== 'mal_formado' && f.propuesto; }).map(function (f) { return f.propuesto; })));
+    const yaEstan = {};
+    if (candidatos.length) {
+      try {
+        const { data } = await supabase.from('contacts').select('id, phone, name, nombre_manual').eq('user_id', ownerId).in('phone', candidatos);
+        (data || []).forEach(function (c) { if (c && c.phone) yaEstan[String(c.phone)] = c; });
+      } catch (e) { /* si falla, se tratan todos como nuevos: se verifican igual y el importador vuelve a chequear duplicados */ }
+    }
+
+    // 3) WHATSAPP: solo los candidatos que NO estan en la base.
+    const aConsultar = candidatos.filter(function (t) { return !yaEstan[t]; });
+    const instancia = nombreInstancia(ownerId);
+    let ver = { modo: 'lote', caido: false, tope_alcanzado: false, resultados: {} };
+    if (aConsultar.length) ver = await verificarNumerosWA(instancia, aConsultar);
+    if (ver.caido) return res.status(503).json({ ok: false, error: 'Servidor procesando, intente nuevamente' });
+
+    // 3b) SEGUNDA VUELTA para los numeros a los que les pusimos el codigo de pais nosotros. A un AR de 10
+    //     digitos no se le puede saber si es MOVIL (549+10) o FIJO (54+10) — y un fijo con WhatsApp Business
+    //     SI tiene cuenta (mismo razonamiento que telefonoCanonicoWA ~6019). Si la propuesta con el 9 no
+    //     existe, se prueba la variante sin el 9 ANTES de mandarlo al tacho de "sin WhatsApp". Cuesta una
+    //     consulta extra SOLO por los que fallaron, no por todos.
+    const alternativas = {}; // propuesto(549..) -> alternativa(54..)
+    if (!ver.tope_alcanzado) {
+      filas.forEach(function (f) {
+        if (f.clase !== 'corregible' || !f.propuesto) return;
+        if (yaEstan[f.propuesto]) return;
+        const r = ver.resultados[f.propuesto];
+        if (r && r.existe === false && f.propuesto.indexOf('549') === 0) alternativas[f.propuesto] = '54' + f.propuesto.slice(3);
+      });
+    }
+    const altList = Object.keys(alternativas).map(function (k) { return alternativas[k]; });
+    let verAlt = { resultados: {}, caido: false };
+    if (altList.length) verAlt = await verificarNumerosWA(instancia, Array.from(new Set(altList)));
+
+    // 4) Armar la clase final de cada fila.
+    filas.forEach(function (f) {
+      if (f.clase === 'mal_formado') return;
+      let t = f.propuesto;
+      const ex = yaEstan[t];
+      if (ex) { f.clase = 'ya_existia'; f.ya_existia = true; f.contacto_id = ex.id; f.nombre_existente = ex.nombre_manual || ex.name || null; return; }
+      let r = ver.resultados[t];
+      // El movil no existe pero el FIJO si -> nos quedamos con el fijo y eso es lo que se muestra y se importa.
+      if (r && r.existe === false && alternativas[t]) {
+        const rAlt = verAlt.resultados[alternativas[t]];
+        if (rAlt && rAlt.existe === true) { t = alternativas[t]; f.propuesto = t; r = rAlt; }
+      }
+      if (!r) { f.clase = 'no_verificado'; f.motivo = 'No se alcanzó a verificar en esta tanda'; return; }
+      f.existe_wa = !!r.existe;
+      f.clase = r.existe ? 'listo' : 'sin_whatsapp';
+      if (!r.existe) f.motivo = 'El número no tiene WhatsApp';
+    });
+
+    return res.json({ ok: true, modo: ver.modo, tope_alcanzado: !!ver.tope_alcanzado, filas: filas });
+  } catch (err) {
+    console.error('Error en /api/importacion/verificar-lote:', err && err.message);
+    return res.status(500).json({ error: (err && err.message) || 'Error interno' });
+  }
+});
+
+// ============================================================================
 // LUZ DE ESTADO DEL SISTEMA  ->  GET /api/estado-sistema  ->  { ok: boolean }
 // Endpoint LIVIANO para el puntito verde/rojo del dashboard. CERO IA, CERO tokens.
 // Solo chequea si el WhatsApp del DUEÑO (instancia Evolution) esta conectado.
@@ -18618,6 +19007,15 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
     let telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
     if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
     if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+    // RED DE CONTENCION (Diego, pedido 6): misma guarda que POST /api/contactos. Aca el front hoy arma el
+    // telefono como pais + numero, pero eso vive en la pantalla: contra la API pelada entra cualquier cosa.
+    // GATEADO por `importacion_verificada_v1` -> con el flag apagado, byte-identico a hoy.
+    if (await importacionVerificadaActiva(ownerId)) {
+      if (faltaCodigoPais(telefono)) {
+        const _cm = clasificarTelefonoImport(telefono);
+        return res.status(400).json({ error: 'El teléfono necesita el código de país' + (_cm.propuesto ? ' (¿quisiste poner ' + _cm.propuesto + '?)' : ''), propuesto: _cm.propuesto || null, motivo: _cm.motivo || null });
+      }
+    }
     // FIX "el 9 argentino" (2026-08-04): guardamos el numero REAL de WhatsApp, no el que se tipeo. Si el
     // contacto nace con un numero distinto al que despues trae el webhook, el lead entra como contacto NUEVO
     // y el historial queda partido. Best-effort: ante cualquier duda deja el numero tal cual (ver ~5978).
@@ -23581,14 +23979,23 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     // el archivo (puede venir vacio) y es el UNICO que se usa para actualizar un contacto EXISTENTE -- si se
     // usara el fallback-a-telefono ahi, un CSV sin columna de nombre le pisaria el nombre real a gente que ya
     // estaba cargada con su numero de telefono.
-    const porTel = {}; let invalidos = 0;
+    // RED DE CONTENCION (Diego, pedido 6): con `importacion_verificada_v1` prendido, este importador deja de
+    // aceptar cualquier cosa. Es el camino por el que entraron los 44 contactos de la agenda del celular
+    // (escribanias, librerias, clubes) a una cola de recontacto sin que nadie los revisara.
+    //   a) FORMA: sin codigo de pais / muy corto -> se rechaza aca, no solo en la pantalla.
+    //   b) WHATSAPP: mas abajo, un telefono NUEVO solo entra si /api/importacion/verificar-lote lo confirmo
+    //      hace menos de 30 min (cache en memoria). Sin eso -> 409 y hay que volver a pasar por la vista previa.
+    // Con el flag apagado NO corre nada de esto: comportamiento byte-identico al de hoy.
+    const _impVerif = await importacionVerificadaActiva(user_id);
+    const porTel = {}; let invalidos = 0; const rechazadosFormato = [];
     for (const lead of leadsRaw) {
       const tel = String((lead && lead.telefono) || '').replace(/[^0-9]/g, '');
       if (!tel || tel.length < 8) { invalidos++; continue; }
+      if (_impVerif && faltaCodigoPais(tel)) { invalidos++; if (rechazadosFormato.length < 20) rechazadosFormato.push(tel); continue; }
       if (!porTel[tel]) porTel[tel] = { nombre: (lead && lead.nombre) || tel, nombreCsv: String((lead && lead.nombre) || '').trim(), categoria: (lead && lead.categoria != null) ? _normCat(lead.categoria) : catBody };
     }
     const telefonos = Object.keys(porTel);
-    if (!telefonos.length) return res.json({ ok: true, total: leadsRaw.length, unicos: 0, creados: 0, yaExistian: 0, enRecontacto: 0, actualizados: 0, invalidos: invalidos });
+    if (!telefonos.length) return res.json({ ok: true, total: leadsRaw.length, unicos: 0, creados: 0, yaExistian: 0, enRecontacto: 0, actualizados: 0, invalidos: invalidos, rechazados_formato: rechazadosFormato.length });
 
     // Helper: procesar en lotes de N (una query por lote, no una por lead -> no se cuelga con miles).
     const LOTE = 500;
@@ -23601,6 +24008,22 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
         (data || []).forEach(function (c) { if (c && c.phone) idPorTel[String(c.phone)] = c.id; }); } catch (e) {}
     });
     const existentesTel = telefonos.filter(function (t) { return !!idPorTel[t]; }); // ya estaban ANTES de este import
+
+    // 2b) RED DE CONTENCION (b): un telefono NUEVO solo entra si WhatsApp lo confirmo hace poco. Los que YA
+    // EXISTEN pasan sin consultar: ya son contactos del cliente y volver a preguntar por ellos gasta cupo
+    // contra WhatsApp sin necesidad (mismo criterio que /api/importacion/verificar-lote).
+    // FAIL-CLOSED a proposito: si el cache se perdio (reinicio de Railway) esto da 409 y hay que volver a la
+    // vista previa. Molesta, pero es la unica forma de que no se pueda importar sin verificar pegandole a la API.
+    if (_impVerif) {
+      const _inst = nombreInstancia(user_id);
+      const _sinVerificar = telefonos.filter(function (t) { return !idPorTel[t] && !_waVerificadoOk(_inst, t); });
+      if (_sinVerificar.length) {
+        return res.status(409).json({
+          ok: false, requiere_verificacion: true, sin_verificar: _sinVerificar.length,
+          error: 'Hay ' + _sinVerificar.length + ' número(s) que no pasaron por la verificación de WhatsApp. Volvé a la vista previa y verificá antes de importar.'
+        });
+      }
+    }
 
     // 3) Contactos NUEVOS: bulk insert por lotes.
     const nuevosTel = telefonos.filter(function (t) { return !idPorTel[t]; });
@@ -23659,7 +24082,7 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
 
     // NOTA: se saco la recuperacion de historial via Evolution (era 1 llamada HTTP por lead, en serie, sin timeout ->
     // colgaba el import con archivos grandes). El historial, si hace falta, se puede recuperar despues por-lead.
-    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos });
+    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos, rechazados_formato: rechazadosFormato.length });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -30025,6 +30448,16 @@ app.post('/api/contactos', async function (req, res) {
     let telefono = (b.telefono != null) ? String(b.telefono).replace(/[^0-9]/g, '') : '';
     if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
     if (!telefono || telefono.length < 6) return res.status(400).json({ error: 'Telefono invalido' });
+    // RED DE CONTENCION (Diego, pedido 6): la validacion NO puede vivir solo en el formulario. Este endpoint es
+    // por donde entro el contacto huerfano de Andres Galdames (`1165078185`, 10 digitos, sin codigo de pais):
+    // `telefono.length < 6` lo dejaba pasar y telefonoCanonicoWA lo devuelve intacto (corta en length < 12).
+    // GATEADO: con `importacion_verificada_v1` apagado esto no corre y el endpoint queda byte-identico a hoy.
+    if (await importacionVerificadaActiva(ownerId)) {
+      if (faltaCodigoPais(telefono)) {
+        const _c = clasificarTelefonoImport(telefono);
+        return res.status(400).json({ error: 'El teléfono necesita el código de país' + (_c.propuesto ? ' (¿quisiste poner ' + _c.propuesto + '?)' : ''), propuesto: _c.propuesto || null, motivo: _c.motivo || null });
+      }
+    }
     // FIX "el 9 argentino" (2026-08-04): guardamos el numero REAL de WhatsApp, no el que se tipeo. Si el
     // contacto nace con un numero distinto al que despues trae el webhook, el lead entra como contacto NUEVO
     // y el historial queda partido. Best-effort: ante cualquier duda deja el numero tal cual (ver ~5978).
@@ -34939,8 +35372,25 @@ app.get('/api/ui-flags', async function(req, res){
         fichas_historial_v1 = _fc.data.fichas_historial_v1 === true;
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, fichas_v1: false, coincidencias_v1: false, fichas_ia_v1: false, fichas_avisos_v1: false, fichas_chat_v1: false, fichas_historial_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+    // IMPORTACION VERIFICADA (Diego 2026-08-06). Query SEPARADA y con LISTA EXPLICITA de columnas: si
+    // `migracion-importacion-verificada.sql` todavia no corrio, esta query falla ENTERA y los dos quedan en
+    // false -- fail-closed -- sin arrastrar a los flags de arriba.
+    //   importacion_verificada_v1 -> la vista previa que verifica contra WhatsApp y filtra ANTES de guardar,
+    //                                + la red de contencion de codigo de pais en POST /api/contactos,
+    //                                  /api/contactos/cargar-manual y /api/whatsapp/importar-leads
+    //   chat_desde_ficha_v1       -> el boton unico "Crear chat" / "Abrir chat" en la ficha del contacto
+    // Son DOS flags separados a proposito: el boton de la ficha no tiene nada que ver con el importador y se
+    // puede prender solo (o al reves) sin arrastrar al otro.
+    var importacion_verificada_v1 = false, chat_desde_ficha_v1 = false;
+    try {
+      var _iv = await supabase.from('business_settings').select('importacion_verificada_v1, chat_desde_ficha_v1').eq('user_id', user_id).maybeSingle();
+      if (_iv && !_iv.error && _iv.data) {
+        importacion_verificada_v1 = _iv.data.importacion_verificada_v1 === true;
+        chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 === true;
+      }
+    } catch (e) { /* columnas ausentes / error -> los dos en false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, fichas_v1: false, coincidencias_v1: false, fichas_ia_v1: false, fichas_avisos_v1: false, fichas_chat_v1: false, fichas_historial_v1: false, importacion_verificada_v1: false, chat_desde_ficha_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================

@@ -9883,7 +9883,13 @@ async function _leadEscribioDespuesDeLaPrimeraRespuesta(conversation_id) {
 // usa todavia para rutear ni cambia el reparto.
 // MEDIDOR (2026-07-23): conversation_id y turnoId son OPCIONALES y van AL FINAL (default null). Solo se usan para
 // atribuir el costo de esta llamada al lead / al mensaje del lead. Si no vienen, el comportamiento es el de siempre.
-async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoId, tildarDeptoOn) {
+// CIERRE POR NEGATIVA (Diego 2026-08-06): "si el lead dice no me interesa o muestra que no tiene interes o
+// no me escriban o equivocado va a cerrado de forma automatica".
+// `cierreNegativoOn` (6o parametro, OPCIONAL): con false/undefined el prompt y el parseo quedan
+// BYTE-IDENTICOS a antes -- el cuarto estado no se menciona ni se acepta.
+// COSTO: ~25 tokens mas de prompt en Haiku (USD 1/millon) = USD 0,000025 por mensaje. No hay llamada nueva:
+// es la MISMA clasificacion que ya corre en cada mensaje del lead.
+async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoId, tildarDeptoOn, cierreNegativoOn) {
   try {
     // Cargar los departamentos ACTIVOS del tenant (DB, sin IA). Si no hay, el depto queda inerte/null.
     let _deptos = [];
@@ -9933,9 +9939,23 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
       // FASE 2 (punto 5): senal de que la IA NO puede resolver / el pedido esta fuera de alcance del negocio.
       'Indica ademas "fuera_alcance": true SOLO si el cliente pide algo que claramente NO puede resolver un asistente automatico y excede informar/derivar (ej. un reclamo formal, una decision que requiere un responsable, un tema legal/contractual puntual); si no, false.'
     ] : [];
+    // CIERRE POR NEGATIVA: la cuarta opcion. El motivo viaja PEGADO al estado (sin_interes:no_interesado)
+    // para no tener que cambiar el formato de salida ni el parseo del caso sin deptos (una sola palabra).
+    const _cn = (cierreNegativoOn === true);
+    const _lineaNegativa = _cn ? [
+      '- sin_interes   => si el cliente CIERRA la puerta. Solo estos tres casos, y agregale el motivo pegado con dos puntos:',
+      '    sin_interes:no_interesado      => dice que no le interesa, que ya no busca, que ya compro/alquilo, que resolvio por otro lado, o agradece y se despide dando por terminado el tema.',
+      '    sin_interes:pidio_no_contacto  => pide que no lo contacten mas, que lo borren de la lista, que dejen de escribirle.',
+      '    sin_interes:numero_equivocado  => dice que es numero equivocado, que no es quien buscan, o que nunca consulto nada.',
+      'REGLA DURA DE sin_interes (lo mas importante de todo): un "no" a UNA PROPIEDAD, a una zona, a un precio o a una opcion puntual NO es sin_interes -- ese cliente SIGUE INTERESADO y esta descartando opciones. "no me interesa ese", "esa no", "muy caro", "no me gusta la zona" => interesado, NUNCA sin_interes. sin_interes es solo cuando el cliente cierra la relacion con el negocio, no cuando descarta algo.',
+      'Ante CUALQUIER duda de si es sin_interes o no => elegi sin_cambio (no pasa nada). Es mejor seguir hablando con alguien que ya no quiere, que cerrarle la puerta a alguien que si quiere.'
+    ] : [];
+    const _opcJson = _cn ? '<listo_humano|interesado|sin_cambio|sin_interes:no_interesado|sin_interes:pidio_no_contacto|sin_interes:numero_equivocado>' : '<listo_humano|interesado|sin_cambio>';
     const _formato = _hayDeptos
-      ? 'Responde UNICAMENTE un JSON sin markdown con esta forma EXACTA: {"estado":"<listo_humano|interesado|sin_cambio>","departamento":"<nombre exacto de la lista o ninguno>","pidio_area":<true|false>,"fuera_alcance":<true|false>}'
-      : 'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.';
+      ? ('Responde UNICAMENTE un JSON sin markdown con esta forma EXACTA: {"estado":"' + _opcJson + '","departamento":"<nombre exacto de la lista o ninguno>","pidio_area":<true|false>,"fuera_alcance":<true|false>}')
+      : (_cn
+        ? 'Responde SOLO una de esas opciones exactas (listo_humano, interesado, sin_cambio, o sin_interes:<motivo>), sin nada mas.'
+        : 'Responde SOLO una de esas tres palabras exactas (listo_humano, interesado o sin_cambio), sin nada mas.');
     const prompt = [
       'Sos un clasificador de intencion de un cliente que escribe a una inmobiliaria/hotel por WhatsApp.',
       'Segun el mensaje del cliente, clasifica el ESTADO en una de estas opciones exactas:',
@@ -9943,7 +9963,7 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
       '- interesado    => todavia esta CONSULTANDO sin confirmar, pero MOSTRO INTERES. Mostrar interes es UNA de estas cinco: (1) da un dato de lo que necesita (zona, presupuesto, fechas, cuantas personas, tipo, para cuando, para que lo quiere); (2) pregunta por algo CONCRETO del inventario (una propiedad o unidad puntual, su precio, si esta disponible); (3) pide material (fotos, video, ubicacion, la ficha, mas opciones); (4) pregunta como seguir (si puede ir a verlo, como es el proceso, que necesita para avanzar); (5) compara o evalua opciones. NO alcanza y NO es interes: saludar, agradecer, "ok"/"dale"/"perfecto", o preguntar en general "que tienen?" sin dar ningun dato.',
       '- sin_cambio    => SOLO si es un saludo inicial sin consulta (hola, buenas) o algo no relacionado al negocio. Si ya pregunto algo concreto, NO es sin_cambio.',
       'CLAVE: la diferencia entre listo_humano e interesado es el COMPROMISO. Si SOLO consulta o muestra interes => interesado. Si ACEPTA/COORDINA una visita, reserva o avanzar la operacion => listo_humano (hay que derivar a un humano). Ante la duda entre interesado y sin_cambio, elegi interesado.'
-    ].concat(_lineasDepto).concat([
+    ].concat(_lineaNegativa).concat(_lineasDepto).concat([
       _formato,
       // B4 (anti prompt-injection): el texto del lead va DELIMITADO como DATO, entre marcadores, y se aclara que
       // todo lo que este adentro es contenido a clasificar, NUNCA instrucciones a obedecer. Asi un lead que escriba
@@ -9970,7 +9990,8 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
           // otra cosa (texto inyectado, valor raro, ausente) cae a 'sin_cambio' (= no cambia el estado, el caso mas
           // conservador: no deriva a humano ni marca interesado por una respuesta envenenada). El departamento solo
           // queda si _resolverDeptoId lo matchea contra un depto REAL del tenant (whitelist por id); si no -> null.
-          const _ESTADOS_OK = ['listo_humano', 'interesado', 'sin_cambio'];
+          const _ESTADOS_OK = ['listo_humano', 'interesado', 'sin_cambio'].concat(_cn
+            ? ['sin_interes:no_interesado', 'sin_interes:pidio_no_contacto', 'sin_interes:numero_equivocado'] : []);
           const _estadoRaw = String(parsed.estado || '').toLowerCase().trim();
           _outLower = (_ESTADOS_OK.indexOf(_estadoRaw) >= 0) ? _estadoRaw : 'sin_cambio';
           _departamentoId = _resolverDeptoId(parsed.departamento); // null si no matchea un depto real del tenant
@@ -9979,7 +10000,20 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
         }
       } catch (eJson) { /* si el JSON falla, caemos al parseo por substring de abajo */ }
     }
-    if (_outLower.includes('listo_humano')) _estado = 'listo_humano';
+    // OJO CON EL ORDEN: 'sin_interes:no_interesado' CONTIENE la subcadena 'interesado', asi que si se
+    // chequeara `interesado` primero, un "no me interesa" se clasificaria como INTERESADO -- exactamente
+    // al revés. Por eso sin_interes va ANTES.
+    let _motivoNegativo = null;
+    if (_cn && _outLower.includes('sin_interes')) {
+      _estado = 'sin_interes';
+      _motivoNegativo = _outLower.includes('numero_equivocado') ? 'numero_equivocado'
+                      : (_outLower.includes('pidio_no_contacto') ? 'pidio_no_contacto' : 'no_interesado');
+    }
+    // Con el flag APAGADO el prompt no ofrece 'sin_interes', pero si el modelo lo devolviera igual, el
+    // `includes('interesado')` de abajo lo leeria como INTERESADO (la subcadena esta ahi). Se descarta a
+    // sin_cambio: no se le puede subir el estado a alguien por un mensaje que dice que no quiere nada.
+    else if (!_cn && _outLower.includes('sin_interes')) _estado = null;
+    else if (_outLower.includes('listo_humano')) _estado = 'listo_humano';
     else if (_outLower.includes('interesado')) _estado = 'interesado';
     // FASE 2 (punto 1): "deducido" = la IA infirio el depto del tema (hay depto y el cliente NO lo pidio explicito).
     const _deducido = !!(_departamentoId && !_pidioArea);
@@ -9996,7 +10030,9 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
       departamentoIdTildar: _tildarMode ? _departamentoId : null,
       pidioArea: _tildarMode ? false : _pidioArea,
       deducido: _tildarMode ? false : _deducido,
-      fueraAlcance: _tildarMode ? false : _fueraAlcance
+      fueraAlcance: _tildarMode ? false : _fueraAlcance,
+      // Solo viene cuando estado === 'sin_interes'. Con el flag apagado es siempre null.
+      motivoNegativo: _motivoNegativo
     };
   } catch (e) { console.error('Error clasificando estado:', e && e.message); return { estado: null, departamentoId: null, departamentoIdTildar: null, pidioArea: false, deducido: false, fueraAlcance: false }; }
 }
@@ -12674,11 +12710,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             // MUDO EN SILENCIO. Para que los dos flags conviban sin pisarse: si _tildarOn esta ON se usa SIEMPRE
             // clasificarEstado (que si lo deduce) aunque haiku_fusion este ON -> gana el flag que APORTA informacion.
             // El guard de trivial devuelve departamentoIdTildar:null para conservar la forma completa del objeto.
+            // CIERRE POR NEGATIVA: se resuelve ANTES de clasificar porque el flag cambia el prompt. Prendido
+            // salvo que la cuenta lo tenga en false explicito (ver cierreNegativoActivo).
+            let _cierreNegOn = false; try { _cierreNegOn = await cierreNegativoActivo(user_id); } catch (eCN) { _cierreNegOn = false; }
             const _clasif = esMensajeTrivial(texto)
               ? { estado: 'sin_cambio', departamentoId: null, departamentoIdTildar: null, pidioArea: false, deducido: false, fueraAlcance: false }
               : ((_haikuFusionOn && !_tildarOn)
                   ? (await _fusionGet()).estado
-                  : await clasificarEstado(texto, user_id, _convId, _turnoId, _tildarOn)); // MEDIDOR: atribucion (no cambia la clasificacion)
+                  : await clasificarEstado(texto, user_id, _convId, _turnoId, _tildarOn, _cierreNegOn)); // MEDIDOR: atribucion (no cambia la clasificacion)
             const nuevoEstado = _clasif && _clasif.estado;
             const _departamentoId = _clasif && _clasif.departamentoId; // PUNTO 6: sigue null en modo tildar (aislado)
             // FASE 2: senales nuevas (solo se USAN con reparto_v2 ON; con flag OFF se ignoran -> comportamiento ACTUAL).
@@ -12851,10 +12890,56 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
             // REGISTRO DECISIONES IA: se aplico el estado propuesto? y si NO, POR QUE. Son SOLO etiquetas para el
             // registro (ninguna condicion de negocio las lee). Se calculan de las MISMAS variables que ya decidieron.
             let _decAplicado = false;
+            // ===== CIERRE POR NEGATIVA (Diego 2026-08-06) =========================================
+            // "si el lead dice no me interesa o muestra que no tiene interes o no me escriban o
+            //  equivocado va a cerrado de forma automatica".
+            //
+            // VA ACA, ANTES DE LA ESCALERA DE ESTADOS, y no adentro: esa escalera solo SUBE
+            // (en_conversacion 1 < interesado 2 < listo_humano 3) y 'cerrado' no es un escalon mas
+            // arriba, es una SALIDA. Metido ahi nunca se aplicaria.
+            //
+            // EL CASO QUE ESTO ARREGLA (medido en Anton, conv de "Consulta 22/12 Jonh"): el lead
+            // escribio "Pero no estoy interesada" + "Gracias", la IA contesto bien... y el cron la
+            // volvio a recontactar, porque nada la saco de la cola.
+            //
+            // Se hacen TRES cosas y ninguna mas:
+            //   status='cerrado'            -> sale del listado activo
+            //   recontacto_excluido=true    -> DOBLE CANDADO: el cron no la agarra ni si alguien la
+            //                                  devuelve a 'recontacto' a mano por error
+            //   motivo_perdida=<motivo>     -> en Cerrados se ve POR QUE se cerro, no solo que esta cerrado
+            // La IA IGUAL manda su respuesta amable (ya lo hace bien y no se toca) y NO se avisa a
+            // nadie: un lead que dijo "no" no es una notificacion para el equipo.
+            // NO es camino sin retorno: si el lead vuelve a escribir, el webhook revive las conversaciones
+            // cerradas con la IA encendida (~6069), y el asesor puede sacarla de Cerrado a mano.
+            let _cerroPorNegativa = false;
+            if (nuevoEstado === 'sin_interes') {
+              const _motNeg = (_clasif && _clasif.motivoNegativo) || 'no_interesado';
+              try {
+                // Condicional por status: si en el medio alguien la movio, no se pisa ese cambio.
+                const _updCierre = await supabase.from('conversations')
+                  .update({ status: 'cerrado', recontacto_excluido: true, motivo_perdida: _motNeg, updated_at: new Date().toISOString() })
+                  .eq('id', _convId).neq('status', 'cerrado');
+                if (_updCierre && _updCierre.error) {
+                  // DEFENSIVO: si `motivo_perdida` o `recontacto_excluido` faltaran en alguna base, lo
+                  // importante es CERRAR (que es lo que saca al lead de la cola). El motivo es secundario.
+                  await supabase.from('conversations')
+                    .update({ status: 'cerrado', updated_at: new Date().toISOString() })
+                    .eq('id', _convId).neq('status', 'cerrado');
+                }
+                _cerroPorNegativa = true;
+                console.log('[CIERRE-NEGATIVO] conv ' + _convId + ' -> cerrado (' + _motNeg + ') cuenta ' + user_id);
+                try { registrarCambioEstadoConv(_convId, estadoActual, 'cerrado', 'La IA', 'el lead no tiene interes (' + _motNeg + ')', user_id).catch(function(){}); } catch (eHE) {}
+                try { registrarCambioEstado({ conversation_id: _convId, user_id: user_id, estado_anterior: estadoActual, estado_nuevo: 'cerrado', origen: 'ia', motivo: 'cierre por negativa del lead (' + _motNeg + ')' }).catch(function(){}); } catch (eLEH) {}
+              } catch (eCierre) { console.error('[CIERRE-NEGATIVO] conv ' + _convId + ':', eCierre && eCierre.message); }
+            }
+
             let _decMotivoNo = (!nuevoEstado || nuevoEstado === 'sin_cambio') ? 'sin_cambio'
+                             : (_cerroPorNegativa ? 'cerrado_por_negativa'
                              : (_yaDerivoEnEsteMensaje ? 'ya_derivo_en_este_mensaje'
-                             : (_bloqueoInteresado ? 'bloqueo_interesado' : null));
-            if (nuevoEstado && !_yaDerivoEnEsteMensaje && !_bloqueoInteresado) {
+                             : (_bloqueoInteresado ? 'bloqueo_interesado' : null)));
+            // `!_cerroPorNegativa`: si el lead cerro la puerta, NO se entra a la escalera de subida de
+            // estado -- seria absurdo marcarlo 'interesado' en el mismo mensaje en que dijo que no.
+            if (nuevoEstado && nuevoEstado !== 'sin_interes' && !_cerroPorNegativa && !_yaDerivoEnEsteMensaje && !_bloqueoInteresado) {
               // Orden de prioridad: en_conversacion < interesado < listo_humano (solo sube, nunca baja)
               const nivel = { en_conversacion: 1, interesado: 2, listo_humano: 3 };
               // REGISTRO DECISIONES IA: lectura pura del mismo mapa `nivel` (0 I/O). No altera el if de abajo.
@@ -30135,6 +30220,25 @@ app.post('/api/leads/actualizar', async function (req, res) {
 
 // Flag por-cuenta (mismo patron defensivo EXACTO que visibilidadServerV1Activo): columna ausente / error ->
 // false (los endpoints de /api/contactos/* devuelven 409 "gated", nada nuevo corre).
+// CIERRE POR NEGATIVA — gate FAIL-**OPEN**, al revés de todos los demás de este archivo.
+// REGLA DE ORO DE DIEGO (2026-08-06): "si aplico cambios en todas las cuentas es si o si para las cuentas
+// futuras". Diego pidió esto "en todos lados y las cuentas nuevas", así que una cuenta nueva TIENE que
+// nacer con el cambio puesto. Con el patrón fail-closed de siempre (`=== true`) la cuenta nueva nacería
+// SIN la mejora y habría que acordarse de prenderla a mano: exactamente lo que la regla prohíbe.
+//   columna ausente (migración sin correr) -> PRENDIDO
+//   columna NULL (cuenta nueva)            -> PRENDIDO
+//   columna en false explícito             -> apagado  (el ÚNICO caso apagado)
+// La perilla sigue existiendo: `UPDATE business_settings SET cierre_negativo_v1=false WHERE user_id=...`
+// apaga una cuenta puntual sin desplegar. Así queda apagada Raíces Meta Test, que está congelada.
+async function cierreNegativoActivo(ownerId) {
+  try {
+    if (!ownerId) return false;   // sin cuenta resuelta no se decide nada (esto sí es fail-closed)
+    const { data, error } = await supabase.from('business_settings').select('cierre_negativo_v1').eq('user_id', ownerId).maybeSingle();
+    if (error) return true;        // columna ausente / error de lectura -> PRENDIDO (fail-open a propósito)
+    return !(data && data.cierre_negativo_v1 === false);
+  } catch (e) { return true; }
+}
+
 async function contactosV1Activo(ownerId) {
   try {
     if (!ownerId) return false;

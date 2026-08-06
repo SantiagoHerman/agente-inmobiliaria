@@ -30243,7 +30243,8 @@ app.get('/api/contactos', async function (req, res) {
     // Lo usan LAS DOS queries: la de la pagina y la que arma el orden alfabetico. Escrito una sola vez a
     // proposito: si el orden alfabetico repitiera estos filtros por su cuenta, cualquier cambio en uno
     // sin el otro haria que "buscar + ordenar por nombre" devuelva cosas distintas que solo buscar.
-    function _filtrosContacts(q) {
+    // `conIds=false` deja AFUERA los filtros por lista de ids. Ver el bloque "IDS QUE NO CABEN EN LA URL".
+    function _filtrosContacts(q, conIds) {
       // texto libre: nombre / nombre_manual / telefono / notas — EN EL SERVIDOR (nunca sobre lo ya bajado).
       const texto = String(qp.q || '').trim();
       if (texto) {
@@ -30260,75 +30261,103 @@ app.get('/api/contactos', async function (req, res) {
       // presupuesto cargado: usa contacts.budget (columna confirmada por el pedido), no el de `conversations`.
       if (qp.presupuesto === '1') q = q.not('budget', 'is', null).neq('budget', '');
 
-      if (idsRequeridos != null) q = q.in('id', idsRequeridos);
-      if (idsSinConversacion != null && idsSinConversacion.length) q = q.not('id', 'in', '(' + idsSinConversacion.join(',') + ')');
-      if (idsExcluirScope.length) q = q.not('id', 'in', '(' + idsExcluirScope.join(',') + ')');
+      if (conIds !== false) {
+        if (idsRequeridos != null) q = q.in('id', idsRequeridos);
+        if (idsSinConversacion != null && idsSinConversacion.length) q = q.not('id', 'in', '(' + idsSinConversacion.join(',') + ')');
+        if (idsExcluirScope.length) q = q.not('id', 'in', '(' + idsExcluirScope.join(',') + ')');
+      }
       return q;
     }
 
-    // ---- ORDEN ALFABETICO: se ordena EN JS, no en la base ----------------------------------------
-    // POR QUE: `order=name.asc` usa la colacion de Postgres, y con los nombres REALES de esta base eso
-    // deja la primera pagina llena de basura. MEDIDO en la cuenta de Anton: los primeros 10 de la A a la Z
-    // eran ".", ".", ".", ".", ".", "~ Matebreak Thomas Zamudio" y 4 emojis. Es alfabeticamente correcto
-    // (los simbolos van antes que las letras) y a la vez inservible para quien abre la pantalla buscando la A.
-    // El comparador de aca: (1) ordena por el nombre QUE SE VE (nombre_manual || name), no por el crudo,
-    // (2) ignora acentos y mayusculas, (3) manda al FINAL lo que no empieza con letra o numero.
-    // TOPE: si la cuenta pasa de ALFA_MAX contactos NO se ordena en JS (habria que bajar demasiadas filas
-    // para armar una pagina de 50) y se cae al orden por id. Anton, la cuenta mas grande, tiene 1.222.
-    const ALFA_MAX = 6000;
-    const _ordenAlfa = String(qp.orden || '').trim();
-    let idsOrdenAlfa = null;   // null = no aplica; array = los ids EXACTOS de esta pagina, ya ordenados
-    let ordenAlfaPos = null;   // mapa id -> posicion, para reordenar la pagina al final
-    if (_ordenAlfa === 'nombre_asc' || _ordenAlfa === 'nombre_desc') {
-      const rTodos = await _paginarPorId(function (afterId) {
-        let qa = _filtrosContacts(supabase.from('contacts').select('id, name, nombre_manual').eq('user_id', scope.ownerId))
+    // ---- IDS QUE NO CABEN EN LA URL (BUG REPORTADO POR DIEGO, 2026-08-06) ------------------------
+    // "en Anton me dice que los filtros no se pueden cargar."
+    //
+    // CAUSA MEDIDA: los filtros que miran `conversations` (Con/Sin conversacion, Estado, Asesor y ahora
+    // Temperatura) se resuelven trayendo los `contact_id` que matchean y pasandolos como `id=in.(...)`.
+    // En Anton eso son 1.222 uuids => una URL de 45.553 caracteres, y Supabase la rechaza con HTTP 400.
+    // Probado directo contra la base: 1.222 ids -> 400 Bad Request. NO es un problema del filtro nuevo:
+    // "Con conversacion" y "Estado" ya pasaban por el mismo lugar y ya se rompian; el panel nuevo
+    // simplemente los puso a la vista.
+    //
+    // ARREGLO: cuando la lista de ids es grande, NO va en la URL. Se traen los contactos de la cuenta
+    // con los filtros que SI son de `contacts` (texto/canal/presupuesto, todos cortos), se cruzan los ids
+    // en JS con un Set, se ordena y se corta la pagina. Es la MISMA maquinaria que ya usa el orden
+    // alfabetico. Acotado por _RESOLVER_JS_MAX_FILAS para no bajar una tabla enorme.
+    const _ID_EN_URL_MAX = 300;          // 300 uuids ~ 11k de URL: bien lejos del limite
+    const _RESOLVER_JS_MAX_FILAS = 20000;
+    const _ordenPedidoTop = String(qp.orden || '').trim();
+    const _esOrdenAlfa = (_ordenPedidoTop === 'nombre_asc' || _ordenPedidoTop === 'nombre_desc');
+    const _idsNoCaben = ((idsRequeridos != null && idsRequeridos.length > _ID_EN_URL_MAX)
+      || (idsSinConversacion != null && idsSinConversacion.length > _ID_EN_URL_MAX)
+      || (idsExcluirScope.length > _ID_EN_URL_MAX));
+
+    if (_idsNoCaben || _esOrdenAlfa) {
+      const rUniv = await _paginarPorId(function (afterId) {
+        // conIds=false: los ids se cruzan despues en JS. Asi la URL queda corta SIEMPRE.
+        let qu = _filtrosContacts(supabase.from('contacts').select(CONTACTOS_COLS_FULL).eq('user_id', scope.ownerId), false)
           .order('id', { ascending: true }).limit(1000);
-        if (afterId) qa = qa.gt('id', afterId);
-        return qa;
+        if (afterId) qu = qu.gt('id', afterId);
+        return qu;
       });
-      if (!rTodos.ok) return res.status(500).json({ error: rTodos.error });
-      const univ = rTodos.rows || [];
-      if (univ.length <= ALFA_MAX) {
-        const clave = function (x) {
+      if (!rUniv.ok) return res.status(500).json({ error: rUniv.error });
+      let univ = rUniv.rows || [];
+      if (univ.length > _RESOLVER_JS_MAX_FILAS) return res.status(500).json({ error: 'Demasiados contactos para filtrar de esta forma' });
+
+      // Los cruces de ids, ahora en memoria.
+      if (idsRequeridos != null) { const s = new Set(idsRequeridos); univ = univ.filter(function (x) { return s.has(x.id); }); }
+      if (idsSinConversacion != null && idsSinConversacion.length) { const s = new Set(idsSinConversacion); univ = univ.filter(function (x) { return !s.has(x.id); }); }
+      if (idsExcluirScope.length) { const s = new Set(idsExcluirScope); univ = univ.filter(function (x) { return !s.has(x.id); }); }
+
+      // ORDEN. El alfabetico usa el comparador propio (ver el comentario largo mas abajo: la colacion de
+      // Postgres deja "." y los emojis en la primera pagina de la A). Los demas, por columna.
+      if (_esOrdenAlfa) {
+        const claveAlfa = function (x) {
           const s = String(x.nombre_manual || x.name || '').trim().toLowerCase()
-            .normalize('NFD').replace(/[̀-ͯ]/g, '');  // saca los acentos (combining marks)
-          return (/^[a-z0-9]/.test(s) ? '1' : '2') + s;          // '2...' = al final
+            .normalize('NFD').replace(/[̀-ͯ]/g, '');
+          return (/^[a-z0-9]/.test(s) ? '1' : '2') + s;
         };
         univ.sort(function (a, b) {
-          const ka = clave(a), kb = clave(b);
-          if (ka < kb) return _ordenAlfa === 'nombre_asc' ? -1 : 1;
-          if (ka > kb) return _ordenAlfa === 'nombre_asc' ? 1 : -1;
-          return String(a.id) < String(b.id) ? -1 : 1;           // desempate estable entre paginas
+          const ka = claveAlfa(a), kb = claveAlfa(b);
+          if (ka < kb) return _ordenPedidoTop === 'nombre_asc' ? -1 : 1;
+          if (ka > kb) return _ordenPedidoTop === 'nombre_asc' ? 1 : -1;
+          return String(a.id) < String(b.id) ? -1 : 1;
         });
-        const offAlfa = Math.max(0, parseInt(String(qp.cursor || '').replace(/^off:/, ''), 10) || 0);
-        idsOrdenAlfa = univ.slice(offAlfa, offAlfa + limit).map(function (x) { return x.id; });
-        ordenAlfaPos = {};
-        idsOrdenAlfa.forEach(function (id, i) { ordenAlfaPos[id] = i; });
-        if (!idsOrdenAlfa.length) return res.json({ ok: true, contactos: [], next_cursor: null });
+      } else if (_ordenPedidoTop === 'alta_asc' || _ordenPedidoTop === 'alta_desc') {
+        const asc = _ordenPedidoTop === 'alta_asc';
+        univ.sort(function (a, b) {
+          const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+          const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+          if (ta !== tb) return asc ? ta - tb : tb - ta;
+          return String(a.id) < String(b.id) ? -1 : 1;
+        });
+      } else {
+        // Sin orden pedido: el de siempre, por id descendente (el ultimo cargado arriba).
+        univ.sort(function (a, b) { return (dirAsc ? 1 : -1) * (String(a.id) < String(b.id) ? -1 : 1); });
       }
+
+      const offJS = Math.max(0, parseInt(String(qp.cursor || '').replace(/^off:/, ''), 10) || 0);
+      const pagina = univ.slice(offJS, offJS + limit);
+      const sigJS = (offJS + pagina.length) < univ.length ? ('off:' + (offJS + pagina.length)) : null;
+      // Se enriquece y se devuelve con la MISMA funcion que el camino normal, para no tener dos formatos.
+      return res.json(await _armarRespuestaContactos(pagina, scope, sigJS));
     }
 
-    // ---- armar la query de `contacts`, con fallback DEFENSIVO de columnas (created_at puede no existir) ----
+    // ---- CAMINO NORMAL: la base filtra, ordena y pagina (listas de ids CORTAS o sin filtro de ids) ----
     function _build(cols) {
       let q = _filtrosContacts(supabase.from('contacts').select(cols).eq('user_id', scope.ownerId));
 
-      // ORDEN DE VISTA por FECHA DE ALTA (Diego 2026-08-06). Se pagina por RANGO en vez de keyset: el
-      // keyset por created_at necesitaria cursor compuesto (fecha, id) dentro de un .or() de PostgREST.
-      // Con 1.222 contactos y paginas de 50 el rango es exacto y barato. El desempate por `id` deja el
-      // orden estable entre paginas. (El orden alfabetico NO pasa por aca: ver el bloque de arriba.)
+      // ORDEN DE VISTA por FECHA DE ALTA. Se pagina por RANGO en vez de keyset: el keyset por created_at
+      // necesitaria cursor compuesto (fecha, id) dentro de un .or() de PostgREST. El desempate por `id`
+      // deja el orden estable entre paginas. (El orden ALFABETICO nunca llega aca: se resuelve arriba.)
       const cursor = String(qp.cursor || '').trim();
       const ORDEN_COLS = { alta_asc: ['created_at', true], alta_desc: ['created_at', false] };
       const oc = ORDEN_COLS[String(qp.orden || '').trim()];
-      // `cols.indexOf` = red de contencion: si la columna no vino en el set (created_at puede no existir,
-      // ver el fallback de abajo), se cae al orden por id en vez de tirar un 500.
+      // `cols.indexOf` = red de contencion: si la columna no vino en el set (ver el fallback a BASE), se
+      // cae al orden por id en vez de tirar un 500.
       if (oc && cols.indexOf(oc[0]) >= 0) {
         const off = Math.max(0, parseInt(cursor.replace(/^off:/, ''), 10) || 0);
         return q.order(oc[0], { ascending: oc[1], nullsFirst: false }).order('id', { ascending: true }).range(off, off + limit - 1);
       }
-
-      // ORDEN ALFABETICO: se resuelve ANTES de llegar aca (idsOrdenAlfa). Cuando viene esa lista, esta
-      // query solo tiene que traer ESA pagina de ids -- el orden final lo pone el JS de abajo.
-      if (idsOrdenAlfa != null) return q.in('id', idsOrdenAlfa).limit(limit);
 
       // KEYSET real por `id` (nunca offset — GOTCHA de arriba).
       if (cursor) q = dirAsc ? q.gt('id', cursor) : q.lt('id', cursor);
@@ -30340,67 +30369,63 @@ app.get('/api/contactos', async function (req, res) {
     if (r.error && _esColumnaAusente(r.error)) r = await _build(CONTACTOS_COLS_BASE);
     if (r.error) return res.status(500).json({ error: r.error.message });
 
-    let contactos = r.data || [];
-    // Con orden alfabetico la base devuelve las filas del .in('id', ...) en SU orden, no en el mio: hay que
-    // reordenarlas con las posiciones calculadas arriba. Sin esto la pagina sale desordenada.
-    if (ordenAlfaPos) {
-      contactos = contactos.slice().sort(function (a, b) {
-        const pa = ordenAlfaPos[a.id], pb = ordenAlfaPos[b.id];
-        return (pa == null ? 1e9 : pa) - (pb == null ? 1e9 : pb);
-      });
-    }
-    const pageIds = contactos.map(function (c) { return c.id; });
+    const contactos = r.data || [];
 
     // ---- enriquecer SOLO la pagina actual (acotada a `limit`, nunca toda la tabla) con su conversacion ----
-    let convPorContacto = {};
-    if (pageIds.length) {
-      const rc = await supabase.from('conversations').select('id, contact_id, status, asesor_id, temperatura, updated_at')
-        .eq('user_id', scope.ownerId).in('contact_id', pageIds);
-      if (!rc.error) (rc.data || []).forEach(function (c) { convPorContacto[c.contact_id] = c; });
-    }
-    const asesorIds = Array.from(new Set(Object.keys(convPorContacto).map(function (k) { return convPorContacto[k].asesor_id; }).filter(Boolean)));
-    let nombreAsesor = {};
-    if (asesorIds.length) {
-      const ra = await supabase.from('asesores').select('id, nombre').in('id', asesorIds);
-      (ra.data || []).forEach(function (a) { nombreAsesor[a.id] = a.nombre; });
-    }
-
-    const filas = contactos.map(function (c) {
-      const conv = convPorContacto[c.id] || null;
-      return {
-        id: c.id,
-        nombre: c.nombre_manual || c.name || null,
-        telefono: c.phone || null,
-        interes: c.interest || null,
-        presupuesto: c.budget || null,
-        origen: c.channel || null,
-        fecha_alta: (Object.prototype.hasOwnProperty.call(c, 'created_at') ? c.created_at : null),
-        conversation_id: conv ? conv.id : null,
-        estado_conversacion: conv ? conv.status : null,
-        temperatura: conv ? conv.temperatura : null,
-        asesor_id: conv ? conv.asesor_id : null,
-        asesor_nombre: (conv && conv.asesor_id) ? (nombreAsesor[conv.asesor_id] || null) : null
-      };
-    });
-
     let next_cursor = null;
     if (contactos.length === limit) {
-      // Con orden de vista el cursor es el OFFSET siguiente ('off:N'); sin orden, el id de la ultima fila
-      // (keyset de siempre). El front no interpreta el cursor: lo devuelve tal cual.
-      // OJO: para el alfabetico se mira `ordenAlfaPos`, NO lo que pidio el front. Si la cuenta paso el tope
-      // ALFA_MAX, el orden cayo al keyset por id y el cursor TIENE que ser un id: devolver 'off:N' ahi haria
-      // que la pagina siguiente pidiera `id < "off:50"`.
+      // Con orden por fecha de alta el cursor es el OFFSET siguiente ('off:N'); sin orden, el id de la
+      // ultima fila (keyset de siempre). El front no interpreta el cursor: lo devuelve tal cual.
       const _ordenPedido = String(qp.orden || '').trim();
-      if (ordenAlfaPos || _ordenPedido === 'alta_asc' || _ordenPedido === 'alta_desc') {
+      if (_ordenPedido === 'alta_asc' || _ordenPedido === 'alta_desc') {
         const _off = Math.max(0, parseInt(String(qp.cursor || '').replace(/^off:/, ''), 10) || 0);
         next_cursor = 'off:' + (_off + contactos.length);
       } else {
         next_cursor = contactos[contactos.length - 1].id;
       }
     }
-    return res.json({ ok: true, contactos: filas, next_cursor: next_cursor });
+    return res.json(await _armarRespuestaContactos(contactos, scope, next_cursor));
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
+
+// Enriquece UNA PAGINA de contactos con su conversacion y el nombre del asesor, y arma la respuesta.
+// UNA sola funcion para los DOS caminos del listado (el que filtra en la base y el que cruza ids en JS):
+// si cada camino armara su propia respuesta, cualquier campo nuevo habria que agregarlo en dos lados y
+// tarde o temprano uno queda distinto del otro.
+// Se enriquece SOLO la pagina (acotada a `limit`), nunca toda la tabla.
+async function _armarRespuestaContactos(contactos, scope, next_cursor) {
+  const pageIds = (contactos || []).map(function (c) { return c.id; });
+  let convPorContacto = {};
+  if (pageIds.length) {
+    const rc = await supabase.from('conversations').select('id, contact_id, status, asesor_id, temperatura, updated_at')
+      .eq('user_id', scope.ownerId).in('contact_id', pageIds);
+    if (!rc.error) (rc.data || []).forEach(function (c) { convPorContacto[c.contact_id] = c; });
+  }
+  const asesorIds = Array.from(new Set(Object.keys(convPorContacto).map(function (k) { return convPorContacto[k].asesor_id; }).filter(Boolean)));
+  let nombreAsesor = {};
+  if (asesorIds.length) {
+    const ra = await supabase.from('asesores').select('id, nombre').in('id', asesorIds);
+    (ra.data || []).forEach(function (a) { nombreAsesor[a.id] = a.nombre; });
+  }
+  const filas = (contactos || []).map(function (c) {
+    const conv = convPorContacto[c.id] || null;
+    return {
+      id: c.id,
+      nombre: c.nombre_manual || c.name || null,
+      telefono: c.phone || null,
+      interes: c.interest || null,
+      presupuesto: c.budget || null,
+      origen: c.channel || null,
+      fecha_alta: (Object.prototype.hasOwnProperty.call(c, 'created_at') ? c.created_at : null),
+      conversation_id: conv ? conv.id : null,
+      estado_conversacion: conv ? conv.status : null,
+      temperatura: conv ? conv.temperatura : null,
+      asesor_id: conv ? conv.asesor_id : null,
+      asesor_nombre: (conv && conv.asesor_id) ? (nombreAsesor[conv.asesor_id] || null) : null
+    };
+  });
+  return { ok: true, contactos: filas, next_cursor: next_cursor || null };
+}
 
 // GET /api/contactos/contadores — chips (total, con conversacion, sin conversacion), recortados por el MISMO
 // scope que el listado. count con head:true no tiene el tope de 1000 filas (no trae filas).

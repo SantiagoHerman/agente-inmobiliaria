@@ -9744,6 +9744,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // y guardamos la version en idioma base como content_original para que el asesor la lea (mismo criterio que el envio manual).
   let replyCliente = reply; // lo que efectivamente se le envia al cliente por WhatsApp
   let idiomaAi = null;
+  // id de la fila de `messages` donde queda guardada esta respuesta. Se devuelve al caller para que se lo
+  // pase a enviarWhatsapp() y ahi se guarde el wa_message_id (= el segundo tilde). Null si no se pudo leer.
+  let _msgIdAi = null;
   if (conversation_id && !modoPrueba) {
     try {
       const { data: convTrad } = await supabase.from('conversations').select('traductor_activo, idioma_lead').eq('id', conversation_id).maybeSingle();
@@ -9756,9 +9759,24 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // PARTE B (punto 4 anti-delate): si cubre un usuario IA, firmamos el mensaje con SU NOMBRE HUMANO en enviado_por
     // (lo que ve el equipo en el CRM), nunca "Agente IA". role sigue siendo 'ai' (no cambia pausa ni contador).
     const _enviadoPor = (agenteConfig && agenteConfig.nombre) ? agenteConfig.nombre : 'Agente IA';
-    await supabase.from('messages').insert([
-      { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: _enviadoPor }
-    ]);
+    // Se pide el `id` de la fila insertada para poder devolverlo al caller: es lo que le permite pasarlo a
+    // enviarWhatsapp() y que ahi se guarde el `wa_message_id`. Sin eso, el webhook de acks no tiene por
+    // donde encontrar el mensaje y TODO lo que manda la IA (descripciones, links) se queda en UN tilde.
+    // Defensivo: si el .select() fallara, se reintenta el insert pelado (lo importante es guardar el
+    // mensaje; el tilde es secundario).
+    try {
+      const _insAi = await supabase.from('messages').insert([
+        { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: _enviadoPor }
+      ]).select('id').single();
+      if (!_insAi.error && _insAi.data && _insAi.data.id) _msgIdAi = _insAi.data.id;
+      else if (_insAi.error) throw _insAi.error;
+    } catch (eInsAi) {
+      try {
+        await supabase.from('messages').insert([
+          { conversation_id: conversation_id, user_id: user_id, role: 'ai', content: replyCliente, content_original: (idiomaAi ? reply : null), idioma: idiomaAi, enviado_por: _enviadoPor }
+        ]);
+      } catch (eInsAi2) { console.error('insert mensaje IA:', eInsAi2 && eInsAi2.message); }
+    }
     await _updConvMensaje({ last_message: replyCliente, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conversation_id); });
     // E3: marcar la 1a respuesta (IA) para la metrica "tiempo de 1a respuesta". Fire-and-forget, 0 IA, defensivo.
     _marcarPrimeraRespuesta(conversation_id).catch(function(){});
@@ -9779,7 +9797,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       ? completion.content.filter(function(b){ return b && b.type === 'tool_use' && b.name; }).map(function(b){ return String(b.name); })
       : [];
   } catch (eTU) { _toolsUsadas = []; }
-  return { reply: reply, replyCliente: replyCliente, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada, toolsUsadas: _toolsUsadas, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
+  return { reply: reply, replyCliente: replyCliente, msgId: _msgIdAi, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada, toolsUsadas: _toolsUsadas, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -12554,7 +12572,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           }
           const resultado = await generarRespuestaAgente(user_id, _convId, texto, _opcGen || undefined, _turnoId);
           if (resultado && resultado.reply) {
-            await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply);
+            // 4o parametro = el id de la fila donde generarRespuestaAgente() guardo esta respuesta. Con eso
+            // enviarWhatsapp() escribe el `wa_message_id`, que es lo que le permite al webhook de acks
+            // pintar el segundo tilde. Sin esto TODO lo que manda la IA (descripciones, links) se quedaba
+            // en UN tilde para siempre. OJO: si la respuesta se parte en varios mensajes de WhatsApp, se
+            // guarda el id del PRIMERO -- el tilde refleja esa primera parte.
+            await enviarWhatsapp(instanciaNombre, telefono, resultado.replyCliente || resultado.reply, resultado.msgId || null);
             // MEDIDOR: etiqueta 'respuesta_agente' (antes null) + atribucion al lead y al turno. PRECIO_IA es el
             // MISMO default que usaba esta llamada, asi que el costo registrado no cambia ni un centavo.
             try { await registrarUsoTokens(user_id, resultado.usage, 'respuesta_agente', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
@@ -41689,6 +41712,12 @@ async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil,
           const _txt = resultado.replyCliente || resultado.reply;
           const _env = await enviarTextoCloud(tenantUserId, telefono, _txt);
           if (!_env.ok) console.error('[cloud-api] no se pudo enviar la respuesta:', _env.error);
+          // Guardar el wamid de Meta en la fila que ya persistio generarRespuestaAgente(): es lo que deja
+          // que el webhook de `statuses` pinte el segundo tilde. Best-effort: si falla, queda un tilde
+          // (el comportamiento anterior), nunca se pierde el mensaje.
+          if (_env.ok && _env.id && resultado.msgId) {
+            try { await supabase.from('messages').update({ wa_message_id: _env.id }).eq('id', resultado.msgId); } catch (eWid) {}
+          }
           // MEDIDOR: etiqueta 'respuesta_agente_cloud' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
           try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_cloud', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
           // FUGA (Diego 2026-07-24): igual que WhatsApp (~10222), cobrar los EXTRAS con cobrar_todo_v2 ON: +1 si tradujo,

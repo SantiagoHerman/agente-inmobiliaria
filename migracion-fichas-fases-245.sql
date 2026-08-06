@@ -32,13 +32,12 @@ alter table public.business_settings
 alter table public.business_settings
   add column if not exists fichas_ia_v1 boolean default false;
 
--- fichas_ia_matchea: DECISION PENDIENTE DE DIEGO. ¿Una ficha propuesta por la IA y todavia SIN
--- CONFIRMAR entra al matcheo?
---   * Si  -> el sistema funciona desde el dia uno sin que nadie cargue nada, pero con datos que
---            nadie miro todavia.
---   * No  -> sigue vacio igual, solo que ahora con una lista de tareas.
--- Se deja en OFF (no entra) hasta que Diego decida. Cuando decida, es prender ESTA columna, no
--- tocar codigo. La coincidencia ya muestra "ficha propuesta por la IA, sin confirmar".
+-- fichas_ia_matchea: DECIDIDO POR DIEGO (2026-08-05, decision 1): la ficha que propone la IA y que
+-- nadie confirmo todavia NO ENTRA AL MATCHEO. Se muestra en el chat y en el contacto con su origen a
+-- la vista y se confirma de un toque; recien AHI entra. El motivo es que una coincidencia armada
+-- sobre un dato que nadie miro se le presenta al asesor como si fuera un hecho.
+-- La columna se DEJA porque es la marcha atras: si algun dia se quiere probar lo contrario en UNA
+-- cuenta, es prender esta columna y no tocar codigo. Default false = la decision de Diego.
 alter table public.business_settings
   add column if not exists fichas_ia_matchea boolean default false;
 
@@ -47,6 +46,23 @@ alter table public.business_settings
 -- NO le llega nada al cliente final. CERO IA.
 alter table public.business_settings
   add column if not exists fichas_avisos_v1 boolean default false;
+
+-- fichas_chat_v1: el boton "Crear ficha" DENTRO de la conversacion (el formulario precargado con lo
+-- que la IA ya venia leyendo del chat).
+-- POR QUE UN FLAG PROPIO Y NO `fichas_v1`: `fichas_v1` ya esta en TRUE en las 6 cuentas vivas desde
+-- el 2026-08-04 (habilita el panel de Fichas dentro del contacto). Colgar el boton nuevo de esa
+-- misma columna lo prendio de golpe en las 6 cuentas sin que nadie lo decidiera, que es justo lo que
+-- la revision marco. Con esta columna en false el chat queda EXACTAMENTE como el 2026-08-04.
+alter table public.business_settings
+  add column if not exists fichas_chat_v1 boolean default false;
+
+-- fichas_historial_v1: el boton "Ver cambios" (el registro de cambios de la ficha).
+-- FLAG SEPARADO de fichas_chat_v1 A PROPOSITO, no por prolijidad: "Ver cambios" LEE la tabla
+-- `fichas_historial`, que se crea mas abajo en ESTE archivo y todavia no existe. Si compartiera flag
+-- con "Crear ficha" (que anda con el esquema de hoy), prender el boton del chat en una cuenta donde
+-- la migracion no corrio dibujaria ademas un boton que solo puede contestar "todavia no hay cambios".
+alter table public.business_settings
+  add column if not exists fichas_historial_v1 boolean default false;
 
 
 -- ----------------------------------------------------------------------------
@@ -100,6 +116,34 @@ create index if not exists fichas_hasta_idx
 -- upsert que usa la IA para respetar "una intencion = UNA ficha".
 create index if not exists fichas_contacto_tipo_estado_idx
   on public.fichas (user_id, contact_id, tipo, estado);
+
+-- ----------------------------------------------------------------------------
+-- CANDADO CONTRA LA CARRERA DE LA IA (arreglo #2 de la revision adversarial)
+-- ----------------------------------------------------------------------------
+-- LA CARRERA: `_fichaPropuestaPorIA` hace "leo si hay ficha activa de este tipo -> si no hay, la
+-- inserto". Entre el SELECT y el INSERT no hay nada. Si el lead manda dos mensajes seguidos, los dos
+-- webhooks leen "no hay ficha" al mismo tiempo y los dos insertan: quedan DOS fichas de la misma
+-- intencion, que es exactamente el problema de duplicados que la ficha vino a resolver.
+--
+-- POR QUE ESTE INDICE Y NO UNO SOBRE (user_id, contact_id, tipo, estado) A SECAS: ese indice ancho
+-- BLOQUEARIA AL HUMANO. Diego decidio (decision 2) que los duplicados de una persona se AVISAN, no
+-- se bloquean: hay casos legitimos (el mismo cliente busca dos deptos distintos para comprar) y un
+-- error 23505 en la cara del asesor no le deja crear la ficha que necesita.
+--
+-- La solucion es acotar el UNIQUE a la franja donde SOLO vive la creacion automatica:
+--   creado_por = 'ia'  AND  confirmada = false  AND  estado = 'activa'
+-- Una ficha cargada a mano nace con creado_por='humano' y confirmada=true -> NUNCA entra al indice
+-- -> el humano no se choca con nada. Y apenas una persona confirma o edita la propuesta de la IA
+-- (confirmada pasa a true), la fila SALE del indice y deja de ocupar el lugar.
+--
+-- Se resuelve con el indice y no con un upsert idempotente a proposito: el upsert necesitaria una
+-- clave de conflicto UNICA en la base igual (on conflict pide un indice unico), asi que el indice es
+-- inevitable; y ademas el candado del indice tambien cubre a cualquier otro camino que en el futuro
+-- inserte fichas de IA sin pasar por esa funcion. El codigo trata el 23505 como "otro mensaje ya la
+-- creo": no es un error, es la carrera resuelta.
+create unique index if not exists fichas_ia_sin_confirmar_uq
+  on public.fichas (user_id, contact_id, tipo)
+  where creado_por = 'ia' and confirmada = false and estado = 'activa';
 
 
 -- ----------------------------------------------------------------------------

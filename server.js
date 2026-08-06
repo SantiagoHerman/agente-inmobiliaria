@@ -15608,6 +15608,45 @@ async function _recontactoTextosOn(uid, _cache) {
   return on;
 }
 
+// E1 (PLAN-RECONTACTO-CON-MEMORIA): flag helper AISLADO fail-closed -> recontacto_prio_charla. Sin columna /
+// error -> OFF (orden de la cola BYTE-IDENTICO al de hoy). Cacheado por cuenta y por corrida del cron.
+// Para que sirve: hoy `recontacto_categoria='viejo'` NO significa "escribio en el CRM" -- lo pone el CHECKBOX del
+// importador de CSV (ver ~23326 catBody y ~23397), asi que en Anton los 1.092 'viejo' son casi todos importados
+// que NUNCA escribieron (medido 2026-08-05: solo 148 tienen un mensaje real del lead). Como TODOS son 'viejo',
+// el desempate de la cola queda en oldest-due-first y los 148 que SI tienen algo para retomar compiten de igual
+// a igual con 944 que no -> con tope 20/dia practicamente nunca les toca y el unico camino que personaliza
+// (mensajeRecontactoIA, exige !esPrimerContacto) jamas corre. Con el flag ON van PRIMERO los que charlaron.
+async function _recontactoPrioCharlaOn(uid, _cache) {
+  if (!uid) return false;
+  if (_cache && Object.prototype.hasOwnProperty.call(_cache, uid)) return _cache[uid];
+  let on = false;
+  try {
+    const { data } = await supabase.from('business_settings').select('recontacto_prio_charla').eq('user_id', uid).maybeSingle();
+    on = !!(data && data.recontacto_prio_charla === true);
+  } catch (e) { on = false; } // fail-safe: sin columna / error -> OFF
+  if (_cache) _cache[uid] = on;
+  return on;
+}
+
+// E1: MISMO criterio que _leadCharloReal (~15655) pero para MUCHAS conversaciones de una (lotes de 100 ids), para
+// no disparar una query por conv al ordenar la cola. Devuelve un Set con los conversation_id en los que el LEAD
+// escribio de verdad (role='contact' y origen != 'historial_importado'; los importados NO cuentan).
+// FAIL-SAFE: ante cualquier error devuelve el Set VACIO -> el caller no reordena nada (orden actual exacto).
+async function _convsCharlaRealBulk(ids) {
+  const out = new Set();
+  try {
+    if (!Array.isArray(ids) || ids.length === 0) return out;
+    const LOTE = 100;
+    for (let i = 0; i < ids.length; i += LOTE) {
+      const lote = ids.slice(i, i + LOTE);
+      const { data, error } = await supabase.from('messages').select('conversation_id, origen').in('conversation_id', lote).eq('role', 'contact');
+      if (error) return new Set(); // lectura incompleta -> no reordenar con datos a medias
+      (data || []).forEach(function (m) { if (m && m.origen !== 'historial_importado' && m.conversation_id != null) out.add(m.conversation_id); });
+    }
+  } catch (e) { return new Set(); }
+  return out;
+}
+
 // *** LECTOR AISLADO de la columna jsonb recontacto_plantillas (LANDMINE F4). Se lee SOLO aca, con su propio
 // select, NUNCA junto al select compartido del motor v2 (server.js ~11022): si se cayera esa lectura por columna
 // ausente, SOLO se apaga la edicion (caemos a la fabrica), jamas el motor entero. Patron _saltoViejoDia. ***
@@ -17121,6 +17160,7 @@ async function _enviarRecontactosV2(ahoraMs) {
   const _textosFlagCacheV2 = {};   // flag recontacto_textos_v2 por cuenta
   const _plantillasCacheV2 = {};   // jsonb recontacto_plantillas por cuenta (lectura AISLADA, NO en el select del motor)
   const _maxDefCacheV2 = {};        // recontacto_max_def por cuenta (para el piso del merge)
+  const _prioCharlaCacheV2 = {};    // flag recontacto_prio_charla por cuenta (E1: priorizar a los que SI charlaron)
 
   // Cuentas con el flag ON. Si la columna no existe (migracion no corrida) -> no hay cuentas v2 -> no hace nada.
   let cuentasV2 = [];
@@ -17262,6 +17302,16 @@ async function _enviarRecontactosV2(ahoraMs) {
         return Number.isFinite(_t) ? _t : 0;
       };
       const _prioCat = function(c) { return ((c.recontacto_categoria === 'viejo') ? 0 : 1); }; // viejo antes que frio
+      // E1 (flag recontacto_prio_charla, default OFF): PRIMERO los que CHARLARON de verdad. Con el flag OFF
+      // _setCharla queda null y el comparador de abajo es BYTE-IDENTICO al de hoy (no se hace ni la query).
+      let _setCharla = null;
+      try {
+        if (await _recontactoPrioCharlaOn(uid, _prioCharlaCacheV2)) {
+          const _s = await _convsCharlaRealBulk(convs.map(function (c) { return c.id; }));
+          if (_s && _s.size > 0) _setCharla = _s; // Set vacio (error o nadie charlo) -> no reordenar
+        }
+      } catch (ePrioCh) { _setCharla = null; } // fail-safe: cualquier problema -> orden actual exacto
+      const _prioCharla = function(c) { return (_setCharla && _setCharla.has(c.id)) ? 0 : 1; }; // charlo (0) antes que nunca-escribio (1)
       // F5.1 (SOLO hotel): fecha de ingreso FUTURA -> prioridad ALTA, cuanto MAS CERCA antes se ofrece (para
       // llegar ANTES de esa fecha). Devuelve el timestamp de la fecha de ingreso si es futura; null si no aplica
       // (no-hotel, sin fecha, o fecha ya pasada -> ademas se saltea en el loop de abajo). En no-hotel devuelve
@@ -17279,6 +17329,10 @@ async function _enviarRecontactosV2(ahoraMs) {
         if (_fa !== null && _fb !== null) { if (_fa !== _fb) return _fa - _fb; }
         else if (_fa !== null) return -1;
         else if (_fb !== null) return 1;
+        // E1 (solo con el flag ON): el que YA CHARLO va antes que el importado que nunca escribio. Con el flag
+        // OFF _setCharla es null -> _prioCharla devuelve 1 para todos -> este bloque NUNCA desempata (no-op).
+        const _ca = _prioCharla(a), _cb = _prioCharla(b);
+        if (_ca !== _cb) return _ca - _cb;                // 0.5) charlo de verdad (0) antes que nunca-escribio (1)
         const _pa = _prioCat(a), _pb = _prioCat(b);
         if (_pa !== _pb) return _pa - _pb;                // 1) categoria: viejo (0) antes que frio (1)
         return _dueSinceMs(a) - _dueSinceMs(b);           // 2) oldest-due-first (menor timestamp primero)

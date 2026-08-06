@@ -30157,11 +30157,18 @@ async function _contactosDeOtroAsesor(ownerId, miAsesorId) {
   return { ok: true, ids: Array.from(new Set(r.rows.map(function (x) { return x.contact_id; }).filter(Boolean))) };
 }
 
-// Columnas EXPLICITAS de `contacts` -- confirmadas por grep sobre el uso real en este archivo (memoria del
-// lead / cargar-manual / renombrar): name, nombre_manual, phone, interest, budget, notes, channel,
-// perfil_comprador. `created_at` se PIDE pero de forma DEFENSIVA (ver CONTACTOS_COLS_BASE): no encontre un uso
-// existente que confirme que la columna existe en todas las cuentas.
-const CONTACTOS_COLS_FULL = 'id, name, nombre_manual, phone, interest, budget, notes, channel, perfil_comprador, created_at';
+// Columnas EXPLICITAS de `contacts`, VERIFICADAS contra la base (no por grep del codigo).
+// BUG QUE ESTABA ADENTRO DE ESTA CONSTANTE (encontrado 2026-08-06 al probar el select contra la base):
+// `perfil_comprador` NO EXISTE en `contacts`. Con esa columna en la lista, el select FALLABA SIEMPRE con
+// 42703 y el codigo caia al set reducido (CONTACTOS_COLS_BASE) en el 100% de los casos. Consecuencia real:
+// `created_at` nunca llegaba, o sea "Fecha de alta" venia vacia en la ficha y en el listado desde el dia uno,
+// y cualquier orden por fecha de alta era imposible. Sacada la columna fantasma, el set completo funciona
+// (probado: 16 columnas OK). El fallback a BASE queda como red de contencion, no como camino normal.
+//
+// email/documento/pais/provincia/ciudad/empresa/about = los DATOS GENERALES DEL CLIENTE (Diego 2026-08-06:
+// "el 8 con datos relevantes generales del cliente"). Las columnas YA existian en la tabla y estaban 100%
+// vacias (0 de 1.222 en Anton) porque nunca hubo pantalla para cargarlas. Cero migracion.
+const CONTACTOS_COLS_FULL = 'id, name, nombre_manual, phone, interest, budget, notes, channel, created_at, email, documento, pais, provincia, ciudad, empresa, about';
 // BASE = SOLO columnas confirmadas en la tabla. FIX 2026-08-03: antes esta lista tambien traia
 // `perfil_comprador`, que NO existe en `contacts` (verificado en la base: es la unica de las 10 que falta).
 // Como estaba en las DOS listas, el fallback no degradaba nada -- fallaban las dos y el listado devolvia 500
@@ -30506,6 +30513,17 @@ app.get('/api/contactos/uno', async function (req, res) {
         nota: contacto.notes || null,
         origen: contacto.channel || null,
         perfil_comprador: contacto.perfil_comprador || null,
+        // DATOS GENERALES DEL CLIENTE. `hasOwnProperty` y no `|| null` a secas: si la fila vino con el set
+        // de columnas reducido (CONTACTOS_COLS_BASE, el fallback de arriba) estos campos NO estan, y
+        // devolverlos como null haria creer al front que estan vacios cuando en realidad no se leyeron.
+        email: (Object.prototype.hasOwnProperty.call(contacto, 'email') ? (contacto.email || null) : null),
+        documento: (Object.prototype.hasOwnProperty.call(contacto, 'documento') ? (contacto.documento || null) : null),
+        pais: (Object.prototype.hasOwnProperty.call(contacto, 'pais') ? (contacto.pais || null) : null),
+        provincia: (Object.prototype.hasOwnProperty.call(contacto, 'provincia') ? (contacto.provincia || null) : null),
+        ciudad: (Object.prototype.hasOwnProperty.call(contacto, 'ciudad') ? (contacto.ciudad || null) : null),
+        empresa: (Object.prototype.hasOwnProperty.call(contacto, 'empresa') ? (contacto.empresa || null) : null),
+        // `about` es el texto de "info" que trae WhatsApp: se muestra, NO se edita (lo escribe el lead).
+        about: (Object.prototype.hasOwnProperty.call(contacto, 'about') ? (contacto.about || null) : null),
         fecha_alta: (Object.prototype.hasOwnProperty.call(contacto, 'created_at') ? contacto.created_at : null)
       },
       conversacion: conv,
@@ -30628,6 +30646,17 @@ app.patch('/api/contactos/:id', async function (req, res) {
     if (Object.prototype.hasOwnProperty.call(cambios, 'interes')) upd.interest = String(cambios.interes == null ? '' : cambios.interes).slice(0, 500);
     if (Object.prototype.hasOwnProperty.call(cambios, 'presupuesto')) upd.budget = String(cambios.presupuesto == null ? '' : cambios.presupuesto).slice(0, 300);
     if (Object.prototype.hasOwnProperty.call(cambios, 'nota')) upd.notes = String(cambios.nota == null ? '' : cambios.nota).slice(0, 10000);
+    // DATOS GENERALES DEL CLIENTE (Diego 2026-08-06: "el 8 con datos relevantes generales del cliente y
+    // las fichas que sean por intereses"). Las columnas ya EXISTEN en `contacts` y estan 100% vacias
+    // (medido en Anton: 0 de 1.222 en email/documento/pais/provincia/ciudad/empresa) simplemente porque
+    // nunca hubo pantalla para cargarlas. Cero migracion.
+    // Un string vacio se guarda como NULL y no como '': asi los filtros `is null` siguen contando bien.
+    const _GENERALES = { email: 200, documento: 60, pais: 80, provincia: 80, ciudad: 120, empresa: 160 };
+    Object.keys(_GENERALES).forEach(function (campo) {
+      if (!Object.prototype.hasOwnProperty.call(cambios, campo)) return;
+      const v = String(cambios[campo] == null ? '' : cambios[campo]).trim().slice(0, _GENERALES[campo]);
+      upd[campo] = v === '' ? null : v;
+    });
     if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nada para actualizar' });
 
     const updR = await supabase.from('contacts').update(upd).eq('id', contactId).eq('user_id', scope.ownerId);

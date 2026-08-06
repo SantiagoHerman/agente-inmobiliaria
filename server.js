@@ -5868,8 +5868,22 @@ async function enviarWhatsappMedia(instancia, numero, mediaUrl, tipo, caption) {
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
       body: JSON.stringify(bodyFinal)
     });
-    return resp.ok;
-  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return false; }
+    // BUG DE LAS TILDES EN LAS FOTOS (Diego 2026-08-06: "cuando se envia una foto solo recibe un tilde
+    // y no 2"). Esta funcion devolvia SOLO `resp.ok` y TIRABA A LA BASURA el cuerpo de la respuesta, donde
+    // viene `key.id` = el id del mensaje en WhatsApp. Las tildes ✓✓ las pinta el webhook `messages.update`,
+    // que BUSCA el mensaje por `wa_message_id`: sin ese id guardado, el ack no encuentra la fila, nunca se
+    // escribe `estado_entrega`, y la foto se queda en un tilde para siempre. El texto y la ubicacion si lo
+    // guardan (ver ~13166) -- era solo el camino de media.
+    // Se devuelve un OBJETO, no un booleano. Los llamadores viejos hacian `if (ok)`: un objeto siempre es
+    // truthy, asi que igual habria que tocarlos -- se tocan abajo. `id` puede venir null (Evolution no
+    // siempre lo devuelve) y en ese caso el comportamiento es el de antes: un tilde. No se rompe nada.
+    let _idWa = null;
+    try {
+      const _j = await resp.json();
+      _idWa = (_j && _j.key && _j.key.id) ? String(_j.key.id) : ((_j && _j.id) ? String(_j.id) : null);
+    } catch (eJson) { /* respuesta sin JSON: queda sin id, como antes */ }
+    return { ok: resp.ok, id: _idWa };
+  } catch (e) { console.error('enviarWhatsappMedia error:', e && e.message); return { ok: false, id: null }; }
 }
 
 // ============================================================================
@@ -6455,8 +6469,10 @@ async function enviarSoporteWhatsapp(opts) {
       try { conectada = await instanciaConectada(SOPORTE_WA_INSTANCE); } catch (eC) { conectada = false; }
       if (conectada) {
         if (opts && opts.imagen_url) {
+          // `.ok`: enviarWhatsappMedia ahora devuelve { ok, id }. Sin el `.ok` esto seria `if (objeto)`,
+          // siempre verdadero, y un envio FALLIDO se reportaria como enviado por WhatsApp.
           var okMedia = await enviarWhatsappMedia(SOPORTE_WA_INSTANCE, telefono, opts.imagen_url, 'imagen', texto);
-          if (okMedia) return 'whatsapp';
+          if (okMedia && okMedia.ok) return 'whatsapp';
         }
         var resp = await fetch(EVOLUTION_URL + '/message/sendText/' + SOPORTE_WA_INSTANCE, {
           method: 'POST',
@@ -6546,8 +6562,19 @@ app.post('/api/enviar-media', async (req, res) => {
     // Responder YA: el mensaje quedo guardado. El envio a WhatsApp sigue en segundo plano.
     res.json({ ok: true });
     // Envio a Evolution en segundo plano (no bloquea la respuesta)
-    enviarWhatsappMedia(instanciaNombre, contacto.phone, media_url, media_tipo, caption).then(function(ok){
-      if (msgIns && msgIns.id) { supabase.from('messages').update({ estado_envio: ok ? 'enviado' : 'fallido' }).eq('id', msgIns.id).then(function(){}, function(){}); }
+    // Se guarda `wa_message_id` junto con el estado: es lo que le permite al webhook `messages.update`
+    // encontrar esta fila y pintar el segundo tilde. Sin eso la foto quedaba en un tilde para siempre
+    // (mismo patron que ya usaba el envio de texto/ubicacion, ver ~13166).
+    enviarWhatsappMedia(instanciaNombre, contacto.phone, media_url, media_tipo, caption).then(function(r){
+      const _ok = !!(r && r.ok);
+      if (msgIns && msgIns.id) {
+        const _upd = Object.assign({ estado_envio: _ok ? 'enviado' : 'fallido' }, (_ok && r && r.id) ? { wa_message_id: r.id } : {});
+        supabase.from('messages').update(_upd).eq('id', msgIns.id).then(function(){}, function(){
+          // Reintento SIN wa_message_id: si esa columna faltara en alguna base, el estado igual tiene que
+          // quedar guardado (si no, el mensaje se ve "enviando" para siempre).
+          supabase.from('messages').update({ estado_envio: _ok ? 'enviado' : 'fallido' }).eq('id', msgIns.id).then(function(){}, function(){});
+        });
+      }
     }, function(err){ console.error('envio media bg:', err && err.message); if (msgIns && msgIns.id) { supabase.from('messages').update({ estado_envio: 'fallido' }).eq('id', msgIns.id).then(function(){}, function(){}); } });
   } catch (e) { console.error('enviar-media error:', e && e.message); if (!res.headersSent) return res.status(500).json({ error: e && e.message }); }
 });
@@ -12544,10 +12571,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               for (let _i = 0; _i < _media.length; _i++) {
                 const _m = _media[_i];
                 if (_m && _m.url) {
-                  try { await enviarWhatsappMedia(instanciaNombre, telefono, _m.url, 'imagen', _m.caption || ''); }
+                  let _idFoto = null;
+                  try { const _rF = await enviarWhatsappMedia(instanciaNombre, telefono, _m.url, 'imagen', _m.caption || ''); if (_rF && _rF.ok && _rF.id) _idFoto = _rF.id; }
                   catch (eM1) { console.error('envio foto propiedad:', eM1 && eM1.message); }
                   // Guardar la foto como mensaje para que TAMBIEN se vea en el chat de la app (no solo en WhatsApp). NO gasta IA.
-                  try { await supabase.from('messages').insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: _m.caption || '', media_url: _m.url, media_tipo: 'imagen', enviado_por: 'Agente IA' }); }
+                  // Con `wa_message_id` las fotos que manda la IA tambien reciben el segundo tilde (antes, igual
+                  // que las del asesor, se quedaban en uno porque el ack no tenia por donde encontrarlas).
+                  try { await supabase.from('messages').insert(Object.assign({ conversation_id: _convId, user_id: user_id, role: 'ai', content: _m.caption || '', media_url: _m.url, media_tipo: 'imagen', enviado_por: 'Agente IA' }, _idFoto ? { wa_message_id: _idFoto } : {})); }
                   catch (eM2) { console.error('guardar foto IA en chat:', eM2 && eM2.message); }
                 }
               }
@@ -17620,7 +17650,9 @@ async function procesarOportunidades() {
           // Enviar (CON MEDIA si corresponde). Defensivo: un fallo de envio no rompe la tanda.
           let ok = false;
           try {
-            if (mediaUrl) { ok = await enviarWhatsappMedia(instancia, contacto.phone, mediaUrl, mediaTipo, textoFinal || undefined); }
+            // `.ok`: enviarWhatsappMedia devuelve { ok, id }. Sin el `.ok`, `ok` seria un objeto (siempre
+            // truthy) y un recontacto que FALLO se contaria como enviado -- gastando un intento del tope.
+            if (mediaUrl) { const _rMed = await enviarWhatsappMedia(instancia, contacto.phone, mediaUrl, mediaTipo, textoFinal || undefined); ok = !!(_rMed && _rMed.ok); }
             else if (textoFinal) { ok = await enviarWhatsapp(instancia, contacto.phone, textoFinal, null); }
             else { ok = false; } // sin cuerpo ni media -> nada que mandar
           } catch (eSend) { ok = false; }

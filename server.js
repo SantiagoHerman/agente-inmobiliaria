@@ -6337,14 +6337,19 @@ function _waVerificadoOk(instancia, soloDigitos) {
   return !!(c && c.existe === true);
 }
 
-// Gate de la feature. MISMO patron defensivo que contactosV1Activo (~29650): columna ausente / error -> false.
+// Gate de la feature. FAIL-OPEN (Diego 2026-08-06, REGLA DE ORO: "si aplico cambios en todas las cuentas es
+// si o si para las cuentas futuras"). Antes era `=== true`: una cuenta nueva nacia SIN esto y habia que
+// acordarse de prenderla a mano. Ahora:
+//   columna ausente / error de lectura / NULL / fila inexistente -> PRENDIDO
+//   `false` explicito                                            -> apagado (el UNICO caso apagado)
+// La perilla sigue siendo un UPDATE de una linea, sin desplegar.
 async function importacionVerificadaActiva(ownerId) {
   try {
-    if (!ownerId) return false;
+    if (!ownerId) return false;   // sin cuenta resuelta no se decide nada (esto si es fail-closed)
     const { data, error } = await supabase.from('business_settings').select('importacion_verificada_v1').eq('user_id', ownerId).maybeSingle();
-    if (error) return false;
-    return !!(data && data.importacion_verificada_v1 === true);
-  } catch (e) { return false; }
+    if (error) return true;
+    return !(data && data.importacion_verificada_v1 === false);
+  } catch (e) { return true; }
 }
 
 // ===== SOPORTE: subir una imagen (data URL base64) al bucket 'media', carpeta soporte/ =====
@@ -30239,13 +30244,15 @@ async function cierreNegativoActivo(ownerId) {
   } catch (e) { return true; }
 }
 
+// FAIL-OPEN por la REGLA DE ORO (ver importacionVerificadaActiva). Una cuenta nueva nace CON la pantalla
+// de Contactos; solo un `false` explicito la apaga. Sigue siendo la MISMA perilla por SQL.
 async function contactosV1Activo(ownerId) {
   try {
-    if (!ownerId) return false;
+    if (!ownerId) return false;   // sin cuenta resuelta no se decide nada
     const { data, error } = await supabase.from('business_settings').select('contactos_v1').eq('user_id', ownerId).maybeSingle();
-    if (error) return false; // columna ausente u otro error -> comportamiento actual (flag OFF)
-    return !!(data && data.contactos_v1 === true);
-  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+    if (error) return true;
+    return !(data && data.contactos_v1 === false);
+  } catch (e) { return true; }
 }
 
 // Pagina TODA una consulta en tandas de 1000 (NUNCA offset — GOTCHA de arriba: PostgREST corta en 1000 pase lo
@@ -35749,17 +35756,17 @@ app.get('/api/ui-flags', async function(req, res){
     // contactos_v1 (Diego 2026-08-02): gate del menu/pantalla nueva Contactos (listado+ficha+import/alta manual).
     // Query SEPARADA y defensiva: columna ausente / error -> false = el menu NO aparece, BYTE-IDENTICO a hoy.
     // migracion-contactos-v1.sql escrita y SIN CORRER. 0 tokens de IA: son consultas a la base, ninguna llama a un modelo.
-    var contactos_v1 = false;
+    var contactos_v1 = true;   // FAIL-OPEN (regla de oro): si la lectura falla, queda PRENDIDO
     try {
       var _ctv = await supabase.from('business_settings').select('contactos_v1').eq('user_id', user_id).maybeSingle();
-      if (_ctv && _ctv.data) contactos_v1 = _ctv.data.contactos_v1 === true;
+      if (_ctv && _ctv.data) contactos_v1 = _ctv.data.contactos_v1 !== false;
     } catch (e) { /* columna ausente / error -> false */ }
     // fichas_v1 (Diego 2026-08-04): gate del PANEL de Fichas del cliente dentro de la ficha del contacto.
     // Query SEPARADA y defensiva para que, si la columna faltara, NO tire abajo los flags de arriba.
-    var fichas_v1 = false;
+    var fichas_v1 = true;      // FAIL-OPEN (regla de oro)
     try {
       var _fv = await supabase.from('business_settings').select('fichas_v1').eq('user_id', user_id).maybeSingle();
-      if (_fv && _fv.data) fichas_v1 = _fv.data.fichas_v1 === true;
+      if (_fv && _fv.data) fichas_v1 = _fv.data.fichas_v1 !== false;
     } catch (e) { /* columna ausente / error -> false */ }
     // FICHAS FASES 2/4/5 (Diego 2026-08-05). Query SEPARADA de la de fichas_v1 y con LISTA EXPLICITA
     // de columnas: si `migracion-fichas-fases-245.sql` todavia no corrio, esta query falla ENTERA y
@@ -35768,13 +35775,13 @@ app.get('/api/ui-flags', async function(req, res){
     //   fichas_ia_v1      -> la IA propone la ficha (se muestra el origen "propuesta por la IA")
     //   fichas_avisos_v1  -> avisos por vencimiento (no cambia nada en el front, se expone para la config)
     // fichas_ia_matchea NO se expone: es una decision de matcheo del servidor, el front no la usa.
-    var coincidencias_v1 = false, fichas_ia_v1 = false, fichas_avisos_v1 = false;
+    var coincidencias_v1 = true, fichas_ia_v1 = true, fichas_avisos_v1 = true;   // FAIL-OPEN (regla de oro)
     try {
       var _ff = await supabase.from('business_settings').select('coincidencias_v1, fichas_ia_v1, fichas_avisos_v1').eq('user_id', user_id).maybeSingle();
       if (_ff && !_ff.error && _ff.data) {
-        coincidencias_v1 = _ff.data.coincidencias_v1 === true;
-        fichas_ia_v1 = _ff.data.fichas_ia_v1 === true;
-        fichas_avisos_v1 = _ff.data.fichas_avisos_v1 === true;
+        coincidencias_v1 = _ff.data.coincidencias_v1 !== false;   // FAIL-OPEN (regla de oro): NULL = prendido
+        fichas_ia_v1 = _ff.data.fichas_ia_v1 !== false;           // FAIL-OPEN. Costo IA CERO (reusa la extraccion ya hecha)
+        fichas_avisos_v1 = _ff.data.fichas_avisos_v1 !== false;   // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los tres en false */ }
     // ARREGLO #3 DE LA REVISION ADVERSARIAL (Diego 2026-08-05). Los botones "Crear ficha" (dentro de
@@ -35786,12 +35793,12 @@ app.get('/api/ui-flags', async function(req, res){
     // fichas_v1 ni a los flags de arriba, que estan en sus propias queries.
     //   fichas_chat_v1       -> el boton "Crear ficha" del chat + el overlay <FichaDesdeChat>
     //   fichas_historial_v1  -> el boton "Ver cambios" (lee la tabla fichas_historial)
-    var fichas_chat_v1 = false, fichas_historial_v1 = false;
+    var fichas_chat_v1 = true, fichas_historial_v1 = true;   // FAIL-OPEN (regla de oro)
     try {
       var _fc = await supabase.from('business_settings').select('fichas_chat_v1, fichas_historial_v1').eq('user_id', user_id).maybeSingle();
       if (_fc && !_fc.error && _fc.data) {
-        fichas_chat_v1 = _fc.data.fichas_chat_v1 === true;
-        fichas_historial_v1 = _fc.data.fichas_historial_v1 === true;
+        fichas_chat_v1 = _fc.data.fichas_chat_v1 !== false;       // FAIL-OPEN
+        fichas_historial_v1 = _fc.data.fichas_historial_v1 !== false; // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
     // IMPORTACION VERIFICADA (Diego 2026-08-06). Query SEPARADA y con LISTA EXPLICITA de columnas: si
@@ -35803,16 +35810,20 @@ app.get('/api/ui-flags', async function(req, res){
     //   chat_desde_ficha_v1       -> el boton unico "Crear chat" / "Abrir chat" en la ficha del contacto
     // Son DOS flags separados a proposito: el boton de la ficha no tiene nada que ver con el importador y se
     // puede prender solo (o al reves) sin arrastrar al otro.
-    var importacion_verificada_v1 = false, chat_desde_ficha_v1 = false;
+    var importacion_verificada_v1 = true, chat_desde_ficha_v1 = true;   // FAIL-OPEN (regla de oro)
     try {
       var _iv = await supabase.from('business_settings').select('importacion_verificada_v1, chat_desde_ficha_v1').eq('user_id', user_id).maybeSingle();
       if (_iv && !_iv.error && _iv.data) {
-        importacion_verificada_v1 = _iv.data.importacion_verificada_v1 === true;
-        chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 === true;
+        importacion_verificada_v1 = _iv.data.importacion_verificada_v1 !== false; // FAIL-OPEN
+        chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 !== false; // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
     return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, fichas_v1: false, coincidencias_v1: false, fichas_ia_v1: false, fichas_avisos_v1: false, fichas_chat_v1: false, fichas_historial_v1: false, importacion_verificada_v1: false, chat_desde_ficha_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+  // ULTIMO RECURSO: si TODO el endpoint explota. Los flags de Contactos/Fichas van en true por la REGLA DE
+  // ORO (una cuenta nueva nace con todo puesto, y un error de lectura no tiene que apagarle la pantalla).
+  // Los otros (reservas, cloud_api, matching...) siguen en false: NO son parte de "todos los cambios" y
+  // prenderlos por un error seria activar cosas que Diego no pidio.
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: true, fichas_v1: true, coincidencias_v1: true, fichas_ia_v1: true, fichas_avisos_v1: true, fichas_chat_v1: true, fichas_historial_v1: true, importacion_verificada_v1: true, chat_desde_ficha_v1: true, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================
@@ -40133,17 +40144,16 @@ async function _duenoDelUid(uid) {
   } catch (e) { return uid; }
 }
 
-// Flag por-cuenta `fichas_v1` (mismo patron DEFENSIVO EXACTO que contactos_v1 / visibilidad_server_v1):
-// columna ausente / error / false -> OFF. Con OFF estos endpoints devuelven 409 "gated" y el panel de
-// Fichas no se dibuja: el sistema queda byte-identico a como estaba antes de esta feature.
-// Es el interruptor para apagar la pantalla en segundos SIN un deploy.
+// Flag por-cuenta `fichas_v1`. FAIL-OPEN por la REGLA DE ORO de Diego (2026-08-06): "si aplico cambios en
+// todas las cuentas es si o si para las cuentas futuras". Una cuenta nueva nace CON el panel de Fichas.
+// Solo un `false` explicito lo apaga -> sigue siendo el interruptor para apagarlo en segundos SIN deploy.
 async function fichasV1Activo(ownerId) {
   try {
-    if (!ownerId) return false;
+    if (!ownerId) return false;   // sin cuenta resuelta no se decide nada
     const { data, error } = await supabase.from('business_settings').select('fichas_v1').eq('user_id', ownerId).maybeSingle();
-    if (error) return false; // columna ausente u otro error -> OFF
-    return !!(data && data.fichas_v1 === true);
-  } catch (e) { return false; } // ante cualquier fallo, NUNCA romper: tratar como flag OFF
+    if (error) return true;
+    return !(data && data.fichas_v1 === false);
+  } catch (e) { return true; }
 }
 
 // Campos ESTRUCTURADOS que el sistema usa para actuar. Todo lo demas va a `datos` (jsonb).

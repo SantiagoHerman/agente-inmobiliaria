@@ -30105,9 +30105,13 @@ async function _paginarPorId(queryFactory) {
 // contact_ids que tienen conversacion Y matchean (opcionalmente) estado/asesor. Sin filtros -> TODOS los
 // contact_ids con alguna conversacion (sirve para el filtro "con conversacion" a secas). asesorCsv acepta
 // 'sin' (asesor_id IS NULL), MISMO criterio que el csv de asesor_id de GET /api/leads.
-async function _contactosConConversacionQueMatchean(ownerId, estadosCsv, asesorCsv) {
+// tempCsv (Diego 2026-08-06, "el mismo sistema de filtros de Conversaciones pero con los datos de
+// Contactos"): la temperatura vive en `conversations`, no en `contacts`, asi que se filtra ACA junto con
+// estado y asesor. Acepta el valor especial 'sin' = temperatura NULL (el "Sin clasificar" de la pantalla).
+// PARAMETRO OPCIONAL AL FINAL: sin pasarlo, esta funcion se comporta BYTE-IDENTICO a antes.
+async function _contactosConConversacionQueMatchean(ownerId, estadosCsv, asesorCsv, tempCsv) {
   var r = await _paginarPorId(function (afterId) {
-    var q = supabase.from('conversations').select('id, contact_id').eq('user_id', ownerId).not('contact_id', 'is', null);
+    var q = supabase.from('conversations').select('id, contact_id, temperatura').eq('user_id', ownerId).not('contact_id', 'is', null);
     if (estadosCsv && estadosCsv.length) q = q.in('status', estadosCsv);
     if (asesorCsv && asesorCsv.length) {
       var aseIds = asesorCsv.filter(function (a) { return a !== 'sin'; });
@@ -30122,7 +30126,20 @@ async function _contactosConConversacionQueMatchean(ownerId, estadosCsv, asesorC
     return q;
   });
   if (!r.ok) return r;
-  return { ok: true, ids: Array.from(new Set(r.rows.map(function (x) { return x.contact_id; }).filter(Boolean))) };
+  // La temperatura se filtra ACA EN JS a proposito, no en la query: `asesorCsv` ya usa el unico .or() que
+  // PostgREST-js maneja bien por query, y un segundo .or() para la temperatura podia pisarlo. Filtrar sobre
+  // las filas ya traidas es exacto y gratis (son las conversaciones de UNA cuenta, no toda la tabla).
+  var filasTemp = r.rows;
+  if (tempCsv && tempCsv.length) {
+    var temps = tempCsv.filter(function (t) { return t !== 'sin'; });
+    var quiereSinTemp = tempCsv.indexOf('sin') >= 0;
+    filasTemp = filasTemp.filter(function (x) {
+      var t = (x && x.temperatura) ? String(x.temperatura) : '';
+      if (!t) return quiereSinTemp;               // "Sin clasificar"
+      return temps.indexOf(t) >= 0;
+    });
+  }
+  return { ok: true, ids: Array.from(new Set(filasTemp.map(function (x) { return x.contact_id; }).filter(Boolean))) };
 }
 
 // contact_ids asignados a un asesor DISTINTO del que pide (para el scope 'propias': lo que es de otro asesor
@@ -30183,6 +30200,7 @@ app.get('/api/contactos', async function (req, res) {
     // ---- filtros que necesitan mirar `conversations` (con/sin conversacion, estado, asesor) ----
     const estadoCsv = _leadsCsv(qp.estado).filter(function (s) { return LEADS_ESTADOS_VALIDOS.indexOf(s) >= 0; });
     const asesorCsv = _leadsCsv(qp.asesor_id);
+    const tempCsv = _leadsCsv(qp.temperatura);   // Diego 2026-08-06: mismo grupo de filtro que en Conversaciones
     const conConv = String(qp.con_conversacion || '');
 
     let idsRequeridos = null;      // null = sin filtro; array = contacts.id TIENE que estar adentro
@@ -30191,17 +30209,18 @@ app.get('/api/contactos', async function (req, res) {
       const r = await _contactosConConversacionQueMatchean(scope.ownerId, [], []);
       if (!r.ok) return res.status(500).json({ error: r.error });
       idsSinConversacion = r.ids;
-    } else if (conConv === '1' || estadoCsv.length || asesorCsv.length) {
-      const r = await _contactosConConversacionQueMatchean(scope.ownerId, estadoCsv, asesorCsv);
+    } else if (conConv === '1' || estadoCsv.length || asesorCsv.length || tempCsv.length) {
+      const r = await _contactosConConversacionQueMatchean(scope.ownerId, estadoCsv, asesorCsv, tempCsv);
       if (!r.ok) return res.status(500).json({ error: r.error });
       idsRequeridos = r.ids;
     }
     if (idsRequeridos != null && !idsRequeridos.length) return res.json({ ok: true, contactos: [], next_cursor: null });
 
-    // ---- armar la query de `contacts`, con fallback DEFENSIVO de columnas (created_at puede no existir) ----
-    function _build(cols) {
-      let q = supabase.from('contacts').select(cols).eq('user_id', scope.ownerId);
-
+    // ---- LOS FILTROS DE `contacts`, EN UN SOLO LUGAR --------------------------------------------
+    // Lo usan LAS DOS queries: la de la pagina y la que arma el orden alfabetico. Escrito una sola vez a
+    // proposito: si el orden alfabetico repitiera estos filtros por su cuenta, cualquier cambio en uno
+    // sin el otro haria que "buscar + ordenar por nombre" devuelva cosas distintas que solo buscar.
+    function _filtrosContacts(q) {
       // texto libre: nombre / nombre_manual / telefono / notas — EN EL SERVIDOR (nunca sobre lo ya bajado).
       const texto = String(qp.q || '').trim();
       if (texto) {
@@ -30221,9 +30240,74 @@ app.get('/api/contactos', async function (req, res) {
       if (idsRequeridos != null) q = q.in('id', idsRequeridos);
       if (idsSinConversacion != null && idsSinConversacion.length) q = q.not('id', 'in', '(' + idsSinConversacion.join(',') + ')');
       if (idsExcluirScope.length) q = q.not('id', 'in', '(' + idsExcluirScope.join(',') + ')');
+      return q;
+    }
+
+    // ---- ORDEN ALFABETICO: se ordena EN JS, no en la base ----------------------------------------
+    // POR QUE: `order=name.asc` usa la colacion de Postgres, y con los nombres REALES de esta base eso
+    // deja la primera pagina llena de basura. MEDIDO en la cuenta de Anton: los primeros 10 de la A a la Z
+    // eran ".", ".", ".", ".", ".", "~ Matebreak Thomas Zamudio" y 4 emojis. Es alfabeticamente correcto
+    // (los simbolos van antes que las letras) y a la vez inservible para quien abre la pantalla buscando la A.
+    // El comparador de aca: (1) ordena por el nombre QUE SE VE (nombre_manual || name), no por el crudo,
+    // (2) ignora acentos y mayusculas, (3) manda al FINAL lo que no empieza con letra o numero.
+    // TOPE: si la cuenta pasa de ALFA_MAX contactos NO se ordena en JS (habria que bajar demasiadas filas
+    // para armar una pagina de 50) y se cae al orden por id. Anton, la cuenta mas grande, tiene 1.222.
+    const ALFA_MAX = 6000;
+    const _ordenAlfa = String(qp.orden || '').trim();
+    let idsOrdenAlfa = null;   // null = no aplica; array = los ids EXACTOS de esta pagina, ya ordenados
+    let ordenAlfaPos = null;   // mapa id -> posicion, para reordenar la pagina al final
+    if (_ordenAlfa === 'nombre_asc' || _ordenAlfa === 'nombre_desc') {
+      const rTodos = await _paginarPorId(function (afterId) {
+        let qa = _filtrosContacts(supabase.from('contacts').select('id, name, nombre_manual').eq('user_id', scope.ownerId))
+          .order('id', { ascending: true }).limit(1000);
+        if (afterId) qa = qa.gt('id', afterId);
+        return qa;
+      });
+      if (!rTodos.ok) return res.status(500).json({ error: rTodos.error });
+      const univ = rTodos.rows || [];
+      if (univ.length <= ALFA_MAX) {
+        const clave = function (x) {
+          const s = String(x.nombre_manual || x.name || '').trim().toLowerCase()
+            .normalize('NFD').replace(/[̀-ͯ]/g, '');  // saca los acentos (combining marks)
+          return (/^[a-z0-9]/.test(s) ? '1' : '2') + s;          // '2...' = al final
+        };
+        univ.sort(function (a, b) {
+          const ka = clave(a), kb = clave(b);
+          if (ka < kb) return _ordenAlfa === 'nombre_asc' ? -1 : 1;
+          if (ka > kb) return _ordenAlfa === 'nombre_asc' ? 1 : -1;
+          return String(a.id) < String(b.id) ? -1 : 1;           // desempate estable entre paginas
+        });
+        const offAlfa = Math.max(0, parseInt(String(qp.cursor || '').replace(/^off:/, ''), 10) || 0);
+        idsOrdenAlfa = univ.slice(offAlfa, offAlfa + limit).map(function (x) { return x.id; });
+        ordenAlfaPos = {};
+        idsOrdenAlfa.forEach(function (id, i) { ordenAlfaPos[id] = i; });
+        if (!idsOrdenAlfa.length) return res.json({ ok: true, contactos: [], next_cursor: null });
+      }
+    }
+
+    // ---- armar la query de `contacts`, con fallback DEFENSIVO de columnas (created_at puede no existir) ----
+    function _build(cols) {
+      let q = _filtrosContacts(supabase.from('contacts').select(cols).eq('user_id', scope.ownerId));
+
+      // ORDEN DE VISTA por FECHA DE ALTA (Diego 2026-08-06). Se pagina por RANGO en vez de keyset: el
+      // keyset por created_at necesitaria cursor compuesto (fecha, id) dentro de un .or() de PostgREST.
+      // Con 1.222 contactos y paginas de 50 el rango es exacto y barato. El desempate por `id` deja el
+      // orden estable entre paginas. (El orden alfabetico NO pasa por aca: ver el bloque de arriba.)
+      const cursor = String(qp.cursor || '').trim();
+      const ORDEN_COLS = { alta_asc: ['created_at', true], alta_desc: ['created_at', false] };
+      const oc = ORDEN_COLS[String(qp.orden || '').trim()];
+      // `cols.indexOf` = red de contencion: si la columna no vino en el set (created_at puede no existir,
+      // ver el fallback de abajo), se cae al orden por id en vez de tirar un 500.
+      if (oc && cols.indexOf(oc[0]) >= 0) {
+        const off = Math.max(0, parseInt(cursor.replace(/^off:/, ''), 10) || 0);
+        return q.order(oc[0], { ascending: oc[1], nullsFirst: false }).order('id', { ascending: true }).range(off, off + limit - 1);
+      }
+
+      // ORDEN ALFABETICO: se resuelve ANTES de llegar aca (idsOrdenAlfa). Cuando viene esa lista, esta
+      // query solo tiene que traer ESA pagina de ids -- el orden final lo pone el JS de abajo.
+      if (idsOrdenAlfa != null) return q.in('id', idsOrdenAlfa).limit(limit);
 
       // KEYSET real por `id` (nunca offset — GOTCHA de arriba).
-      const cursor = String(qp.cursor || '').trim();
       if (cursor) q = dirAsc ? q.gt('id', cursor) : q.lt('id', cursor);
 
       return q.order('id', { ascending: dirAsc }).limit(limit);
@@ -30233,7 +30317,15 @@ app.get('/api/contactos', async function (req, res) {
     if (r.error && _esColumnaAusente(r.error)) r = await _build(CONTACTOS_COLS_BASE);
     if (r.error) return res.status(500).json({ error: r.error.message });
 
-    const contactos = r.data || [];
+    let contactos = r.data || [];
+    // Con orden alfabetico la base devuelve las filas del .in('id', ...) en SU orden, no en el mio: hay que
+    // reordenarlas con las posiciones calculadas arriba. Sin esto la pagina sale desordenada.
+    if (ordenAlfaPos) {
+      contactos = contactos.slice().sort(function (a, b) {
+        const pa = ordenAlfaPos[a.id], pb = ordenAlfaPos[b.id];
+        return (pa == null ? 1e9 : pa) - (pb == null ? 1e9 : pb);
+      });
+    }
     const pageIds = contactos.map(function (c) { return c.id; });
 
     // ---- enriquecer SOLO la pagina actual (acotada a `limit`, nunca toda la tabla) con su conversacion ----
@@ -30269,7 +30361,20 @@ app.get('/api/contactos', async function (req, res) {
     });
 
     let next_cursor = null;
-    if (contactos.length === limit) next_cursor = contactos[contactos.length - 1].id;
+    if (contactos.length === limit) {
+      // Con orden de vista el cursor es el OFFSET siguiente ('off:N'); sin orden, el id de la ultima fila
+      // (keyset de siempre). El front no interpreta el cursor: lo devuelve tal cual.
+      // OJO: para el alfabetico se mira `ordenAlfaPos`, NO lo que pidio el front. Si la cuenta paso el tope
+      // ALFA_MAX, el orden cayo al keyset por id y el cursor TIENE que ser un id: devolver 'off:N' ahi haria
+      // que la pagina siguiente pidiera `id < "off:50"`.
+      const _ordenPedido = String(qp.orden || '').trim();
+      if (ordenAlfaPos || _ordenPedido === 'alta_asc' || _ordenPedido === 'alta_desc') {
+        const _off = Math.max(0, parseInt(String(qp.cursor || '').replace(/^off:/, ''), 10) || 0);
+        next_cursor = 'off:' + (_off + contactos.length);
+      } else {
+        next_cursor = contactos[contactos.length - 1].id;
+      }
+    }
     return res.json({ ok: true, contactos: filas, next_cursor: next_cursor });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });

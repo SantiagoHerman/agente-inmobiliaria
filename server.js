@@ -10663,6 +10663,136 @@ async function actualizarMemoriaViva(user_id, conversation_id, turnoId) {
   } catch (e) { console.error('actualizarMemoriaViva:', e && e.message); }
 }
 
+// ============================================================================
+// BACKFILL DE LA MEMORIA VIVA — corrida MANUAL, una sola vez. NO CORRE SOLA.
+// ----------------------------------------------------------------------------
+// QUE RESUELVE: el resumen se escribe solo cuando el lead escribe y se cumple el throttle. Las
+// conversaciones que ya pasaron nunca lo van a tener, y son justo las que necesita el recontacto
+// para no salir generico. Esto las completa de una.
+//
+// TRES CANDADOS, porque esto GASTA PLATA:
+//   1. `business_settings.memoria_backfill_v1` (migracion-memoria-viva-backfill.sql, SIN CORRER).
+//      Ausente / false -> 409 y no hace nada. Fail-closed, mismo patron que todo el resto.
+//   2. Solo el DUEÑO de la cuenta. Un asesor no puede disparar gasto de la cuenta.
+//   3. MODO SIMULACION POR DEFECTO. Sin `confirmar: 'CORRER BACKFILL'` (texto exacto) solo CUENTA y
+//      devuelve el presupuesto. Cero llamadas a la IA, cero centavos.
+//
+// 🔴 GASTO — el numero, MEDIDO: 563 llamadas de memoria viva costaron USD 0,31 => USD 0,00055 por
+// conversacion (Haiku, ~14 mensajes de input + 220 tokens de salida). El presupuesto sale en la
+// respuesta de la simulacion, calculado sobre el conteo REAL de esa cuenta, no extrapolado.
+// El gasto se registra con registrarUsoTokens (aparece en el panel de costos) y NO con
+// registrarUsoIA: es una nota interna del sistema, NO descuenta cupo del plan del cliente.
+//
+// COMO SE CORRE (los dos pasos, en este orden):
+//   1) Correr migracion-memoria-viva-backfill.sql y prender la columna en la cuenta:
+//      update business_settings set memoria_backfill_v1 = true where user_id = '<uid del dueño>';
+//   2) SIMULAR (no gasta):
+//      curl -X POST https://<backend>/api/memoria-viva/backfill \
+//           -H "Authorization: Bearer <token del dueño>" -H "Content-Type: application/json" \
+//           -d '{"min_mensajes":9}'
+//      -> devuelve { candidatas, costo_estimado_usd }.
+//   3) CORRER DE VERDAD (gasta), de a tandas:
+//      ... -d '{"min_mensajes":9,"limite":50,"confirmar":"CORRER BACKFILL"}'
+//      Repetir hasta que `candidatas` de 0. `limite` topea en 1000 por corrida.
+//
+// `min_mensajes` es el mismo piso que usa el throttle en vivo (9). Bajarlo agranda el universo y el
+// costo: una charla de 3 mensajes no tiene un resumen que valga USD 0,00055.
+// ============================================================================
+var _memBackfillEnCurso = false;
+
+// Cuenta los mensajes por conversacion de UN tenant. Se lee la columna `conversation_id` sola y se
+// cuenta en JS: PostgREST no agrupa, y hacer un head-count por conversacion serian mil queries.
+// PAGINADO OBLIGATORIO: PostgREST corta en 1000 filas sin importar el .limit().
+async function _memContarMensajesPorConv(ownerId) {
+  var cnt = {};
+  var desde = 0, pagina = 1000, techo = 500000;
+  while (desde < techo) {
+    var r = await supabase.from('messages').select('conversation_id').eq('user_id', ownerId).order('id').range(desde, desde + pagina - 1);
+    if (!r || r.error) break;
+    var filas = r.data || [];
+    filas.forEach(function (m) { if (m && m.conversation_id) cnt[m.conversation_id] = (cnt[m.conversation_id] || 0) + 1; });
+    if (filas.length < pagina) break;
+    desde += pagina;
+  }
+  return cnt;
+}
+
+app.post('/api/memoria-viva/backfill', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    // CANDADO 2: solo el dueño. `_duenoDelUid` devuelve el admin_id si quien llama es un asesor, asi
+    // que si son distintos es porque el que llama NO es el dueño.
+    if (String(dueno) !== String(uid)) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede correr el backfill' });
+    // CANDADO 1: el flag. Ausente / false -> no pasa nada.
+    if (!(await _fichasFlagActivo(dueno, 'memoria_backfill_v1'))) {
+      return res.status(409).json({ error: 'El backfill de memoria viva no esta activado en esta cuenta', gate: 'memoria_backfill_v1' });
+    }
+    if (_memBackfillEnCurso) return res.status(409).json({ error: 'Ya hay un backfill corriendo. Espera a que termine.' });
+
+    var b = (req.body && typeof req.body === 'object') ? req.body : {};
+    var minMsgs = Math.max(1, Math.min(200, parseInt(b.min_mensajes, 10) || 9));
+    var limite = Math.max(1, Math.min(1000, parseInt(b.limite, 10) || 50));
+    var deVerdad = (String(b.confirmar || '') === 'CORRER BACKFILL');
+
+    // Conversaciones SIN resumen de esta cuenta. Paginado (PostgREST corta en 1000).
+    var convs = [], desde = 0, pagina = 1000;
+    while (desde < 100000) {
+      var rc = await supabase.from('conversations').select('id, status, memoria_viva').eq('user_id', dueno).order('id').range(desde, desde + pagina - 1);
+      if (!rc || rc.error) return res.status(500).json({ error: (rc && rc.error && rc.error.message) || 'No se pudieron leer las conversaciones' });
+      var filas = rc.data || [];
+      filas.forEach(function (c) { if (c && !(c.memoria_viva && String(c.memoria_viva).trim())) convs.push(c); });
+      if (filas.length < pagina) break;
+      desde += pagina;
+    }
+    var porConv = await _memContarMensajesPorConv(dueno);
+    var candidatas = convs.filter(function (c) { return (porConv[c.id] || 0) >= minMsgs; });
+
+    // USD por conversacion: MEDIDO (563 llamadas = USD 0,31). Es una constante local a proposito, no
+    // un precio del sistema: si el modelo o el prompt cambian, este numero deja de valer y hay que
+    // volver a medirlo, no ajustarlo a ojo.
+    var USD_POR_CONV = 0.00055;
+    var presupuesto = {
+      candidatas: candidatas.length,
+      min_mensajes: minMsgs,
+      usd_por_conversacion_medido: USD_POR_CONV,
+      costo_estimado_usd: Math.round(candidatas.length * USD_POR_CONV * 100) / 100
+    };
+
+    // CANDADO 3: sin la palabra exacta, se contesta el presupuesto y se corta. CERO gasto.
+    if (!deVerdad) {
+      return res.json({
+        ok: true, modo: 'simulacion', gasto: 'ninguno',
+        resumen: presupuesto,
+        como_correr: 'Volve a llamar con {"confirmar":"CORRER BACKFILL","limite":50,"min_mensajes":' + minMsgs + '}. Se procesan de a `limite` por corrida.'
+      });
+    }
+
+    var lote = candidatas.slice(0, limite);
+    _memBackfillEnCurso = true;
+    var hechas = 0, fallidas = 0;
+    try {
+      for (var i = 0; i < lote.length; i++) {
+        try {
+          // SECUENCIAL a proposito: en paralelo se le pega a la API de Anthropic con una rafaga y se
+          // arriesga un 429 que corta el backfill Y las respuestas a los leads en vivo.
+          await actualizarMemoriaViva(dueno, lote[i].id, null);
+          hechas++;
+        } catch (eU) { fallidas++; }
+      }
+    } finally { _memBackfillEnCurso = false; }
+
+    return res.json({
+      ok: true, modo: 'corrida',
+      procesadas: hechas, fallidas: fallidas,
+      quedan: Math.max(0, candidatas.length - lote.length),
+      costo_estimado_usd: Math.round(hechas * USD_POR_CONV * 100) / 100,
+      aviso: 'El costo REAL de esta corrida queda registrado en ia_uso con la etiqueta memoria_viva (panel de costos). El numero de arriba es la estimacion.'
+    });
+  } catch (e) { _memBackfillEnCurso = false; return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
 // CITAS: al derivar (handoff), detectar si el lead ACORDO una cita concreta (fecha+hora) y agendarla en la tabla
 // `citas` + avisar al asesor (push, sin tokens). Usa Haiku (barato) y SOLO corre en el momento del handoff (raro).
 // No duplica si ya hay una cita futura agendada para esa conversacion. Best-effort: nunca rompe el flujo.
@@ -11750,6 +11880,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               try { const { error: _ePc } = await supabase.from('contacts').update({ perfil_comprador: _pc }).eq('id', contacto.id); if (_ePc) console.error('perfil_comprador (columna ausente?):', _ePc.message); } catch (ePcE) {}
             }
           }
+          // FASE 4 — LA IA PROPONE LA FICHA (gated fichas_ia_v1, default OFF).
+          // COSTO IA: CERO. Se le pasa el `ext` que ACABAMOS de calcular unas lineas mas arriba; no
+          // hay ninguna llamada nueva a ningun modelo. Ademas es lo que deja rastro del pisado de
+          // cal_fecha_ingreso/cal_fecha_salida: aunque la ficha no cambie, el movimiento de fecha
+          // queda anotado en fichas_historial.
+          // DENTRO del mismo try fire-and-forget que ya envuelve toda la memoria del lead: si algo
+          // falla, se loguea y el webhook sigue exactamente igual (no toca la respuesta al lead).
+          try { await _fichaPropuestaPorIA(user_id, contacto, conv, ext, _bsGate && _bsGate.rubro); } catch (eFic) { console.error('ficha IA:', eFic && eFic.message); }
         } catch (eMem) { console.error('memoria lead:', eMem && eMem.message); }
       })();
     }
@@ -12488,12 +12626,6 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               }).catch(function(){});
             } catch (eDec) { /* jamas rompe el flujo */ }
 
-            // MEMORIA VIVA: actualizar el resumen-de-avance (THROTTLED) para que el agente retome sin releer todo
-            // y se pueda acortar el historial. Solo charlas con recorrido (>=9 msgs) y cada 3 -> cero costo extra en cortas.
-            try {
-              const { count: _nMsgs } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('conversation_id', _convId);
-              if (typeof _nMsgs === 'number' && _nMsgs >= 9 && (_nMsgs % 3 === 0)) { actualizarMemoriaViva(user_id, _convId, _turnoId).catch(function(){}); }
-            } catch (eMem) {}
           }
 
           // ===== REGISTRO DE DECISIONES DE LA IA (camino SIN CLASIFICAR) =====
@@ -12529,6 +12661,40 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               }).catch(function(){});
             } catch (eDec2) { /* jamas rompe el flujo */ }
           }
+
+          // ============================================================================
+          // MEMORIA VIVA — el resumen-de-avance de la conversacion (THROTTLED).
+          // ----------------------------------------------------------------------------
+          // ARREGLO #6 (Diego 2026-08-05). ESTE BLOQUE VIVIA ADENTRO del `if` de mas arriba
+          // (`!_enRotacion && !_rotacionV3Iniciada && estadoActual !== 'listo_humano' && !== 'cerrado'`),
+          // que existe para no RECLASIFICAR ni RE-DERIVAR una conversacion que ya se decidio. Escribir
+          // un resumen no es ninguna de esas dos cosas: es una nota interna. Colgado de ese `if`, el
+          // resumen dejaba de actualizarse justo cuando el lead ya fue derivado o cerrado -- o sea,
+          // cuando un humano toma el chat y el resumen es lo que mas sirve.
+          // Ahora corre SIEMPRE que el turno llegue hasta aca, con o sin clasificacion.
+          //
+          // NO SE TOCA EL THROTTLE (>=9 mensajes && count % 3 === 0): decision de Diego, un cambio por
+          // vez y medir. Es tambien lo que mantiene el gasto acotado en las charlas cortas.
+          //
+          // GASTO (aprobado por Diego): la estimacion previa era pasar de USD 0,31 a ~USD 0,79/mes en
+          // las 6 cuentas (factor 0,390 sobre la medicion de 563 llamadas por USD 0,31). VERIFICADO
+          // CONTRA LA BASE el 2026-08-05: el aumento REAL va a ser MUCHO menor que eso, porque el
+          // camino nunca llega hasta aca con la IA apagada -- el webhook corta antes (~11888 y ~11962,
+          // `ai_enabled !== true` -> return). De las 111 conversaciones en 'listo_humano' hoy, 110
+          // tienen la IA apagada; y las 'cerrado' con IA prendida REVIVEN a 'en_conversacion' en
+          // ~11845 antes de llegar aca (reparto_v2 esta ON en las 8 cuentas), asi que esas ya pasaban.
+          // Lo que este cambio realmente destraba son los turnos con `_rotacionV3Iniciada` y las
+          // conversaciones que quedaron en estado terminal con la IA re-encendida a mano.
+          // Traducido: el techo aprobado es USD 0,79/mes y el gasto esperado queda MUY por debajo.
+          //
+          // NO CONSUME CUPO DEL PLAN DEL CLIENTE, y tiene que seguir asi: actualizarMemoriaViva
+          // (~10649) registra DOLARES con registrarUsoTokens y NO llama a registrarUsoIA. Es una nota
+          // interna del sistema, no un mensaje que el cliente pidio: cobrarsela seria descontarle
+          // cupo por algo que no vio.
+          try {
+            const { count: _nMsgs } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('conversation_id', _convId);
+            if (typeof _nMsgs === 'number' && _nMsgs >= 9 && (_nMsgs % 3 === 0)) { actualizarMemoriaViva(user_id, _convId, _turnoId).catch(function(){}); }
+          } catch (eMem) {}
         }
       } catch (eGen) {
         console.error('Error generando respuesta (debounce):', eGen && eGen.message);
@@ -13838,11 +14004,25 @@ async function _matchLeadsParaPropiedad(ownerId, prop) {
     // (migracion sin correr) o falla la query, quedamos sin fichas -> todo cae al camino de texto = como hoy.
     var fichasPorContacto = {};
     try {
-      var fq = await supabase.from('fichas').select('contact_id, tipo, estado, zonas, presupuesto, moneda, tipo_propiedad, ambientes, dormitorios')
+      // FASE 4: `confirmada` se pide en un select APARTE del resto, porque es una columna de
+      // migracion-fichas-fases-245.sql que puede no existir. Si el select con confirmada falla, se
+      // reintenta sin ella y todo sigue como hasta hoy.
+      var _selFicha = 'contact_id, tipo, estado, zonas, presupuesto, moneda, tipo_propiedad, ambientes, dormitorios';
+      var fq = await supabase.from('fichas').select(_selFicha + ', confirmada')
         .eq('user_id', ownerId).eq('estado', 'activa').in('tipo', MATCH_FICHA_TIPOS_DEMANDA);
+      if (fq && fq.error) {
+        fq = await supabase.from('fichas').select(_selFicha)
+          .eq('user_id', ownerId).eq('estado', 'activa').in('tipo', MATCH_FICHA_TIPOS_DEMANDA);
+      }
+      // DECISION PENDIENTE DE DIEGO (flag fichas_ia_matchea, default OFF): ¿una ficha que propuso la
+      // IA y que nadie confirmo todavia entra al matcheo? Con el flag OFF no entra. El filtro va en
+      // JS y no como .eq('confirmada', true) a proposito: con la columna ausente un .eq() romperia
+      // la query entera y el matcheo se quedaria sin NINGUNA ficha -- una regresion silenciosa.
+      var _incluirSinConfirmar = await _fichasFlagActivo(ownerId, 'fichas_ia_matchea');
       if (fq && !fq.error) {
         (fq.data || []).forEach(function (f) {
           if (!f || !f.contact_id) return;
+          if (!_incluirSinConfirmar && f.confirmada === false) return;
           (fichasPorContacto[f.contact_id] = fichasPorContacto[f.contact_id] || []).push(f);
         });
       }
@@ -17983,6 +18163,12 @@ setTimeout(hacerBackup, 90 * 1000);
 // INERTE si ninguna cuenta tiene reservas_v1 ON (el cron consulta y sale). 0 IA / 0 tokens (plantillas fijas).
 setInterval(enviarAvisosEstadia, 30 * 60 * 1000);
 setTimeout(enviarAvisosEstadia, 100 * 1000);
+// FASE 2 de Fichas: vencimientos de las fichas (alquiler que vence, cuota, check-out) -> aviso al canal
+// interno "Todos". Cada 6 HORAS a proposito: son avisos con dias de anticipacion (30/7/0), no minutos, y
+// el claim por ficha ya evita repetirlos. INERTE si ninguna cuenta tiene fichas_avisos_v1 ON (el cron
+// consulta y sale). 0 IA / 0 tokens. NO le llega nada al cliente final.
+setInterval(revisarVencimientosFichas, 6 * 60 * 60 * 1000);
+setTimeout(revisarVencimientosFichas, 140 * 1000);
 
 // F6.2: import iCal de OTAs -> bloqueos source='ical'. INERTE salvo ICAL_IMPORT_ENABLED==='true'
 // (borra/re-crea bloqueos ical: se habilita cuando Diego lo apruebe). Cada 60 min + corrida ~120s tras arrancar.
@@ -34720,8 +34906,41 @@ app.get('/api/ui-flags', async function(req, res){
       var _fv = await supabase.from('business_settings').select('fichas_v1').eq('user_id', user_id).maybeSingle();
       if (_fv && _fv.data) fichas_v1 = _fv.data.fichas_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, fichas_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+    // FICHAS FASES 2/4/5 (Diego 2026-08-05). Query SEPARADA de la de fichas_v1 y con LISTA EXPLICITA
+    // de columnas: si `migracion-fichas-fases-245.sql` todavia no corrio, esta query falla ENTERA y
+    // los tres flags quedan en false -- sin arrastrar a fichas_v1, que ya esta ON en las 6 cuentas.
+    //   coincidencias_v1  -> boton "Recalcular coincidencias" + coincidencias dentro de la ficha
+    //   fichas_ia_v1      -> la IA propone la ficha (se muestra el origen "propuesta por la IA")
+    //   fichas_avisos_v1  -> avisos por vencimiento (no cambia nada en el front, se expone para la config)
+    // fichas_ia_matchea NO se expone: es una decision de matcheo del servidor, el front no la usa.
+    var coincidencias_v1 = false, fichas_ia_v1 = false, fichas_avisos_v1 = false;
+    try {
+      var _ff = await supabase.from('business_settings').select('coincidencias_v1, fichas_ia_v1, fichas_avisos_v1').eq('user_id', user_id).maybeSingle();
+      if (_ff && !_ff.error && _ff.data) {
+        coincidencias_v1 = _ff.data.coincidencias_v1 === true;
+        fichas_ia_v1 = _ff.data.fichas_ia_v1 === true;
+        fichas_avisos_v1 = _ff.data.fichas_avisos_v1 === true;
+      }
+    } catch (e) { /* columnas ausentes / error -> los tres en false */ }
+    // ARREGLO #3 DE LA REVISION ADVERSARIAL (Diego 2026-08-05). Los botones "Crear ficha" (dentro de
+    // la conversacion) y "Ver cambios" (el registro de cambios de la ficha) colgaban de `fichas_v1`,
+    // que ya esta en TRUE en las 6 cuentas vivas desde el 2026-08-04. O sea: se prendieron solos en
+    // las 6 cuentas sin que nadie lo decidiera. Ahora cada uno tiene SU columna, default false.
+    // Query SEPARADA y con LISTA EXPLICITA de columnas (no select('*')): si la migracion todavia no
+    // corrio, esta query falla ENTERA y los dos quedan en false -- fail-closed -- SIN arrastrar a
+    // fichas_v1 ni a los flags de arriba, que estan en sus propias queries.
+    //   fichas_chat_v1       -> el boton "Crear ficha" del chat + el overlay <FichaDesdeChat>
+    //   fichas_historial_v1  -> el boton "Ver cambios" (lee la tabla fichas_historial)
+    var fichas_chat_v1 = false, fichas_historial_v1 = false;
+    try {
+      var _fc = await supabase.from('business_settings').select('fichas_chat_v1, fichas_historial_v1').eq('user_id', user_id).maybeSingle();
+      if (_fc && !_fc.error && _fc.data) {
+        fichas_chat_v1 = _fc.data.fichas_chat_v1 === true;
+        fichas_historial_v1 = _fc.data.fichas_historial_v1 === true;
+      }
+    } catch (e) { /* columnas ausentes / error -> los dos en false */ }
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: false, fichas_v1: false, coincidencias_v1: false, fichas_ia_v1: false, fichas_avisos_v1: false, fichas_chat_v1: false, fichas_historial_v1: false, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================
@@ -39056,9 +39275,13 @@ async function fichasV1Activo(ownerId) {
 }
 
 // Campos ESTRUCTURADOS que el sistema usa para actuar. Todo lo demas va a `datos` (jsonb).
+// FASES 2/4/5: se suman `origen` (por que camino nacio la ficha: manual | chat | ia_extraccion |
+// concretada) y `resultado` (como termino: concreto | perdido | desistio). Van al final de la lista
+// a proposito -- si la migracion todavia no corrio, el front simplemente no los manda y el insert
+// queda igual que antes. `confirmada` NO esta aca: la setea el backend, nunca el body del cliente.
 var _FICHA_CAMPOS = ['contact_id', 'tipo', 'estado', 'property_id', 'conversation_id', 'desde', 'hasta',
   'proximo_vencimiento', 'zonas', 'presupuesto', 'moneda', 'tipo_propiedad', 'ambientes', 'dormitorios',
-  'asesor_id', 'notas'];
+  'asesor_id', 'notas', 'origen', 'resultado'];
 
 function _fichaDesdeBody(body) {
   var out = {};
@@ -39103,11 +39326,25 @@ app.post('/api/fichas', async function (req, res) {
     var fila = _fichaDesdeBody(b);
     fila.user_id = dueno;
     fila.creado_por = fila.creado_por || 'humano';
+    // De donde salio: 'chat' cuando la crea el boton de la conversacion (viene con conversation_id),
+    // 'manual' cuando se carga desde la ficha del contacto. Sirve para medir si el boton del chat
+    // realmente resuelve el problema de que nadie carga fichas. Si la columna no existe todavia, el
+    // insert falla y se reintenta sin ella (abajo): la ficha se crea igual.
+    if (!fila.origen) fila.origen = fila.conversation_id ? 'chat' : 'manual';
     // UNA FICHA NUEVA NO CREA UN CONTACTO NUEVO (regla del plan §4): el contacto es uno solo, para
     // siempre. Verificamos que el contacto sea de esta cuenta y cortamos si no.
     var c = await supabase.from('contacts').select('id').eq('id', fila.contact_id).eq('user_id', dueno).maybeSingle();
     if (!c || !c.data) return res.status(404).json({ error: 'Ese contacto no es de esta cuenta' });
     var { data, error } = await supabase.from('fichas').insert(fila).select().maybeSingle();
+    // INSERT POR CAPAS: `origen` es una columna de migracion-fichas-fases-245.sql, que todavia no
+    // corrio. Si no existe, se reintenta SIN ella -- perder de que camino vino la ficha es aceptable;
+    // perder la ficha que alguien acaba de cargar, no.
+    if (error && /column|origen|schema cache/i.test(error.message || '')) {
+      var _sinOrigen = Object.assign({}, fila); delete _sinOrigen.origen; delete _sinOrigen.resultado;
+      var _r2 = await supabase.from('fichas').insert(_sinOrigen).select().maybeSingle();
+      if (_r2 && _r2.error) return res.status(500).json({ error: _r2.error.message });
+      return res.json({ ok: true, ficha: (_r2 && _r2.data) || null });
+    }
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ ok: true, ficha: data });
   } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
@@ -39122,10 +39359,22 @@ app.patch('/api/fichas/:id', async function (req, res) {
     if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
     var upd = _fichaDesdeBody((req.body && typeof req.body === 'object') ? req.body : {});
     delete upd.contact_id; // una ficha NO cambia de dueño: si se equivocaron, se borra y se crea otra
+    delete upd.origen;     // el origen dice como NACIO la ficha: editarla no lo cambia
+    // REGISTRO DE CAMBIOS (etapa D): se lee la fila ANTES del update para poder anotar que cambio.
+    // Es UNA lectura extra por edicion de ficha, y es la unica forma de contestar "este lead viene
+    // moviendo la fecha hace 3 semanas". Si falla, se edita igual y se pierde solo el registro.
+    var antes = null;
+    try { var _pre = await supabase.from('fichas').select('*').eq('id', req.params.id).eq('user_id', dueno).maybeSingle(); if (_pre && !_pre.error) antes = _pre.data; } catch (ePre) {}
+    // Si una persona toca la ficha, deja de ser una propuesta sin mirar: pasa a confirmada. Va en un
+    // update APARTE y defensivo -- si la columna no existe todavia (migracion sin correr), el update
+    // principal de abajo NO se ve afectado y la edicion se guarda igual.
     upd.updated_at = new Date().toISOString();
     var { data, error } = await supabase.from('fichas').update(upd).eq('id', req.params.id).eq('user_id', dueno).select().maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
     if (!data) return res.status(404).json({ error: 'Ficha no encontrada' });
+    try { await supabase.from('fichas').update({ confirmada: true }).eq('id', req.params.id).eq('user_id', dueno); } catch (eConf) {}
+    var _cambios = _fichaDiff(antes, upd);
+    if (_cambios.length) _fichaLogCambios(dueno, String(req.params.id), _cambios, 'humano', uid);
     return res.json({ ok: true, ficha: data });
   } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
@@ -39141,6 +39390,940 @@ app.delete('/api/fichas/:id', async function (req, res) {
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
 });
+
+// ============================================================================
+// FICHAS — FASES 2, 4 y 5 + COINCIDENCIAS (Diego 2026-08-05)
+// Ver PLAN-FICHAS-FASE-4-5.md. Migracion: migracion-fichas-fases-245.sql (ESCRITA Y SIN CORRER).
+// ----------------------------------------------------------------------------
+// EL PROBLEMA QUE RESUELVE ESTE BLOQUE, medido en produccion: hay 0 fichas cargadas y 0
+// coincidencias generadas en TODO el sistema. Las fases 1 y 3 estan desplegadas y no se notan
+// porque (a) nadie carga fichas a mano -- "a veces las personas no cargan a mano la info" -- y
+// (b) el matcheo SOLO se dispara al guardar una propiedad A MANO desde Inventario: las 271
+// propiedades de Anton entraron por el scraper, asi que no corrio ni una vez.
+//
+// CERO IA EN TODO EL BLOQUE. Ni una llamada a un modelo, ni un token. En particular la fase 4
+// (que la IA proponga la ficha) NO agrega una llamada nueva: REUSA lo que `extraerDatosLead`
+// (~11699) ya devuelve en cada mensaje de texto no trivial. Medido: 563 llamadas por US$ 0,31.
+//
+// FLAGS NUEVOS, todos fail-closed / default OFF:
+//   coincidencias_v1   -> el barrido inventario<->fichas y la pantalla de coincidencias
+//   fichas_ia_v1       -> la IA propone la ficha (sin confirmar) reusando la extraccion
+//   fichas_ia_matchea  -> DECISION PENDIENTE DE DIEGO: ¿una ficha propuesta y sin confirmar
+//                         entra al matcheo? OFF = no entra.
+//   fichas_avisos_v1   -> el cron de vencimientos
+// ============================================================================
+
+// Lector de flag por-cuenta GENERICO. `fichasV1Activo` quedo escrito para una sola columna y este
+// bloque necesita cuatro mas; mismo patron DEFENSIVO EXACTO: columna ausente / error / false -> OFF.
+// Con la migracion SIN correr todas devuelven false y este bloque entero queda inerte.
+async function _fichasFlagActivo(ownerId, columna) {
+  try {
+    if (!ownerId || !columna) return false;
+    var r = await supabase.from('business_settings').select(columna).eq('user_id', ownerId).maybeSingle();
+    if (!r || r.error || !r.data) return false;
+    return r.data[columna] === true;
+  } catch (e) { return false; }
+}
+
+// ----------------------------------------------------------------------------
+// REGISTRO DE CAMBIOS DE LA FICHA (etapa D del plan)
+// ----------------------------------------------------------------------------
+// POR QUE EXISTE: `conversations.cal_fecha_ingreso` / `cal_fecha_salida` se PISAN en cada mensaje.
+// El caso que planteo Diego -- "del 15 al 25 de enero... no, mejor del 10 al 15... pasame precio de
+// febrero" -- hoy termina con FEBRERO guardado y enero borrado sin rastro. Nadie puede saber que
+// ese lead viene moviendo la fecha hace tres semanas, que es justo la senal de que algo no le
+// cierra. El historial es append-only: cada cambio de criterio queda con su fecha y quien lo hizo.
+var _FICHA_CAMPOS_HIST = ['tipo', 'estado', 'property_id', 'desde', 'hasta', 'proximo_vencimiento',
+  'zonas', 'presupuesto', 'moneda', 'tipo_propiedad', 'ambientes', 'dormitorios', 'asesor_id',
+  'notas', 'resultado', 'confirmada'];
+
+// Compara la fila ANTES contra lo que trae el PATCH. Solo mira las claves que VINIERON en el
+// update: un campo que el formulario no mando no cambio, y anotarlo como "paso a vacio" seria
+// mentir. Devuelve [] si no cambio nada (y entonces no se escribe ninguna fila).
+function _fichaDiff(antes, cambios) {
+  var out = [];
+  try {
+    if (!cambios) return out;
+    _FICHA_CAMPOS_HIST.forEach(function (k) {
+      if (!Object.prototype.hasOwnProperty.call(cambios, k)) return;
+      var a = (antes && antes[k] !== null && antes[k] !== undefined) ? String(antes[k]) : '';
+      var b = (cambios[k] !== null && cambios[k] !== undefined) ? String(cambios[k]) : '';
+      if (a === b) return;
+      out.push({ campo: k, valor_anterior: a || null, valor_nuevo: b || null });
+    });
+    // `datos` (jsonb) se compara clave por clave: si no, cualquier cambio de un opcional quedaria
+    // registrado como "todo el jsonb cambio", que no le sirve a nadie para leer que paso.
+    if (cambios.datos && typeof cambios.datos === 'object' && !Array.isArray(cambios.datos)) {
+      var dA = (antes && antes.datos && typeof antes.datos === 'object') ? antes.datos : {};
+      var dB = cambios.datos;
+      var keys = {};
+      Object.keys(dA).forEach(function (k) { keys[k] = true; });
+      Object.keys(dB).forEach(function (k) { keys[k] = true; });
+      Object.keys(keys).forEach(function (k) {
+        var a2 = (dA[k] === null || dA[k] === undefined) ? '' : String(dA[k]);
+        var b2 = (dB[k] === null || dB[k] === undefined) ? '' : String(dB[k]);
+        if (a2 === b2) return;
+        out.push({ campo: 'datos.' + k, valor_anterior: a2 || null, valor_nuevo: b2 || null });
+      });
+    }
+  } catch (e) { return out; }
+  return out;
+}
+
+// Escribe el historial. DEFENSIVO ABSOLUTO: si la tabla no existe (migracion sin correr) se pierde
+// el REGISTRO, nunca el cambio -- el update de la ficha ya ocurrio y es lo que importa.
+async function _fichaLogCambios(ownerId, fichaId, cambios, origen, quien) {
+  try {
+    if (!ownerId || !fichaId || !cambios || !cambios.length) return;
+    var filas = cambios.slice(0, 40).map(function (c) {
+      return {
+        user_id: ownerId, ficha_id: fichaId, campo: String(c.campo).slice(0, 80),
+        valor_anterior: (c.valor_anterior == null) ? null : String(c.valor_anterior).slice(0, 500),
+        valor_nuevo: (c.valor_nuevo == null) ? null : String(c.valor_nuevo).slice(0, 500),
+        origen: origen || 'humano',
+        quien: quien ? String(quien).slice(0, 120) : null
+      };
+    });
+    await supabase.from('fichas_historial').insert(filas);
+  } catch (e) { /* tabla ausente -> sin registro, sin romper */ }
+}
+
+// GET /api/fichas/:id/historial -> los cambios de UNA ficha, del mas nuevo al mas viejo.
+// Es lo que responde "este lead viene moviendo la fecha hace 3 semanas".
+app.get('/api/fichas/:id/historial', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
+    // ARREGLO #3: gate PROPIO, no `fichas_v1`. Y se valida ACA tambien, no solo escondiendo el boton
+    // en el front: un flag que solo apaga un boton no es un gate, es una decoracion.
+    if (!(await _fichasFlagActivo(dueno, 'fichas_historial_v1'))) return res.status(409).json({ error: 'El registro de cambios no esta activado en esta cuenta', gate: 'fichas_historial_v1' });
+    var q = await supabase.from('fichas_historial').select('*')
+      .eq('user_id', dueno).eq('ficha_id', String(req.params.id))
+      .order('created_at', { ascending: false }).limit(200);
+    // Tabla ausente -> lista vacia, NO un 500 que rompa el panel de la ficha.
+    if (q && q.error) return res.json({ ok: true, historial: [], aviso: 'El registro de cambios todavia no existe.' });
+    return res.json({ ok: true, historial: (q && q.data) || [] });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// POST /api/fichas/:id/confirmar -> el asesor confirma una ficha que propuso la IA.
+// Es el "de un toque" de la fase 4: la ficha ya esta cargada, solo falta que una persona la mire.
+app.post('/api/fichas/:id/confirmar', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
+    var upd = await supabase.from('fichas').update({ confirmada: true, updated_at: new Date().toISOString() })
+      .eq('id', String(req.params.id)).eq('user_id', dueno).select().maybeSingle();
+    // Columna ausente (migracion sin correr) -> se dice la verdad en vez de fingir que se confirmo.
+    if (upd && upd.error) return res.status(503).json({ error: 'Falta correr migracion-fichas-fases-245.sql: ' + upd.error.message });
+    if (!upd || !upd.data) return res.status(404).json({ error: 'Ficha no encontrada' });
+    _fichaLogCambios(dueno, String(req.params.id), [{ campo: 'confirmada', valor_anterior: 'false', valor_nuevo: 'true' }], 'humano', uid);
+    return res.json({ ok: true, ficha: upd.data });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// POST /api/fichas/:id/concretar -> DECISION DE MODELO DE DIEGO.
+// Cuando una busqueda SE CONCRETA nace una SEGUNDA ficha enlazada (`ficha_origen_id`) y la de
+// busqueda se CIERRA con resultado 'concreto'. Son cosas distintas: una es LO QUE BUSCABA, la otra
+// es LO QUE PASO. Si se mutara la misma ficha se pierde lo que el cliente pedia originalmente, y
+// con eso las dos preguntas que importan: cuantas busquedas terminan en operacion, y por que se
+// caen las que se caen.
+app.post('/api/fichas/:id/concretar', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
+    var b = (req.body && typeof req.body === 'object') ? req.body : {};
+    if (!b.tipo) return res.status(400).json({ error: 'Falta el tipo de la ficha nueva' });
+    var orig = await supabase.from('fichas').select('*').eq('id', String(req.params.id)).eq('user_id', dueno).maybeSingle();
+    if (!orig || orig.error || !orig.data) return res.status(404).json({ error: 'Ficha no encontrada' });
+    var nueva = _fichaDesdeBody(b);
+    nueva.user_id = dueno;
+    nueva.contact_id = orig.data.contact_id;   // la ficha nueva es del MISMO contacto, siempre
+    nueva.creado_por = 'humano';
+    nueva.origen = 'concretada';
+    nueva.ficha_origen_id = orig.data.id;
+    var ins = await supabase.from('fichas').insert(nueva).select().maybeSingle();
+    if (ins && ins.error) return res.status(503).json({ error: 'No se pudo crear la ficha nueva (¿falta la migracion?): ' + ins.error.message });
+    // La de busqueda se cierra recien DESPUES de que la nueva existe: si el insert falla, la
+    // original queda intacta y el asesor reintenta. Al reves quedaria cerrada y sin reemplazo.
+    await supabase.from('fichas').update({ estado: 'cerrada', resultado: 'concreto', updated_at: new Date().toISOString() })
+      .eq('id', orig.data.id).eq('user_id', dueno);
+    _fichaLogCambios(dueno, orig.data.id, [
+      { campo: 'estado', valor_anterior: orig.data.estado || null, valor_nuevo: 'cerrada' },
+      { campo: 'resultado', valor_anterior: orig.data.resultado || null, valor_nuevo: 'concreto' }
+    ], 'humano', uid);
+    return res.json({ ok: true, ficha: (ins && ins.data) || null, cerrada: orig.data.id });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// ----------------------------------------------------------------------------
+// SUGERENCIA: la ficha PRECARGADA con lo que la IA ya extrajo (etapa C del plan)
+// ----------------------------------------------------------------------------
+// LA PIEZA QUE DECIDE SI TODO ESTO SIRVE O NO. El asesor abre la conversacion, toca un boton y el
+// formulario ya viene con el interes, el presupuesto y (en hotel) las fechas que la IA venia
+// leyendo del chat. Corrige y confirma. Dos toques, sin salir del chat, sin ir a Contactos -> ficha
+// -> nueva. Sin esto las fichas no se cargan y el resto del plan es decorado.
+// NO hace ninguna llamada de IA: lee lo que YA esta guardado en `contacts` y `conversations`.
+
+// Sugiere el TIPO de ficha para que el select venga elegido. Son regex sobre el texto que la IA ya
+// guardo, CERO IA. Es una sugerencia dentro de un formulario que una persona confirma: si no hay
+// senal clara devuelve '' y el asesor elige (no se inventa un tipo).
+function _fichaTipoSugerido(rubro, texto) {
+  try {
+    var r = normalizarRubro(rubro);
+    if (r === 'hotel_cabanas') return 'consulta';
+    if (r === 'desarrolladora') return 'consulta_inversion';
+    var t = _mtchNorm(texto || '');
+    if (/alquil|renta|inquilin/.test(t)) return 'busca_alquilar';
+    if (/compr/.test(t)) return 'busca_comprar';
+    return '';
+  } catch (e) { return ''; }
+}
+
+// Los numeros del texto CON su magnitud: "200 mil" -> 200000.
+// POR QUE NO ALCANZA `_ppNumeros`: esa funcion NO lee la magnitud, y no hay que tocarla -- la usa el
+// parseo de PRECIOS del inventario (~13757) y el de planes (~28346), donde el numero llega limpio de
+// una columna y meterle multiplicadores le cambiaria el significado a datos que hoy andan bien.
+// POR QUE HACE FALTA ACA: `contacts.budget` lo escribe la IA en TEXTO LIBRE y el propio prompt del
+// extractor (~9702) le PIDE ese formato -- el ejemplo textual es "hasta 200 mil pesos por mes". Sin
+// leer el "mil", esa ficha nace con presupuesto=200 en vez de 200000; y como el matcheo compara
+// numero contra numero, no coincide con NADA y no hay forma de darse cuenta de por que.
+function _fichaNumerosConMagnitud(txt) {
+  var out = [], m;
+  var s = String(txt == null ? '' : txt);
+  // El `\b` va DENTRO del grupo opcional a proposito: asi "200 milanesas" NO se lee como 200 mil
+  // (el grupo no matchea y el numero queda crudo), y "200 kg" no se lee como 200k.
+  // 'm' suelta queda AFUERA: en este dominio "m" es metros ("120 m2"), no millones.
+  var re = /(\d[\d.,]*)(?:\s*(millones|millon|palos|palo|lucas|luca|mil|k)\b)?/gi;
+  while ((m = re.exec(s)) !== null) {
+    if (!m[1]) continue;
+    var n = _ppANumero(String(m[1]).replace(/[.,]+$/, ''));
+    if (n == null) continue;
+    var mag = String(m[2] || '').toLowerCase();
+    if (mag === 'mil' || mag === 'k' || mag === 'luca' || mag === 'lucas') n = n * 1000;
+    else if (mag === 'millon' || mag === 'millones' || mag === 'palo' || mag === 'palos') n = n * 1000000;
+    out.push(n);
+  }
+  return out;
+}
+
+// `contacts.budget` es TEXTO LIBRE ("hasta 850 mil", "U$S 185.000", "entre 80 y 120 mil"). Se
+// precarga SOLO si el texto tiene UN numero inequivoco: con dos no se adivina cual es el techo, se
+// deja vacio y se le muestra el texto crudo a la persona. Mismo criterio que _mtchPrecioMoneda.
+function _fichaPresupuestoDeTexto(txt) {
+  try {
+    var nums = _fichaNumerosConMagnitud(txt);
+    var uniq = nums.filter(function (v, i, a) { return a.indexOf(v) === i; });
+    if (uniq.length !== 1) return { presupuesto: null, moneda: _ppMoneda(txt) };
+    return { presupuesto: uniq[0], moneda: _ppMoneda(txt) };
+  } catch (e) { return { presupuesto: null, moneda: null }; }
+}
+
+app.get('/api/fichas/sugerencia', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await fichasV1Activo(dueno))) return res.status(409).json({ error: 'Fichas no esta activado en esta cuenta' });
+    // ARREGLO #3: este endpoint es el que alimenta el boton "Crear ficha" del chat, y ese boton tiene
+    // su propio flag. Se valida en el servidor y no solo escondiendo el boton: si no, cualquiera con
+    // la sesion abierta puede pegarle a la URL igual.
+    if (!(await _fichasFlagActivo(dueno, 'fichas_chat_v1'))) return res.status(409).json({ error: 'La ficha desde el chat no esta activada en esta cuenta', gate: 'fichas_chat_v1' });
+    var convId = (req.query && req.query.conversation_id) ? String(req.query.conversation_id) : '';
+    var contactId = (req.query && req.query.contact_id) ? String(req.query.contact_id) : '';
+    if (!convId && !contactId) return res.status(400).json({ error: 'Falta conversation_id (o contact_id)' });
+
+    // 1) La conversacion. Lectura POR CAPAS: las columnas cal_* (fechas de estadia que ya extrae la
+    // IA en hotel) pueden no existir en una cuenta cuya migracion no corrio. Si el select falla se
+    // reintenta sin ellas y la precarga simplemente no trae fechas -- nunca un 500.
+    var conv = null;
+    if (convId) {
+      var _c1 = await supabase.from('conversations')
+        .select('id, contact_id, cal_fecha_ingreso, cal_fecha_salida, cal_adultos, cal_ninos, cal_mascotas, cal_tipo_alojamiento')
+        .eq('id', convId).eq('user_id', dueno).maybeSingle();
+      if (_c1 && !_c1.error && _c1.data) conv = _c1.data;
+      else {
+        var _c2 = await supabase.from('conversations').select('id, contact_id').eq('id', convId).eq('user_id', dueno).maybeSingle();
+        if (_c2 && !_c2.error && _c2.data) conv = _c2.data;
+      }
+      if (!conv) return res.status(404).json({ error: 'Esa conversacion no es de esta cuenta' });
+      contactId = conv.contact_id || contactId;
+    }
+    if (!contactId) return res.status(404).json({ error: 'La conversacion todavia no tiene un contacto' });
+
+    // 2) El contacto. `perfil_comprador` es de desarrolladora y puede no existir -> misma lectura por capas.
+    var contacto = null;
+    var _k1 = await supabase.from('contacts').select('id, name, nombre_manual, interest, budget, notes, perfil_comprador')
+      .eq('id', contactId).eq('user_id', dueno).maybeSingle();
+    if (_k1 && !_k1.error && _k1.data) contacto = _k1.data;
+    else {
+      var _k2 = await supabase.from('contacts').select('id, name, nombre_manual, interest, budget, notes').eq('id', contactId).eq('user_id', dueno).maybeSingle();
+      if (_k2 && !_k2.error && _k2.data) contacto = _k2.data;
+    }
+    if (!contacto) return res.status(404).json({ error: 'Ese contacto no es de esta cuenta' });
+
+    var rubro = 'inmobiliaria';
+    try { var _br = await supabase.from('business_settings').select('rubro').eq('user_id', dueno).maybeSingle(); if (_br && _br.data) rubro = normalizarRubro(_br.data.rubro); } catch (eR) {}
+
+    // 3) La precarga. Las claves son las MISMAS que usa el formulario del front ('presupuesto',
+    // 'datos.huespedes'), asi no hay que traducir nada del otro lado.
+    var precarga = {};
+    var pres = _fichaPresupuestoDeTexto(contacto.budget);
+    if (pres.presupuesto) precarga.presupuesto = String(pres.presupuesto);
+    if (pres.moneda) precarga.moneda = pres.moneda;
+    // El interes es texto libre y NO se parte en zona/tipo con regex: adivinar la zona es
+    // exactamente el error que la ficha vino a corregir. Va entero a Observaciones, verbatim, y la
+    // persona lo reparte en los campos que correspondan.
+    if (contacto.interest && String(contacto.interest).trim()) precarga.notas = String(contacto.interest).trim().slice(0, 2000);
+    if (rubro === 'hotel_cabanas' && conv) {
+      if (conv.cal_fecha_ingreso) precarga.desde = String(conv.cal_fecha_ingreso).slice(0, 10);
+      if (conv.cal_fecha_salida) precarga.hasta = String(conv.cal_fecha_salida).slice(0, 10);
+      var _hu = (Number(conv.cal_adultos) || 0) + (Number(conv.cal_ninos) || 0);
+      if (_hu > 0) precarga['datos.huespedes'] = String(_hu);
+      if (conv.cal_tipo_alojamiento) precarga['datos.preferencias'] = String(conv.cal_tipo_alojamiento).slice(0, 200);
+    }
+    if (rubro === 'desarrolladora' && contacto.perfil_comprador) {
+      precarga['datos.perfil'] = (String(contacto.perfil_comprador) === 'inversion') ? 'Inversión' : 'Vivienda';
+    }
+
+    // 4) Las fichas ACTIVAS que ya tiene. RIESGO #3 del plan: si el asesor crea desde el chat una
+    // ficha que ya existe hay que detectarlo -- mismo contacto + mismo tipo + activa -> se ofrece
+    // EDITAR la que hay, no crear otra. Mismo criterio que el alta de contacto con telefono repetido.
+    var activas = [];
+    try {
+      var _f1 = await supabase.from('fichas').select('id, tipo, estado, desde, hasta, presupuesto, moneda, zonas, confirmada')
+        .eq('user_id', dueno).eq('contact_id', contactId).eq('estado', 'activa');
+      if (_f1 && !_f1.error) activas = _f1.data || [];
+      else {
+        var _f2 = await supabase.from('fichas').select('id, tipo, estado, desde, hasta, presupuesto, moneda, zonas')
+          .eq('user_id', dueno).eq('contact_id', contactId).eq('estado', 'activa');
+        if (_f2 && !_f2.error) activas = _f2.data || [];
+      }
+    } catch (eF) { /* tabla ausente -> sin fichas previas, se ofrece crear */ }
+
+    return res.json({
+      ok: true,
+      contact_id: contactId,
+      contacto_nombre: contacto.nombre_manual || contacto.name || '',
+      conversation_id: conv ? conv.id : null,
+      rubro: rubro,
+      tipo_sugerido: _fichaTipoSugerido(rubro, (contacto.interest || '') + ' ' + (contacto.notes || '')),
+      precarga: precarga,
+      // El texto crudo, para MOSTRARLO al lado del formulario. Que la persona vea de donde salio
+      // cada dato es la regla del plan: todo dato de IA con fuente y fecha.
+      fuente: { interes: contacto.interest || '', presupuesto: contacto.budget || '' },
+      fichas_activas: activas
+    });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// ============================================================================
+// COINCIDENCIAS — el matcheo al REVES y guardado (etapas A y B.1 del plan)
+// ----------------------------------------------------------------------------
+// POR QUE UNA TABLA Y NO UNA OPORTUNIDAD POR PROPIEDAD: `_ejecutarMatchingPropiedad` (~13950) crea
+// una Oportunidad BORRADOR + un aviso por CADA propiedad que matchea. Barrer las 271 propiedades de
+// Anton por ese camino dejaria 271 borradores y 271 avisos: seria inusable, y encima el dueno
+// perderia de vista los borradores que si le importan. La coincidencia es un DATO (esta propiedad
+// le sirve a esta ficha, con este puntaje y por estos motivos); la Oportunidad sigue siendo la
+// campaña de envio, y se arma cuando alguien decide mandar algo. Este bloque NO toca el matcheo
+// existente ni crea oportunidades.
+//
+// LA DIRECCION NUEVA: hoy solo se puede preguntar "que leads le sirven a esta propiedad". Aca se
+// pregunta "que propiedades le sirven a esta ficha", que es la que hoy no existe y es la mas util:
+// el cliente dice que quiere y ves al toque que tenes. Reusa `_mtchScoreFicha` (~13779) SIN
+// modificarlo: es la misma comparacion campo contra campo, mirada del otro lado.
+//
+// ESTO NO SIRVE PARA HOTEL (decision 3 de Diego, 2026-08-05). El barrido lee `properties`, y el
+// inventario de un hotel vive en `hotel_unidades`: en una cuenta hotel_cabanas este barrido no puede
+// devolver nada, nunca. Por eso el front NO dibuja el boton en ese rubro -- un boton que no puede
+// funcionar es peor que no tenerlo. NO se "arregla" apuntando a otra tabla: el matcheo de hotel es
+// OTRO problema, se resuelve por FECHAS y DISPONIBILIDAD (¿hay una unidad libre del 10 al 15?), no
+// por zona/tipo/ambientes. Meterlo aca seria forzar un algoritmo que no aplica.
+// ============================================================================
+var COINC_MAX_POR_FICHA = 50;    // tope por ficha: una ficha floja no puede generar 271 filas de ruido
+var COINC_MAX_CORRIDA = 3000;    // tope global por corrida
+var COINC_MAX_PROPS = 20000;     // techo de inventario a evaluar
+
+// Contexto de UNA propiedad con la MISMA forma que arma `_matchLeadsParaPropiedad`, para poder
+// pasarselo a `_mtchScoreFicha` tal cual. Si cambia el scoring, cambia en un solo lugar.
+function _coincCtxProp(p) {
+  var _pm = _mtchPrecioMoneda(p);
+  return {
+    zonaP: _mtchNorm(p && p.zone), tipoP: _mtchNorm(p && p.type), tokP: _mtchTokensZona(p && p.zone),
+    precioP: _pm.precio || 0, monedaP: _pm.moneda,
+    ambP: Number(p && p.rooms) || 0, dormP: Number(p && p.dormitorios) || 0
+  };
+}
+function _coincLabelProp(p) {
+  try {
+    return ((p.numero ? ('#' + p.numero + ' ') : '') + (p.title || p.type || 'propiedad') + (p.zone ? (' en ' + p.zone) : '')).slice(0, 240);
+  } catch (e) { return 'propiedad'; }
+}
+
+// ----------------------------------------------------------------------------
+// DECISION 4 DE DIEGO — POR QUE esta ficha no puede dar ninguna coincidencia.
+// ----------------------------------------------------------------------------
+// EL PROBLEMA REAL, no teorico: la ficha que sale del chat viene con presupuesto y con el interes
+// COPIADO A OBSERVACIONES (a proposito: adivinar la zona con una regex es el error que la ficha vino
+// a corregir, ver ~39326). O sea: cero zona, cero tipo_propiedad, cero ambientes. Con eso el maximo
+// puntaje alcanzable es 1 y el minimo para matchear es MATCH_MIN_SCORE=2 (~13776) -> el resultado es
+// CERO por construccion, contra cualquier inventario. Y el mensaje que se le mostraba era "ninguna
+// propiedad entra en estos criterios", que suena a "no tengo nada para ofrecerle" cuando en realidad
+// es "te falta cargar la zona". La primera vez que alguien usa la funcion, parece rota.
+//
+// NO SE TOCA EL ALGORITMO DE PUNTAJE (pedido explicito). Esto solo LEE la ficha y calcula el techo
+// que _mtchScoreFicha podria darle en el mejor de los casos, para poder decir la verdad.
+// El espejo de _mtchScoreFicha: zona exacta=2, tipo=1, presupuesto=1, ambientes=1, dormitorios=1.
+function _coincCriteriosFicha(f) {
+  var max = 0, faltan = [];
+  if (f && f.zonas && String(f.zonas).trim()) max += 2; else faltan.push('la Zona');
+  if (f && f.tipo_propiedad && String(f.tipo_propiedad).trim()) max += 1; else faltan.push('el Tipo de propiedad');
+  if (f && typeof f.presupuesto === 'number' && f.presupuesto > 0) max += 1; else faltan.push('el Presupuesto');
+  if (f && Number(f.ambientes) > 0) max += 1; else faltan.push('los Ambientes');
+  if (f && Number(f.dormitorios) > 0) max += 1; else faltan.push('los Dormitorios');
+  return { max: max, suficiente: max >= MATCH_MIN_SCORE, faltan: faltan };
+}
+// El texto que se le muestra a la persona. Nombra la ZONA primero porque sola ya alcanza para llegar
+// al minimo (vale 2); las demas suman de a 1 y hacen falta dos.
+function _coincMotivoSinCriterios(f) {
+  var c = _coincCriteriosFicha(f);
+  if (c.suficiente) return '';
+  if (c.faltan.indexOf('la Zona') >= 0) return 'A esta ficha le falta la ZONA. Sin zona no hay forma de que una propiedad llegue al puntaje minimo, aunque el inventario este lleno. Cargala y volve a buscar.';
+  return 'A esta ficha le faltan criterios para poder comparar: cargá ' + c.faltan.slice(0, 2).join(' o ') + '.';
+}
+
+// GOTCHA DURO DEL PROYECTO: PostgREST corta en 1000 filas SIN IMPORTAR el .limit() -> hay que
+// paginar con .range(). Anton tiene 271 propiedades y hoy entra en una pagina, pero el dia que una
+// cuenta tenga 1.200 el barrido silenciosamente ignoraria 200 y nadie se enteraria.
+async function _coincLeerPropiedades(ownerId) {
+  var out = [];
+  // ¿La cuenta tiene la columna `activa`? Se prueba UNA vez y despues se pagina siempre igual
+  // (nada de reintentos adentro del loop, que es donde se esconden los bugs de paginado).
+  var tieneActiva = true;
+  try { var pr = await supabase.from('properties').select('activa').limit(1); if (pr && pr.error) tieneActiva = false; } catch (e) { tieneActiva = false; }
+  var from = 0, size = 1000;
+  while (from < COINC_MAX_PROPS) {
+    var q = supabase.from('properties').select('*').eq('user_id', ownerId);
+    if (tieneActiva) q = q.eq('activa', true);   // una propiedad dada de baja no le sirve a nadie
+    var r = await q.order('id').range(from, from + size - 1);
+    if (!r || r.error) break;
+    var rows = r.data || [];
+    out = out.concat(rows);
+    if (rows.length < size) break;
+    from += size;
+  }
+  return out;
+}
+
+// Las fichas de DEMANDA activas del tenant (las mismas que ya usa el matcheo de la fase 3).
+// DECISION 1 DE DIEGO (2026-08-05), y es EXPLICITA, no un default que quedo asi: una ficha que
+// PROPUSO LA IA y que nadie confirmo NO entra al matcheo. Se muestra en el chat y en el contacto con
+// su origen a la vista para confirmarla de un toque; al confirmarla (`confirmada=true`) entra sola,
+// sin tocar nada mas. `incluirNoConfirmadas` es el unico camino para que entren antes, y solo lo
+// activa el flag `fichas_ia_matchea` (default false = la decision de Diego) o una consulta a mano
+// sobre UNA ficha puntual (/api/coincidencias/para-ficha, donde alguien pregunto por ESA ficha).
+async function _coincLeerFichas(ownerId, fichaId, incluirNoConfirmadas) {
+  var fichas = [];
+  var cols = 'id, contact_id, tipo, estado, zonas, presupuesto, moneda, tipo_propiedad, ambientes, dormitorios, confirmada';
+  var colsViejas = 'id, contact_id, tipo, estado, zonas, presupuesto, moneda, tipo_propiedad, ambientes, dormitorios';
+  async function pedir(sel) {
+    var q = supabase.from('fichas').select(sel).eq('user_id', ownerId).eq('estado', 'activa').in('tipo', MATCH_FICHA_TIPOS_DEMANDA);
+    if (fichaId) q = q.eq('id', String(fichaId));
+    return await q.limit(1000);
+  }
+  try {
+    var r = await pedir(cols);
+    if (r && !r.error) fichas = r.data || [];
+    else { var r2 = await pedir(colsViejas); if (r2 && !r2.error) fichas = r2.data || []; }
+  } catch (e) { return []; }
+  // El filtro se hace EN JS, no con .eq('confirmada', true), a proposito: si la columna todavia no
+  // existe el .eq() haria fallar la query entera y el barrido devolveria cero -- una regresion
+  // silenciosa. Con `undefined` (columna ausente) la ficha entra, que es el comportamiento de hoy.
+  if (!incluirNoConfirmadas) fichas = fichas.filter(function (f) { return f && f.confirmada !== false; });
+  return fichas;
+}
+
+// EL BARRIDO. Para cada ficha, que propiedades del inventario le sirven.
+// Devuelve { fichas, propiedades, nuevas, conservadas, por_ficha:[{ficha_id, contact_id, tipo, total, top:[...]}] }
+async function _coincBarrer(ownerId, fichas, origen) {
+  var out = { fichas: fichas.length, propiedades: 0, nuevas: 0, conservadas: 0, por_ficha: [] };
+  if (!fichas.length) return out;
+  var props = await _coincLeerPropiedades(ownerId);
+  out.propiedades = props.length;
+  if (!props.length) return out;
+
+  // El contexto se calcula UNA vez por propiedad, no una por cada par ficha x propiedad.
+  var ctxs = [];
+  props.forEach(function (p) {
+    var ctx = _coincCtxProp(p);
+    // Misma guarda que _matchLeadsParaPropiedad: sin ninguna señal util no se matchea nada (si no,
+    // una propiedad sin zona/tipo/precio le "coincidiria" a todo el mundo).
+    if (!ctx.zonaP && !ctx.tipoP && !(ctx.precioP > 0) && !(ctx.tokP && ctx.tokP.length)) return;
+    ctxs.push({ id: p.id, ctx: ctx, label: _coincLabelProp(p) });
+  });
+
+  var porFicha = {};
+  fichas.forEach(function (f) {
+    var lista = [];
+    for (var i = 0; i < ctxs.length; i++) {
+      var r = _mtchScoreFicha(f, ctxs[i].ctx);
+      if (r.score >= MATCH_MIN_SCORE) lista.push({ property_id: ctxs[i].id, etiqueta: ctxs[i].label, score: r.score, motivos: r.motivos.join('+') });
+    }
+    lista.sort(function (a, b) { return b.score - a.score; });
+    porFicha[f.id] = lista.slice(0, COINC_MAX_POR_FICHA);
+  });
+
+  // Que hacemos con lo que ya estaba guardado:
+  //   * las coincidencias en estado 'nueva' (que nadie miro) se BORRAN y se regeneran -> si la
+  //     ficha se edito, el resultado viejo desaparece en vez de quedar mintiendo;
+  //   * las que alguien ya marco ('vista' / 'descartada') se CONSERVAN y no se vuelven a insertar:
+  //     una decision de una persona no se tira por correr un boton.
+  var fichaIds = fichas.map(function (f) { return f.id; });
+  var conservadas = {};
+  try {
+    for (var ci = 0; ci < fichaIds.length; ci += 100) {
+      var chunk = fichaIds.slice(ci, ci + 100);
+      // ARREGLO #5 DE LA REVISION. Antes esto era UN solo select sin paginar. GOTCHA DURO DEL
+      // PROYECTO: PostgREST corta en 1000 filas SIN IMPORTAR que no haya .limit(). Con 100 fichas
+      // por chunk y hasta 50 coincidencias por ficha son 5.000 filas: se leian 1000 y las otras
+      // 4.000 quedaban invisibles. Consecuencias encadenadas, todas silenciosas:
+      //   1. una coincidencia marcada 'vista'/'descartada' que no entraba en las primeras 1000 no
+      //      se contaba como conservada -> se la volvia a insertar;
+      //   2. el insert chocaba contra el indice unico (ficha+propiedad) y devolvia error;
+      //   3. el catch de abajo marcaba `sin_tabla` y el front decia "falta correr la migracion",
+      //      que es MENTIRA: la tabla existe, lo que fallo fue el paginado.
+      // Se pagina con .range() y se ordena por id para que las paginas no se pisen entre si.
+      var desde = 0, pagina = 1000;
+      while (true) {
+        var ex = await supabase.from('coincidencias').select('ficha_id, property_id, estado')
+          .eq('user_id', ownerId).in('ficha_id', chunk)
+          .order('id').range(desde, desde + pagina - 1);
+        if (ex && ex.error) throw new Error(ex.error.message);
+        var filasEx = (ex && ex.data) || [];
+        filasEx.forEach(function (c) {
+          if (c && c.estado && c.estado !== 'nueva') { conservadas[c.ficha_id + '|' + c.property_id] = true; out.conservadas++; }
+        });
+        if (filasEx.length < pagina) break;
+        desde += pagina;
+      }
+      var del = await supabase.from('coincidencias').delete().eq('user_id', ownerId).in('ficha_id', chunk).eq('estado', 'nueva');
+      if (del && del.error) throw new Error(del.error.message);
+    }
+  } catch (eEx) {
+    // NO todo fallo es "falta la migracion". Se distingue, porque decirle a alguien que corra una
+    // migracion que YA corrio lo manda a buscar el problema al lugar equivocado.
+    var _msgEx = (eEx && eEx.message) || '';
+    if (/does not exist|schema cache|relation .* does not exist|PGRST20[0-9]/i.test(_msgEx)) {
+      // Tabla ausente (migracion sin correr): se devuelve el calculo igual, sin persistir. El boton
+      // sirve para VER el resultado aunque todavia no haya donde guardarlo.
+      out.sin_tabla = true;
+    } else {
+      out.error_guardado = _msgEx || 'no se pudieron guardar las coincidencias';
+      console.error('[coincidencias] barrido, guardado:', _msgEx);
+    }
+  }
+
+  var filas = [];
+  fichas.forEach(function (f) {
+    var lista = porFicha[f.id] || [];
+    out.por_ficha.push({
+      ficha_id: f.id, contact_id: f.contact_id, tipo: f.tipo,
+      confirmada: f.confirmada !== false, total: lista.length, top: lista.slice(0, 5),
+      // DECISION 4: si la ficha no puede llegar al minimo NI EN EL MEJOR CASO, se dice POR QUE en vez
+      // de "ninguna propiedad entra en estos criterios" (que hace parecer que el problema es el
+      // inventario). Va siempre en la respuesta; el front lo muestra solo cuando total === 0.
+      motivo_sin_resultados: lista.length ? '' : _coincMotivoSinCriterios(f)
+    });
+    lista.forEach(function (c) {
+      if (conservadas[f.id + '|' + c.property_id]) return;
+      if (filas.length >= COINC_MAX_CORRIDA) return;
+      filas.push({
+        user_id: ownerId, ficha_id: f.id, contact_id: f.contact_id, property_id: c.property_id,
+        etiqueta: c.etiqueta, score: c.score, motivos: c.motivos,
+        ficha_confirmada: f.confirmada !== false, origen: origen || 'recalculo', estado: 'nueva'
+      });
+    });
+  });
+
+  if (!out.sin_tabla && !out.error_guardado && filas.length) {
+    for (var fi = 0; fi < filas.length; fi += 500) {
+      var lote = filas.slice(fi, fi + 500);
+      // Mismo criterio que arriba: un error de insert NO es "falta la migracion" salvo que el
+      // mensaje diga que la tabla/columna no existe. Antes cualquier fallo (un unique violado, un
+      // timeout) se le mostraba al usuario como "falta correr migracion-fichas-fases-245.sql".
+      try {
+        var ins = await supabase.from('coincidencias').insert(lote);
+        if (ins && ins.error) {
+          var _mi = (ins.error && ins.error.message) || '';
+          if (/does not exist|schema cache|PGRST20[0-9]/i.test(_mi)) out.sin_tabla = true;
+          else { out.error_guardado = _mi || 'no se pudieron guardar las coincidencias'; console.error('[coincidencias] insert:', _mi); }
+          break;
+        }
+        out.nuevas += lote.length;
+      } catch (eIns) { out.error_guardado = (eIns && eIns.message) || 'no se pudieron guardar las coincidencias'; break; }
+    }
+  }
+  return out;
+}
+
+// POST /api/coincidencias/recalcular -> BARRE TODO: cada ficha de demanda activa contra todo el
+// inventario. Es lo unico que permite ver el matcheo funcionando HOY, con las propiedades que ya
+// estan cargadas, sin construir nada mas. CERO IA.
+app.post('/api/coincidencias/recalcular', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await _fichasFlagActivo(dueno, 'coincidencias_v1'))) return res.status(409).json({ error: 'Las coincidencias no estan activadas en esta cuenta', gate: 'coincidencias_v1' });
+    var iaMatchea = await _fichasFlagActivo(dueno, 'fichas_ia_matchea');
+    var fichas = await _coincLeerFichas(dueno, null, iaMatchea);
+    var r = await _coincBarrer(dueno, fichas, 'recalculo');
+    return res.json({ ok: true, resultado: r, ia_matchea: iaMatchea });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// POST /api/coincidencias/para-ficha { ficha_id } -> lo mismo pero de UNA ficha.
+// Es el disparador que faltaba (etapa B.1): al guardar una ficha, ver al toque que propiedades le
+// sirven. El front lo llama despues de crear/editar una ficha.
+app.post('/api/coincidencias/para-ficha', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await _fichasFlagActivo(dueno, 'coincidencias_v1'))) return res.status(409).json({ error: 'Las coincidencias no estan activadas en esta cuenta', gate: 'coincidencias_v1' });
+    var fichaId = (req.body && req.body.ficha_id) ? String(req.body.ficha_id) : '';
+    if (!fichaId) return res.status(400).json({ error: 'Falta ficha_id' });
+    // Se lee la ficha aunque no este confirmada para poder DECIR POR QUE no se matchea (si se
+    // filtrara aca, la respuesta seria "esa ficha no existe", que es mentira).
+    var fichas = await _coincLeerFichas(dueno, fichaId, true);
+    if (!fichas.length) return res.json({ ok: true, resultado: { fichas: 0, propiedades: 0, nuevas: 0, por_ficha: [] }, aviso: 'Esa ficha no es de demanda activa: solo las de busqueda matchean contra el inventario.' });
+    // DECISION 1 DE DIEGO, APLICADA TAMBIEN ACA. Este endpoint pasaba `incluirNoConfirmadas=true` y
+    // despues barria igual, o sea que una ficha que propuso la IA y que nadie miro SI entraba al
+    // matcheo por este camino y hasta dejaba coincidencias guardadas. Era el agujero por el que la
+    // decision se volvia accidental. Ahora se corta y se dice que falta: confirmarla es un toque.
+    var _iaMatchea = await _fichasFlagActivo(dueno, 'fichas_ia_matchea');
+    if (!_iaMatchea && fichas[0] && fichas[0].confirmada === false) {
+      return res.json({
+        ok: true,
+        resultado: { fichas: 0, propiedades: 0, nuevas: 0, por_ficha: [] },
+        aviso: 'Esta ficha la propuso la IA y todavia nadie la confirmo, asi que no se compara contra el inventario. Confirmala y volve a buscar.'
+      });
+    }
+    var r = await _coincBarrer(dueno, fichas, 'alta_ficha');
+    return res.json({ ok: true, resultado: r });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// GET /api/coincidencias?ficha_id= | ?contact_id= -> lo generado, para mostrarlo.
+app.get('/api/coincidencias', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await _fichasFlagActivo(dueno, 'coincidencias_v1'))) return res.status(409).json({ error: 'Las coincidencias no estan activadas en esta cuenta', gate: 'coincidencias_v1' });
+    var q = supabase.from('coincidencias').select('*').eq('user_id', dueno);
+    if (req.query && req.query.ficha_id) q = q.eq('ficha_id', String(req.query.ficha_id));
+    if (req.query && req.query.contact_id) q = q.eq('contact_id', String(req.query.contact_id));
+    if (req.query && req.query.estado) q = q.eq('estado', String(req.query.estado));
+    var r = await q.order('score', { ascending: false }).limit(500);
+    if (r && r.error) return res.json({ ok: true, coincidencias: [], aviso: 'La tabla de coincidencias todavia no existe.' });
+    return res.json({ ok: true, coincidencias: (r && r.data) || [] });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// PATCH /api/coincidencias/:id { estado } -> marcar vista / descartada.
+// Es lo que hace que el barrido NO la pise en la proxima corrida (ver _coincBarrer).
+app.patch('/api/coincidencias/:id', async function (req, res) {
+  try {
+    var uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    var dueno = await _duenoDelUid(uid);
+    if (!(await _fichasFlagActivo(dueno, 'coincidencias_v1'))) return res.status(409).json({ error: 'Las coincidencias no estan activadas en esta cuenta', gate: 'coincidencias_v1' });
+    var est = (req.body && req.body.estado) ? String(req.body.estado) : '';
+    if (['nueva', 'vista', 'descartada'].indexOf(est) < 0) return res.status(400).json({ error: 'Estado invalido' });
+    var r = await supabase.from('coincidencias').update({ estado: est, updated_at: new Date().toISOString() })
+      .eq('id', String(req.params.id)).eq('user_id', dueno).select().maybeSingle();
+    if (r && r.error) return res.status(500).json({ error: r.error.message });
+    if (!r || !r.data) return res.status(404).json({ error: 'Coincidencia no encontrada' });
+    return res.json({ ok: true, coincidencia: r.data });
+  } catch (e) { return res.status(500).json({ error: (e && e.message) || 'Error' }); }
+});
+
+// ============================================================================
+// FASE 4 — LA IA PROPONE LA FICHA. Reusa lo que YA se extrae; no agrega ni una llamada.
+// ----------------------------------------------------------------------------
+// Se llama fire-and-forget desde el webhook (~11750) con el `ext` que `extraerDatosLead` YA
+// devolvio. Esta funcion NO habla con ningun modelo: recibe el dato ya calculado y lo estructura.
+//
+// REGLA DE ORO (decision de modelo de Diego): UNA INTENCION = UNA FICHA. Mover fechas es EDITAR la
+// misma ficha, no crear otra. Si cada cambio creara una ficha, en tres mensajes hay tres fichas del
+// mismo tipo y volvemos al problema de duplicados que la ficha vino a resolver.
+//
+// QUE PASA CON LO QUE CARGO UNA PERSONA: la IA NUNCA pisa un valor confirmado por un humano. Si la
+// ficha esta confirmada y el lead cambia la fecha, el cambio se ANOTA en el historial con
+// origen='ia' y la ficha queda como la dejo la persona. Asi se ve "viene moviendo la fecha hace 3
+// semanas" sin que un extractor le rompa el dato al asesor.
+// >>> DECISION PENDIENTE DE DIEGO: si prefiere que la IA TAMBIEN actualice las fichas confirmadas,
+//     es sacar la guarda `esDeIA` de abajo. Hoy esta del lado conservador a proposito.
+// ============================================================================
+async function _fichaPropuestaPorIA(ownerId, contacto, conv, ext, rubro) {
+  try {
+    if (!ownerId || !contacto || !contacto.id || !ext) return;
+    if (!(await fichasV1Activo(ownerId))) return;
+    if (!(await _fichasFlagActivo(ownerId, 'fichas_ia_v1'))) return;
+    var r = normalizarRubro(rubro);
+    var tipo = _fichaTipoSugerido(r, (ext.interes || '') + ' ' + (contacto.interest || ''));
+    if (!tipo) return;   // sin senal clara del tipo NO se inventa una ficha
+
+    // Los campos que salen de la extraccion que ya corre. Nada de esto cuesta un token extra.
+    var campos = {};
+    var pres = _fichaPresupuestoDeTexto(ext.presupuesto || contacto.budget);
+    if (pres.presupuesto) campos.presupuesto = pres.presupuesto;
+    if (pres.moneda) campos.moneda = pres.moneda;
+    var datos = {};
+    if (r === 'hotel_cabanas') {
+      var _reF = /^\d{4}-\d{2}-\d{2}$/;
+      if (ext.fecha_ingreso && _reF.test(ext.fecha_ingreso)) campos.desde = ext.fecha_ingreso;
+      if (ext.fecha_salida && _reF.test(ext.fecha_salida)) campos.hasta = ext.fecha_salida;
+      var _hu = (parseInt(ext.adultos, 10) || 0) + (parseInt(ext.ninos, 10) || 0);
+      if (_hu > 0) datos.huespedes = String(_hu);
+      if (ext.tipo_alojamiento) datos.preferencias = String(ext.tipo_alojamiento).slice(0, 200);
+    }
+    if (r === 'desarrolladora' && ext.perfil_comprador) {
+      var _pc = String(ext.perfil_comprador).trim().toLowerCase();
+      if (_pc === 'vivienda' || _pc === 'inversion') datos.perfil = (_pc === 'inversion') ? 'Inversión' : 'Vivienda';
+    }
+    // Una ficha VACIA no le sirve a nadie y es el riesgo #1 del plan. Si la extraccion no aporto
+    // ningun dato estructurado, no se crea nada.
+    if (!Object.keys(campos).length && !Object.keys(datos).length) return;
+
+    // ¿Ya hay una ficha de ese tipo para este contacto?
+    var previas = [];
+    try {
+      var pq = await supabase.from('fichas').select('id, tipo, estado, desde, hasta, presupuesto, moneda, datos, confirmada, creado_por')
+        .eq('user_id', ownerId).eq('contact_id', contacto.id).eq('tipo', tipo).limit(20);
+      if (!pq || pq.error) return;    // tabla/columna ausente -> no se toca nada
+      previas = pq.data || [];
+    } catch (ePq) { return; }
+
+    var activa = previas.filter(function (f) { return f.estado === 'activa'; })[0] || null;
+    if (!activa) {
+      // Si existe una ficha de ese tipo CERRADA, la IA NO la resucita: cerrarla fue una decision de
+      // una persona y volver a abrir el caso solo porque el lead escribio seria pisarla.
+      if (previas.length) return;
+      var fila = Object.assign({}, campos);
+      fila.user_id = ownerId; fila.contact_id = contacto.id; fila.tipo = tipo; fila.estado = 'activa';
+      fila.conversation_id = (conv && conv.id) ? conv.id : null;
+      fila.creado_por = 'ia'; fila.origen = 'ia_extraccion'; fila.confirmada = false;
+      if (Object.keys(datos).length) fila.datos = datos;
+      var ins = await supabase.from('fichas').insert(fila).select('id').maybeSingle();
+      // LA CARRERA (arreglo #2): entre el SELECT de arriba y este INSERT no hay nada. Dos mensajes
+      // seguidos del lead = dos webhooks que leen "no hay ficha" a la vez y los dos insertan. El
+      // candado real es el indice unico parcial `fichas_ia_sin_confirmar_uq`
+      // (migracion-fichas-fases-245.sql): al segundo le vuelve un 23505 y ACA se trata como lo que
+      // es -- "el otro mensaje ya la creo" -- no como un error. El mensaje siguiente del lead va a
+      // encontrar la ficha ya creada y la va a EDITAR, que es el camino correcto.
+      // El indice NO alcanza a las fichas de una persona (ver el comentario de la migracion), asi
+      // que esto no le puede bloquear un alta a nadie.
+      if (ins && ins.error) {
+        var _cod = String((ins.error && (ins.error.code || '')) || '');
+        var _msg = String((ins.error && ins.error.message) || '');
+        if (_cod !== '23505' && !/duplicate key|unique constraint/i.test(_msg)) console.error('ficha propuesta IA (insert):', _msg);
+        return;
+      }
+      if (!ins || !ins.data) return;
+      _fichaLogCambios(ownerId, ins.data.id, [{ campo: 'estado', valor_anterior: null, valor_nuevo: 'ficha propuesta por la IA' }], 'ia', 'extraerDatosLead');
+      return;
+    }
+
+    // Hay una ficha activa -> se EDITA la misma (una intencion = una ficha). Que se edite depende de
+    // quien la cargo.
+    var esDeIA = (activa.confirmada === false);
+    // DOS listas, y no una, por el arreglo #1 de la revision (era GRAVE):
+    //   * `cambiosAplicados`  -> el valor SE ESCRIBE en la ficha. En el mensaje siguiente `antes` ya
+    //                            va a ser igual a `ahora`, asi que no se puede repetir nunca.
+    //   * `cambiosSoloRastro` -> la ficha la confirmo una persona y ese campo NO se pisa. Como la
+    //                            ficha queda igual, en el mensaje siguiente la comparacion vuelve a
+    //                            dar distinto y se anotaria LO MISMO OTRA VEZ. Y en el siguiente. Y
+    //                            asi para siempre: una fila de historial por cada mensaje del lead.
+    // El rastro sigue existiendo (para eso esta la tabla), pero se anota UNA vez por valor nuevo.
+    var cambiosAplicados = [], cambiosSoloRastro = [], upd = {};
+    Object.keys(campos).forEach(function (k) {
+      var antes = (activa[k] === null || activa[k] === undefined) ? '' : String(activa[k]);
+      var ahora = String(campos[k]);
+      if (antes === ahora) return;
+      // Sobre una ficha CONFIRMADA por una persona: solo se completa lo que esta VACIO. Lo que la
+      // persona cargo no se pisa; el cambio queda anotado en el historial igual.
+      if (!esDeIA && antes !== '') { cambiosSoloRastro.push({ campo: k, valor_anterior: antes, valor_nuevo: ahora }); return; }
+      upd[k] = campos[k];
+      cambiosAplicados.push({ campo: k, valor_anterior: antes || null, valor_nuevo: ahora });
+    });
+    if (Object.keys(datos).length) {
+      var dAnt = (activa.datos && typeof activa.datos === 'object') ? activa.datos : {};
+      var dNue = Object.assign({}, dAnt);
+      var tocoDatos = false;
+      Object.keys(datos).forEach(function (k) {
+        var antesD = (dAnt[k] === null || dAnt[k] === undefined) ? '' : String(dAnt[k]);
+        if (antesD === String(datos[k])) return;
+        var filaD = { campo: 'datos.' + k, valor_anterior: antesD || null, valor_nuevo: String(datos[k]) };
+        if (!esDeIA && antesD !== '') { cambiosSoloRastro.push(filaD); return; }
+        dNue[k] = datos[k]; tocoDatos = true;
+        cambiosAplicados.push(filaD);
+      });
+      if (tocoDatos) upd.datos = dNue;
+    }
+    if (Object.keys(upd).length) {
+      upd.updated_at = new Date().toISOString();
+      var uq = await supabase.from('fichas').update(upd).eq('id', activa.id).eq('user_id', ownerId);
+      if (uq && uq.error) return;
+    }
+    // Los que NO se aplican se comparan contra LO ULTIMO QUE YA QUEDO ANOTADO para ese campo, no
+    // contra la ficha (que por definicion no cambio). Si el ultimo registro ya dice ese mismo valor,
+    // el lead no movio nada nuevo: no se anota de nuevo.
+    // La lectura solo ocurre si hay algo de esta clase -> en el caso normal no agrega ni una query.
+    var aAnotar = cambiosAplicados;
+    if (cambiosSoloRastro.length) {
+      var ultimos = {};
+      try {
+        var hq = await supabase.from('fichas_historial')
+          .select('campo, valor_nuevo, created_at')
+          .eq('user_id', ownerId).eq('ficha_id', activa.id)
+          .in('campo', cambiosSoloRastro.map(function (c) { return c.campo; }))
+          .order('created_at', { ascending: false }).limit(60);
+        // Tabla ausente (migracion sin correr) -> `ultimos` vacio -> se anota, que es el
+        // comportamiento de hoy. No se pierde nada; a lo sumo se repite hasta que la tabla exista.
+        if (hq && !hq.error) (hq.data || []).forEach(function (h) {
+          if (h && h.campo && !Object.prototype.hasOwnProperty.call(ultimos, h.campo)) ultimos[h.campo] = h.valor_nuevo;
+        });
+      } catch (eH) {}
+      aAnotar = aAnotar.concat(cambiosSoloRastro.filter(function (c) {
+        var ya = (ultimos[c.campo] === null || ultimos[c.campo] === undefined) ? '' : String(ultimos[c.campo]);
+        return ya !== String(c.valor_nuevo == null ? '' : c.valor_nuevo);
+      }));
+    }
+    if (aAnotar.length) await _fichaLogCambios(ownerId, activa.id, aAnotar, 'ia', 'extraerDatosLead');
+  } catch (e) { console.error('ficha propuesta IA:', e && e.message); }
+}
+
+// ============================================================================
+// FASE 2 — AVISOS POR VENCIMIENTO DE FICHA. CERO IA.
+// ----------------------------------------------------------------------------
+// Copia el patron de los crons que YA existen (enviarAvisosTareas ~10820, enviarAvisosEstadia
+// ~27999): recorre las cuentas con el flag ON, saltea las pausadas/borradas, hace un CLAIM
+// optimista antes de avisar para que dos corridas solapadas no manden el aviso dos veces, y usa el
+// canal interno que ya existe (`_postearAvisoInterno` -> canal "Todos"). NO inventa un canal nuevo
+// y NO le llega NADA al cliente final: es un aviso para adentro de la oficina.
+// ============================================================================
+var FICHAS_AVISO_UMBRALES = [30, 7, 0];   // dias antes del vencimiento en los que se avisa
+var FICHAS_AVISO_CAP_CUENTA = 20;         // tope de avisos por cuenta y por corrida
+
+async function revisarVencimientosFichas() {
+  try {
+    if (typeof _pausaGlobal !== 'undefined' && _pausaGlobal === true) return;
+    var cuentas = [];
+    try {
+      var rc = await supabase.from('business_settings').select('user_id, crm_pausado, eliminado_at').eq('fichas_avisos_v1', true);
+      if (!rc || rc.error) return;   // columna ausente (migracion sin correr) -> nada que hacer, inerte
+      cuentas = Array.isArray(rc.data) ? rc.data : [];
+    } catch (eSel) { return; }
+    if (!cuentas.length) return;
+    var hoy = _estadiaHoyStr();
+    var tope = _estadiaAddDias(hoy, FICHAS_AVISO_UMBRALES[0]);
+    if (!tope) return;
+
+    for (var ci = 0; ci < cuentas.length; ci++) {
+      var bs = cuentas[ci];
+      try {
+        if (!bs || !bs.user_id) continue;
+        if (bs.eliminado_at || bs.crm_pausado === true) continue;
+        var uid = bs.user_id;
+        // DOS queries en vez de un .or(): `proximo_vencimiento` y `hasta` tienen cada uno su indice
+        // parcial, y un .or() sobre dos columnas nullable no los usa. Se juntan por id.
+        var porId = {};
+        for (var qi = 0; qi < 2; qi++) {
+          var col = (qi === 0) ? 'proximo_vencimiento' : 'hasta';
+          try {
+            var q = await supabase.from('fichas').select('id, contact_id, tipo, estado, desde, hasta, proximo_vencimiento, presupuesto, moneda, aviso_venc_key')
+              .eq('user_id', uid).eq('estado', 'activa').gte(col, hoy).lte(col, tope).limit(500);
+            if (!q || q.error) continue;   // columna aviso_venc_key ausente -> esta cuenta no avisa (fail-closed)
+            (q.data || []).forEach(function (f) { if (f && f.id) porId[f.id] = f; });
+          } catch (eQ) {}
+        }
+        var fichas = Object.keys(porId).map(function (k) { return porId[k]; });
+        if (!fichas.length) continue;
+
+        // Nombres de los contactos: un aviso que dice "la ficha 7f3a..." no lo lee nadie.
+        var nombres = {};
+        var cids = fichas.map(function (f) { return f.contact_id; }).filter(Boolean);
+        for (var ni = 0; ni < cids.length; ni += 200) {
+          try {
+            var cq = await supabase.from('contacts').select('id, name, nombre_manual').eq('user_id', uid).in('id', cids.slice(ni, ni + 200));
+            if (cq && !cq.error) (cq.data || []).forEach(function (c) { nombres[c.id] = c.nombre_manual || c.name || ''; });
+          } catch (eC) {}
+        }
+
+        var enviados = 0;
+        for (var fi = 0; fi < fichas.length; fi++) {
+          if (enviados >= FICHAS_AVISO_CAP_CUENTA) break;
+          var f = fichas[fi];
+          // ARREGLO #4 DE LA REVISION. Antes decia `f.proximo_vencimiento || f.hasta`, y eso agarra
+          // la fecha equivocada en los dos sentidos:
+          //   * la ficha entro por la query de `hasta` (el contrato termina dentro de los 30 dias)
+          //     pero tiene un `proximo_vencimiento` VIEJO (la cuota de hace dos semanas) -> el aviso
+          //     decia "vence en -12 dias";
+          //   * o el `proximo_vencimiento` esta LEJOS (mas alla de los 30 dias) y el que vence es
+          //     `hasta` -> `dias` daba > 30, ningun umbral aplicaba y el fin de contrato NO se
+          //     avisaba nunca.
+          // Lo correcto es la fecha que DE VERDAD se viene: la MAS CERCANA de las dos que todavia no
+          // paso. Como la key del claim lleva la fecha adentro, cuando esa pasa la key cambia sola y
+          // se avisa por la siguiente -- sin repetir ni oscilar entre las dos.
+          var venc = '';
+          [f.proximo_vencimiento, f.hasta].forEach(function (c) {
+            var s = String(c || '').slice(0, 10);
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return;
+            if (s < hoy) return;                          // ya paso: no es un vencimiento que se viene
+            if (!venc || s < venc) venc = s;              // comparacion de strings: 'YYYY-MM-DD' ordena bien
+          });
+          if (!venc) continue;
+          // Diferencia en DIAS. Las dos fechas se parsean con el MISMO ancla UTC a proposito: asi la
+          // resta da dias enteros exactos y no se cuela el corrimiento de huso (el "bug de las 3
+          // horas"). `hoy` ya viene calculado en huso Argentina por _estadiaHoyStr.
+          var dias = Math.round((Date.parse(venc + 'T00:00:00.000Z') - Date.parse(hoy + 'T00:00:00.000Z')) / 86400000);
+          // Umbral que corresponde: el MAS CHICO que ya se alcanzo (a 5 dias del vencimiento el
+          // umbral es 7, no 30; si no, se avisaria de nuevo por cada dia que pasa).
+          var umbral = null;
+          for (var ui = FICHAS_AVISO_UMBRALES.length - 1; ui >= 0; ui--) { if (dias <= FICHAS_AVISO_UMBRALES[ui]) { umbral = FICHAS_AVISO_UMBRALES[ui]; break; } }
+          if (umbral === null) continue;
+          // CLAIM optimista, mismo patron que tareas_evento.aviso_enviado: se marca ANTES de avisar.
+          // La key lleva la FECHA de vencimiento adentro, asi que si el vencimiento se corre a otra
+          // fecha se vuelve a avisar -- que es exactamente lo que hay que hacer. Sin '|' ni comillas
+          // en la key: el filtro .or() de PostgREST usa la coma como separador y las comillas para
+          // escapar, y una key con caracteres raros lo rompe en silencio.
+          var key = venc + '-u' + umbral;
+          var claim = null;
+          try {
+            claim = await supabase.from('fichas').update({ aviso_venc_key: key })
+              .eq('id', f.id).eq('user_id', uid)
+              .or('aviso_venc_key.is.null,aviso_venc_key.neq.' + key).select('id');
+          } catch (eCl) { continue; }
+          if (!claim || claim.error || !claim.data || !claim.data.length) continue;   // ya avisado (o columna ausente)
+
+          var quien = nombres[f.contact_id] || 'un contacto';
+          var cuando = (dias === 0) ? 'vence HOY' : (dias === 1 ? 'vence mañana' : ('vence en ' + dias + ' dias'));
+          var txt = 'Ficha de ' + quien + ' (' + String(f.tipo || '').replace(/_/g, ' ') + ') ' + cuando + ' — ' + _estadiaFmtDDMM(venc) + '. Revisala en la ficha del contacto.';
+          try { await _postearAvisoInterno(uid, 'general', txt); } catch (eAv) {}
+          enviados++;
+        }
+      } catch (eCuenta) { console.error('[fichas venc] cuenta ' + (bs && bs.user_id) + ':', eCuenta && eCuenta.message); }
+    }
+  } catch (e) { console.error('revisarVencimientosFichas:', e && e.message); }
+}
 
 // ============================================================================
 // FICHAS DEL CLIENTE (Diego 2026-08-04) — ver PLAN-FICHA-CLIENTE.md

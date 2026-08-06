@@ -30190,7 +30190,7 @@ const CONTACTOS_COLS_BASE = 'id, name, nombre_manual, phone, interest, budget, n
 // (/api/contactos/uno), que se abre de a una: ahi un request fallido de mas no se nota. En el LISTADO no se
 // usa a proposito -- seria un round-trip perdido en cada carga de pagina, y el listado no necesita las redes.
 // Cuando la migracion este corrida, los campos aparecen solos sin tocar codigo ni desplegar.
-const CONTACTOS_COLS_REDES = CONTACTOS_COLS_FULL + ', instagram, facebook';
+const CONTACTOS_COLS_REDES = CONTACTOS_COLS_FULL + ', instagram, facebook, budget_moneda';
 
 function _esColumnaAusente(err) {
   if (!err) return false;
@@ -30569,6 +30569,9 @@ app.get('/api/contactos/uno', async function (req, res) {
         // cae al set sin esas columnas y llegan como null (no como undefined) para que el front no dude.
         instagram: (Object.prototype.hasOwnProperty.call(contacto, 'instagram') ? (contacto.instagram || null) : null),
         facebook: (Object.prototype.hasOwnProperty.call(contacto, 'facebook') ? (contacto.facebook || null) : null),
+        // Moneda del presupuesto. NULL = nadie la eligio todavia; NO se asume pesos (regla de Diego:
+        // todo monto lleva su moneda, y un monto sin moneda hay que mostrarlo como lo que es: incompleto).
+        budget_moneda: (Object.prototype.hasOwnProperty.call(contacto, 'budget_moneda') ? (contacto.budget_moneda || null) : null),
         redes_disponibles: Object.prototype.hasOwnProperty.call(contacto, 'instagram'),   // false = falta la migracion
         // `about` es el texto de "info" que trae WhatsApp: se muestra, NO se edita (lo escribe el lead).
         about: (Object.prototype.hasOwnProperty.call(contacto, 'about') ? (contacto.about || null) : null),
@@ -30605,14 +30608,27 @@ app.get('/api/contactos/uno', async function (req, res) {
 // 2026-08-06; las otras seis si existen y estaban vacias). Por eso el update se intenta con todo y, si
 // la base se queja de una columna ausente, se reintenta SIN esas dos. Asi este codigo anda igual antes
 // y despues de correr migracion-contactos-redes.sql, sin deploy en el medio.
-const _CONTACTO_GENERALES_MAX = { email: 200, documento: 60, pais: 80, provincia: 80, ciudad: 120, empresa: 160, instagram: 120, facebook: 160 };
-const _CONTACTO_GENERALES_NUEVAS = ['instagram', 'facebook'];   // las que dependen de la migracion
+const _CONTACTO_GENERALES_MAX = { email: 200, documento: 60, pais: 80, provincia: 80, ciudad: 120, empresa: 160, instagram: 120, facebook: 160, budget_moneda: 3 };
+const _CONTACTO_GENERALES_NUEVAS = ['instagram', 'facebook', 'budget_moneda'];   // las que dependen de la migracion
+// REGLA DE DIEGO (2026-08-06): "de aca en adelante cuando se hable de dinero tiene que tener la moneda
+// para elegir". La moneda se valida contra esta lista: cualquier otra cosa se descarta en silencio en vez
+// de guardarse. Mismos valores que ya usan las fichas del cliente (`fichas.moneda`), no una lista nueva.
+const _MONEDAS_VALIDAS = ['ARS', 'USD'];
+function _monedaValida(v) {
+  const m = String(v == null ? '' : v).trim().toUpperCase();
+  return _MONEDAS_VALIDAS.indexOf(m) >= 0 ? m : null;
+}
 async function _aplicarDatosGeneralesContacto(contactId, ownerId, body) {
   try {
     if (!contactId || !ownerId || !body) return { ok: true, aplicados: [] };
     const upd = {};
     Object.keys(_CONTACTO_GENERALES_MAX).forEach(function (campo) {
       if (!Object.prototype.hasOwnProperty.call(body, campo)) return;
+      if (campo === 'budget_moneda') {
+        const m = _monedaValida(body[campo]);       // 'ARS'|'USD' o nada: no se guarda basura
+        if (m) upd[campo] = m;
+        return;
+      }
       const v = String(body[campo] == null ? '' : body[campo]).trim().slice(0, _CONTACTO_GENERALES_MAX[campo]);
       if (v) upd[campo] = v;      // en el ALTA no tiene sentido escribir null: si vino vacio, no se toca
     });
@@ -30749,6 +30765,14 @@ app.patch('/api/contactos/:id', async function (req, res) {
     // lugar donde estan los campos y sus topes, para que editar y crear nunca acepten cosas distintas.
     Object.keys(_CONTACTO_GENERALES_MAX).forEach(function (campo) {
       if (!Object.prototype.hasOwnProperty.call(cambios, campo)) return;
+      if (campo === 'budget_moneda') {
+        // Vacio = volver a "sin moneda" (NULL). Un valor que no sea ARS/USD se descarta: no se guarda.
+        const crudo = String(cambios[campo] == null ? '' : cambios[campo]).trim();
+        if (crudo === '') { upd[campo] = null; return; }
+        const m = _monedaValida(crudo);
+        if (m) upd[campo] = m;
+        return;
+      }
       const v = String(cambios[campo] == null ? '' : cambios[campo]).trim().slice(0, _CONTACTO_GENERALES_MAX[campo]);
       upd[campo] = v === '' ? null : v;    // vacio = borrar el dato (NULL, no '')
     });

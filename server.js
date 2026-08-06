@@ -19064,6 +19064,16 @@ app.post('/api/contactos/cargar-manual', async function(req, res) {
     // cuando efectivamente creamos una conversacion NUEVA para un contacto sin thread previo.
     if (!contacto) return res.status(500).json({ error: 'No se pudo crear el contacto' });
 
+    // 5-bis) DATOS GENERALES del formulario (Diego 2026-08-06: "lo mismo que cuando lo generas en
+    // conversaciones el nuevo contacto, mismos campos y que se vean reflejados en los datos despues en
+    // contactos"). MISMA funcion que usa el alta de Contactos -> los dos formularios guardan igual.
+    // Solo si el contacto es NUEVO: si ya existia es un lead real previo y sobreescribirle los datos
+    // seria pisarlo (mismo criterio que la nota de arriba con name/nombre_manual).
+    if (!contactoYaExistia) {
+      const _genCM = await _aplicarDatosGeneralesContacto(contacto.id, ownerId, b);
+      if (!_genCM.ok) console.error('[CARGAR-MANUAL] datos generales no guardados:', _genCM.error);
+    }
+
     // 6) CONVERSACION: buscar-o-crear por (owner user_id, contact_id).
     //    REFINAMIENTO v2 (NO PISAR): si el contacto YA existia O ya tiene una conversacion, es un lead real previo ->
     //    NO tocamos status / ai_enabled / asesor_id. Solo devolvemos la conversacion existente (para que el front la abra).
@@ -30175,6 +30185,12 @@ const CONTACTOS_COLS_FULL = 'id, name, nombre_manual, phone, interest, budget, n
 // ("No se pudo cargar el listado"), mientras los contadores andaban bien porque no piden esa columna.
 // Una lista de respaldo que repite la columna sospechosa no es un respaldo.
 const CONTACTOS_COLS_BASE = 'id, name, nombre_manual, phone, interest, budget, notes, channel';
+// REDES = FULL + instagram/facebook. Esas dos columnas TODAVIA NO EXISTEN (ver migracion-contactos-redes.sql):
+// hasta que se corra la migracion, este select falla con 42703 y se cae a FULL. Se usa SOLO en la ficha
+// (/api/contactos/uno), que se abre de a una: ahi un request fallido de mas no se nota. En el LISTADO no se
+// usa a proposito -- seria un round-trip perdido en cada carga de pagina, y el listado no necesita las redes.
+// Cuando la migracion este corrida, los campos aparecen solos sin tocar codigo ni desplegar.
+const CONTACTOS_COLS_REDES = CONTACTOS_COLS_FULL + ', instagram, facebook';
 
 function _esColumnaAusente(err) {
   if (!err) return false;
@@ -30436,7 +30452,9 @@ app.get('/api/contactos/uno', async function (req, res) {
     const contactId = String((req.query && req.query.id) || '').trim();
     if (!contactId) return res.status(400).json({ error: 'Falta id' });
 
-    let rc = await supabase.from('contacts').select(CONTACTOS_COLS_FULL).eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
+    // Lectura por capas: REDES (con instagram/facebook, que dependen de la migracion) -> FULL -> BASE.
+    let rc = await supabase.from('contacts').select(CONTACTOS_COLS_REDES).eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
+    if (rc.error && _esColumnaAusente(rc.error)) rc = await supabase.from('contacts').select(CONTACTOS_COLS_FULL).eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
     if (rc.error && _esColumnaAusente(rc.error)) rc = await supabase.from('contacts').select(CONTACTOS_COLS_BASE).eq('id', contactId).eq('user_id', scope.ownerId).maybeSingle();
     if (rc.error) return res.status(500).json({ error: rc.error.message });
     if (!rc.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
@@ -30522,6 +30540,11 @@ app.get('/api/contactos/uno', async function (req, res) {
         provincia: (Object.prototype.hasOwnProperty.call(contacto, 'provincia') ? (contacto.provincia || null) : null),
         ciudad: (Object.prototype.hasOwnProperty.call(contacto, 'ciudad') ? (contacto.ciudad || null) : null),
         empresa: (Object.prototype.hasOwnProperty.call(contacto, 'empresa') ? (contacto.empresa || null) : null),
+        // Instagram / Facebook: dependen de migracion-contactos-redes.sql. Hasta que se corra, la lectura
+        // cae al set sin esas columnas y llegan como null (no como undefined) para que el front no dude.
+        instagram: (Object.prototype.hasOwnProperty.call(contacto, 'instagram') ? (contacto.instagram || null) : null),
+        facebook: (Object.prototype.hasOwnProperty.call(contacto, 'facebook') ? (contacto.facebook || null) : null),
+        redes_disponibles: Object.prototype.hasOwnProperty.call(contacto, 'instagram'),   // false = falta la migracion
         // `about` es el texto de "info" que trae WhatsApp: se muestra, NO se edita (lo escribe el lead).
         about: (Object.prototype.hasOwnProperty.call(contacto, 'about') ? (contacto.about || null) : null),
         fecha_alta: (Object.prototype.hasOwnProperty.call(contacto, 'created_at') ? contacto.created_at : null)
@@ -30542,6 +30565,48 @@ app.get('/api/contactos/uno', async function (req, res) {
 // fallbacks defensivos de columna se repiten IDENTICOS a proposito (misma resiliencia ante migraciones a medio
 // correr). DIFERENCIA con cargar-manual: esto NO crea una conversacion (es un contacto de agenda, no un lead
 // "listo para humano"); cargar-manual sigue siendo el camino para eso desde Conversaciones.
+// ── DATOS GENERALES EN EL ALTA (Diego 2026-08-06) ───────────────────────────────────────────────
+// "cuando se genera el contacto en contactos estaria bueno que se desplieguen estas opciones (...)
+//  Tambien instagram o facebook el nombre. uno nunca sabe (...) Lo mismo que cuando lo generas en
+//  conversaciones el nuevo contacto. mismos campos y que se vean reflejados en los datos despues."
+//
+// Se aplica con un UPDATE APARTE, DESPUES de crear el contacto, y NO metiendo los campos en el insert.
+// Por que: los dos altas (/api/contactos y /api/contactos/cargar-manual) tienen 2 y 3 caminos de
+// respaldo respectivamente (por si falta nombre_manual, por si falta el indice unico...). Sumar campos
+// adentro de esa maraña multiplica las formas de fallar y pone en riesgo el alta, que es lo importante.
+// Aca, si el UPDATE falla, el contacto YA quedo creado: se pierden los datos opcionales, no el contacto.
+//
+// instagram / facebook: esas dos columnas NO EXISTEN todavia en `contacts` (verificado contra la base
+// 2026-08-06; las otras seis si existen y estaban vacias). Por eso el update se intenta con todo y, si
+// la base se queja de una columna ausente, se reintenta SIN esas dos. Asi este codigo anda igual antes
+// y despues de correr migracion-contactos-redes.sql, sin deploy en el medio.
+const _CONTACTO_GENERALES_MAX = { email: 200, documento: 60, pais: 80, provincia: 80, ciudad: 120, empresa: 160, instagram: 120, facebook: 160 };
+const _CONTACTO_GENERALES_NUEVAS = ['instagram', 'facebook'];   // las que dependen de la migracion
+async function _aplicarDatosGeneralesContacto(contactId, ownerId, body) {
+  try {
+    if (!contactId || !ownerId || !body) return { ok: true, aplicados: [] };
+    const upd = {};
+    Object.keys(_CONTACTO_GENERALES_MAX).forEach(function (campo) {
+      if (!Object.prototype.hasOwnProperty.call(body, campo)) return;
+      const v = String(body[campo] == null ? '' : body[campo]).trim().slice(0, _CONTACTO_GENERALES_MAX[campo]);
+      if (v) upd[campo] = v;      // en el ALTA no tiene sentido escribir null: si vino vacio, no se toca
+    });
+    if (!Object.keys(upd).length) return { ok: true, aplicados: [] };
+
+    let r = await supabase.from('contacts').update(upd).eq('id', contactId).eq('user_id', ownerId);
+    if (r.error && _esColumnaAusente(r.error)) {
+      const upd2 = {};
+      Object.keys(upd).forEach(function (k) { if (_CONTACTO_GENERALES_NUEVAS.indexOf(k) < 0) upd2[k] = upd[k]; });
+      if (!Object.keys(upd2).length) return { ok: false, error: 'columnas ausentes', aplicados: [] };
+      r = await supabase.from('contacts').update(upd2).eq('id', contactId).eq('user_id', ownerId);
+      if (r.error) return { ok: false, error: r.error.message, aplicados: [] };
+      return { ok: true, aplicados: Object.keys(upd2), omitidos: _CONTACTO_GENERALES_NUEVAS };
+    }
+    if (r.error) return { ok: false, error: r.error.message, aplicados: [] };
+    return { ok: true, aplicados: Object.keys(upd) };
+  } catch (e) { return { ok: false, error: e && e.message, aplicados: [] }; }
+}
+
 app.post('/api/contactos', async function (req, res) {
   try {
     const uid = await verificarUsuario(req);
@@ -30606,7 +30671,11 @@ app.post('/api/contactos', async function (req, res) {
       ins = await supabase.from('contacts').insert({ user_id: ownerId, name: nombre, phone: telefono, channel: 'manual' }).select('id, name, phone, channel').single();
     }
     if (ins.error) return res.status(500).json({ error: 'No se pudo crear el contacto' });
-    return res.json({ ok: true, ya_existia: false, contacto: ins.data });
+    // Datos generales del alta (mail/documento/empresa/ciudad/provincia/pais/instagram/facebook).
+    // Best-effort a proposito: el contacto ya esta creado y no se cae el alta por un dato opcional.
+    const _gen = await _aplicarDatosGeneralesContacto(ins.data && ins.data.id, ownerId, b);
+    if (!_gen.ok) console.error('[CONTACTOS] datos generales no guardados en el alta:', _gen.error);
+    return res.json({ ok: true, ya_existia: false, contacto: ins.data, generales: _gen.aplicados || [], generales_omitidos: _gen.omitidos || [] });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -30651,15 +30720,26 @@ app.patch('/api/contactos/:id', async function (req, res) {
     // (medido en Anton: 0 de 1.222 en email/documento/pais/provincia/ciudad/empresa) simplemente porque
     // nunca hubo pantalla para cargarlas. Cero migracion.
     // Un string vacio se guarda como NULL y no como '': asi los filtros `is null` siguen contando bien.
-    const _GENERALES = { email: 200, documento: 60, pais: 80, provincia: 80, ciudad: 120, empresa: 160 };
-    Object.keys(_GENERALES).forEach(function (campo) {
+    // `_CONTACTO_GENERALES_MAX` es la MISMA lista que usa el alta (incluye instagram/facebook): un solo
+    // lugar donde estan los campos y sus topes, para que editar y crear nunca acepten cosas distintas.
+    Object.keys(_CONTACTO_GENERALES_MAX).forEach(function (campo) {
       if (!Object.prototype.hasOwnProperty.call(cambios, campo)) return;
-      const v = String(cambios[campo] == null ? '' : cambios[campo]).trim().slice(0, _GENERALES[campo]);
-      upd[campo] = v === '' ? null : v;
+      const v = String(cambios[campo] == null ? '' : cambios[campo]).trim().slice(0, _CONTACTO_GENERALES_MAX[campo]);
+      upd[campo] = v === '' ? null : v;    // vacio = borrar el dato (NULL, no '')
     });
     if (!Object.keys(upd).length) return res.status(400).json({ error: 'Nada para actualizar' });
 
-    const updR = await supabase.from('contacts').update(upd).eq('id', contactId).eq('user_id', scope.ownerId);
+    let updR = await supabase.from('contacts').update(upd).eq('id', contactId).eq('user_id', scope.ownerId);
+    // instagram/facebook dependen de migracion-contactos-redes.sql. Si faltan, se reintenta sin ellas y se
+    // avisa QUE no se guardo, en vez de tirar un 500 que le borra al usuario lo que acababa de escribir.
+    if (updR.error && _esColumnaAusente(updR.error)) {
+      const upd2 = {}; const faltaron = [];
+      Object.keys(upd).forEach(function (k) { if (_CONTACTO_GENERALES_NUEVAS.indexOf(k) < 0) upd2[k] = upd[k]; else faltaron.push(k); });
+      if (!Object.keys(upd2).length) return res.status(409).json({ error: 'Falta correr la migración de Instagram/Facebook en esta base', campos_faltantes: faltaron });
+      updR = await supabase.from('contacts').update(upd2).eq('id', contactId).eq('user_id', scope.ownerId);
+      if (updR.error) return res.status(500).json({ error: 'No se pudo actualizar: ' + updR.error.message });
+      return res.json({ ok: true, cambios: upd2, campos_faltantes: faltaron });
+    }
     if (updR.error) return res.status(500).json({ error: 'No se pudo actualizar: ' + updR.error.message });
     return res.json({ ok: true, cambios: upd });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }

@@ -2968,28 +2968,34 @@ async function iaDisponibilidadActivo(user_id, bs) {
 // BYTE-IDENTICOS al actual) hasta correr migracion-rag-inventario-flag.sql. A DIFERENCIA de otras features, la
 // activacion es SOLO por cuenta (piloto gradual): la migracion agrega la columna en false y NO hay UPDATE masivo a
 // true. "Raices Meta Test" (congelada) jamas se activa. Reusa un `bs` ya cargado => 0 queries extra. Ante error -> OFF.
+// FAIL-OPEN por la REGLA DE ORO de Diego. El flag va prendido en todas las cuentas y en las futuras; la
+// decision de USAR el buscador la toma el UMBRAL POR CANTIDAD DE PROPIEDADES (_RAG_MIN_PROPIEDADES, ~8100),
+// no este flag. Este queda como freno de mano: un `false` explicito lo apaga en una cuenta puntual.
 async function iaRagActivo(user_id, bs) {
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_rag_v1')) return bs.ia_rag_v1 === true;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ia_rag_v1')) return bs.ia_rag_v1 !== false;
     if (!user_id) return false;
     const { data, error } = await supabase.from('business_settings').select('ia_rag_v1').eq('user_id', user_id).maybeSingle();
-    if (error) return false;
-    return !!(data && data.ia_rag_v1 === true);
-  } catch (e) { return false; }
+    if (error) return true;
+    return !(data && data.ia_rag_v1 === false);
+  } catch (e) { return true; }
 }
 // CACHE TTL 1h (gated ai_cache_ttl_1h): ¿pedirle a Anthropic que el bloque estatico cacheado dure 1 HORA en vez
 // de los 5 min por defecto? MISMO patron defensivo FAIL-CLOSED que iaRagActivo / derivacionV3Activo: si el flag no
 // esta (columna ausente porque no se corrio migracion-cache-ttl-telemetria.sql / select error / null / false) -> OFF.
 // Con OFF el cache_control del bloque estatico es BYTE-IDENTICO al actual (ephemeral SIN campo ttl). Reusa el `bs`
 // ya cargado en generarRespuestaAgente (0 queries extra). NO cambia el contenido del prompt, el modelo ni el flujo.
+// FAIL-OPEN por la REGLA DE ORO. Una cuenta nueva nace con el cache largo puesto; solo un `false` explicito
+// lo apaga (hoy: Raices CRM, por bajo volumen — 20 mensajes/dia no alcanzan a amortizar la escritura mas
+// cara). La ventana horaria de abajo sigue siendo la que evita pagarlo de madrugada.
 async function cacheTtl1hActivo(user_id, bs) {
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ai_cache_ttl_1h')) return bs.ai_cache_ttl_1h === true;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ai_cache_ttl_1h')) return bs.ai_cache_ttl_1h !== false;
     if (!user_id) return false;
     const { data, error } = await supabase.from('business_settings').select('ai_cache_ttl_1h').eq('user_id', user_id).maybeSingle();
-    if (error) return false; // columna ausente u otro error -> feature OFF
-    return !!(data && data.ai_cache_ttl_1h === true);
-  } catch (e) { return false; }
+    if (error) return true;
+    return !(data && data.ai_cache_ttl_1h === false);
+  } catch (e) { return true; }
 }
 // VENTANA HORARIA DE LA CACHE LARGA (Diego 2026-07-25): el TTL de 1h SOLO conviene de DIA.
 // La cuenta: la escritura con ttl:'1h' cuesta 2x contra 1,25x del default de 5 min (60% mas cara), y la
@@ -8096,7 +8102,26 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   let _indiceInv = '';
   let _invCompactoRag = '';
   let _headerIndiceRag = '';
-  if (_iaRagOn && !_esHotel) {
+  // UMBRAL POR CANTIDAD (Diego 2026-08-06): "el RAG tiene que estar prendido porque Andres hoy son 6
+  // manana no se cuantas (...) yo no puedo andar adivinando o acordandome si esta prendido en una cuenta
+  // nueva o no".
+  // El FLAG va prendido en todas las cuentas y en las futuras. Lo que decide si se usa el buscador o se
+  // manda el catalogo entero es la CANTIDAD DE PROPIEDADES, no una perilla que alguien tiene que acordarse
+  // de mover cuenta por cuenta.
+  //
+  // POR QUE UN UMBRAL Y NO SIEMPRE: medido, cada propiedad pesa ~560 tokens. Con 253 propiedades (Anton)
+  // el catalogo completo son ~152.000 tokens/mensaje y el indice lo baja a ~12.000: el ahorro es enorme.
+  // Con 6 propiedades (Andres Galdames) el catalogo entero son ~3.400 tokens, y el indice MAS las dos
+  // definiciones de herramienta cuestan casi lo mismo -- pero encima obligan a la IA a buscar, y si la
+  // busqueda no matchea, no ve una propiedad que le habria entrado entera en el prompt. O sea: con
+  // inventario chico, el RAG cuesta parecido y ve PEOR.
+  //
+  // El dia que Galdames cargue la propiedad numero 50, el buscador se prende SOLO en el mensaje siguiente.
+  // Nadie toca nada.
+  const _RAG_MIN_PROPIEDADES = 50;
+  const _propsCant = (properties && properties.length) ? properties.length : 0;
+  const _ragPorCantidad = _propsCant >= _RAG_MIN_PROPIEDADES;
+  if (_iaRagOn && !_esHotel && _ragPorCantidad) {
     try {
       if (properties && properties.length > 0) {
         _indiceInv = _construirIndiceInventario(properties);

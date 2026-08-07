@@ -5296,6 +5296,12 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (_unificada) {
       // El depto ya quedo persistido arriba (si el hint resolvio uno), asi que derivarAHumano lo toma
       // de la conv; si no hay, aplica su propio criterio (es_default) y despues la escalera.
+      // SIN RESUMEN A PROPOSITO, y es el UNICO de los caminos de derivacion que quedo asi (Diego
+      // 2026-08-06, "que el resumen se genere en todas las derivaciones"). Motivo: la rotacion NO es
+      // todavia un pase a un humano -- deja status='interesado' con la IA ENCENDIDA y va ofreciendo el
+      // lead de asesor en asesor. Generar el resumen aca lo pagaria UNA VEZ POR CADA VUELTA de la
+      // rotacion, para un lead que quizas nunca llega a manos de nadie. El pase de verdad es cuando un
+      // asesor escribe, y ese lo maneja _finalizarRotacionV3.
       try { _asesor = await derivarAHumano(convId, ownerId, 'rotacion_v3', { setStatus: false, push: false, resumen: false }); } catch (eDU) { _asesor = null; }
       // La ESCALERA de la v2 puede MOVER el lead al depto de fallback (escribe conversations.departamento_id).
       // Si eso paso, la rotacion tiene que sellar el depto NUEVO, no el viejo: si no, el reloj seguiria
@@ -7317,6 +7323,73 @@ function _resolverCategoriaFoto(raw, rubro) {
   } catch (e) { return null; }
 }
 
+// ===================================================================================================
+// HISTORIAL DEL CLIENTE PARA LA IA (Diego 2026-08-06)
+// "Hola Andres como estas, como va la familia (...) Quieren volver a hospedarse en nuestro hotel como el
+//  verano pasado? o si es inmobiliaria, les gustaria alquilar la casa GARMES nuevamente?"
+//
+// Arma UNA LINEA por ficha DE ESE CONTACTO. No es un catalogo: son las fichas de la persona que esta
+// escribiendo, y viajan en el bloque NO CACHEADO junto a sus datos -- "parte de la conversacion".
+//
+// POR QUE ASI Y NO EN EL BLOQUE CACHEADO: el bloque cacheado es igual para TODOS los leads del tenant.
+// Meter ahi algo que cambia por cliente romperia el cache en cada lead distinto (USD 0,08 cada vez). En el
+// bloque dinamico se paga como entrada normal (USD 3/M) y SOLO en los mensajes de ese cliente.
+//
+// TOPES (Diego: "de forma controlada"): 6 fichas, 140 caracteres por linea. Con 10 fichas por cliente el
+// bloque no puede desbordarse. Las mas RECIENTES primero (created_at desc).
+const _HIST_MAX_FICHAS = 6;
+const _HIST_MAX_LINEA = 140;
+async function _historialClienteParaIA(ownerId, contactId) {
+  try {
+    if (!ownerId || !contactId) return '';
+    // `titulo` va en un select propio: es la columna nueva de migracion-fichas-titulo.sql y puede no
+    // existir todavia. Si falta, se reintenta sin ella y el historial sale igual (con tipo + fechas).
+    const _cols = 'tipo, estado, resultado, desde, hasta, notas, zonas, tipo_propiedad, presupuesto, moneda, property_id, created_at';
+    let q = await supabase.from('fichas').select(_cols + ', titulo')
+      .eq('user_id', ownerId).eq('contact_id', contactId)
+      .order('created_at', { ascending: false }).limit(_HIST_MAX_FICHAS);
+    if (q && q.error) {
+      q = await supabase.from('fichas').select(_cols)
+        .eq('user_id', ownerId).eq('contact_id', contactId)
+        .order('created_at', { ascending: false }).limit(_HIST_MAX_FICHAS);
+    }
+    if (!q || q.error || !q.data || !q.data.length) return '';
+
+    const _fecha = (s) => { const t = String(s || '').slice(0, 10); return t ? t.split('-').reverse().join('/') : ''; };
+    const lineas = q.data.map(function (f) {
+      const p = [];
+      if (f.titulo && String(f.titulo).trim()) p.push(String(f.titulo).trim());
+      p.push(_etiquetaTipoFicha(f.tipo));
+      const d = _fecha(f.desde), h = _fecha(f.hasta);
+      if (d && h) p.push(d + ' al ' + h); else if (d) p.push('desde ' + d);
+      if (f.zonas && String(f.zonas).trim()) p.push(String(f.zonas).trim());
+      if (f.tipo_propiedad && String(f.tipo_propiedad).trim()) p.push(String(f.tipo_propiedad).trim());
+      if (f.presupuesto) p.push((f.moneda === 'USD' ? 'US$ ' : '$ ') + f.presupuesto);
+      // El ESTADO es lo que separa "esto ya pasó" de "esto está en juego ahora".
+      if (f.estado === 'cerrada') p.push(f.resultado === 'concreto' ? 'se concretó' : 'cerrada');
+      else if (f.estado === 'pausada') p.push('en pausa');
+      if (f.notas && String(f.notas).trim()) p.push(String(f.notas).trim());
+      return '- ' + p.join(' · ').slice(0, _HIST_MAX_LINEA);
+    });
+    return 'HISTORIAL DE ESTE CLIENTE (fichas cargadas por el equipo, de ESTA persona):\n' + lineas.join('\n')
+      + '\nCOMO USARLO: sirve para SALUDAR y CONECTAR ("¿vuelven a la misma cabaña?", "¿les interesaría alquilarla de nuevo?"). '
+      + 'Las que dicen "se concretó" o "cerrada" YA PASARON: hablalas en pasado. Las demas son lo que esta en juego ahora. '
+      + 'REGLA DURA: NUNCA des por hecho ni confirmes nada que el cliente no haya dicho HOY -- preguntá, no afirmes.';
+  } catch (e) { return ''; }
+}
+// Etiqueta legible del tipo de ficha. Cubre los 3 mundos; si aparece un tipo nuevo, se muestra el crudo
+// con los guiones bajos cambiados por espacios (nunca queda vacio ni rompe).
+function _etiquetaTipoFicha(t) {
+  const M = {
+    busca_comprar: 'Busca comprar', busca_alquilar: 'Busca alquilar', tiene_en_venta: 'Tiene en venta',
+    tiene_en_alquiler: 'Tiene en alquiler', es_inquilino: 'Alquila (inquilino)', en_administracion: 'En administracion',
+    consulta: 'Consulta', reserva: 'Reserva', estadia: 'Estadía', huesped_recurrente: 'Huésped recurrente',
+    convenio_corporativo: 'Convenio corporativo'
+  };
+  const k = String(t || '').trim();
+  return M[k] || (k ? k.replace(/_/g, ' ') : 'Ficha');
+}
+
 // MEDIDOR (2026-07-23): turnoId es un 5o parametro OPCIONAL (default null) que NO cambia nada del comportamiento:
 // solo viaja hasta las llamadas de IA internas (la traduccion saliente) para que su costo quede atribuido al MISMO
 // turno (mensaje del lead) que la respuesta. Los callers viejos que no lo pasan siguen funcionando igual.
@@ -7491,6 +7564,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // y evitar re-preguntar o re-presentarse. No bloquea ni rompe si falla (campos opcionales).
   let datosLead = null;
   let memoriaViva = '';
+  // HISTORIAL DEL CLIENTE (Diego 2026-08-06): las fichas DE ESTE CONTACTO + el resumen de ESTA charla.
+  // "La ia tiene que poder acceder a la ficha del cliente, no a la de todos, seria parte de la
+  //  conversacion por asi decirlo."
+  let bloqueHistorialCliente = '';
+  let resumenCharla = '';
   if (conversation_id && !modoPrueba) {
     try {
       // RACE #1 (CRITICO, parte c — DEFENSA EN PROFUNDIDAD): re-leer ai_enabled aca, ya en el ultimo eslabon antes
@@ -7498,7 +7576,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       // (return null -> el caller hace `if (resultado && resultado.reply)` y no envia nada). 0 tokens, 0 envio.
       // Solo aplica a conversaciones REALES (conversation_id && !modoPrueba): el modo prueba NO entra a este bloque,
       // asi que el flujo de pruebas queda intacto, y la IA SIGUE respondiendo normal cuando ai_enabled=true.
-      const { data: convC } = await supabase.from('conversations').select('contact_id, memoria_viva, ai_enabled').eq('id', conversation_id).maybeSingle();
+      const { data: convC } = await supabase.from('conversations').select('contact_id, memoria_viva, ai_enabled, summary').eq('id', conversation_id).maybeSingle();
       if (convC && convC.ai_enabled !== true) {
         console.log('generarRespuestaAgente: IA apagada para conv ' + conversation_id + ' (humano a cargo) -> no responder');
         return null;
@@ -7517,7 +7595,14 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
             try { const _r2 = await supabase.from('contacts').select('name, interest, budget, notes').eq('id', convC.contact_id).maybeSingle(); cont = _r2.data; } catch (ePc2) {}
           }
           if (cont) datosLead = cont;
+          // Las FICHAS de ESTE contacto. Acotado a 6 y a una linea cada una: con 10 fichas por cliente
+          // esto no puede crecer sin control. Va al bloque NO CACHEADO, asi que no toca el cache del
+          // tenant -- se paga solo en los mensajes de un cliente que tiene historial.
+          try { bloqueHistorialCliente = await _historialClienteParaIA(user_id, convC.contact_id); } catch (eHC) { bloqueHistorialCliente = ''; }
         }
+        // El RESUMEN de esta charla ya existe (lo genera la derivacion y la ficha del contacto) y hasta
+        // hoy la IA no lo leia: lo veia solo el asesor. Es el mismo dato, sin costo de generarlo.
+        if (convC.summary && String(convC.summary).trim()) resumenCharla = String(convC.summary).trim().slice(0, 700);
       }
     } catch (eDL) { console.error('lectura datos lead:', eDL && eDL.message); }
   }
@@ -8649,6 +8734,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // MEMORIA VIVA: resumen-de-avance de esta conversacion para que el agente RETOME donde quedo (no repregunte ni
   // retroceda). Va en bloque dinamico (no cacheado). Permite acortar el historial sin perder contexto -> baja tokens.
   if (memoriaViva) systemBlocks.push({ type: 'text', text: 'MEMORIA DE LA CONVERSACION (donde venis con este lead; segui DESDE ACA, no repreguntes lo ya hablado ni retrocedas): ' + memoriaViva });
+  // HISTORIAL DEL CLIENTE + RESUMEN DE LA CHARLA (Diego 2026-08-06). Bloques DINAMICOS: van DESPUES del
+  // unico bloque con cache_control, asi que NO tocan el cache del tenant. Se pagan como entrada normal y
+  // SOLO en los mensajes de un cliente que tiene fichas o resumen; un lead nuevo no paga nada extra.
+  if (bloqueHistorialCliente) systemBlocks.push({ type: 'text', text: bloqueHistorialCliente });
+  // El resumen ya se generaba (derivacion / ficha del contacto) pero hasta hoy lo veia SOLO el asesor.
+  // Darselo a la IA no cuesta generarlo: ya esta escrito en la conversacion.
+  if (resumenCharla) systemBlocks.push({ type: 'text', text: 'RESUMEN DE LO HABLADO HASTA ACA (lo mismo que ve el asesor): ' + resumenCharla });
   // UBICACION OSM (gated): regla anti-invento de lugares. Solo se agrega con el flag ON (bloque
   // dinamico, no cacheado) => con flag OFF el system es BYTE-IDENTICO al actual.
   // 5 FUENTES EXTERNAS (gated c/u): regla anti-invento. Bloque dinamico (no cacheado). Solo se agrega si HAY al menos
@@ -13074,7 +13166,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                 // atencion humana). El criterio "sin asesor && !admin_tomo" lo reaplica derivarAHumano por dentro.
                 if (cvSeg && cvSeg.status === 'listo_humano' && !cvSeg.asesor_id && !cvSeg.admin_tomo) {
                   // ETAPA 4: solo asignar asesor (sin tocar status, sin push, sin resumen) — igual que antes.
-                  await derivarAHumano(_convId, cvSeg.user_id, 'red_seguridad', { setStatus: false, push: false, resumen: false });
+                  await derivarAHumano(_convId, cvSeg.user_id, 'red_seguridad', { setStatus: false, push: false, resumen: true });
                   _decCamino = _decCamino || 'red_seguridad'; // REGISTRO DECISIONES IA
                   _yaDerivoRegistro = true;
                 }
@@ -13190,7 +13282,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           if (esErrorTransitorioIA(eGen) && telefono) {
             try { await enviarWhatsapp(instanciaNombre, telefono, MSG_DEMORA_IA); } catch (eEnv) { console.error('demora IA envio:', eEnv && eEnv.message); }
             try { await supabase.from('messages').insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: MSG_DEMORA_IA, enviado_por: 'Agente IA' }); } catch (eIns) {}
-            try { await derivarAHumano(_convId, user_id, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', pushTexto: (data.pushName || telefono), resumen: false }); } catch (eDer) { console.error('demora IA derivar:', eDer && eDer.message); }
+            try { await derivarAHumano(_convId, user_id, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', pushTexto: (data.pushName || telefono), resumen: true }); } catch (eDer) { console.error('demora IA derivar:', eDer && eDer.message); }
             try { await avisarSiIaCaida(eGen); } catch (eAv) {}
           }
         } catch (eDeg) { console.error('degradacion IA wa:', eDeg && eDeg.message); }
@@ -17183,7 +17275,10 @@ async function revisarRespaldoTimeout() {
           candidatos: _candidatos,
           pushTitulo: 'Respaldo automatico: lead sin respuesta de la IA',
           pushTexto: _fraseMotivo + '.',
-          resumen: false
+          // CON RESUMEN (Diego 2026-08-06): el respaldo entrega el lead a un humano PORQUE la IA no
+          // contesto. Es justo el caso donde el asesor abre el chat sin saber nada. Medido: de 170
+          // derivaciones al mes en todas las cuentas, solo 52 generaban resumen.
+          resumen: true
         });
       } catch (eDer) { console.error('Respaldo derivarAHumano:', eDer && eDer.message); }
       // Mensaje de SISTEMA propio del respaldo (0 tokens de IA). Nombre del asesor si quedo uno asignado.
@@ -21003,7 +21098,7 @@ async function _agendarCitaTentativaAgente(ownerId, conversationId, input, leadN
     } else {
       // DIRECTO: derivarAHumano (setStatus:true -> listo_humano + IA off + asigna asesor). resumen:false = 0 tokens IA.
       try {
-        await derivarAHumano(conversationId, ownerId, 'cita_agendada', { setStatus: true, push: true, pushTitulo: 'Nuevo lead con cita agendada', pushTexto: _leadTel || _leadNombre || '', resumen: false });
+        await derivarAHumano(conversationId, ownerId, 'cita_agendada', { setStatus: true, push: true, pushTitulo: 'Nuevo lead con cita agendada', pushTexto: _leadTel || _leadNombre || '', resumen: true });
         _derivada = true;
       } catch (eDir) { console.error('_agendarCitaTentativaAgente directo:', eDir && eDir.message); }
     }
@@ -38388,7 +38483,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
       if (esErrorTransitorioIA(e) && conv && conv.id && creds && senderId) {
         try { await enviarMensajeMeta(creds.page_access_token, senderId, MSG_DEMORA_IA, canal, creds.ig_user_id); } catch (eEnv) {}
         try { await supabase.from('messages').insert({ conversation_id: conv.id, user_id: tenantUserId, role: 'ai', content: MSG_DEMORA_IA, enviado_por: 'Agente IA' }); } catch (eIns) {}
-        try { await derivarAHumano(conv.id, tenantUserId, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', resumen: false }); } catch (eDer) {}
+        try { await derivarAHumano(conv.id, tenantUserId, 'ia_caida_proveedor', { setStatus: true, lastMessage: MSG_DEMORA_IA, lastRole: 'ai', push: true, pushTitulo: 'IA caida: un lead requiere atencion', resumen: true }); } catch (eDer) {}
         try { await avisarSiIaCaida(e); } catch (eAv) {}
       }
     } catch (eDeg) { console.error('degradacion IA meta:', eDeg && eDeg.message); }

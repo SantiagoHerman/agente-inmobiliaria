@@ -2410,14 +2410,17 @@ async function derivacionUnificadaActiva(user_id, bs) {
 // por cuenta). Cada flag es INDEPENDIENTE: prender uno NO altera el path de otro. Reusan un `bs` ya cargado si lo trae.
 //
 // PUNTO 5 (historial_estados): registra cada cambio de status como mensaje role='sistema' en el chat.
+// FAIL-OPEN por la REGLA DE ORO de Diego (2026-08-07: "3 esto es para todas las cuentas?" -> si, y en las
+// futuras). Una cuenta nueva nace mostrando el historial de estados dentro del chat; solo un `false`
+// explicito lo apaga. Ese es el freno de mano si los mensajes molestan: un UPDATE, sin desplegar.
 async function historialEstadosActivo(user_id, bs) {
   try {
-    if (bs && Object.prototype.hasOwnProperty.call(bs, 'historial_estados')) return bs.historial_estados === true;
-    if (!user_id) return false;
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'historial_estados')) return bs.historial_estados !== false;
+    if (!user_id) return false;   // sin cuenta resuelta no se decide nada
     const { data, error } = await supabase.from('business_settings').select('historial_estados').eq('user_id', user_id).maybeSingle();
-    if (error) return false;
-    return !!(data && data.historial_estados === true);
-  } catch (e) { return false; }
+    if (error) return true;
+    return !(data && data.historial_estados === false);
+  } catch (e) { return true; }
 }
 // PUNTO 3 (sin_consultar_solo): el modo ia_no_sabe_modo='preguntar' se trata como 'preguntar_derivar' (nunca
 // consultar-solo -> el cron termina derivando). Con OFF -> 'preguntar' se comporta como hoy (consulta y espera).
@@ -5336,8 +5339,24 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
       } catch (eAnun) {}
     }
     if (_asesor) {
-      // Asignar (condicional: no pisar una toma manual que haya entrado en el interin). IA sigue atendiendo.
-      const _ok = await _asignarRotacionV3(convId, _asesor, _deptoId, nowIso, true);
+      // Asignar. IA sigue atendiendo.
+      //
+      // EL BUG DEL 2026-08-04, ARREGLADO ACA (auditoría con 4 agentes, 2026-08-07):
+      // el 5o parámetro es `condicional`, que agrega `.is('asesor_id', null)` al UPDATE ("no pisar una
+      // toma manual que haya entrado en el interín"). Con `derivacion_unificada_v1` ON, la rama de arriba
+      // llama a derivarAHumano(), que YA ESCRIBE asesor_id — así que la condición pedía que el campo
+      // estuviera vacío justo después de haberlo llenado. Matcheaba CERO filas SIEMPRE (no a veces), la
+      // función salía por `return {ok:false, yaTomado:true}` creyendo que la tomó un humano —y el humano
+      // era ella misma, un renglón antes— y NUNCA llegaba a marcar la rotación, avisar al asesor,
+      // registrar el pase ni avanzar el cursor.
+      // Consecuencias medidas: avisos al equipo 2-4/día -> 0 el 04/08; de 1.364 conversaciones, CERO con
+      // `derivacion_rotando=true`; 22 de 22 derivaciones mudas; y el cursor pegado (Bianca 13 de 24).
+      //
+      // ARREGLO: cuando la asignación la hizo derivarAHumano en ESTA misma llamada (`_unificada`), la
+      // protección contra la toma manual YA la aplicó ÉL (su propio UPDATE lleva `.is('asesor_id', null)`,
+      // ver ~4871). Volver a exigirla acá es imposible por construcción. En el camino viejo (`_unificada`
+      // OFF) nadie asignó todavía, así que el condicional SIGUE siendo necesario y se mantiene.
+      const _ok = await _asignarRotacionV3(convId, _asesor, _deptoId, nowIso, !_unificada);
       if (!_ok) return { ok: false, yaTomado: true }; // otro proceso tomo el lead: respetar
       // REPARTO POR ORDEN (Diego 2026-07-24): este es el arranque (lead NUEVO) tanto de rotacion como de fija -> avanzar
       // el cursor round-robin del depto a quien le acaba de tocar. Best-effort/defensivo (no-op sin la columna nueva).
@@ -13139,10 +13158,24 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
                   // IA off: entramos en ROTACION en el depto deducido (o conv/default) y la IA SIGUE atendiendo. NO tocamos
                   // status/ai_enabled aca (los deja en 'interesado'/IA on): _v4RutearARotacion los mantiene. Con v4 OFF esta
                   // rama no se toma (cae al else de abajo = comportamiento ACTUAL EXACTO). CITAS igual (fire-and-forget).
-                  try { await _v4RutearARotacion(_convId, user_id, { deptoId: _departamentoId || null, leadRef: (data.pushName || telefono) || null }); }
-                  catch (eV4Cl) { console.error('v4 clasificacion listo_humano:', eV4Cl && eV4Cl.message); }
-                  _yaDerivoEnEsteMensaje = true;
-                  _decMotivoNo = 'derivo_rotacion_v4'; _decCamino = 'clasificacion_rotacion_v4'; // REGISTRO DECISIONES IA
+                  // SE MIRA EL RESULTADO (arreglo 2026-08-07). Antes este `await` descartaba el retorno:
+                  // si la rotacion NO arrancaba (devuelve false, p.ej. porque la conv ya tenia asesor de un
+                  // ciclo anterior — el guard de ~5389), igual se marcaba `_yaDerivoEnEsteMensaje = true` y
+                  // se salteaba el `else` de abajo, que es el UNICO lugar que escribe status='listo_humano'.
+                  // Resultado: la IA anunciaba la derivacion y no se persistia NADA — ni estado, ni rotacion,
+                  // ni aviso. Ahora, si la rotacion no pudo arrancar, se cae al camino normal y el lead
+                  // ENTRA a listo_humano como corresponde: es mejor derivar de mas que dejarlo colgado.
+                  let _v4Arranco = false;
+                  try { const _rV4 = await _v4RutearARotacion(_convId, user_id, { deptoId: _departamentoId || null, leadRef: (data.pushName || telefono) || null }); _v4Arranco = !!(_rV4 === true || (_rV4 && _rV4.ok)); }
+                  catch (eV4Cl) { console.error('v4 clasificacion listo_humano:', eV4Cl && eV4Cl.message); _v4Arranco = false; }
+                  // Si la rotacion NO arranco, NO se marca `_yaDerivoEnEsteMensaje`: eso deja viva la RED DE
+                  // SEGURIDAD de mas abajo, que es la que deriva el lead cuando este camino no pudo. Antes se
+                  // marcaba siempre y la red quedaba desactivada -> el lead no lo agarraba nadie.
+                  if (!_v4Arranco) console.log('[DERIVACION] v4 no pudo arrancar la rotacion en conv ' + _convId + ' -> queda la red de seguridad');
+                  if (_v4Arranco) {
+                    _yaDerivoEnEsteMensaje = true;
+                    _decMotivoNo = 'derivo_rotacion_v4'; _decCamino = 'clasificacion_rotacion_v4'; // REGISTRO DECISIONES IA
+                  }
                   detectarYAgendarCita(user_id, _convId, _turnoId).catch(function(){});
                 } else {
                   // temp-decay (gated): este cambio de estado (p.ej. en_conversacion->interesado, que propondria 'tibio')
@@ -14561,6 +14594,21 @@ app.post('/api/conversaciones/registrar-estado', async function (req, res) {
     }
     if (!propias.length) return res.status(404).json({ error: 'Conversacion no encontrada' });
 
+    // EL RESPONSABLE DE LA ACCION (Diego 2026-08-07: "el responsable de esa accion").
+    // Antes acá solo se guardaba `actor_asesor_id`, y cuando el que apretaba era el TITULAR de la cuenta
+    // quedaba en null: el historial decía "un humano" y nada más. Medido: de 271 cambios hechos por
+    // humanos, 143 sin nombre. Caso Betty (04/08 18:48): el 02 y el 03 quedó "Andres Galdames" y el 04
+    // no, por la misma acción — el titular NO tiene fila en `asesores`, se lo reconoce por ausencia.
+    // Acá se resuelve el nombre para MOSTRARLO: el del asesor si tiene ficha, y si no, "el titular de la
+    // cuenta" (nunca "el administrador": ese es un ROL de sub-usuario, no el dueño).
+    var _actorNombre = 'el titular de la cuenta';
+    try {
+      if (actorAsesorId) {
+        var _an = await supabase.from('asesores').select('nombre').eq('id', actorAsesorId).maybeSingle();
+        if (_an && _an.data && _an.data.nombre) _actorNombre = String(_an.data.nombre).trim();
+      }
+    } catch (eAN) { /* sin nombre -> queda "el titular de la cuenta", que igual dice más que null */ }
+
     // Registro en tandas paralelas. registrarCambioEstado es best-effort ABSOLUTO (nunca tira),
     // asi que esto no puede romper aunque falte la tabla o la migracion.
     for (var i = 0; i < propias.length; i += REG_EST_LOTE) {
@@ -14573,8 +14621,28 @@ app.post('/api/conversaciones/registrar-estado', async function (req, res) {
           estado_nuevo: estadoNuevo,
           origen: 'humano',
           actor_asesor_id: actorAsesorId,
-          motivo: motivo
+          // El nombre va TAMBIEN dentro del motivo: `actor_asesor_id` no puede representar al titular
+          // (no tiene fila en `asesores`), y sin esto ese caso se pierde para siempre. Es texto, pero es
+          // el dato que Diego necesita leer. Si mas adelante se quiere estructurado, va una columna.
+          motivo: _actorNombre + ' — ' + motivo
         });
+      }));
+    }
+
+    // ===== EL MISMO CAMBIO, VISIBLE DENTRO DEL CHAT (Diego 2026-08-07) =====
+    // "podemos dejar este historial dentro del chat tambien? (...) hacerlos visible con el responsable de
+    //  la accion sea la IA, el administrador o un usuario".
+    // registrarCambioEstadoConv ya existia y ya se llama en 14 momentos del sistema (la IA clasifica, el
+    // cron de inactividad, el lead que vuelve a escribir...), pero NINGUNO de los cambios hechos desde el
+    // PANEL pasaba por acá. Por eso en Betty se veía el pase a Alejandro y NO se veía que un minuto
+    // después se lo sacaron: el "devolver a la IA" escribe el estado directo desde el front y solo avisaba
+    // a la auditoría. Ahora deja su rastro en el chat, con el nombre de quien lo hizo.
+    // Best-effort y gateado por `historial_estados`: con el flag apagado no inserta nada.
+    for (var iC = 0; iC < propias.length; iC += REG_EST_LOTE) {
+      var tandaC = propias.slice(iC, iC + REG_EST_LOTE);
+      await Promise.all(tandaC.map(function (cid) {
+        return registrarCambioEstadoConv(cid, estadoAnterior, estadoNuevo, _actorNombre, motivo, ownerId)
+          .catch(function () {});
       }));
     }
 

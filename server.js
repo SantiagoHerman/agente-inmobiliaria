@@ -8684,6 +8684,42 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // failover a Bedrock si esta gateado/encendido). Sin BEDROCK_ENABLED + creds, es identico a anthropic.messages.create.
   // VISION — RESGUARDO: si Anthropic no puede leer la URL de la imagen (URL caida, formato no soportado), la respuesta
   // NO debe caerse: reintentamos UNA vez SIN la imagen (solo texto) para que la IA igual conteste. Sin imagen, no aplica.
+  // ===== MODO PING (Diego 2026-08-06) ==========================================================
+  // El ping renueva el caché del bloque estático para que el próximo lead no pague la reescritura.
+  // Llega HASTA ACÁ a propósito, recorriendo TODO el armado del prompt igual que una respuesta real:
+  // el caché de Anthropic se identifica por el PREFIJO EXACTO (bloque estático + herramientas), así que
+  // si el ping armara el prompt distinto escribiría un caché PARALELO -- pagaría USD 0,08 y el caché real
+  // se vencería igual. Por eso NO se usó `modoPrueba`, que apaga una docena de flags (entre ellos
+  // derivacion_v3, que cambia la LISTA DE HERRAMIENTAS, y las tools son parte del prefijo).
+  //
+  // Acá se corta: se llama al modelo con max_tokens 1 (lo mínimo para que la request sea válida y el
+  // caché se renueve), se descarta la respuesta y se devuelven los hashes para que el cron verifique que
+  // el prefijo coincide con el de las respuestas reales. NO guarda mensajes, NO envía nada, NO cuenta
+  // como mensaje del plan del cliente.
+  if (opciones && opciones.modoPing) {
+    const _cPing = await llamarIAConFailover({
+      model: MODELO_CLIENTE, max_tokens: 1, system: systemBlocks, tools: toolsAgente, messages: mensajesParaIA
+    }, 'pingCache');
+    try {
+      if (_cPing && _cPing.usage) {
+        await registrarUsoTokens(user_id, _cPing.usage, 'ping_cache', PRECIO_IA, {
+          conversation_id: conversation_id || null,
+          static_prompt_hash: _staticPromptHash, tools_hash: _toolsHash, cache_ttl: (_ttl1hOn ? '1h' : null)
+        });
+      }
+    } catch (ePu) {}
+    const _u = (_cPing && _cPing.usage) || {};
+    return {
+      esPing: true,
+      staticPromptHash: _staticPromptHash, toolsHash: _toolsHash,
+      // cache_read > 0 = el caché estaba vivo y se renovó (lo barato).
+      // cache_creation > 0 = estaba vencido y hubo que reescribirlo (el ping llegó tarde, o el prefijo no coincide).
+      cacheRead: _u.cache_read_input_tokens || 0,
+      cacheCreation: _u.cache_creation_input_tokens || 0,
+      usage: _cPing && _cPing.usage
+    };
+  }
+
   let completion;
   try {
     completion = await llamarIAConFailover({
@@ -37956,6 +37992,110 @@ async function revisarSaludSistema() {
   }
 }
 setInterval(revisarSaludSistema, 10 * 60 * 1000); // cada 10 min
+
+// ===================================================================================================
+// PING DEL CACHE (Diego 2026-08-06): "el ping va con el cache de 1 hora. Deberia prenderse de forma
+// automatica en todas las cuentas, ya que en definitiva deberia disminuir el costo de los mensajes
+// durante el dia, ya que el primer mensaje es caro el resto no."
+//
+// QUE HACE: cuando una cuenta lleva un rato sin mensajes, su cache de 1h esta por vencer. Si vence, el
+// proximo lead paga la reescritura del bloque entero. El ping lo renueva por una fracción de eso.
+//
+// LA CUENTA (medida en Anton el 2026-08-06): una escritura de cache son 13.318 tok x USD 6/M = USD 0,080.
+// Un ping es una LECTURA de ese mismo bloque: 13.318 x USD 0,30/M = USD 0,004 + 1 token de salida.
+// PUNTO DE EQUILIBRIO: 16 pings pagan 1 escritura. Ese dia hubo 2 silencios largos (119 y 63 min) que
+// costaron 2 escrituras (USD 0,16); taparlos habria salido 3 pings (USD 0,015).
+//
+// LAS 6 REGLAS QUE EVITAN QUE EL PING SE COMA EL AHORRO:
+//   1. Cada 10 minutos.
+//   2. Solo dentro de _horarioCacheLarga() (07:00-23:59 AR) -- LA MISMA ventana del cache de 1h. Fuera de
+//      ahi el bloque se cachea a 5 min, no hay cache largo que mantener.
+//   3. Solo cuentas con ai_cache_ttl_1h activo.
+//   4. Solo si HUBO actividad hoy. Mantener vivo un cache que nadie uso es tirar plata.
+//   5. Solo si pasaron 50+ minutos desde la ultima llamada (el cache vence a los 60).
+//   6. CORTE POR PINGS SECOS: 3 pings seguidos sin que entre un mensaje -> se para hasta que alguien
+//      escriba. Sin esto, una cuenta que se apaga a las 15:00 seguiria pagando pings hasta medianoche.
+//
+// AUTO-VERIFICACION (lo que evita el peor escenario): el cache se identifica por el PREFIJO EXACTO. Si el
+// ping armara un prompt distinto al de una respuesta real, escribiria un cache PARALELO: pagaria la
+// escritura Y el cache real venceria igual -- saldria MAS CARO que no hacer nada. Por eso, despues de
+// cada ping se compara su static_prompt_hash + tools_hash contra los de la ultima respuesta real de esa
+// cuenta. Si no coinciden, la cuenta se DESHABILITA sola y queda el error en el log. No hace falta que
+// nadie revise nada a mano.
+// ===================================================================================================
+const _PING_CADA_MIN = 10;
+const _PING_MIN_SILENCIO = 50;     // minutos desde la ultima llamada a la IA
+const _PING_SECOS_MAX = 3;         // pings seguidos sin actividad -> parar
+const _pingEstado = new Map();     // user_id -> { secos, ultimaActividadVista, deshabilitada, motivo }
+
+async function _cronPingCache() {
+  try {
+    if (!_horarioCacheLarga()) return;                       // regla 2
+    const { data: cuentas, error: eC } = await supabase.from('business_settings').select('user_id, ai_cache_ttl_1h');
+    if (eC || !cuentas) return;
+    const ahora = Date.now();
+    for (const c of cuentas) {
+      try {
+        if (c.ai_cache_ttl_1h === false) continue;           // regla 3 (fail-open: null/true = activo)
+        const est = _pingEstado.get(c.user_id) || { secos: 0, ultimaActividadVista: null, deshabilitada: false, motivo: null };
+        if (est.deshabilitada) continue;
+
+        // Ultima llamada a la IA de esta cuenta (cualquier etiqueta): define el silencio y "hubo actividad hoy".
+        const { data: ult } = await supabase.from('ia_uso').select('created_at, etiqueta')
+          .eq('user_id', c.user_id).neq('etiqueta', 'ping_cache')   // los pings NO cuentan como actividad
+          .order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if (!ult || !ult.created_at) continue;
+        const tUlt = new Date(ult.created_at).getTime();
+        const minsSilencio = (ahora - tUlt) / 60000;
+        if (minsSilencio < _PING_MIN_SILENCIO) {              // regla 5: todavia esta caliente
+          if (est.secos) { est.secos = 0; _pingEstado.set(c.user_id, est); }  // hubo movimiento -> se reinicia el corte
+          continue;
+        }
+        // Regla 4: "hubo actividad HOY" = la ultima llamada es del mismo dia calendario argentino.
+        const diaDe = (ms) => new Date(ms - 3 * 3600000).toISOString().slice(0, 10);
+        if (diaDe(tUlt) !== diaDe(ahora)) continue;
+
+        // Regla 6: si desde el ping anterior NO entro nada nuevo, es un ping seco.
+        if (est.ultimaActividadVista === ult.created_at) {
+          if (est.secos >= _PING_SECOS_MAX) continue;         // ya se corto; espera a que alguien escriba
+        } else {
+          est.secos = 0;                                     // hubo actividad nueva -> arranca de cero
+        }
+
+        // Una conversacion cualquiera de la cuenta: el bloque estatico NO depende de ella (los datos del
+        // lead viajan en un bloque aparte, sin cachear), pero hace falta para que los flags se resuelvan
+        // igual que en una llamada real (`if (conversation_id && !modoPrueba)`).
+        const { data: cv } = await supabase.from('conversations').select('id')
+          .eq('user_id', c.user_id).order('updated_at', { ascending: false }).limit(1).maybeSingle();
+        if (!cv || !cv.id) continue;
+
+        const r = await generarRespuestaAgente(c.user_id, cv.id, 'ping', { modoPing: true });
+        est.secos = (est.secos || 0) + 1;
+        est.ultimaActividadVista = ult.created_at;
+
+        // AUTO-VERIFICACION del prefijo contra la ultima respuesta REAL de esta cuenta.
+        if (r && r.staticPromptHash) {
+          const { data: real } = await supabase.from('ia_uso')
+            .select('static_prompt_hash, tools_hash')
+            .eq('user_id', c.user_id).eq('etiqueta', 'respuesta_agente')
+            .not('static_prompt_hash', 'is', null)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          if (real && real.static_prompt_hash && real.static_prompt_hash !== r.staticPromptHash) {
+            est.deshabilitada = true; est.motivo = 'hash del bloque estatico distinto';
+            console.error('[PING-CACHE] cuenta ' + c.user_id + ' DESHABILITADA: el ping arma un prefijo distinto al de las respuestas reales (' + r.staticPromptHash + ' vs ' + real.static_prompt_hash + '). Estaria pagando un cache paralelo.');
+          } else if (real && real.tools_hash && r.toolsHash && real.tools_hash !== r.toolsHash) {
+            est.deshabilitada = true; est.motivo = 'hash de herramientas distinto';
+            console.error('[PING-CACHE] cuenta ' + c.user_id + ' DESHABILITADA: la lista de herramientas del ping no coincide con la real.');
+          } else {
+            console.log('[PING-CACHE] ' + c.user_id + ' ok | silencio ' + Math.round(minsSilencio) + ' min | cache_read=' + (r.cacheRead || 0) + ' cache_write=' + (r.cacheCreation || 0) + ' | seco #' + est.secos);
+          }
+        }
+        _pingEstado.set(c.user_id, est);
+      } catch (eCta) { console.error('[PING-CACHE] cuenta ' + c.user_id + ':', eCta && eCta.message); }
+    }
+  } catch (e) { console.error('[PING-CACHE] cron:', e && e.message); }
+}
+setInterval(_cronPingCache, _PING_CADA_MIN * 60 * 1000);
 setTimeout(revisarSaludSistema, 75 * 1000);       // primer chequeo a los 75s del arranque
 
 // ============================================================================

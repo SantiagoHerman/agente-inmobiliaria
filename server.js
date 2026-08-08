@@ -30116,6 +30116,37 @@ const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, d
 const LEADS_COLS_CONTACT = 'contacts(name, nombre_manual, phone, channel, interest, budget, foto_url, about)';
 const LEADS_SELECT = LEADS_COLS_CONV + ', ' + LEADS_COLS_CONTACT;
 
+// PRESUPUESTO CON MONEDA (Diego 2026-08-08: "ponele moneda"). `conversations.presupuesto_moneda` es una
+// columna NUEVA (migracion-presupuesto-moneda.sql).
+//
+// POR QUE UNA SONDA Y NO SUMAR LA COLUMNA A LA LISTA DE ARRIBA: cuando una columna del select no existe,
+// PostgREST NO la devuelve vacia -- devuelve 400 y FALLA LA CONSULTA ENTERA. O sea, si el deploy sale antes
+// de la migracion, la lista de conversaciones queda VACIA en produccion. Es EXACTAMENTE el bug de
+// `perfil_comprador` del 6/8 (la consulta FULL fallaba el 100% de las veces y "Fecha de alta" venia vacia
+// desde el dia uno). Con la sonda, el orden migracion/deploy DEJA DE IMPORTAR.
+//
+// Cuesta 1 query por proceso. Si la columna NO esta, se reintenta como maximo cada 5 minutos: cuando la
+// migracion corra, la columna aparece sola SIN redeploy.
+let _presuMonedaOk = null;          // null = sin sondear | true | false
+let _presuMonedaProbeMs = 0;
+const _PRESU_MONEDA_REPROBE_MS = 5 * 60 * 1000;
+async function _presupuestoMonedaExiste() {
+  if (_presuMonedaOk === true) return true;
+  const ahora = Date.now();
+  if (_presuMonedaOk === false && (ahora - _presuMonedaProbeMs) < _PRESU_MONEDA_REPROBE_MS) return false;
+  _presuMonedaProbeMs = ahora;
+  try {
+    const r = await supabase.from('conversations').select('presupuesto_moneda').limit(1);
+    _presuMonedaOk = !(r && r.error);
+  } catch (e) { _presuMonedaOk = false; }
+  return _presuMonedaOk;
+}
+async function _leadsSelect() {
+  return (await _presupuestoMonedaExiste())
+    ? (LEADS_COLS_CONV + ', presupuesto_moneda, ' + LEADS_COLS_CONTACT)
+    : LEADS_SELECT;
+}
+
 const LEADS_ESTADOS_VALIDOS = ['nuevo', 'en_conversacion', 'interesado', 'listo_humano', 'recontacto', 'cerrado'];
 const LEADS_TEMPS_VALIDAS = ['frio', 'tibio', 'caliente'];
 
@@ -30138,7 +30169,7 @@ app.get('/api/leads', async function (req, res) {
     const ordenCol = (qp.orden === 'created_at') ? 'created_at' : 'updated_at'; // default updated_at (misma razon que el front: conversaciones/page.tsx:1006-1015)
     const dirAsc = (qp.dir === 'asc');
 
-    let q = _aplicarScopeLeads(supabase.from('conversations').select(LEADS_SELECT), scope);
+    let q = _aplicarScopeLeads(supabase.from('conversations').select(await _leadsSelect()), scope);
 
     // ---- incluir_recontacto: excluidos por default (MISMO criterio EXACTO que filtrarNoRecontacto del
     // front, conversaciones/page.tsx:978), salvo que el caller los pida explicito o los este filtrando. ----
@@ -30274,7 +30305,7 @@ app.get('/api/leads/uno', async function (req, res) {
 
     const convId = String((req.query && req.query.conversation_id) || '').trim();
     if (!convId) return res.status(400).json({ error: 'Falta conversation_id' });
-    const r = await _aplicarScopeLeads(supabase.from('conversations').select(LEADS_SELECT).eq('id', convId), scope).maybeSingle();
+    const r = await _aplicarScopeLeads(supabase.from('conversations').select(await _leadsSelect()).eq('id', convId), scope).maybeSingle();
     if (r.error) return res.status(500).json({ error: r.error.message });
     if (!r.data) return res.status(403).json({ error: 'Fuera de tu alcance o no existe' });
     return res.json({ ok: true, lead: r.data });
@@ -30393,6 +30424,17 @@ app.post('/api/leads/actualizar', async function (req, res) {
     if (Object.prototype.hasOwnProperty.call(cambios, 'presupuesto')) {
       upd.presupuesto = String(cambios.presupuesto == null ? '' : cambios.presupuesto).slice(0, 300);
     }
+    // MONEDA DEL PRESUPUESTO (Diego 2026-08-08: "ponele moneda"). Se valida contra la MISMA lista que el
+    // resto de la plata del sistema (_MONEDAS_VALIDAS): lo que no sea ARS/USD no se guarda, no se guarda
+    // basura. Vaciar el selector borra la moneda (null), no la deja pegada al valor anterior.
+    // Solo se agrega al UPDATE si la columna existe; si la migracion todavia no corrio, el presupuesto se
+    // guarda igual (lo importante es el numero) y la moneda se vuelve a intentar sola en el proximo guardado.
+    let _quiereMoneda = false;
+    if (Object.prototype.hasOwnProperty.call(cambios, 'presupuesto_moneda') && await _presupuestoMonedaExiste()) {
+      const _crudo = cambios.presupuesto_moneda;
+      upd.presupuesto_moneda = (_crudo == null || String(_crudo).trim() === '') ? null : _monedaValida(_crudo);
+      _quiereMoneda = true;
+    }
     if (Object.prototype.hasOwnProperty.call(cambios, 'traductor_activo')) {
       upd.traductor_activo = cambios.traductor_activo === true;
     }
@@ -30418,7 +30460,16 @@ app.post('/api/leads/actualizar', async function (req, res) {
     upd.updated_at = new Date().toISOString();
 
     // 4) ESCRITURA re-scopeada a nivel DB (defensa en profundidad, ademas del chequeo del paso 1).
-    const updR = await _aplicarScopeLeads(supabase.from('conversations').update(upd).eq('id', conversation_id), scope);
+    let updR = await _aplicarScopeLeads(supabase.from('conversations').update(upd).eq('id', conversation_id), scope);
+    // RED DE SEGURIDAD de la moneda: si la sonda dijo que la columna existia y la escritura falla igual
+    // (base restaurada, migracion revertida, replica atrasada), se reintenta SIN la moneda. Perder la moneda
+    // es molesto; perder el presupuesto que el asesor acaba de tipear, no. La sonda queda en false para no
+    // volver a intentarlo en cada guardado.
+    if (updR.error && _quiereMoneda) {
+      _presuMonedaOk = false; _presuMonedaProbeMs = Date.now();
+      delete upd.presupuesto_moneda;
+      updR = await _aplicarScopeLeads(supabase.from('conversations').update(upd).eq('id', conversation_id), scope);
+    }
     if (updR.error) return res.status(500).json({ error: 'No se pudo actualizar: ' + updR.error.message });
 
     // 5) Historial -- SOLO si cambio el estado, fire-and-forget, MISMOS helpers que /api/conversations/cerrar.

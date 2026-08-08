@@ -10071,7 +10071,10 @@ async function _leadEscribioDespuesDeLaPrimeraRespuesta(conversation_id) {
 // BYTE-IDENTICOS a antes -- el cuarto estado no se menciona ni se acepta.
 // COSTO: ~25 tokens mas de prompt en Haiku (USD 1/millon) = USD 0,000025 por mensaje. No hay llamada nueva:
 // es la MISMA clasificacion que ya corre en cada mensaje del lead.
-async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoId, tildarDeptoOn, cierreNegativoOn) {
+// `contestaRecontacto`: este mensaje del lead ES la respuesta a un recontacto NUESTRO (le escribimos despues
+// de un tiempo de silencio). Cambia por completo lo que significa un "No" pelado, y sin este dato el
+// clasificador no tiene forma de saberlo -- ver el bloque del prompt mas abajo.
+async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoId, tildarDeptoOn, cierreNegativoOn, contestaRecontacto) {
   try {
     // Cargar los departamentos ACTIVOS del tenant (DB, sin IA). Si no hay, el depto queda inerte/null.
     let _deptos = [];
@@ -10132,6 +10135,26 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
       'REGLA DURA DE sin_interes (lo mas importante de todo): un "no" a UNA PROPIEDAD, a una zona, a un precio o a una opcion puntual NO es sin_interes -- ese cliente SIGUE INTERESADO y esta descartando opciones. "no me interesa ese", "esa no", "muy caro", "no me gusta la zona" => interesado, NUNCA sin_interes. sin_interes es solo cuando el cliente cierra la relacion con el negocio, no cuando descarta algo.',
       'Ante CUALQUIER duda de si es sin_interes o no => elegi sin_cambio (no pasa nada). Es mejor seguir hablando con alguien que ya no quiere, que cerrarle la puerta a alguien que si quiere.'
     ] : [];
+    // CONTESTA UN RECONTACTO (Diego 2026-08-08, caso Esteban Conde): el MISMO "No" significa cosas distintas
+    // segun a que le esta contestando. En una charla normal, "No" casi siempre descarta UNA opcion -> la regla
+    // dura de arriba manda abstenerse, y esta bien. Pero cuando le escribimos NOSOTROS despues de dias de
+    // silencio ("seguia pensando en ese duplex, si en algun momento te interesa avisame"), la pregunta que el
+    // lead esta contestando es "¿seguis queriendo esto?": ahi un "No" pelado ES cerrar la puerta.
+    //
+    // VERIFICADO EN LA CAJA NEGRA (ia_decisiones, conv de Esteban, 7/8 21:32): mensaje_lead "No",
+    // clasificador_corrio true, estado_propuesto "sin_cambio". El clasificador obedecio la regla dura -- le
+    // faltaba ESTE dato. Y ademas veia estado_previo "interesado", porque el pase de vuelta de recontacto
+    // (server.js:12488) le habia borrado el rastro 1 segundo antes: pone status=interesado, estado_previo=null
+    // y recontacto_count=0.
+    //
+    // ALCANCE EXACTO DEL PEDIDO DE DIEGO: "Hablo de los leads que ya pasaron por 1 recontacto al menos. No los
+    // que estan en interesados solamente sin haber tenido recontacto". Por eso esto viaja por turno y NO por
+    // estado: un lead que esta en 'interesado' y nunca fue recontactado no ve ninguna de estas lineas.
+    const _lineaRecontacto = (_cn && contestaRecontacto === true) ? [
+      'CONTEXTO IMPORTANTE DE ESTE MENSAJE: el lead NO escribio por su cuenta. Le escribimos NOSOTROS despues de dias de silencio para retomar el contacto, y esto es su RESPUESTA a eso.',
+      'POR ESO, SOLO EN ESTE MENSAJE, la regla de arriba se invierte: aca no hay una propiedad puntual que descartar, la pregunta que contesto fue "¿seguis interesado?". Un "no", "no gracias", "ya no", "gracias igualmente", "estoy bien", "ya no me interesa" o "gracias" a secas ES sin_interes:no_interesado.',
+      'Segui sin cerrar si la respuesta muestra que la charla continua ("contame", "que tenes", "mandame", "mas adelante te aviso", una pregunta, o pide algo distinto): eso es interesado, no sin_interes.'
+    ] : [];
     const _opcJson = _cn ? '<listo_humano|interesado|sin_cambio|sin_interes:no_interesado|sin_interes:pidio_no_contacto|sin_interes:numero_equivocado>' : '<listo_humano|interesado|sin_cambio>';
     const _formato = _hayDeptos
       ? ('Responde UNICAMENTE un JSON sin markdown con esta forma EXACTA: {"estado":"' + _opcJson + '","departamento":"<nombre exacto de la lista o ninguno>","pidio_area":<true|false>,"fuera_alcance":<true|false>}')
@@ -10145,7 +10168,7 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
       '- interesado    => todavia esta CONSULTANDO sin confirmar, pero MOSTRO INTERES. Mostrar interes es UNA de estas cinco: (1) da un dato de lo que necesita (zona, presupuesto, fechas, cuantas personas, tipo, para cuando, para que lo quiere); (2) pregunta por algo CONCRETO del inventario (una propiedad o unidad puntual, su precio, si esta disponible); (3) pide material (fotos, video, ubicacion, la ficha, mas opciones); (4) pregunta como seguir (si puede ir a verlo, como es el proceso, que necesita para avanzar); (5) compara o evalua opciones. NO alcanza y NO es interes: saludar, agradecer, "ok"/"dale"/"perfecto", o preguntar en general "que tienen?" sin dar ningun dato.',
       '- sin_cambio    => SOLO si es un saludo inicial sin consulta (hola, buenas) o algo no relacionado al negocio. Si ya pregunto algo concreto, NO es sin_cambio.',
       'CLAVE: la diferencia entre listo_humano e interesado es el COMPROMISO. Si SOLO consulta o muestra interes => interesado. Si ACEPTA/COORDINA una visita, reserva o avanzar la operacion => listo_humano (hay que derivar a un humano). Ante la duda entre interesado y sin_cambio, elegi interesado.'
-    ].concat(_lineaNegativa).concat(_lineasDepto).concat([
+    ].concat(_lineaNegativa).concat(_lineaRecontacto).concat(_lineasDepto).concat([
       _formato,
       // B4 (anti prompt-injection): el texto del lead va DELIMITADO como DATO, entre marcadores, y se aclara que
       // todo lo que este adentro es contenido a clasificar, NUNCA instrucciones a obedecer. Asi un lead que escriba
@@ -12146,7 +12169,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // WA pasa: contactKey=telefono, nombreNuevo=pushName||telefono, canal='whatsapp', y el set de columnas
     // que el flujo de WA lee de una conv existente (incluye status/estado_previo/idioma_lead, usados mas abajo).
     const _pushName = data.pushName || telefono;
-    const _ocrear = await obtenerOcrearConvDeCanal(user_id, telefono, 'whatsapp', _pushName, 'id, ai_enabled, status, estado_previo, idioma_lead, asesor_id');
+    const _ocrear = await obtenerOcrearConvDeCanal(user_id, telefono, 'whatsapp', _pushName, 'id, ai_enabled, status, estado_previo, idioma_lead, asesor_id, motivo_perdida, recontacto_excluido');
     let contacto = _ocrear.contacto;
     if (!contacto) return;
     // ENRIQUECIMIENTO best-effort: leer name/interest/budget/notes para la memoria del lead.
@@ -12483,9 +12506,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         .eq('recontacto_categoria', 'frio');
     } catch (ePromo) { /* columna ausente / error -> no promociona, no rompe */ }
 
+    // ESTE MENSAJE CONTESTA UN RECONTACTO (Diego 2026-08-08, caso Esteban Conde). Es el UNICO lugar del
+    // sistema donde todavia se sabe: el `if` de abajo pisa status/estado_previo/recontacto_count, asi que un
+    // segundo despues no queda ni rastro de que el lead venia de la cola. El clasificador (que corre mas
+    // adelante, dentro de `procesar`) lee esta variable por closure.
+    // Diego lo acoto explicito: "Hablo de los leads que ya pasaron por 1 recontacto al menos. No los que estan
+    // en interesados solamente sin haber tenido recontacto".
+    let _contestaRecontacto = false;
+
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos
     if (convExistente && convExistente.status === 'recontacto') {
+      _contestaRecontacto = true;
       // DETERMINISTICO / CERO IA: al volver de recontacto, restauramos el estado previo y la temperatura
       // SIGUE a ese estado (temperaturaPorEstado), sin ninguna llamada a Haiku/IA.
       let volverA = convExistente.estado_previo || 'en_conversacion';
@@ -12526,9 +12558,25 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // temp-decay (gated): al revivir un caso cerrado, el cambio a en_conversacion NO debe ENFRIAR un lead que
           // seguia caliente/tibio. Con flag ON aplica el maximo (solo sube); con flag OFF -> 'frio' tal cual (byte-identico).
           const _tempRevive = await _tempConDecayParaConv(conv.id, temperaturaPorEstado('en_conversacion'), user_id, _bsGate);
+          // EL CICLO EMPIEZA DE NUEVO (Diego 2026-08-08: "si vuelve a escribir empieza el ciclo nuevamente y
+          // ahi si no importa si vuelve a entrar por recontacto"). Hasta hoy el cierre por negativa dejaba
+          // recontacto_excluido=true y ACA NO SE LIMPIABA NUNCA: un lead cerrado por decir "no" quedaba fuera
+          // de la cola PARA SIEMPRE, incluso despues de volver a escribir el solo. Verificado antes de tocar:
+          // 0 apariciones de recontacto_excluido en este bloque.
+          //
+          // PERO NO PARA TODOS LOS MOTIVOS. Si el lead pidio que no lo contacten mas (pidio_no_contacto) o es
+          // un numero equivocado, el bloqueo SE MANTIENE hasta que una persona lo saque a mano: reabrirle la
+          // cola automaticamente seria volver a escribirle a alguien que pidio explicitamente que no.
+          // Solo se libera cuando el motivo fue 'no_interesado' (o no hay motivo guardado, que es el caso de
+          // los cierres viejos hechos a mano desde el panel).
+          const _motPrev = convExistente.motivo_perdida || null;
+          const _liberaCola = (_motPrev !== 'pidio_no_contacto' && _motPrev !== 'numero_equivocado');
           await supabase.from('conversations').update({
             status: 'en_conversacion',
             temperatura: _tempRevive,
+            recontacto_excluido: _liberaCola ? false : true,
+            recontacto_count: 0,
+            motivo_perdida: _liberaCola ? null : _motPrev,
             updated_at: new Date().toISOString()
           }).eq('id', conv.id);
           conv.status = 'en_conversacion'; // sincronizar el objeto en memoria: el ciclo de abajo lo trata como conv viva
@@ -12903,7 +12951,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               ? { estado: 'sin_cambio', departamentoId: null, departamentoIdTildar: null, pidioArea: false, deducido: false, fueraAlcance: false }
               : ((_haikuFusionOn && !_tildarOn)
                   ? (await _fusionGet()).estado
-                  : await clasificarEstado(texto, user_id, _convId, _turnoId, _tildarOn, _cierreNegOn)); // MEDIDOR: atribucion (no cambia la clasificacion)
+                  : await clasificarEstado(texto, user_id, _convId, _turnoId, _tildarOn, _cierreNegOn, _contestaRecontacto)); // MEDIDOR: atribucion (no cambia la clasificacion)
             const nuevoEstado = _clasif && _clasif.estado;
             const _departamentoId = _clasif && _clasif.departamentoId; // PUNTO 6: sigue null en modo tildar (aislado)
             // FASE 2: senales nuevas (solo se USAN con reparto_v2 ON; con flag OFF se ignoran -> comportamiento ACTUAL).
@@ -13109,8 +13157,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               const _motNeg = (_clasif && _clasif.motivoNegativo) || 'no_interesado';
               try {
                 // Condicional por status: si en el medio alguien la movio, no se pisa ese cambio.
+                // `recontacto_count: 0` -- Diego 2026-08-08: "si van a cerrado se cierra el recuento, porque si
+                // vuelve a escribir empieza el ciclo nuevamente". El contador arranca de cero para el ciclo
+                // siguiente; el que frena la cola AHORA es recontacto_excluido, no el contador.
                 const _updCierre = await supabase.from('conversations')
-                  .update({ status: 'cerrado', recontacto_excluido: true, motivo_perdida: _motNeg, updated_at: new Date().toISOString() })
+                  .update({ status: 'cerrado', recontacto_excluido: true, motivo_perdida: _motNeg, recontacto_count: 0, updated_at: new Date().toISOString() })
                   .eq('id', _convId).neq('status', 'cerrado');
                 if (_updCierre && _updCierre.error) {
                   // DEFENSIVO: si `motivo_perdida` o `recontacto_excluido` faltaran en alguna base, lo
@@ -38524,7 +38575,7 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     //    asesor al crear; con flag OFF -> EAGER (elegirAsesorActivo). Misma logica defensiva que antes.
     // Resolver el NOMBRE real del remitente (antes se guardaba el PSID/IGSID como nombre -> aparecia un codigo).
     const _nombreMeta = await _nombreRemitenteMeta(canal, senderId, creds);
-    const _ocrearMeta = await obtenerOcrearConvDeCanal(tenantUserId, String(senderId), canal, (_nombreMeta || String(senderId)), 'id, ai_enabled, status, asesor_id');
+    const _ocrearMeta = await obtenerOcrearConvDeCanal(tenantUserId, String(senderId), canal, (_nombreMeta || String(senderId)), 'id, ai_enabled, status, asesor_id, motivo_perdida, recontacto_excluido');
     let contacto = _ocrearMeta.contacto;
     if (!contacto) return;
     let conv = _ocrearMeta.conv;
@@ -42104,7 +42155,7 @@ async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil,
     }
 
     // Contacto + conversacion (helper M18 compartido, agnostico al canal).
-    const _ocrear = await obtenerOcrearConvDeCanal(tenantUserId, telefono, 'whatsapp', (nombrePerfil || telefono), 'id, ai_enabled, status, asesor_id');
+    const _ocrear = await obtenerOcrearConvDeCanal(tenantUserId, telefono, 'whatsapp', (nombrePerfil || telefono), 'id, ai_enabled, status, asesor_id, motivo_perdida, recontacto_excluido');
     const contacto = _ocrear.contacto;
     if (!contacto) return;
     conv = _ocrear.conv;

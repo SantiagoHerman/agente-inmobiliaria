@@ -1,0 +1,31 @@
+-- Vuelve atras EXACTAMENTE los 27 flags de Lozano al estado previo.
+-- Valores leidos de la base el 2026-08-10T21:35:58.016Z (antes de tocar nada).
+UPDATE public.business_settings SET
+       recontacto_v2                = false,
+       agente_voz_v2                = false,
+       recontacto_reglas_v2         = false,
+       respaldo_v2                  = false,
+       notif_presencia              = false,
+       ia_rag_v1                    = false,
+       ai_cache_ttl_1h              = false,
+       historial_estados            = false,
+       sin_consultar_solo           = false,
+       matching_v1                  = false,
+       ciclo_tools_v1               = false,
+       pipeline_filtros_v1          = false,
+       derivacion_validada_v1       = false,
+       pipeline_exportar_v1         = false,
+       reportes_v2                  = false,
+       contactos_v1                 = false,
+       recontacto_prio_charla       = false,
+       importacion_verificada_v1    = false,
+       chat_desde_ficha_v1          = false,
+       coincidencias_v1             = false,
+       fichas_ia_v1                 = false,
+       fichas_avisos_v1             = false,
+       fichas_chat_v1               = false,
+       fichas_historial_v1          = false,
+       derivacion_unificada_v1      = true,
+       derivacion_avisar_equipo     = true,
+       ia_agenda                    = true
+ WHERE user_id = '4bb4e5ad-dc23-4971-982a-5218e9c18b14';

@@ -1,0 +1,45 @@
+{
+ "cuando": "2026-08-10T23:23:29.250Z",
+ "nota": "estado ANTES de poner al dia las 5 cuentas atrasadas",
+ "cuentas": {
+  "Hosteria Tequendama": {
+   "user_id": "8e810148-af29-4ffd-a965-331ee120464a",
+   "flags": {
+    "respaldo_v2": false,
+    "notif_presencia": false
+   }
+  },
+  "Pagel Propiedades": {
+   "user_id": "02aacbf1-af83-4ef6-b4cc-0b81f7197e4f",
+   "flags": {
+    "respaldo_v2": false,
+    "notif_presencia": false
+   }
+  },
+  "Raices CRM": {
+   "user_id": "be10f668-6719-40c6-9cfc-00039adda9e0",
+   "flags": {
+    "respaldo_v2": false,
+    "notif_presencia": false
+   }
+  },
+  "Raices Desarrolladora": {
+   "user_id": "fdde5351-128d-4c82-9d5e-922baaff98b6",
+   "flags": {
+    "respaldo_v2": false,
+    "notif_presencia": false,
+    "sin_consultar_solo": false,
+    "pipeline_filtros_v1": false,
+    "pipeline_exportar_v1": false,
+    "reportes_v2": false
+   }
+  },
+  "Raices Inmobiliaria": {
+   "user_id": "673ed078-2336-417a-a2c5-00697a063b4b",
+   "flags": {
+    "respaldo_v2": false,
+    "notif_presencia": false
+   }
+  }
+ }
+}

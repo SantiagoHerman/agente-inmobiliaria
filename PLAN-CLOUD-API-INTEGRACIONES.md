@@ -76,6 +76,15 @@ donde no hay ventana de 24 h ni costo. Instagram y Messenger suman leads que tam
 - Migración: tabla `plantillas_catalogo` (por el Chrome de Diego).
 
 ## FASE 6 — Botones de origen en Oportunidades y Recontacto
+- **BÚSQUEDA POR ETIQUETA EN OPORTUNIDADES (Diego 2026-08-11: "agregar la busqueda de etiquetas
+  dentro de oportunidades").** Segmento nuevo "por etiqueta" junto a fríos/tibios/calientes/etc.,
+  con el catálogo del tenant (`/api/etiquetas`). Lee de LAS DOS fuentes:
+  - `conversations.etiquetas` (existe HOY, operador `ov` ya probado en `/api/leads`) → sirve ya
+    mismo para leads con conversación etiquetados a mano.
+  - `contacts.etiquetas` (llega con F10) → los importados sin conversación.
+  También en `buscar-leads` (14180) para armar `custom_ids` filtrando por etiqueta. Tocar
+  `_resolverUniversoOportunidad` (14085) con el mismo cuidado del hallazgo #20 (un universo con
+  contactos sin conversación no debe trabar la cola de oportunidades).
 - Oportunidades: botones [WhatsApp Business ●] / [Cloud API] arriba, número visible en cada uno. Con Cloud: selector SOLO de plantillas aprobadas de esa cuenta + variables; el motor manda `enviarPlantillaCloud` en vez de texto libre. Topes de Fase 1 aplican por canal.
 - Recontacto: mismo par de botones (aunque el uso esperado es WhatsApp Business).
 - Las 3 oportunidades existentes siguen en texto libre por WhatsApp Business (sin cambios).

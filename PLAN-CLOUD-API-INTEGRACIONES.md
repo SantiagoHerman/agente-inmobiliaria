@@ -46,6 +46,31 @@ donde no hay ventana de 24 h ni costo. Instagram y Messenger suman leads que tam
 
 ---
 
+# ESTADO AL 2026-08-11 — TODO EL CÓDIGO ESTÁ HECHO Y DESPLEGADO
+
+| Fase | Qué | Commit |
+|---|---|---|
+| 1 | Techos duros 20/día (recontacto) y 10/día (oportunidades) | `420ba3d9` |
+| 1b | Las 10 guardas de Oportunidades | `420ba3d9` + `b91f9887` |
+| 2 | Pestañas por canal en Conversaciones | `363306ab` |
+| 3 | Arreglos obligatorios pre-envío | `9c331d8f` |
+| 4 | Integraciones: backend, 3 estados y escalera del trámite | `d2985431` `621b452a` `20a54518` |
+| 5 | Catálogo de plantillas + webhook de estado | `37ae974e` |
+| 6 | De qué número sale cada oportunidad + segmento por etiqueta | `950f5dcd` `d5ae1a43` |
+| 7 | El pase a la línea comercial | `9371e7b2` |
+| 8 | Unificación de contacto IG/Messenger → WhatsApp | `d5ae1a43` |
+| 9 | Perfil automático sin pisar lo manual | `d5ae1a43` |
+| 10 | Importación inteligente (Excel/PDF/fotos) con permiso de gasto | `83fa0089` |
+| — | Bugs de plantillas + catálogo escrito + guiones de video | `b9178133` |
+
+**LO ÚNICO QUE FALTA DE DIEGO: correr `migracion-fases-5-8-10.sql`** (una sola vez, 11 columnas y
+3 tablas, todo aditivo e idempotente). Hasta que se corra, todo lo nuevo degrada a no-op — verificado
+en vivo con el cron del pase, que no manda nada porque la columna no existe.
+
+**Falta también la parte visual de las fases 5, 6, 7 y 10** (el backend está entero): el selector de
+plantillas del catálogo, los dos botones de origen en la pantalla de Oportunidades, y la pantalla de
+la importación con la cola de aprobación.
+
 # LAS FASES
 
 ## FASE 0 — Verificaciones previas (solo lectura; necesita el Chrome de Diego)

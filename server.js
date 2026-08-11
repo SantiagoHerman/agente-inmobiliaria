@@ -20707,6 +20707,50 @@ app.get('/api/etiquetas', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// POST /api/etiquetas { nombre, color? } -> AGREGA una etiqueta al catalogo del tenant y la devuelve.
+// Diego (2026-08-11), sobre la solapa de importacion: "crear una nueva y que queden todos marcados
+// con esa... en esa solapa no se pueden eliminar etiquetas".
+//
+// POR ESO ESTE ENDPOINT SOLO SUMA. No hay DELETE ni rename: borrar sigue viviendo donde siempre
+// (Configuracion -> Etiquetas de leads), que es el unico lugar donde alguien ve el catalogo entero y
+// entiende que se lleva puesto. Desde la importacion se crea al vuelo, nunca se destruye.
+//
+// Solo el DUEÑO: el catalogo vive en business_settings, que un asesor no escribe (RLS owner-only).
+app.post('/api/etiquetas', async function(req, res) {
+  try {
+    const ident = await _equipoIdentidad(req);
+    if (!ident) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!ident.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede crear etiquetas.' });
+
+    const nombre = String((req.body && req.body.nombre) || '').trim().slice(0, 60);
+    if (!nombre) return res.status(400).json({ error: 'Poné un nombre para la etiqueta.' });
+    // Color: se acepta un hex y cualquier otra cosa cae al neutro. No se confia en el body.
+    const _colorRaw = String((req.body && req.body.color) || '').trim();
+    const color = /^#[0-9a-fA-F]{6}$/.test(_colorRaw) ? _colorRaw : '#6B7280';
+
+    const { data: _bs, error: _eBs } = await supabase.from('business_settings')
+      .select('etiquetas').eq('user_id', ident.ownerId).maybeSingle();
+    if (_eBs) return res.status(503).json({ error: 'No se pudo leer el catalogo de etiquetas.' });
+    const previas = (_bs && Array.isArray(_bs.etiquetas)) ? _bs.etiquetas : [];
+
+    // Idempotente por nombre: apretar dos veces no puede dejar dos etiquetas iguales que despues
+    // nadie distingue en los filtros. Si ya existe, se devuelve LA QUE HAY (con su id), no una nueva.
+    const _ya = previas.filter(function (e) {
+      return e && String(e.nombre || '').trim().toLowerCase() === nombre.toLowerCase();
+    })[0];
+    if (_ya) return res.json({ ok: true, etiqueta: _ya, ya_existia: true, etiquetas: previas });
+
+    if (previas.length >= 100) return res.status(400).json({ error: 'El catálogo llegó a 100 etiquetas. Ordená las que hay antes de sumar otra.' });
+
+    // Mismo formato de id que genera Configuracion, para que las dos fuentes convivan.
+    const nueva = { id: 'etq-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), nombre: nombre, color: color };
+    const salida = previas.concat([nueva]);
+    const { error } = await supabase.from('business_settings').update({ etiquetas: salida }).eq('user_id', ident.ownerId);
+    if (error) return res.status(503).json({ error: 'No se pudo guardar la etiqueta: ' + (error.message || 'error de esquema') });
+    return res.json({ ok: true, etiqueta: nueva, ya_existia: false, etiquetas: salida });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/equipo/avisos-config', async function(req, res) {
   try {
     const ident = await _equipoIdentidad(req);

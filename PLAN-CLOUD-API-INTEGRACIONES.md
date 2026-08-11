@@ -116,6 +116,61 @@ carga manual, no quita que se modifique manualmente."*
 - Aplica a TODOS los canales (WhatsApp/Cloud/IG/Messenger). Misma filosofía que fichas_ia_v1
   (la IA propone, la persona confirma) y que el resumen automático.
 
+## FASE 10 — Importación inteligente de contactos (Diego 2026-08-11)
+*"dejar la importacion por CSV pero agregar una mas: un excel, varios pdf o imagenes de fotos de un
+libro para que la IA interprete, y rellene, arme fichas y todo lo necesario para crear contactos
+nuevos o actualizar los que hay… ver el uso de IA, Haiku o Sonnet, evaluar el gasto y SIEMPRE pedir
+permiso para ese gasto… y aprobar cada contacto nuevo o cada informacion o ficha."*
+- El CSV actual queda intacto. Lo nuevo es un segundo camino: subir Excel / PDFs / fotos.
+- **🔴 PERMISO SIEMPRE, POR LOTE:** antes de llamar a la IA se cuenta el material (filas, páginas,
+  imágenes), se estima el costo CON NÚMERO y el modelo elegido, y se muestra el botón "Aprobar
+  gasto". Sin ese click no se gasta un token. Cada importación pide permiso de nuevo.
+- **Modelo por material:** Excel/tabla limpia → Haiku; PDFs escaneados, manuscritos, fotos de libro →
+  Sonnet (visión). El presupuesto dice cuál y por qué; se puede forzar el otro.
+- **NADA escribe directo en contacts:** todo va a STAGING (tablas nuevas `import_lotes` +
+  `import_items`, migración). Cola de aprobación ítem por ítem: contacto nuevo / actualización de
+  uno existente (con diff contra lo que hay) / ficha propuesta. Dedupe por teléfono y email contra
+  los contactos existentes.
+- Al aprobar, se aplica con la regla de Fase 9: **lo manual nunca se pisa** — una actualización que
+  reemplaza un dato cargado a mano se marca distinto y exige aprobación explícita de ese reemplazo.
+- Reusa lo construido: fichas con `confirmada=false` (patrón existente), el alta del importador CSV,
+  la normalización de teléfonos.
+
+## CORRECCIONES DE LA AUDITORÍA (2026-08-11 — 4 auditores, informes completos en
+## AUDITORIA-PRE-PLAN-HALLAZGOS.md; los números # refieren a ese archivo)
+- **F4 = EXTENDER `/whatsapp`** — la sección "Integraciones" YA existe (key 'whatsapp'), con
+  CloudApiCard montada y tabs por canal (#4). No se crea `/integraciones`.
+- **Saneos ANTES de la pantalla F4:** las 2 filas IG duplicadas de Meta Test + arreglar los upserts
+  de credenciales que multiplican filas (#40) · popup o redirect en el OAuth (#46) · sacar los DOS
+  gates hardcodeados (EN_PREPARACION y la exclusión de Anton, #5) · switch dueño para prender
+  `cloud_api_v1` (#29) · Integraciones = solo dueño (#47).
+- **La escalera se construye honesta (#43):** extender `/estado` pidiendo a Graph
+  `code_verification_status` + `name_status` (y persistir `verified_name`); tarjeta/pago = tilde
+  manual o inferencia por error 131042 (mapearlo); portafolio = "no verificable" si Graph falla;
+  persistir el envío de prueba. "Esperando aprobación de Meta" = flag manual + detección reactiva
+  por granular_scopes en el callback (#44). Revisar el scope manage_comments antes de liberar (#45).
+- **F3a se agranda:** factorizar la persistencia del path manual (13559) en un adaptador usado por
+  TODOS los envíos Cloud; para Oportunidades además CREAR la fila en messages y renderizar el texto
+  local (#26). El default de `estado_envio` es 'enviado' → el bug real es el ✓ mentiroso, no el
+  "enviando" (#27). Marcar fallo también en la fila de la IA del canal Meta (#41).
+- **F3b se agranda:** la exclusión de canal va en LOS TRES SENDERS (4 puertas de entrada, #14) +
+  escape de canal en `reintentarFallidos` (#42) + guarda de destinatario con `verificarNumeroWA`
+  (#15) + guarda de ventana de 24 h en IG/MSN (#41).
+- **F1 corregida:** v2 YA tiene contador diario — el tope es 1 línea en 18244 (#18); el legacy solo
+  corre en Meta Test; **el tope de Oportunidades necesita contador POR CUENTA nuevo** (el existente
+  es por-oportunidad y su default es 200/día, #17); los motores de recontacto deben chequear el
+  resultado del envío antes de contar (copiar el patrón de Oportunidades, #16).
+- **FASE NUEVA (previa a F2/F7/F9): post-proceso compartido.** `clasificarEstado`, `extraerDatosLead`
+  y el revive corren SOLO en Evolution (#36): una conv de Cloud no cambia de etapa nunca, y en
+  IG/MSN hay derivación pero no clasificación. Factorizar y enchufar a los 3 webhooks.
+- **F5:** plantillas body-only por ahora (#32); webhook `message_template_status_update` +
+  `_resolverTenantPorWaba` + cron de refresco (#31); unificar idioma crear/enviar (#33).
+- **Exclusividad Cloud:** unique por `phone_number_id` + 409 en `/conectar` (#35) + UNIQUE(user_id)
+  o resolución única de fila (#34).
+- **F9:** el arreglo del pisado de `interest`/`budget` (#3) entra ANTES de extender la extracción.
+- **Token Cloud:** columna de vencimiento + aviso; el 190 hoy es silencioso y gasta IA (#30).
+- **i18n:** traducir las pantallas que salgan en el video (conversaciones ~35-40%, CloudApiCard 0%).
+
 ## ORDEN DE EJECUCIÓN (Diego 2026-08-11: "primero integraciones y despues el resto")
 1. Revisión previa profunda (4 auditores de solo lectura sobre todo lo que el plan toca)
 2. **FASE 4 — Integraciones** (pantalla + escalera + tarjetas IG/MSN "esperando aprobación")

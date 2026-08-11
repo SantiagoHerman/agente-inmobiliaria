@@ -36,8 +36,12 @@ CREATE INDEX IF NOT EXISTS contacts_etiquetas_idx ON public.contacts USING GIN (
 -- ============================================================================================
 ALTER TABLE public.contacts ADD COLUMN IF NOT EXISTS telefono_capturado text;
 ALTER TABLE public.contacts ADD COLUMN IF NOT EXISTS contacto_principal_id uuid;
+-- FASE 7: cuando se le mando el mensaje desde la linea comercial. Es el candado que garantiza UNA
+-- sola vez por lead (y de paso, el contador del tope diario por cuenta).
+ALTER TABLE public.contacts ADD COLUMN IF NOT EXISTS pase_enviado_at timestamptz;
 CREATE INDEX IF NOT EXISTS contacts_tel_capturado_idx ON public.contacts (user_id, telefono_capturado);
 CREATE INDEX IF NOT EXISTS contacts_principal_idx ON public.contacts (contacto_principal_id);
+CREATE INDEX IF NOT EXISTS contacts_pase_idx ON public.contacts (user_id, pase_enviado_at);
 
 
 -- ============================================================================================
@@ -124,7 +128,7 @@ NOTIFY pgrst, 'reload schema';
 SELECT 'columna' AS que, table_name || '.' || column_name AS nombre
   FROM information_schema.columns
  WHERE table_schema = 'public'
-   AND ((table_name = 'contacts' AND column_name IN ('etiquetas','telefono_capturado','contacto_principal_id')))
+   AND ((table_name = 'contacts' AND column_name IN ('etiquetas','telefono_capturado','contacto_principal_id','pase_enviado_at')))
 UNION ALL
 SELECT 'tabla', table_name
   FROM information_schema.tables
@@ -137,6 +141,7 @@ SELECT 'tabla', table_name
 --   DROP TABLE IF EXISTS public.import_items;
 --   DROP TABLE IF EXISTS public.import_lotes;
 --   DROP TABLE IF EXISTS public.plantillas_catalogo;
+--   ALTER TABLE public.contacts DROP COLUMN IF EXISTS pase_enviado_at;
 --   ALTER TABLE public.contacts DROP COLUMN IF EXISTS contacto_principal_id;
 --   ALTER TABLE public.contacts DROP COLUMN IF EXISTS telefono_capturado;
 --   ALTER TABLE public.contacts DROP COLUMN IF EXISTS etiquetas;

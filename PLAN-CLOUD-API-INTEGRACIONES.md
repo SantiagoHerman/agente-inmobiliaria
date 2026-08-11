@@ -83,7 +83,27 @@ donde no hay ventana de 24 h ni costo. Instagram y Messenger suman leads que tam
 ## FASE 7 — El pase a la línea comercial
 - Marca `pase_pedido_at` cuando la IA (por Cloud/IG/MSN) pide que escriba al WhatsApp Business.
 - Trigger: si no escribió en X (supuesto 1), mensaje breve/humano/variado por Evolution desde la línea comercial. Tope 10/día + rojo. Prompt: modo "primer mensaje de línea comercial" — usa la info del lead SIN recapitular.
-- En IG/MSN la IA pide el WhatsApp TEMPRANO (el reloj de 24 h corre y no hay recuperación).
+- En IG/MSN la IA pide el WhatsApp TEMPRANO (el reloj de 24 h corre y no hay recuperación): pide el
+  número del lead O le sugiere seguir con el sector correspondiente por esa línea (le da el número).
+
+## FASE 8 — Unificación del contacto: IG/Messenger → WhatsApp (Diego 2026-08-11)
+*"hay que lograr una unificacion de datos dentro del contacto. Si escribe a cloud api, al ser un
+numero de telefono ya tiene el dato para seguir. Pero instagram y messenger no, ahi los tiene que
+pedir."* — En Cloud API la unificación es automática (misma llave = teléfono). En IG/MSN el contacto
+vive bajo un IGSID/PSID que no se parece a un teléfono: hay que capturarlo y enlazar.
+- **8a. Capturar el teléfono:** sumar `telefono` a la extracción que YA corre por turno (hoy saca
+  interés/presupuesto/nombre/fechas; 0 llamadas extra de IA). Normalizado a formato internacional.
+- **8b. Guardarlo:** columna nueva `contacts.telefono_capturado` (migración; `contacts.phone` en IG
+  guarda el IGSID, no se toca).
+- **8c. Enlazar:** cuando aparece (o ya existe) una conversación de WhatsApp con ese teléfono en la
+  misma cuenta → vincular ambos contactos (`contacts.contacto_principal_id`, enlace NO destructivo:
+  nada se borra ni se pisa). La ficha, el resumen y el historial se muestran UNIFICADOS bajo el
+  contacto principal (el de WhatsApp); la conversación de IG/MSN sigue visible en su pestaña.
+- **8d. El disparo del pase:** con el teléfono capturado, el trigger de Fase 7 puede salir por la
+  línea comercial hacia ese número ("Hola Pablo, te escribo desde la línea comercial de Anton…"),
+  dentro del tope de 10/día. Al primer mensaje, el enlace 8c ya une todo.
+- Si el lead nunca da el teléfono ni escribe: la conversación IG/MSN sigue su ciclo normal y a la
+  inactividad va a **cerrado** (Fase 3b), con revive si vuelve a escribir.
 
 ## CARRIL APARTE — App Review de Meta (desbloquea IG/Messenger de verdad)
 - Escribir los 2 guiones de video (Messenger con login Facebook; Instagram con login Instagram): login completo, usuario con acceso, ida y vuelta de mensajes, interfaz EN INGLÉS (el panel ya tiene i18n con 'en'), subtítulos.

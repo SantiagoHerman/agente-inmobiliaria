@@ -14382,6 +14382,11 @@ app.post('/api/oportunidades', async (req, res) => {
       max_dia: _maxDia,
       horario: (b.horario != null) ? String(b.horario).slice(0, 40) : 'oficina',
       ritmo: (b.ritmo != null) ? String(b.ritmo).slice(0, 40) : 'normal',
+      // FASE 6: de que numero sale. Default 'evolution' = como funciona hoy, para que una oportunidad
+      // creada sin elegir nada se comporte EXACTAMENTE igual que antes de este cambio.
+      canal_envio: (String(b.canal_envio || '').toLowerCase() === 'cloud') ? 'cloud' : 'evolution',
+      plantilla: (b.plantilla != null) ? String(b.plantilla).slice(0, 200) : null,
+      plantilla_idioma: (b.plantilla_idioma != null) ? String(b.plantilla_idioma).slice(0, 20) : null,
       programado_para: b.programado_para || null,
       total: universo.length,
       enviados: 0,
@@ -14427,6 +14432,14 @@ app.patch('/api/oportunidades/:id', async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(b, 'media')) upd.media = (b.media && typeof b.media === 'object' && b.media.url) ? { url: String(b.media.url).slice(0, 2000), tipo: (b.media.tipo ? String(b.media.tipo).slice(0, 20) : 'imagen') } : null;
     if (Object.prototype.hasOwnProperty.call(b, 'max_dia')) upd.max_dia = (Number.isFinite(Number(b.max_dia)) && Number(b.max_dia) > 0) ? Math.min(Number(b.max_dia), 5000) : null;
     if (b.horario != null) upd.horario = String(b.horario).slice(0, 40);
+    // FASE 6: de que numero sale. Solo dos valores validos; cualquier otra cosa se ignora en vez de
+    // guardarse, para que un typo no mande un broadcast por un canal que no existe.
+    if (b.canal_envio != null) {
+      const _ce = String(b.canal_envio).trim().toLowerCase();
+      if (_ce === 'cloud' || _ce === 'evolution') upd.canal_envio = _ce;
+    }
+    if (b.plantilla != null) upd.plantilla = String(b.plantilla).slice(0, 200) || null;
+    if (b.plantilla_idioma != null) upd.plantilla_idioma = String(b.plantilla_idioma).slice(0, 20) || null;
     if (b.ritmo != null) upd.ritmo = String(b.ritmo).slice(0, 40);
     if (Object.prototype.hasOwnProperty.call(b, 'programado_para')) upd.programado_para = b.programado_para || null;
     let recalcularTotal = false;
@@ -18348,8 +18361,16 @@ async function procesarOportunidades() {
         let enviadosTotalNuevo = (Number.isFinite(op.enviados) ? op.enviados : 0) || 0;
         let enviadosHoyNuevo = enviadosHoy;
         // Sin cuerpo ni media no hay NADA que mandar: se pausa de entrada, sin recorrer el universo
-        // ni golpear a Evolution una sola vez.
-        if (!textoFinal && !mediaUrl) {
+        // ni golpear a Evolution una sola vez. (Por Cloud el "cuerpo" es la plantilla aprobada.)
+        const _porCloud = String(op.canal_envio || '') === 'cloud';
+        if (_porCloud && !op.plantilla) {
+          try {
+            await supabase.from('oportunidades').update({ estado: 'pausada', updated_at: new Date().toISOString() }).eq('id', op.id).neq('estado', 'completada');
+            console.warn('[oportunidades] "' + op.nombre + '" pausada: sale por la API oficial pero no tiene plantilla elegida');
+          } catch (eSp) {}
+          continue;
+        }
+        if (!_porCloud && !textoFinal && !mediaUrl) {
           try {
             await supabase.from('oportunidades').update({ estado: 'pausada', updated_at: new Date().toISOString() }).eq('id', op.id).neq('estado', 'completada');
             console.warn('[oportunidades] "' + op.nombre + '" pausada: no tiene mensaje ni imagen para enviar');
@@ -18367,7 +18388,24 @@ async function procesarOportunidades() {
           try {
             // `.ok`: enviarWhatsappMedia devuelve { ok, id }. Sin el `.ok`, `ok` seria un objeto (siempre
             // truthy) y un recontacto que FALLO se contaria como enviado -- gastando un intento del tope.
-            if (mediaUrl) { const _rMed = await enviarWhatsappMedia(instancia, contacto.phone, mediaUrl, mediaTipo, textoFinal || undefined); ok = !!(_rMed && _rMed.ok); }
+            // ===== FASE 6: DE QUE NUMERO SALE (Diego 2026-08-11) =====
+            // "en oportunidades poner 2 botones arriba para que elijan de que numero debe salir:
+            //  WhatsApp Business predeterminado... y otro boton whatsapp cloud api con lo mismo pero
+            //  adaptado con las plantillas aprobadas".
+            // `op.canal_envio`: null/'evolution' = como siempre (predeterminado, no cambia nada para
+            // nadie); 'cloud' = sale por la API oficial CON PLANTILLA (op.plantilla), que es lo unico
+            // que Meta acepta fuera de la ventana de 24 h.
+            if (String(op.canal_envio || '') === 'cloud') {
+              if (!op.plantilla) { ok = false; }   // sin plantilla no hay envio posible por Cloud
+              else {
+                // Los parametros son POSICIONALES (ver enviarPlantillaCloud): {{1}} = nombre del lead.
+                const _nomLead = String(contacto.name || '').trim() || 'Hola';
+                const _rCl = await enviarPlantillaCloud(op.user_id, String(op.plantilla), String(op.plantilla_idioma || IDIOMA_PLANTILLA_DEFAULT), contacto.phone, [_nomLead]);
+                ok = !!(_rCl && _rCl.ok);
+                if (!ok) console.warn('[oportunidades cloud] ' + (_rCl && _rCl.error ? _rCl.error : 'fallo el envio'));
+              }
+            }
+            else if (mediaUrl) { const _rMed = await enviarWhatsappMedia(instancia, contacto.phone, mediaUrl, mediaTipo, textoFinal || undefined); ok = !!(_rMed && _rMed.ok); }
             else if (textoFinal) { ok = await enviarWhatsapp(instancia, contacto.phone, textoFinal, null); }
             else { ok = false; } // sin cuerpo ni media -> nada que mandar
           } catch (eSend) { ok = false; }

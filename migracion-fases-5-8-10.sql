@@ -45,6 +45,18 @@ CREATE INDEX IF NOT EXISTS contacts_pase_idx ON public.contacts (user_id, pase_e
 
 
 -- ============================================================================================
+-- FASE 6 — DE QUE NUMERO SALE CADA OPORTUNIDAD
+-- Diego: "en oportunidades poner 2 botones arriba para que elijan de que numero debe salir".
+-- 'evolution' (default) = como funciona hoy, texto libre por el WhatsApp de siempre.
+-- 'cloud' = por la API oficial, y ahi Meta SOLO acepta una plantilla aprobada.
+-- El default explicito garantiza que toda oportunidad ya creada siga comportandose igual.
+-- ============================================================================================
+ALTER TABLE public.oportunidades ADD COLUMN IF NOT EXISTS canal_envio text NOT NULL DEFAULT 'evolution';
+ALTER TABLE public.oportunidades ADD COLUMN IF NOT EXISTS plantilla text;
+ALTER TABLE public.oportunidades ADD COLUMN IF NOT EXISTS plantilla_idioma text;
+
+
+-- ============================================================================================
 -- FASE 5 — CATALOGO CENTRAL DE PLANTILLAS DE RAICES
 -- Las plantillas se aprueban POR WABA (por cliente), no se comparten entre cuentas. Pero el
 -- catalogo lo mantiene Raices una sola vez y cada cliente elige cuales manda a aprobar a SU WABA.
@@ -128,7 +140,8 @@ NOTIFY pgrst, 'reload schema';
 SELECT 'columna' AS que, table_name || '.' || column_name AS nombre
   FROM information_schema.columns
  WHERE table_schema = 'public'
-   AND ((table_name = 'contacts' AND column_name IN ('etiquetas','telefono_capturado','contacto_principal_id','pase_enviado_at')))
+   AND ((table_name = 'contacts' AND column_name IN ('etiquetas','telefono_capturado','contacto_principal_id','pase_enviado_at'))
+     OR (table_name = 'oportunidades' AND column_name IN ('canal_envio','plantilla','plantilla_idioma')))
 UNION ALL
 SELECT 'tabla', table_name
   FROM information_schema.tables

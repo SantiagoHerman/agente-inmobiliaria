@@ -43011,6 +43011,35 @@ app.post('/api/webhook/cloud-api', function(req, res) {
         for (let c = 0; c < cambios.length; c++) {
           try {
             const cambio = cambios[c] || {};
+
+            // ===== ESTADO DE PLANTILLAS (Fase 5) =====
+            // Antes este webhook se DESCARTABA (el `continue` de abajo se lo comia), asi que el
+            // estado de aprobacion solo se refrescaba si alguien abria la pantalla de plantillas.
+            // Medido: las 9 plantillas de la cuenta de prueba tenian el estado congelado hace 6 dias,
+            // 4 en PENDING -- nadie sabia si Meta ya las habia aprobado o rechazado.
+            // OJO: este evento NO trae metadata.phone_number_id, asi que el resolver de tenant normal
+            // no sirve. Se resuelve por entry.id, que ES el WABA ID.
+            if (cambio.field === 'message_template_status_update') {
+              try {
+                const _v = cambio.value || {};
+                const _waba = entry.id ? String(entry.id) : null;
+                if (!_waba) continue;
+                const { data: _fila } = await supabase.from('cloud_api_numbers')
+                  .select('user_id').eq('waba_id', _waba).order('creado_at', { ascending: false }).limit(1).maybeSingle();
+                if (!_fila || !_fila.user_id) continue;
+                const _nom = _v.message_template_name || _v.name;
+                const _idi = _v.message_template_language || _v.language || IDIOMA_PLANTILLA_DEFAULT;
+                const _est = _v.event || _v.new_certificate_status || _v.status;   // APPROVED | REJECTED | ...
+                if (!_nom || !_est) continue;
+                await supabase.from('cloud_api_templates')
+                  .update({ estado_aprobacion: String(_est).toUpperCase(), actualizado_at: new Date().toISOString() })
+                  .eq('user_id', _fila.user_id).eq('nombre', String(_nom)).eq('idioma', String(_idi));
+                console.log('[cloud-api] plantilla "' + _nom + '" (' + _idi + ') -> ' + _est + ' en la cuenta ' + _fila.user_id +
+                  (_v.reason ? ' · motivo: ' + _v.reason : ''));
+              } catch (eTpl) { console.error('[cloud-api] estado de plantilla:', eTpl && eTpl.message); }
+              continue;
+            }
+
             if (cambio.field && cambio.field !== 'messages') continue; // solo el campo 'messages'
             const val = cambio.value || {};
             const phoneNumberId = val.metadata && val.metadata.phone_number_id;
@@ -43557,6 +43586,102 @@ app.get('/api/cloud-api/plantillas', async function(req, res) {
 // Meta: POST /<waba_id>/message_templates { name, language, category, components:[{type:'BODY',text}] }
 // La plantilla NACE EN PENDING y la aprueba Meta (de minutos a horas). No se puede enviar hasta
 // que quede APPROVED: por eso la respuesta devuelve el estado y el front lo muestra tal cual.
+// ============================================================================================
+// FASE 5 — EL CATALOGO DE PLANTILLAS DE RAICES
+// --------------------------------------------------------------------------------------------
+// Diego: "plantillas: tener la opcion de 20 o 30 plantillas distintas para que el cliente pueda
+// elegir y enviar a aprobacion".
+//
+// POR QUE HACE FALTA UN CATALOGO: las plantillas son activos DE LA WABA, o sea de cada cliente.
+// No se comparten entre cuentas y cada una se aprueba por separado (verificado en la doc de Meta).
+// Sin catalogo, cada cliente tendria que redactar sus 25 plantillas desde cero. Con catalogo,
+// Raices las escribe UNA vez y cada cliente elige cuales manda a aprobar a SU WABA — el trabajo
+// humano se hace una sola vez y el resto es un click.
+//
+// GET /api/cloud-api/catalogo -> el catalogo + en que estado esta cada una EN ESTA cuenta.
+app.get('/api/cloud-api/catalogo', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el titular de la cuenta puede ver el catalogo de plantillas.', solo_dueno: true });
+    const dueno = await _cloudApiDueno(uid);
+
+    let catalogo = [];
+    try {
+      const { data, error } = await supabase.from('plantillas_catalogo')
+        .select('id, nombre, idioma, categoria, cuerpo, variables, rubro, caso, riesgo')
+        .eq('activa', true).order('nombre');
+      if (error) return res.json({ ok: true, disponible: false, catalogo: [] }); // tabla ausente -> el front no muestra la seccion
+      catalogo = data || [];
+    } catch (e) { return res.json({ ok: true, disponible: false, catalogo: [] }); }
+
+    // Estado por cliente: se cruza contra lo que YA existe en su WABA (cache local).
+    const _yaTiene = {};
+    try {
+      const { data: _mias } = await supabase.from('cloud_api_templates')
+        .select('nombre, idioma, estado_aprobacion').eq('user_id', dueno);
+      (_mias || []).forEach(function (t) { _yaTiene[t.nombre + '|' + t.idioma] = t.estado_aprobacion || 'PENDING'; });
+    } catch (e) {}
+
+    return res.json({
+      ok: true,
+      disponible: true,
+      catalogo: catalogo.map(function (p) {
+        return Object.assign({}, p, { estado_en_mi_cuenta: _yaTiene[p.nombre + '|' + p.idioma] || null });
+      })
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/cloud-api/catalogo/pedir { nombres:[...] } -> crea esas plantillas en la WABA DEL CLIENTE.
+// Es el "elegir y enviar a aprobacion" de Diego. Cada una nace en PENDING y la aprueba Meta.
+app.post('/api/cloud-api/catalogo/pedir', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el titular de la cuenta puede pedir plantillas.', solo_dueno: true });
+    const dueno = await _cloudApiDueno(uid);
+    if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'La WhatsApp API oficial no esta activada en esta cuenta.' });
+    const cfg = await _cloudApiConfigDeCuenta(dueno);
+    if (!cfg || !cfg.waba_id || !cfg.token) return res.status(400).json({ error: 'Primero hay que conectar el numero: sin WABA y token no se pueden crear plantillas.' });
+
+    const nombres = Array.isArray(req.body && req.body.nombres) ? req.body.nombres.map(String) : [];
+    if (!nombres.length) return res.status(400).json({ error: 'No elegiste ninguna plantilla.' });
+    // Tope por request: crear 30 plantillas de un saque contra Graph puede pegarle al rate limit y
+    // dejar la mitad hechas sin saber cuales. De a 10, y el front repite.
+    if (nombres.length > 10) return res.status(400).json({ error: 'Elegí hasta 10 por vez (Meta limita cuántas se pueden crear seguidas).' });
+
+    const { data: _cat } = await supabase.from('plantillas_catalogo')
+      .select('nombre, idioma, categoria, cuerpo').in('nombre', nombres).eq('activa', true);
+    const resultados = [];
+    for (const p of (_cat || [])) {
+      try {
+        const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(cfg.waba_id) + '/message_templates';
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.token },
+          body: JSON.stringify({ name: p.nombre, language: p.idioma, category: p.categoria, components: [{ type: 'BODY', text: p.cuerpo }] })
+        });
+        const j = await r.json().catch(function () { return null; });
+        if (!r.ok || !j || j.error) {
+          resultados.push({ nombre: p.nombre, ok: false, error: _cloudApiErrorLegible(j && j.error) });
+          continue;
+        }
+        // Cache local para que la escalera y el selector la vean sin ir a Meta.
+        try {
+          await supabase.from('cloud_api_templates').upsert({
+            user_id: dueno, nombre: p.nombre, idioma: p.idioma, categoria: p.categoria,
+            cuerpo: p.cuerpo, estado_aprobacion: j.status || 'PENDING',
+            meta_template_id: j.id ? String(j.id) : null, actualizado_at: new Date().toISOString()
+          }, { onConflict: 'user_id,nombre,idioma' });
+        } catch (eUp) {}
+        resultados.push({ nombre: p.nombre, ok: true, estado: j.status || 'PENDING' });
+      } catch (eP) { resultados.push({ nombre: p.nombre, ok: false, error: eP && eP.message }); }
+    }
+    return res.json({ ok: true, resultados: resultados });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 app.post('/api/cloud-api/plantillas', async function(req, res) {
   try {
     const uid = await verificarUsuario(req);

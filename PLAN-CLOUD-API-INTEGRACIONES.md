@@ -57,6 +57,35 @@ donde no hay ventana de 24 h ni costo. Instagram y Messenger suman leads que tam
 - Front: contador "X de 20 hoy" + estado ROJO con el texto de Diego cuando se alcanza; lo excedente queda en cola para mañana, marcado.
 - Gate patrón correcto (sin default + `IS NOT FALSE`), Meta Test afuera.
 
+## FASE 1b — Correcciones de OPORTUNIDADES (aprobado 2026-08-11; todo verificado)
+Bloqueantes, van con los topes porque son lo que impide prenderlo sin riesgo:
+1. **Editar un borrador lo ARMA** (queda `en_cola`, el estado que levanta el cron): el front llama
+   `/reanudar` después de todo PATCH (`page.tsx:337`) y `/reanudar` no mira el estado previo
+   (`server.js:14365`). Guardas: el front reanuda SOLO si estaba `en_cola`/`enviando`; `/reanudar`
+   se niega a sacar de `borrador`.
+2. **Tope de 10/día POR CUENTA**: el contador existente es por-oportunidad (18003-18016) y al
+   completarse una la siguiente arranca en 0. Y `max_dia=null` ⇒ default **200/día**. Contador nuevo
+   por cuenta + bajar el default.
+3. **Una oportunidad con un contacto no enviable no completa nunca y BLOQUEA la cola** (18055/18065/
+   18083; se procesa una por cuenta por prioridad). Además el camino `!ok` **no tiene pausa** →
+   recorre el universo roto a máxima velocidad contra Evolution. Arreglo: contar intentos fallidos
+   por ítem y sacarlo del universo tras N, + sleep en el camino de fallo.
+4. **El universo no filtra canal** (14093/14105 y buscar-leads 14180): una conv de Instagram entra al
+   broadcast y el envío sale contra el IGSID.
+Para que sea confiable, antes del primer envío real:
+5. **Dedupe no atómico**: el registro se inserta DESPUÉS del envío (18067) y el índice NO es UNIQUE
+   (`migracion-oportunidades.sql:61`) → un corte duplica el mensaje. Índice UNIQUE + reservar antes.
+6. **No crea fila en `messages`** (18062 pasa null) → el envío no se ve en la conversación ni tiene
+   estado/tilde.
+7. **No consulta `canalSalienteDe`** → un lead nacido en Cloud recibiría por Evolution.
+8. **No se puede prender desde el producto**: hay código que lo APAGA solo (18816) y 0 escrituras
+   para prenderlo. Va con el switch de Integraciones.
+Limpieza: 9. `ritmo` se guarda y nunca se lee (perilla muerta). 10. **Separar el auto-match de la
+cola** — que las coincidencias dejen de escribir filas en `oportunidades` (decisión de Diego: son
+dos cosas distintas).
+NO TOCAR (está bien): verifica el resultado del envío antes de contar (patrón que le falta a
+recontacto), contador persistido, aislamiento por cuenta, corte si la instancia está caída, horario.
+
 ## FASE 2 — Conversaciones: pestañas por canal
 - 4 pestañas: WhatsApp Business (default) / Cloud API / Instagram / Messenger.
 - Filtros: `channel=whatsapp & canal_origen is null` / `canal_origen='cloud'` / `channel=instagram` / `channel=messenger`. Hoy: 1383 / 1 / 2 / 1.

@@ -14116,6 +14116,22 @@ app.post('/api/whatsapp/grupo-todos', async (req, res) => {
 // error controlado). Auth: verificarUsuario + resolver dueño (como recontacto).
 // ----------------------------------------------------------------------------
 
+// ¿Este error de PostgREST es "esa columna no existe"?
+//
+// POR QUE HACE FALTA: postgrest-js NO tira excepcion, devuelve { data, error }. Y cuando una columna
+// del payload no existe, el error es 42703 (PostgreSQL) o PGRST204 (PostgREST no la encuentra en su
+// cache de esquema, que ademas no se refresca solo con un ADD COLUMN). Un write que menciona una
+// columna nueva falla ENTERO hasta que corre la migracion, y eso ata el deploy del codigo al orden
+// exacto de la migracion. Con esto se puede reintentar sin los campos nuevos y degradar al
+// comportamiento anterior en vez de romper.
+function _esColumnaAusente(error) {
+  if (!error) return false;
+  const c = String(error.code || '');
+  if (c === '42703' || c === 'PGRST204') return true;
+  // El mensaje se chequea tambien porque el code no siempre viaja (segun la version de PostgREST).
+  return /column .* does not exist|could not find the .* column/i.test(String(error.message || ''));
+}
+
 // Helper: resuelve el ownerId (dueño) a partir del uid autenticado. Si es asesor,
 // devuelve su admin_id; si es el dueño, devuelve su propio uid. Mismo criterio que
 // los endpoints de recontacto/grupo-todos.
@@ -14394,7 +14410,20 @@ app.post('/api/oportunidades', async (req, res) => {
     };
     let creada = null;
     try {
-      const { data, error } = await supabase.from('oportunidades').insert(fila).select('*').single();
+      let { data, error } = await supabase.from('oportunidades').insert(fila).select('*').single();
+      // DEPLOY-SAFE (bug propio, encontrado el 11/08 despues de desplegar la Fase 6):
+      // las tres columnas de la Fase 6 iban SIEMPRE en el insert, asi que mientras la migracion no
+      // corriera, PostgREST devolvia 42703 y CREAR UNA OPORTUNIDAD FALLABA EN TODAS LAS CUENTAS.
+      // El resto de la fase se escribio a prueba de orden de despliegue y esto se colo. Si las
+      // columnas no estan, se reintenta sin ellas: la oportunidad nace igual y sale por el canal de
+      // siempre, que es exactamente el comportamiento anterior al cambio.
+      if (error && _esColumnaAusente(error)) {
+        console.warn('[oportunidades] faltan las columnas de la Fase 6 (canal_envio/plantilla): creando sin ellas hasta que corra la migracion');
+        const _sinF6 = Object.assign({}, fila);
+        delete _sinF6.canal_envio; delete _sinF6.plantilla; delete _sinF6.plantilla_idioma;
+        const _r2 = await supabase.from('oportunidades').insert(_sinF6).select('*').single();
+        data = _r2.data; error = _r2.error;
+      }
       if (error) { console.error('POST /api/oportunidades insert:', error.message); return res.status(500).json({ error: error.message }); }
       creada = data;
     } catch (eIns) { console.error('POST /api/oportunidades:', eIns && eIns.message); return res.status(500).json({ error: 'No se pudo crear (tabla ausente?)' }); }
@@ -14454,7 +14483,16 @@ app.patch('/api/oportunidades/:id', async (req, res) => {
     // Editar PAUSA el envio (salvo 'completada', ya filtrado arriba). Asi editar detiene el goteo hasta reanudar.
     upd.estado = 'pausada';
     try {
-      const { data, error } = await supabase.from('oportunidades').update(upd).eq('id', id).eq('user_id', ownerId).select('*').single();
+      let { data, error } = await supabase.from('oportunidades').update(upd).eq('id', id).eq('user_id', ownerId).select('*').single();
+      // Mismo caso que el POST: sin la migracion, EDITAR tambien fallaba. Se reintenta sin las
+      // columnas de la Fase 6 para no perder el resto de los cambios del formulario.
+      if (error && _esColumnaAusente(error)) {
+        console.warn('[oportunidades] faltan las columnas de la Fase 6: editando sin ellas hasta que corra la migracion');
+        const _sinF6 = Object.assign({}, upd);
+        delete _sinF6.canal_envio; delete _sinF6.plantilla; delete _sinF6.plantilla_idioma;
+        const _r2 = await supabase.from('oportunidades').update(_sinF6).eq('id', id).eq('user_id', ownerId).select('*').single();
+        data = _r2.data; error = _r2.error;
+      }
       if (error) { console.error('PATCH /api/oportunidades update:', error.message); return res.status(500).json({ error: error.message }); }
       return res.json({ ok: true, oportunidad: data });
     } catch (eUpd) { console.error('PATCH /api/oportunidades:', eUpd && eUpd.message); return res.status(500).json({ error: 'No se pudo editar' }); }

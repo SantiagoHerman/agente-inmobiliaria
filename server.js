@@ -39470,7 +39470,14 @@ const META_LOGIN_CONFIG_ID = process.env.META_LOGIN_CONFIG_ID || '18145262926463
 function _metaOauthConfigurado() { return !!(META_APP_ID && META_APP_SECRET); }
 
 // --- INSTAGRAM (flujo "Instagram API con inicio de sesion de Instagram") ---
-// IG usa una APP DE INSTAGRAM SEPARADA (Raices-IG, id 1003865422423472) con su PROPIA clave secreta. El OAuth de IG
+// CORRECCION 2026-08-11 (verificado en la consola de Meta, no deducido): 1003865422423472 NO es una
+// app aparte. Es el "Identificador de la app de Instagram" DE LA MISMA app Raices (2022932525766291),
+// que se ve en Casos de uso -> Instagram -> "Configuracion de la API con inicio de sesion con
+// Instagram", con nombre "Raices-IG". En este modelo Meta le da a la app una identidad y una clave de
+// Instagram aparte de las de Facebook, pero es UNA sola app, la de Diego. Abrir /apps/1003865.../ en
+// la consola rebota a la lista justamente porque no es un id de app de Facebook.
+// El texto viejo decia "APP DE INSTAGRAM SEPARADA" y llevo a concluir que dependiamos de una cuenta
+// ajena; es falso. IG usa una clave secreta propia (META_IG_APP_SECRET). El OAuth de IG
 // es distinto al de Facebook: authorize en www.instagram.com/oauth/authorize, token en api.instagram.com/oauth/access_token,
 // long-lived en graph.instagram.com/access_token. La redirect URL (…/api/meta/ig/oauth/callback) ya esta cargada en Meta.
 // GATEADO por META_IG_APP_SECRET (el id tiene default). Sin el secret -> 503, el boton del front no arranca nada.
@@ -42181,6 +42188,13 @@ const CLOUD_API_VERIFY_TOKEN = process.env.META_WEBHOOK_VERIFY_TOKEN || process.
 // Overridable por env por si se rehace la configuracion en la consola (el id cambia).
 const META_ES_CONFIG_ID = process.env.META_ES_CONFIG_ID || '1562398828709758';
 
+// Idioma por defecto de las plantillas. UNA sola constante para crear, buscar y enviar: antes se
+// creaban en 'es_AR' y se enviaban con 'es' si el caller no lo pasaba explicito. Consecuencias: el
+// pre-chequeo de variables no encontraba la plantilla en el cache (cache miss silencioso) y Meta
+// rechazaba con 132001, cuyo texto sugiere "la plantilla no existe o no esta aprobada" -- una causa
+// FALSA que manda a buscar el problema al lugar equivocado. Cada plantilla es nombre + idioma.
+const IDIOMA_PLANTILLA_DEFAULT = 'es_AR';
+
 // ===== GATE por cuenta: business_settings.cloud_api_v1 =====
 // FAIL-CLOSED: ante CUALQUIER error (columna inexistente, sin migracion, red) -> false
 // => comportamiento ACTUAL EXACTO (Evolution). Mismo patron que iaUbicacionActivo /
@@ -42300,7 +42314,21 @@ async function enviarPlantillaCloud(user_id, plantilla, idioma, destinatario, pa
       template: { name: String(plantilla), language: { code: String(idioma || 'es') } }
     };
     // Parametros del BODY: solo se mandan si hay (una plantilla sin variables NO lleva components).
-    const params = Array.isArray(parametros) ? parametros.filter(function(p){ return p != null && String(p) !== ''; }) : [];
+    //
+    // OJO CON EL ORDEN — aca habia un `.filter()` que sacaba los vacios (2026-08-11).
+    // Los parametros de una plantilla son POSICIONALES: el primero es {{1}}, el segundo {{2}}, etc.
+    // Sacar un vacio del medio CORRE a todos los que siguen: mandar ['Pablo', '', 'Anton'] terminaba
+    // en {{1}}=Pablo y {{2}}=Anton, o sea el nombre del negocio metido donde iba el del asesor. Y si
+    // la cuenta quedaba corta, Meta rechaza por cantidad de parametros y el motivo real (un campo
+    // vacio) quedaba invisible detras de un 132000.
+    // Ahora: NO se reordena nunca. Si falta un dato, se corta con un error claro ANTES de gastar el
+    // envio pago -- un mensaje con el dato corrido es peor que no mandar nada, porque sale a un
+    // cliente real, se cobra igual y no hay forma de retirarlo.
+    const params = Array.isArray(parametros) ? parametros : [];
+    const _vacio = params.findIndex(function (p) { return p == null || String(p).trim() === ''; });
+    if (_vacio >= 0) {
+      return { ok: false, error: 'Falta el dato de la variable {{' + (_vacio + 1) + '}} de la plantilla "' + plantilla + '". No se envio nada para no mandar un mensaje con los datos corridos.' };
+    }
     if (params.length) {
       cuerpo.template.components = [{
         type: 'body',
@@ -43307,7 +43335,7 @@ app.post('/api/cloud-api/plantillas', async function(req, res) {
     if (['MARKETING', 'UTILITY', 'AUTHENTICATION'].indexOf(categoria) === -1) {
       return res.status(400).json({ error: 'Categoria invalida: tiene que ser MARKETING, UTILITY o AUTHENTICATION.' });
     }
-    const idioma = String(b.idioma || '').trim() || 'es_AR';
+    const idioma = String(b.idioma || '').trim() || IDIOMA_PLANTILLA_DEFAULT;
     const cuerpo = String(b.cuerpo == null ? '' : b.cuerpo).trim();
     if (!cuerpo) return res.status(400).json({ error: 'Falta el texto de la plantilla.' });
     if (cuerpo.length > 1024) return res.status(400).json({ error: 'El texto es demasiado largo (maximo 1024 caracteres).' });
@@ -43399,7 +43427,7 @@ app.post('/api/cloud-api/enviar-prueba', async function(req, res) {
     try {
       const _params = Array.isArray(b.parametros) ? b.parametros.filter(function(p){ return p != null && String(p) !== ''; }) : [];
       const { data: _tpl } = await supabase.from('cloud_api_templates')
-        .select('cuerpo').eq('user_id', dueno).eq('nombre', String(b.plantilla)).eq('idioma', String(b.idioma || 'es'))
+        .select('cuerpo').eq('user_id', dueno).eq('nombre', String(b.plantilla)).eq('idioma', String(b.idioma || IDIOMA_PLANTILLA_DEFAULT))
         .limit(1).maybeSingle();
       if (_tpl && _tpl.cuerpo) {
         const _nVars = _cloudApiVarsDeCuerpo(_tpl.cuerpo);
@@ -43412,7 +43440,7 @@ app.post('/api/cloud-api/enviar-prueba', async function(req, res) {
       }
     } catch (eVar) { /* sin cache -> seguir; el error de Meta llegara igual */ }
 
-    const r = await enviarPlantillaCloud(dueno, String(b.plantilla), String(b.idioma || 'es'), String(b.destinatario), b.parametros);
+    const r = await enviarPlantillaCloud(dueno, String(b.plantilla), String(b.idioma || IDIOMA_PLANTILLA_DEFAULT), String(b.destinatario), b.parametros);
     if (!r.ok) return res.status(400).json({ error: r.error });
     return res.json({ ok: true, id: r.id });
   } catch (e) {

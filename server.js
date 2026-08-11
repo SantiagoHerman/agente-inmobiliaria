@@ -10256,7 +10256,7 @@ async function clasificarEstado(mensajeCliente, user_id, conversation_id, turnoI
 // MEDIDOR (2026-07-23): conversation_id y turnoId OPCIONALES al final (default null), solo para atribuir el costo.
 async function extraerDatosLead(texto, datosPrevios, user_id, esHotel, esDesarrolladora, conversation_id, turnoId) {
   try {
-    if (!texto || !texto.trim()) return { nombre: '', origen: '', interes: '', presupuesto: '' };
+    if (!texto || !texto.trim()) return { nombre: '', origen: '', interes: '', presupuesto: '', telefono: '' };
     const prev = datosPrevios || {};
     const _hoyISO = _fechaLocalArg();
     const prompt = [
@@ -10271,6 +10271,11 @@ async function extraerDatosLead(texto, datosPrevios, user_id, esHotel, esDesarro
       '- origen: de donde viene o como llego (ej: "Instagram", "Facebook", "un anuncio", "me recomendo un amigo", una ciudad/pais). Si no lo dice, "".',
       '- interes: que busca o le interesa (ej: "departamento 2 ambientes en Palermo", "casa para alquilar", "cabana para 4 personas el finde"). Si no lo dice, "".',
       '- presupuesto: cuanto puede/quiere gastar si lo menciona (ej: "USD 80000", "hasta 200 mil pesos por mes"). Si no lo dice, "".',
+      // FASE 8/9: el telefono. En Instagram y Messenger la identidad del contacto es un IGSID/PSID,
+      // NO un numero: sin esto, el mismo lead que despues escribe al WhatsApp es una persona nueva y
+      // se pierde toda su historia. Capturarlo aca no cuesta NADA: se suma al JSON de una extraccion
+      // que ya corre en cada turno, no hay una llamada nueva a ningun modelo.
+      '- telefono: el numero de telefono/WhatsApp SOLO si el cliente lo escribe en el mensaje (ej: "mi numero es 11 5555-4444", "escribime al +54 9 351 234 5678"). Copialo tal cual lo escribio, con los digitos que puso. Si no da un numero, "".',
       esDesarrolladora ? '- perfil_comprador: "inversion" si el cliente da senales de que compra para INVERTIR (renta, reventa, "para alquilar", "inversion", "para poner en alquiler", "revender", rentabilidad); "vivienda" si es para VIVIR el o su familia ("para mudarme", "para vivir", "mi casa", "para mi familia"). Si no queda claro, "".' : '',
       esHotel ? ('HOY es ' + _hoyISO + ' (formato YYYY-MM-DD). Usalo para resolver el ano de las fechas.') : '',
       esHotel ? '- fecha_ingreso: fecha de check-in / llegada si la menciona, SIEMPRE en formato YYYY-MM-DD. Resolve expresiones tipo "del 15 al 20 de enero" tomando el ano de la PROXIMA ocurrencia futura respecto de HOY. Si no da una fecha o no se puede armar la fecha completa, "".' : '',
@@ -10291,13 +10296,14 @@ async function extraerDatosLead(texto, datosPrevios, user_id, esHotel, esDesarro
     const m = out.match(/\{[\s\S]*\}/);
     if (m) out = m[0];
     let parsed = {};
-    try { parsed = JSON.parse(out); } catch (eP) { return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
+    try { parsed = JSON.parse(out); } catch (eP) { return { nombre: '', origen: '', interes: '', presupuesto: '', telefono: '' }; }
     const limpiar = function(v){ return (typeof v === 'string') ? v.trim() : ''; };
     const _res = {
       nombre: limpiar(parsed.nombre),
       origen: limpiar(parsed.origen),
       interes: limpiar(parsed.interes),
-      presupuesto: limpiar(parsed.presupuesto)
+      presupuesto: limpiar(parsed.presupuesto),
+      telefono: limpiar(parsed.telefono)   // FASE 8: la llave para unir el lead de IG/MSN con su WhatsApp
     };
     if (esHotel) {
       _res.fecha_ingreso = limpiar(parsed.fecha_ingreso);
@@ -10311,7 +10317,7 @@ async function extraerDatosLead(texto, datosPrevios, user_id, esHotel, esDesarro
       _res.perfil_comprador = limpiar(parsed.perfil_comprador);
     }
     return _res;
-  } catch (e) { console.error('Error extrayendo datos del lead:', e && e.message); return { nombre: '', origen: '', interes: '', presupuesto: '' }; }
+  } catch (e) { console.error('Error extrayendo datos del lead:', e && e.message); return { nombre: '', origen: '', interes: '', presupuesto: '', telefono: '' }; }
 }
 
 // True si el mensaje es claramente TRIVIAL (saludo/confirmacion puro, sin datos): no vale gastar una llamada
@@ -10487,7 +10493,7 @@ async function detectarIdioma(texto, user_id, idiomaActual, conversation_id, tur
 async function analizarLeadFusion(texto, datosPrevios, user_id, esHotel, esDesarrolladora, idiomaActual, conversation_id, turnoId) {
   const _actual = (idiomaActual && String(idiomaActual).trim()) || 'es';
   const _ISO = ['es','en','pt','fr','it','de','nl','ru','zh','ja','ko','ar','hi','tr','pl'];
-  const _datosVacios = function () { const o = { nombre: '', origen: '', interes: '', presupuesto: '' }; if (esHotel) { o.fecha_ingreso=''; o.fecha_salida=''; o.adultos=''; o.ninos=''; o.mascotas=''; o.tipo_alojamiento=''; } if (esDesarrolladora) { o.perfil_comprador=''; } return o; };
+  const _datosVacios = function () { const o = { nombre: '', origen: '', interes: '', presupuesto: '', telefono: '' }; if (esHotel) { o.fecha_ingreso=''; o.fecha_salida=''; o.adultos=''; o.ninos=''; o.mascotas=''; o.tipo_alojamiento=''; } if (esDesarrolladora) { o.perfil_comprador=''; } return o; };
   try {
     const _txt = String(texto == null ? '' : texto);
     const _pideHum = _pideHumano(_txt);
@@ -12425,9 +12431,25 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           // (pushName); si hay que corregirlo, se hace A MANO (nombre_manual). La IA NO pisa el name con el
           // nombre que "detecta" en la charla -> evita el caso Roman->Bruno (confundir al asesor con el lead).
           // El nombre detectado igual se guarda como PISTA en notes mas abajo ("dice llamarse: X").
-          // interest / budget: completar/actualizar si el lead aporto algo
-          if (ext.interes) updContacto.interest = ext.interes;
-          if (ext.presupuesto) updContacto.budget = ext.presupuesto;
+          // ===== LO AUTOMATICO SOLO COMPLETA LO VACIO. LO MANUAL NUNCA SE PISA =====
+          // Diego, 2026-08-11: "que se vaya armando automaticamente el perfil del contacto asi no
+          // depende de una carga manual, no quita que se modifique manualmente".
+          //
+          // EL BUG QUE ESTO ARREGLA (auditoria 2026-08-11, verificado): estas dos lineas escribian
+          // SIN NINGUNA GUARDA, sobre las MISMAS columnas que edita la ficha a mano
+          // (PATCH /api/contactos/:id -> upd.interest / upd.budget). O sea: el asesor cargaba el
+          // presupuesto real que le paso el cliente por telefono, el lead mencionaba cualquier cifra
+          // en el chat, y la extraccion se lo borraba. Medido: 73 contactos con budget cargado
+          // estaban expuestos.
+          // Y peor con la moneda: `ext.presupuesto` es texto libre SIN moneda y no toca
+          // budget_moneda -> podia quedar "hasta 200 mil pesos" marcado como USD. Justo el escenario
+          // que el guardado manual evita a proposito mandando monto y moneda en UNA sola llamada.
+          //
+          // El patron es el mismo que ya usa `fichas.confirmada` (la IA nunca pisa lo confirmado por
+          // una persona) y el de `nombre_manual` (el manual gana al leer).
+          const _vacio = function (v) { return v == null || String(v).trim() === ''; };
+          if (ext.interes && _vacio(contacto.interest)) updContacto.interest = ext.interes;
+          if (ext.presupuesto && _vacio(contacto.budget)) updContacto.budget = ext.presupuesto;
           // origen (y nombre, si no fue a la columna name) van a notes: append corto sin pisar lo que haya
           const notasNuevas = [];
           if (ext.origen) notasNuevas.push('origen: ' + ext.origen);
@@ -12451,6 +12473,50 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               try { const { error: _ePc } = await supabase.from('contacts').update({ perfil_comprador: _pc }).eq('id', contacto.id); if (_ePc) console.error('perfil_comprador (columna ausente?):', _ePc.message); } catch (ePcE) {}
             }
           }
+          // ===== FASE 8 — UNIFICAR EL LEAD DE INSTAGRAM/MESSENGER CON SU WHATSAPP =====
+          // Diego 2026-08-11: "instagram y messenger no [tienen el telefono], ahi los tiene que pedir
+          // o sugerir seguir con el sector correspondiente a traves de esa linea. Todo el embudo
+          // recae en whatsapp business."
+          //
+          // El problema concreto: la identidad de un contacto es `contactKey` — el TELEFONO en
+          // WhatsApp, el IGSID/PSID en Instagram/Messenger. Un IGSID y un telefono no tienen NADA en
+          // comun, asi que el mismo humano escribiendo por los dos lados son dos contactos distintos
+          // y la charla arranca de cero. (En Cloud API esto no pasa: comparte la llave con Evolution.)
+          //
+          // Cuando el lead escribe su numero en el chat de IG/MSN, se guarda aparte (sin tocar
+          // `phone`, que ahi es el IGSID) y se busca si ya existe el contacto de WhatsApp con ese
+          // numero. Si existe, se ENLAZAN: enlace NO destructivo, no se borra ni se pisa nada.
+          // DEFENSIVA: si las columnas todavia no existen (migracion sin correr), todo el bloque es
+          // un no-op silencioso.
+          try {
+            const _canalConv = String((conv && conv.channel) || (convExistente && convExistente.channel) || '').toLowerCase();
+            if (ext.telefono && (_canalConv === 'instagram' || _canalConv === 'messenger')) {
+              // Normalizacion minima: solo digitos. Se guarda tal cual lo escribio para no inventar
+              // un prefijo que el lead no puso.
+              const _digitos = String(ext.telefono).replace(/[^0-9]/g, '');
+              if (_digitos.length >= 8) {
+                const { error: _eTel } = await supabase.from('contacts')
+                  .update({ telefono_capturado: _digitos }).eq('id', contacto.id);
+                if (!_eTel) {
+                  // Buscar el contacto de WhatsApp de la MISMA cuenta con ese numero. `phone` en
+                  // WhatsApp guarda el numero, asi que el match es directo (sufijo por si uno tiene
+                  // el 54/9 y el otro no).
+                  const { data: _cands } = await supabase.from('contacts')
+                    .select('id, phone, channel').eq('user_id', user_id).neq('id', contacto.id).limit(2000);
+                  const _wa = (_cands || []).filter(function (c) {
+                    const p = String(c.phone || '').replace(/[^0-9]/g, '');
+                    if (!p || p.length < 8) return false;
+                    return p === _digitos || p.endsWith(_digitos.slice(-8)) || _digitos.endsWith(p.slice(-8));
+                  })[0];
+                  if (_wa) {
+                    await supabase.from('contacts').update({ contacto_principal_id: _wa.id }).eq('id', contacto.id);
+                    console.log('[fase8] contacto de ' + _canalConv + ' ' + contacto.id + ' enlazado al de WhatsApp ' + _wa.id);
+                  }
+                }
+              }
+            }
+          } catch (eTel) { /* columnas ausentes o error -> no-op, el webhook sigue igual */ }
+
           // FASE 4 — LA IA PROPONE LA FICHA (gated fichas_ia_v1, default OFF).
           // COSTO IA: CERO. Se le pasa el `ext` que ACABAMOS de calcular unas lineas mas arriba; no
           // hay ninguna llamada nueva a ningun modelo. Ademas es lo que deja rastro del pisado de
@@ -14099,6 +14165,50 @@ async function _resolverUniversoOportunidad(ownerId, segmentos, customIds) {
   // Mapeo segmento -> filtro sobre conversations. Cada uno se consulta acotado al tenant.
   const _tempDe = { frios: 'frio', tibios: 'tibio', calientes: 'caliente' };
   const _statusDe = { en_conversacion: 'en_conversacion', en_recontacto: 'recontacto' };
+
+  // ===== SEGMENTO POR ETIQUETA (Diego 2026-08-11) =====
+  // "si importo contactos nuevos de un telefono de alquileres, a todos les pongo una etiqueta de
+  //  alquileres viejos y al buscar en oportunidades los puedo buscar con esa etiqueta".
+  // Formato del segmento: 'etq:<id-de-etiqueta>'.
+  //
+  // Lee de LAS DOS fuentes, porque el caso de uso de Diego (contactos importados) todavia no tiene
+  // conversacion:
+  //   1. conversations.etiquetas -> existe hoy, es lo que se etiqueta a mano desde el chat.
+  //   2. contacts.etiquetas      -> llega con la importacion. Para esos hay que ir a buscar (o crear
+  //      al vuelo NO: aca solo se leen) las conversaciones de ese contacto.
+  // DEFENSIVA: si contacts.etiquetas todavia no existe (migracion sin correr), ese tramo devuelve
+  // error y se ignora -> el segmento sigue funcionando con las etiquetas de conversacion.
+  const _etqIds = segs.filter(function (s) { return s.indexOf('etq:') === 0; })
+    .map(function (s) { return s.slice(4).trim(); }).filter(Boolean);
+  if (_etqIds.length) {
+    // 1) Conversaciones etiquetadas directamente.
+    try {
+      const { data } = await supabase.from('conversations')
+        .select('id, contact_id, temperatura, status, asesor_id, channel')
+        .eq('user_id', ownerId).overlaps('etiquetas', _etqIds).limit(100000);
+      (data || []).forEach(function (c) {
+        if (c && c.id && c.contact_id && _canalAdmiteRecontacto(c.channel)) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null };
+      });
+    } catch (eEtqC) {}
+    // 2) Contactos etiquetados (importados): se traen SUS conversaciones.
+    try {
+      const { data: _cts, error: _eCt } = await supabase.from('contacts')
+        .select('id').eq('user_id', ownerId).overlaps('etiquetas', _etqIds).limit(100000);
+      if (!_eCt && _cts && _cts.length) {
+        const _ids = _cts.map(function (x) { return x.id; });
+        // De a 300 ids por request: una URL con miles de uuids da HTTP 400 (limite de largo de URL).
+        for (let i = 0; i < _ids.length; i += 300) {
+          const { data } = await supabase.from('conversations')
+            .select('id, contact_id, temperatura, status, asesor_id, channel')
+            .eq('user_id', ownerId).in('contact_id', _ids.slice(i, i + 300));
+          (data || []).forEach(function (c) {
+            if (c && c.id && c.contact_id && _canalAdmiteRecontacto(c.channel)) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null };
+          });
+        }
+      }
+    } catch (eEtqCt) {} // columna contacts.etiquetas ausente -> solo cuentan las etiquetas de conversacion
+  }
+
   for (const seg of segs) {
     try {
       let q = supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id, channel').eq('user_id', ownerId);

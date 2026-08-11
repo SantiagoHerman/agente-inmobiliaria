@@ -13535,7 +13535,18 @@ app.post('/api/whatsapp/send', async (req, res) => {
       }
       const _okMeta = await enviarMensajeMeta(_credMeta.page_access_token, contacto.phone, textoEnviar, conv.channel, _credMeta.ig_user_id);
       if (msgId) { try { await supabase.from('messages').update({ estado_envio: _okMeta ? 'enviado' : 'fallido' }).eq('id', msgId); } catch (eUpM) {} }
-      if (!_okMeta) return res.status(400).json({ sent: false, estado_envio: 'fallido', error: 'Meta rechazo el envio a ' + _etqCanal + ' (ventana de 24 h vencida o token no valido).' });
+      if (!_okMeta) {
+        // La CAUSA real en vez de adivinar. Antes el asesor leia siempre "ventana de 24 h vencida o
+        // token no valido" -- dos problemas opuestos: uno es normal (hay que llevar el lead a WhatsApp)
+        // y el otro es una conexion caida que alguien tiene que reconectar.
+        const _c = (_metaUltimaCausaEnvio && (Date.now() - _metaUltimaCausaEnvio.at) < 15000) ? _metaUltimaCausaEnvio : null;
+        const _msg = (_c && _c.ventanaVencida)
+          ? ('Pasaron mas de 24 horas desde el ultimo mensaje del cliente, y ' + _etqCanal + ' no permite escribirle despues de ese plazo. Pedile por otro medio que te escriba, o segui la conversacion por WhatsApp.')
+          : ((_c && _c.tokenInvalido)
+            ? ('La conexion con ' + _etqCanal + ' dejo de ser valida (el token vencio). Hay que volver a conectar el canal desde Integraciones.')
+            : ('Meta rechazo el envio a ' + _etqCanal + '. Revisa la conexion en Integraciones o intenta de nuevo.'));
+        return res.status(400).json({ sent: false, estado_envio: 'fallido', error: _msg, causa: _c ? _c.causa : 'DESCONOCIDA' });
+      }
       return res.json({ sent: true, estado_envio: 'enviado' });
     }
 
@@ -14090,20 +14101,25 @@ async function _resolverUniversoOportunidad(ownerId, segmentos, customIds) {
   const _statusDe = { en_conversacion: 'en_conversacion', en_recontacto: 'recontacto' };
   for (const seg of segs) {
     try {
-      let q = supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id').eq('user_id', ownerId);
+      let q = supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id, channel').eq('user_id', ownerId);
       if (Object.prototype.hasOwnProperty.call(_tempDe, seg)) { q = q.eq('temperatura', _tempDe[seg]); }
       else if (Object.prototype.hasOwnProperty.call(_statusDe, seg)) { q = q.eq('status', _statusDe[seg]); }
       else { continue; } // segmento desconocido -> ignorar
       const { data } = await q.limit(100000);
-      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null }; });
+      // CANAL: Instagram/Messenger quedan AFUERA del universo. El envio sale por WhatsApp y en esos
+      // canales `contacts.phone` es un IGSID/PSID, no un telefono (ver CANALES_SIN_RECONTACTO). Un
+      // solo contacto no enviable dejaba la oportunidad colgada para siempre y bloqueaba la cola.
+      (data || []).forEach(function (c) { if (c && c.id && c.contact_id && _canalAdmiteRecontacto(c.channel)) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null }; });
     } catch (eSeg) {}
   }
   // custom_ids: convs elegidas a mano (siempre acotado al tenant para no filtrar cross-tenant).
   const cids = Array.isArray(customIds) ? customIds.map(function (x) { return String(x || '').trim(); }).filter(Boolean) : [];
   if (cids.length) {
     try {
-      const { data } = await supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id').eq('user_id', ownerId).in('id', cids.slice(0, 5000));
-      (data || []).forEach(function (c) { if (c && c.id && c.contact_id) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null }; });
+      const { data } = await supabase.from('conversations').select('id, contact_id, temperatura, status, asesor_id, channel').eq('user_id', ownerId).in('id', cids.slice(0, 5000));
+      // Mismo filtro de canal que arriba: ni a mano se puede meter un lead de Instagram a un broadcast
+      // que sale por WhatsApp.
+      (data || []).forEach(function (c) { if (c && c.id && c.contact_id && _canalAdmiteRecontacto(c.channel)) porId[c.id] = { id: c.id, contact_id: c.contact_id, temperatura: c.temperatura || '', status: c.status || '', asesor_id: c.asesor_id || null }; });
     } catch (eC) {}
   }
   return Object.keys(porId).map(function (k) { return porId[k]; });
@@ -16805,6 +16821,31 @@ async function getTextosRecontacto(user_id) {
   return val;
 }
 
+// ============================================================================================
+// CANALES SIN RECONTACTO POSIBLE — el guard que faltaba en los 4 senders
+// --------------------------------------------------------------------------------------------
+// Diego, 2026-08-11: en Instagram y Messenger el recontacto es IMPOSIBLE por politica de Meta. La
+// ventana de 24 h existe igual que en Cloud API, pero NO hay plantillas pagas para reabrirla:
+// pasadas las 24 h no se le puede escribir, punto. Por eso la inactividad en esos canales va a
+// CERRADO (y si el lead vuelve a escribir, el revive de la REGLA 22 lo devuelve solo).
+//
+// EL BUG QUE ESTO ARREGLA (auditoria 2026-08-11, #14): NINGUNO de los senders miraba `channel`.
+// `revisarInactividad` no lo menciona ni una vez, y los dos motores de recontacto y el de
+// oportunidades tampoco. En IG/Messenger `contacts.phone` NO es un telefono: es el IGSID/PSID
+// (verificado en base: '1534973438357299' y '27283403391320389'). Ese id viajaba CRUDO a Evolution,
+// que no valida nada -> si Baileys arma el JID igual, el mensaje se pierde en la red de WhatsApp
+// pero vuelve con key.id, y el CRM lo marca 'enviado'. Un envio fantasma, sin aviso a nadie.
+//
+// Hoy no exploto de casualidad: las 3 convs de IG/MSN estan en listo_humano o cerrado, estados que
+// el cron no toca. Pero el revive las devuelve a 'en_conversacion' en cuanto el lead escribe, y 72 h
+// despues caen ahi. Y hay CUATRO puertas de entrada al estado 'recontacto' (el cron de inactividad,
+// el panel a mano, el importador y oportunidades), asi que el guard va en los SENDERS, que es el
+// unico punto que las cierra todas.
+const CANALES_SIN_RECONTACTO = ['instagram', 'messenger'];
+function _canalAdmiteRecontacto(channel) {
+  return CANALES_SIN_RECONTACTO.indexOf(String(channel || '').toLowerCase()) < 0;
+}
+
 var _inactividadEnCurso = false;
 async function revisarInactividad() {
   // RACE #6: guard de no-solapamiento (mismo patron que escalarLeadsEnColaVencidos / _escalarEnCurso). Dos ticks
@@ -16828,7 +16869,9 @@ async function revisarInactividad() {
     let activas = null;
     try {
       const r = await supabase.from('conversations')
-        .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado, derivacion_rotando')
+        // `channel`: necesario para NO mandar a recontacto una conv de Instagram/Messenger, donde el
+        // recontacto es imposible (ver CANALES_SIN_RECONTACTO). Esas van a CERRADO mas abajo.
+        .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado, derivacion_rotando, channel')
         .in('status', ['en_conversacion', 'interesado']);
       if (r.error) throw r.error;
       activas = r.data;
@@ -16836,7 +16879,7 @@ async function revisarInactividad() {
       const r2 = await supabase.from('conversations')
         // B7: traemos tambien asesor_id, admin_tomo y ai_enabled para NO forzar ai_enabled=true al pasar a recontacto.
         // recontacto_congelado (R1, gated): si un humano derivo/asigno a mano, el cron NO debe barrer esta conv.
-        .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado')
+        .select('id, status, user_id, contact_id, asesor_id, admin_tomo, ai_enabled, recontacto_congelado, channel')
         .in('status', ['en_conversacion', 'interesado']);
       activas = r2.data;
     }
@@ -16915,6 +16958,28 @@ async function revisarInactividad() {
       // ANTES de pasar a recontacto (derivacion_rotando=false + purga de marcadores) para que el cron de rotacion deje
       // de tratarla. Best-effort/idempotente. Solo aplica si el guard de arriba la marco (v4 ON + estaba rotando).
       if (conv.__v4RotandoBarrer) { try { await _limpiarRotacionV3(conv.id); } catch (eLimp) {} }
+
+      // ===== INSTAGRAM / MESSENGER: a CERRADO, no a recontacto (Diego 2026-08-11) =====
+      // En esos canales el recontacto es imposible (ver CANALES_SIN_RECONTACTO): pasada la ventana de
+      // 24 h Meta no deja escribir y no hay plantillas para reabrirla. Mandarlas a 'recontacto' hacia
+      // que el motor intentara enviarles por Evolution contra un IGSID -> envio fantasma marcado como
+      // 'enviado'. Van a cerrado, y si el lead vuelve a escribir el revive de la REGLA 22 las devuelve
+      // solo a 'en_conversacion' (server.js ~12555, verificado en vivo el 8/8).
+      // Condicional por status: si alguien la movio en el interin, no se pisa ese cambio.
+      if (!_canalAdmiteRecontacto(conv.channel)) {
+        try {
+          await supabase.from('conversations').update({
+            status: 'cerrado',
+            motivo_perdida: 'inactividad_canal_sin_recontacto',
+            updated_at: new Date().toISOString()
+          }).eq('id', conv.id).in('status', ['en_conversacion', 'interesado']);
+          try { registrarCambioEstadoConv(conv.id, conv.status, 'cerrado', 'El sistema', 'inactividad en ' + conv.channel + ' (ese canal no admite recontacto)', conv.user_id).catch(function () {}); } catch (eHE) {}
+          try { registrarCambioEstado({ conversation_id: conv.id, user_id: conv.user_id, estado_anterior: conv.status, estado_nuevo: 'cerrado', origen: 'sistema', motivo: 'inactividad en canal sin recontacto (' + conv.channel + ')' }); } catch (eH2) {}
+          console.log('[inactividad] conv ' + conv.id + ' (' + conv.channel + ') -> cerrado: ese canal no admite recontacto');
+        } catch (eCierre) { console.error('[inactividad] cierre canal sin recontacto ' + conv.id + ':', eCierre && eCierre.message); }
+        continue;
+      }
+
       if (_libreDeHumano) {
         // RACE #6 (anti-stale, PATRON CANONICO server.js:1866): el snapshot conv.asesor_id/admin_tomo se leyo arriba;
         // si entre esa lectura y este write un HUMANO tomo el lead (/api/whatsapp/send setea asesor_id/admin_tomo),
@@ -17754,7 +17819,8 @@ async function enviarRecontactosPendientes() {
     const { data: enRecontacto } = await supabase
       .from('conversations')
       // recontacto_congelado (R1, gated): si un humano congelo la conv, el sender NO debe mandarle recontacto.
-      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at, recontacto_congelado')
+      // `channel`: excluir Instagram/Messenger (ver CANALES_SIN_RECONTACTO).
+      .select('id, user_id, contact_id, recontacto_count, recontacto_max, traductor_activo, idioma_lead, created_at, recontacto_congelado, channel')
       .eq('status', 'recontacto');
     if (!enRecontacto || enRecontacto.length === 0) return;
     const _reglasCacheSender = {}; // cache efimero del flag reglas_v2 por cuenta para esta corrida del sender
@@ -17782,6 +17848,11 @@ async function enviarRecontactosPendientes() {
       if (conv.recontacto_congelado === true && await _reglasRecontactoV2(conv.user_id, _reglasCacheSender)) continue;
       // Si la cuenta tiene recontacto_v2 ON, NO la procesa el loop legacy: la atiende el motor nuevo mas abajo.
       if (await _esCuentaV2(conv.user_id)) continue;
+      // CANAL SIN RECONTACTO POSIBLE (Instagram/Messenger): ver CANALES_SIN_RECONTACTO. No consume cupo.
+      if (!_canalAdmiteRecontacto(conv.channel)) {
+        console.log('[recontacto legacy] conv ' + conv.id + ' salteada: canal ' + conv.channel + ' no admite recontacto');
+        continue;
+      }
       // SALVAGUARDA 1: respetar el maximo de recontactos
       const maxRec = (conv.recontacto_max != null) ? conv.recontacto_max : 5;
       const countRec = conv.recontacto_count || 0;
@@ -18266,7 +18337,10 @@ async function _enviarRecontactosV2(ahoraMs) {
 
       // --- Candidatas de esta cuenta en estado recontacto ---
       // recontacto_congelado (R1, gated): humano congelo la conv -> el motor v2 tampoco debe recontactarla.
-      const _selConvsBase = 'id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido, recontacto_congelado';
+      // `channel`: para excluir Instagram/Messenger, donde el recontacto es imposible y el "telefono"
+      // es un IGSID (ver CANALES_SIN_RECONTACTO). Sin esto el motor le enviaba por Evolution a un id
+      // que no es un numero, y el CRM lo marcaba 'enviado'.
+      const _selConvsBase = 'id, user_id, contact_id, recontacto_count, recontacto_max, recontacto_frecuencia, traductor_activo, idioma_lead, created_at, recontacto_categoria, recontacto_pausado_lead, recontacto_excluido, recontacto_congelado, channel';
       let convs = null;
       if (_esHotelCuenta) {
         // F5.1 (solo hotel): tambien necesitamos cal_fecha_ingreso para la regla de fecha. DEFENSIVO: si la
@@ -18381,6 +18455,13 @@ async function _enviarRecontactosV2(ahoraMs) {
         if (_reglasOnCuenta && conv.recontacto_congelado === true) continue;
         // Exclusiones / pausas por conversacion
         if (conv.recontacto_excluido === true || conv.recontacto_pausado_lead === true) continue;
+        // CANAL SIN RECONTACTO POSIBLE (Instagram/Messenger): no se puede enviar y el "telefono" es un
+        // IGSID. Se saltea SIN consumir cupo ni contar intento. La inactividad ya las manda a cerrado;
+        // esto cubre las que quedaron en 'recontacto' por las otras 3 puertas (panel, importador, etc).
+        if (!_canalAdmiteRecontacto(conv.channel)) {
+          console.log('[recontacto v2] conv ' + conv.id + ' salteada: canal ' + conv.channel + ' no admite recontacto');
+          continue;
+        }
         // F5.1 (SOLO hotel): si la fecha de ingreso YA PASO -> NO recontactar (regla explicita de Diego: no
         // preguntar despues de la fecha si consiguio). La conv sigue en 'recontacto' (no 'cerrado'), asi que
         // no la cerramos: solo la saltamos. En no-hotel _esHotelCuenta=false => nunca aplica (comportamiento actual).
@@ -18556,7 +18637,7 @@ async function reintentarFallidos() {
           continue;
         }
         // conversacion -> user_id y contacto
-        const { data: conv } = await supabase.from('conversations').select('id, user_id, contact_id').eq('id', msg.conversation_id).maybeSingle();
+        const { data: conv } = await supabase.from('conversations').select('id, user_id, contact_id, channel').eq('id', msg.conversation_id).maybeSingle();
         if (!conv) continue;
         // CLOUD API (ADITIVO): este cron reenvia SIEMPRE por Evolution. Un mensaje que salio por Cloud y Meta rechazo
         // queda 'fallido' y SIN wa_message_id -> el guard de arriba no lo saltea -> se reenviaria por el numero VIEJO
@@ -18570,6 +18651,20 @@ async function reintentarFallidos() {
             continue;
           }
         } catch (eCanalR) { /* ante duda: seguir por Evolution, como siempre */ }
+
+        // FUGA CROSS-CANAL (auditoria 2026-08-11, #42): este cron levanta estado_envio='fallido' +
+        // role='human' y reenvia SIEMPRE por Evolution, sin mirar el canal. Un mensaje humano que Meta
+        // rechazo en Instagram/Messenger (ventana de 24 h vencida o token invalido) queda 'fallido'
+        // (server.js ~13537) -> entraba aca -> se reintentaba por WhatsApp CONTRA EL IGSID/PSID. Y si
+        // Evolution devolvia key.id, `enviarWhatsapp` lo marcaba 'enviado': tilde de entregado sobre un
+        // mensaje que no llego a nadie. Mismo escape que Cloud: se marca 'indeterminado' (= pudo salir,
+        // no reintentar) y se sigue. El asesor ya vio el 400 en el momento del envio.
+        if (!_canalAdmiteRecontacto(conv.channel)) {
+          try { await supabase.from('messages').update({ estado_envio: 'indeterminado' }).eq('id', msg.id); } catch (eMkM) {}
+          console.log('[reintentar] msg ' + msg.id + ' NO se reintenta: canal ' + conv.channel + ' no sale por Evolution');
+          continue;
+        }
+
         const instancia = nombreInstancia(conv.user_id);
         // solo reenviar si la instancia esta conectada ahora
         const conectada = await instanciaConectada(instancia);
@@ -38410,6 +38505,12 @@ const META_VERIFY_TOKEN_ENV = process.env.META_VERIFY_TOKEN || '';
 //   que es un campo del Messenger Platform (IG no lo usa). DEFAULT (canal ausente o 'messenger') = Facebook +
 //   messaging_type:'RESPONSE' -> BYTE-IDENTICO al comportamiento anterior. igBusinessId = el ig_user_id propio del
 //   tenant (segmento del path para IG); si no se pasa, se cae a 'me' (el token identifica igual a la cuenta).
+// Ultima causa de rechazo de la Send API de Meta. Se usa SOLO para el mensaje que ve el asesor
+// (antes el panel decia "ventana de 24 h vencida o token no valido" adivinando, sin saber cual).
+// Es best-effort y de un solo turno: si dos envios fallan a la vez puede quedar el del otro, por eso
+// NUNCA se usa para decidir nada, solo para redactar el aviso.
+var _metaUltimaCausaEnvio = null;
+
 async function enviarMensajeMeta(pageAccessToken, recipientId, texto, canal, igBusinessId) {
   try {
     if (!pageAccessToken || !recipientId || !texto) return false;
@@ -38430,7 +38531,21 @@ async function enviarMensajeMeta(pageAccessToken, recipientId, texto, canal, igB
     if (!resp.ok) {
       let _det = '';
       try { _det = await resp.text(); } catch (e) {}
-      console.error('enviarMensajeMeta HTTP ' + resp.status + ': ' + String(_det).slice(0, 300));
+      // LA CAUSA, no solo el numero (auditoria 2026-08-11, #41): antes todo rechazo era el mismo log
+      // generico y quien miraba no podia distinguir "se cerro la ventana de 24 h" de "el token murio".
+      // Son dos problemas OPUESTOS: uno es normal y esperable (hay que llevar al lead a WhatsApp), el
+      // otro es una conexion caida que hay que reconectar. Meta usa el codigo 2018278 / #10 para la
+      // ventana en Messenger y el equivalente en Instagram; 190 para el token.
+      const _txtErr = String(_det);
+      const _esVentana = /2018278|outside of allowed window|outside the allowed window|24 ?h/i.test(_txtErr);
+      const _esToken = /\b190\b|access token|OAuthException/i.test(_txtErr);
+      const _causa = _esVentana ? 'VENTANA_24H_VENCIDA' : (_esToken ? 'TOKEN_INVALIDO' : 'DESCONOCIDA');
+      console.error('enviarMensajeMeta HTTP ' + resp.status + ' canal=' + (canal || '?') +
+        ' causa=' + _causa + ': ' + _txtErr.slice(0, 300));
+      // OJO: se devuelve `false` PELADO, no un objeto. Un `{ok:false}` es TRUTHY en JS y romperia
+      // los tres `if (!_ok)` que ya existen (webhook Meta, envio manual del panel) -> el fallo
+      // pasaria como exito. La causa queda en el log y en _metaUltimaCausaEnvio para quien la necesite.
+      _metaUltimaCausaEnvio = { causa: _causa, ventanaVencida: _esVentana, tokenInvalido: _esToken, at: Date.now() };
       return false;
     }
     return true;
@@ -38636,6 +38751,23 @@ async function procesarMensajeMeta(canal, tenantUserId, senderId, texto, creds) 
     if (resultado && resultado.reply) {
       const _txt = resultado.replyCliente || resultado.reply;
       const _ok = await enviarMensajeMeta(creds.page_access_token, senderId, _txt, canal, creds.ig_user_id);
+
+      // ===== EL TILDE MENTIROSO (auditoria 2026-08-11, #41) =====
+      // `generarRespuestaAgente` inserta la fila role='ai' SIN estado_envio, y esa columna tiene
+      // DEFAULT 'enviado' en la base. Si Meta rechaza (ventana de 24 h vencida, token invalido), el
+      // fallo quedaba SOLO en un console.error: la fila seguia diciendo 'enviado' y el asesor leia un
+      // mensaje entregado que el lead NUNCA recibio. Sin aviso, sin tilde de error, sin derivar.
+      // Ahora el resultado real se escribe en la fila. 'indeterminado' no aplica aca: la Send API de
+      // Meta es sincronica (o acepto o rechazo), y ademas reintentarFallidos ya no toca estos canales.
+      if (resultado.msgId) {
+        try {
+          await supabase.from('messages')
+            .update({ estado_envio: _ok ? 'enviado' : 'fallido' })
+            .eq('id', resultado.msgId);
+        } catch (eEst) { console.error('meta estado_envio:', eEst && eEst.message); }
+      }
+      if (!_ok) console.error('[meta] la respuesta de la IA NO se entrego (canal=' + canal + ', conv=' + conv.id + '). Causa tipica: ventana de 24 h vencida o token invalido.');
+
       // Registrar uso (best-effort), igual que el webhook WA.
       // MEDIDOR: etiqueta 'respuesta_agente_meta' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
       try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_meta', PRECIO_IA, { conversation_id: conv.id, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}
@@ -42420,8 +42552,14 @@ async function procesarMensajeCloud(tenantUserId, telefono, texto, nombrePerfil,
           // Guardar el wamid de Meta en la fila que ya persistio generarRespuestaAgente(): es lo que deja
           // que el webhook de `statuses` pinte el segundo tilde. Best-effort: si falla, queda un tilde
           // (el comportamiento anterior), nunca se pierde el mensaje.
-          if (_env.ok && _env.id && resultado.msgId) {
-            try { await supabase.from('messages').update({ wa_message_id: _env.id }).eq('id', resultado.msgId); } catch (eWid) {}
+          // EL TILDE MENTIROSO (auditoria #27): faltaba la rama del FALLO. La fila role='ai' se inserta
+          // SIN estado_envio y esa columna tiene DEFAULT 'enviado' en la base -> si Meta rechazaba (token
+          // vencido, ventana cerrada), quedaba como ENTREGADA y ningun cron la recuperaba
+          // (reintentarFallidos filtra 'fallido'). Ahora se escribe el resultado real.
+          if (resultado.msgId) {
+            const _upd = { estado_envio: _env.ok ? 'enviado' : 'fallido' };
+            if (_env.ok && _env.id) _upd.wa_message_id = _env.id;   // habilita el 2do tilde por `statuses`
+            try { await supabase.from('messages').update(_upd).eq('id', resultado.msgId); } catch (eWid) {}
           }
           // MEDIDOR: etiqueta 'respuesta_agente_cloud' (antes null) + atribucion. PRECIO_IA = el MISMO default de antes.
           try { await registrarUsoTokens(tenantUserId, resultado.usage, 'respuesta_agente_cloud', PRECIO_IA, { conversation_id: _convId, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (e) {}

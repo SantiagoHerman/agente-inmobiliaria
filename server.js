@@ -14378,9 +14378,17 @@ app.post('/api/oportunidades/:id/reanudar', async (req, res) => {
     const ownerId = _idOp.ownerId;
     const id = req.params.id;
     try {
-      const { data, error } = await supabase.from('oportunidades').update({ estado: 'en_cola', updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId).neq('estado', 'completada').select('*').maybeSingle();
+      // `.neq('estado','borrador')`: UN BORRADOR NO SE "REANUDA" (Diego 2026-08-11, lo encontro
+      // probando: "estaban todos en borrador y cuando probe editar uno quedo en cola y no se porque").
+      // La cadena era: Editar -> el front llama /pausar -> el PATCH fuerza 'pausada' -> y el front
+      // llamaba SOLO a /reanudar, que ponia 'en_cola' sin mirar de donde venia. 'en_cola' es
+      // EXACTAMENTE el estado que el cron levanta para enviar: editar un borrador lo ARMABA.
+      // El /reanudar esta pensado para un envio que YA estaba corriendo; un borrador nunca se lanzo,
+      // asi que no hay nada que reanudar. (El front tambien se arregla, pero el guard va en el back:
+      // es el que no se puede esquivar.)
+      const { data, error } = await supabase.from('oportunidades').update({ estado: 'en_cola', updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', ownerId).neq('estado', 'completada').neq('estado', 'borrador').select('*').maybeSingle();
       if (error) return res.status(500).json({ error: error.message });
-      if (!data) return res.status(404).json({ error: 'Oportunidad no encontrada o ya completada' });
+      if (!data) return res.status(404).json({ error: 'Oportunidad no encontrada, en borrador o ya completada. Un borrador se lanza con "Programar", no se reanuda.' });
       return res.json({ ok: true, oportunidad: data });
     } catch (eR) { return res.status(500).json({ error: 'No se pudo reanudar' }); }
   } catch (err) {
@@ -15736,6 +15744,14 @@ app.get('/api/whatsapp/estado', async (req, res) => {
 //   - RECONTACTO_GRACIA_FRIO_HS / _VIEJO_HS: horas de gracia antes del 1er recontacto
 //     de un contacto nuevo (sin recontacto previo). 'frio' = 48hs (mas conservador).
 const RECONTACTO_TOPE_MAX_DEFAULT = 300;
+// ===== TECHO DURO DIARIO POR CUENTA (Diego 2026-08-11) =====
+// "recontacto un limite de 20 por dia maximo, osea pasados los 20 riesgo de baneo y queda en rojo el
+// numero porque no puedo asegurar nada". Se aplica SOBRE el warm-up: la rampa puede mandar menos,
+// nunca mas. Anton ya venia a 20/dia de hecho (tiene recontacto_tope_max=20 cargado a mano); esto lo
+// vuelve una garantia del sistema en vez de una config que alguien puede subir sin querer.
+const RECONTACTO_TECHO_DIARIO = 20;
+// Mismo criterio para el broadcast de Oportunidades: "oportunidades 10 por dia no mas".
+const OPORTUNIDADES_TECHO_DIARIO = 10;
 const RECONTACTO_SUBCUPO_FRIO_DEFAULT = 30;
 const RECONTACTO_SALTO_VIEJO_DIA_DEFAULT = 3;
 const RECONTACTO_GRACIA_FRIO_HS = 48;
@@ -17815,6 +17831,27 @@ async function enviarRecontactosPendientes() {
     const UN_DIA_MS = 24 * 60 * 60 * 1000;
     const RECONTACTO_CAP = 20; // tope de envios por tanda (anti-baneo): el resto va en las proximas corridas
     let enviados = 0;
+    // TECHO DIARIO POR CUENTA en el motor LEGACY (Diego 2026-08-11). El CAP de arriba es POR TANDA y
+    // GLOBAL a todos los tenants: una cuenta con backlog grande se comia la tanda entera, y como
+    // `enviados` vive en memoria, cada redeploy relanzaba una tanda nueva (el cron dispara a los 60 s
+    // de cada arranque) -> N deploys = N tandas de 20. Ahora se cuenta lo enviado HOY por cada cuenta
+    // contra la tabla `recontactos`, que sobrevive reinicios.
+    // Hoy el legacy solo corre en Raices Meta Test (todas las cuentas productivas estan en v2), pero
+    // el guard va igual: es la ruta que queda si alguien apaga recontacto_v2 en una cuenta.
+    const _enviadosHoyPorCuenta = {};
+    const _cupoLegacyDe = async function (uid) {
+      if (_enviadosHoyPorCuenta[uid] === undefined) {
+        try {
+          const _hoyArg = new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+          const _desdeArg = new Date(new Date(_hoyArg + 'T00:00:00.000Z').getTime() + 3 * 3600e3).toISOString();
+          const { count } = await supabase.from('recontactos')
+            .select('id', { count: 'exact', head: true })
+            .eq('user_id', uid).gte('enviado_at', _desdeArg);
+          _enviadosHoyPorCuenta[uid] = count || 0;
+        } catch (eL) { _enviadosHoyPorCuenta[uid] = 0; }
+      }
+      return Math.max(0, RECONTACTO_TECHO_DIARIO - _enviadosHoyPorCuenta[uid]);
+    };
     // Conversaciones en recontacto
     const { data: enRecontacto } = await supabase
       .from('conversations')
@@ -17851,6 +17888,11 @@ async function enviarRecontactosPendientes() {
       // CANAL SIN RECONTACTO POSIBLE (Instagram/Messenger): ver CANALES_SIN_RECONTACTO. No consume cupo.
       if (!_canalAdmiteRecontacto(conv.channel)) {
         console.log('[recontacto legacy] conv ' + conv.id + ' salteada: canal ' + conv.channel + ' no admite recontacto');
+        continue;
+      }
+      // TECHO DIARIO POR CUENTA (ver _cupoLegacyDe): 20/dia, contados contra la tabla `recontactos`.
+      if ((await _cupoLegacyDe(conv.user_id)) <= 0) {
+        console.log('[recontacto legacy] cuenta ' + conv.user_id + ' llego al techo diario (' + RECONTACTO_TECHO_DIARIO + ')');
         continue;
       }
       // SALVAGUARDA 1: respetar el maximo de recontactos
@@ -17968,13 +18010,24 @@ async function enviarRecontactosPendientes() {
       // Registrar primero en messages (con id) para marcar estado de envio. content = lo que recibe el cliente; content_original = castellano para el asesor.
       const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: conv.user_id, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
       // Enviar y registrar estado (enviado/fallido) en ese mensaje
-      await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
+      // EL RESULTADO DEL ENVIO SE MIRA (auditoria 2026-08-11, #16). Antes se descartaba: si el envio
+      // fallaba, IGUAL subia recontacto_count (el lead gastaba un intento sin recibir nada), IGUAL se
+      // escribia last_message (la bandeja mentia) y IGUAL sumaba al contador diario del que cuelga el
+      // tope de 20 -> el techo contaba envios que no salieron. Y como `reintentarFallidos` excluye a
+      // la IA por diseño, ese mensaje quedaba 'fallido' para siempre.
+      // Oportunidades ya lo hacia bien; esto lo empareja.
+      const _okRec = await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
+      if (!_okRec) {
+        console.warn('[recontacto legacy] envio FALLIDO a conv ' + conv.id + ': no se cuenta el intento ni se toca la bandeja');
+        continue; // sin consumir cupo ni gastar un intento: se reintenta en la proxima tanda
+      }
       await _updConvMensaje({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
       await supabase.from('recontactos').insert({ user_id: conv.user_id, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
       await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);
       try { if (SUBSCRIPTIONS_ENABLED && _recEsIA && await cobrarTodoV2Activo(conv.user_id)) await registrarUsoIA(conv.user_id, 1 + (idiomaRec ? 1 : 0), 'recontacto'); } catch (eCobRec) {}
       console.log('Recontacto ENVIADO a conversacion ' + conv.id + ' (intento ' + (countRec+1) + ')');
       enviados++;
+      if (_enviadosHoyPorCuenta[conv.user_id] !== undefined) _enviadosHoyPorCuenta[conv.user_id]++;
       if (enviados >= RECONTACTO_CAP) break; // tope por tanda: el resto sale en las proximas corridas (cada 15 min)
       // FIX recontacto ("enviados muy pegados"): subimos el gap de 8-20s a 45-120s (mas natural/humano, anti-baneo),
       // consistente con el motor v2. Solo timing, 0 IA.
@@ -18078,8 +18131,40 @@ async function procesarOportunidades() {
           enviadosHoy = 0;
           try { await supabase.from('oportunidades').update({ enviados_hoy: 0, enviados_fecha: hoyStr }).eq('id', op.id); } catch (eRf) {}
         }
-        const maxDia = (Number.isFinite(op.max_dia) && op.max_dia > 0) ? op.max_dia : 200; // default conservador
-        const cupoDiaRestante = Math.max(0, maxDia - enviadosHoy);
+        // ===== TECHO DIARIO POR CUENTA (Diego 2026-08-11: "oportunidades 10 por dia no mas") =====
+        // El contador `enviados_hoy` de arriba es POR OPORTUNIDAD, no por cuenta: cuando una se
+        // completa, la siguiente por prioridad arranca con su propio contador en 0 y la cuenta se
+        // pasaba del tope el MISMO dia. Y con `max_dia` en null el default era 200/dia, 20 veces lo
+        // pedido (las 4 oportunidades que existen hoy lo tienen en null).
+        // Por eso se cuenta aparte lo enviado por la CUENTA en el dia, sumando `oportunidad_envios`
+        // de todas sus oportunidades. Fuente unica de verdad, sobrevive reinicios y no depende de que
+        // cada oportunidad lleve bien su contador.
+        // `oportunidad_envios` NO tiene user_id (verificado: id, oportunidad_id, contact_id,
+        // conversation_id, enviado_at), asi que se cuenta por las oportunidades DE ESTA CUENTA.
+        let _enviadosCuentaHoy = 0;
+        try {
+          // Medianoche de Argentina expresada en UTC (hoyStr ya viene calculado con esa misma regla).
+          const _desdeArg = new Date(new Date(hoyStr + 'T00:00:00.000Z').getTime() + 3 * 3600e3).toISOString();
+          const { data: _opsCuenta } = await supabase.from('oportunidades')
+            .select('id').eq('user_id', op.user_id);
+          const _ids = (_opsCuenta || []).map(function (o) { return o.id; });
+          if (_ids.length) {
+            const { count } = await supabase.from('oportunidad_envios')
+              .select('id', { count: 'exact', head: true })
+              .in('oportunidad_id', _ids).gte('enviado_at', _desdeArg);
+            _enviadosCuentaHoy = count || 0;
+          }
+        } catch (eCC) { _enviadosCuentaHoy = 0; } // tabla/columna ausente -> no bloquea (el tope por oportunidad sigue)
+        const _cupoCuenta = Math.max(0, OPORTUNIDADES_TECHO_DIARIO - _enviadosCuentaHoy);
+        if (_cupoCuenta <= 0) {
+          console.log('[oportunidades] cuenta ' + op.user_id + ' llego al techo diario (' + OPORTUNIDADES_TECHO_DIARIO + '): nada mas hoy');
+          continue;
+        }
+
+        // `maxDia` baja de 200 a OPORTUNIDADES_TECHO_DIARIO cuando no hay valor explicito: el default
+        // viejo era mas alto que el techo, o sea inutil.
+        const maxDia = (Number.isFinite(op.max_dia) && op.max_dia > 0) ? Math.min(op.max_dia, OPORTUNIDADES_TECHO_DIARIO) : OPORTUNIDADES_TECHO_DIARIO;
+        const cupoDiaRestante = Math.min(Math.max(0, maxDia - enviadosHoy), _cupoCuenta);
         if (cupoDiaRestante <= 0) continue; // ya cumplio el cupo del dia -> nada mas hoy (retoma manana)
 
         // Cuantos mandar en ESTA tanda: min(CAP por tanda, cupo del dia restante).
@@ -18115,15 +18200,34 @@ async function procesarOportunidades() {
         const mediaUrl = (op.media && typeof op.media === 'object' && op.media.url) ? String(op.media.url) : null;
         const mediaTipo = (op.media && typeof op.media === 'object' && op.media.tipo) ? String(op.media.tipo) : 'imagen';
 
+        // ===== LA OPORTUNIDAD QUE SE CUELGA Y BLOQUEA LA COLA (auditoria #20) =====
+        // Un contacto que SIEMPRE falla (sin telefono, numero invalido, mensaje vacio) nunca se marca
+        // como enviado -> `pendientes` nunca llega a 0 -> la oportunidad no completa NUNCA -> y como
+        // se procesa UNA por cuenta y por prioridad, LAS SIGUIENTES NO ARRANCAN JAMAS. Es el estado
+        // exacto en el que quedarian las 4 de Galdames (mensaje vacio, una en 'en_cola').
+        // Ademas, en el camino de fallo NO habia pausa: un universo roto se recorria a maxima
+        // velocidad golpeando Evolution.
+        // Arreglo: se cuentan los fallos de la tanda; si NINGUNO salio, se pausa la oportunidad con un
+        // motivo visible en vez de dejarla girando. El humano ve por que y la arregla.
+        let _fallosTanda = 0;
         let enviadosTanda = 0;
         let enviadosTotalNuevo = (Number.isFinite(op.enviados) ? op.enviados : 0) || 0;
         let enviadosHoyNuevo = enviadosHoy;
+        // Sin cuerpo ni media no hay NADA que mandar: se pausa de entrada, sin recorrer el universo
+        // ni golpear a Evolution una sola vez.
+        if (!textoFinal && !mediaUrl) {
+          try {
+            await supabase.from('oportunidades').update({ estado: 'pausada', updated_at: new Date().toISOString() }).eq('id', op.id).neq('estado', 'completada');
+            console.warn('[oportunidades] "' + op.nombre + '" pausada: no tiene mensaje ni imagen para enviar');
+          } catch (eVac) {}
+          continue;
+        }
         for (const c of pendientes) {
           if (enviadosTanda >= nTanda) break;
           // Datos del contacto.
           let contacto = null;
           try { const { data } = await supabase.from('contacts').select('name, phone').eq('id', c.contact_id).maybeSingle(); contacto = data || null; } catch (eCt) { contacto = null; }
-          if (!contacto || !contacto.phone) continue; // sin telefono -> saltar (pero NO marcar enviado: quedara pendiente)
+          if (!contacto || !contacto.phone) { _fallosTanda++; continue; } // sin telefono -> saltar (pero NO marcar enviado: quedara pendiente)
           // Enviar (CON MEDIA si corresponde). Defensivo: un fallo de envio no rompe la tanda.
           let ok = false;
           try {
@@ -18133,7 +18237,13 @@ async function procesarOportunidades() {
             else if (textoFinal) { ok = await enviarWhatsapp(instancia, contacto.phone, textoFinal, null); }
             else { ok = false; } // sin cuerpo ni media -> nada que mandar
           } catch (eSend) { ok = false; }
-          if (!ok) { continue; } // no marcamos enviado si fallo -> se reintenta en la proxima tanda
+          if (!ok) {
+            _fallosTanda++;
+            // Pausa entre fallos: sin esto un universo roto se recorre a maxima velocidad contra
+            // Evolution, que es justo lo que dispara los bloqueos.
+            await new Promise(function (r) { setTimeout(r, 3000); });
+            continue; // no marcamos enviado si fallo -> se reintenta en la proxima tanda
+          }
           // DEDUPE: registrar el envio (una sola vez).
           try { await supabase.from('oportunidad_envios').insert({ oportunidad_id: op.id, contact_id: c.contact_id, conversation_id: c.id, enviado_at: new Date().toISOString() }); } catch (eIns) {}
           // Actualizar last_message de la conv (best-effort, para que el asesor vea que salio algo).
@@ -18154,6 +18264,14 @@ async function procesarOportunidades() {
         if ((pendientes.length - enviadosTanda) <= 0) {
           try { await supabase.from('oportunidades').update({ estado: 'completada', updated_at: new Date().toISOString() }).eq('id', op.id); } catch (eC2) {}
           console.log('[OPORTUNIDADES] Oportunidad ' + op.id + ' COMPLETADA tras la tanda (cuenta ' + uid + ').');
+        } else if (enviadosTanda === 0 && _fallosTanda > 0) {
+          // NADIE salio y hubo fallos: el universo tiene algo que no se puede enviar. Si la dejamos
+          // 'en_cola'/'enviando' nunca completa y TAPA a las siguientes (se procesa una por cuenta,
+          // por prioridad). Se pausa para que la cola siga y quede visible que hay algo que arreglar.
+          try {
+            await supabase.from('oportunidades').update({ estado: 'pausada', updated_at: new Date().toISOString() }).eq('id', op.id).neq('estado', 'completada');
+            console.warn('[OPORTUNIDADES] "' + op.nombre + '" PAUSADA: ' + _fallosTanda + ' destinatario(s) no se pudieron enviar y ninguno salio. Se libera la cola para las siguientes.');
+          } catch (ePau) {}
         }
       } catch (eCuenta) { console.error('[OPORTUNIDADES] error en cuenta ' + uid + ':', eCuenta && eCuenta.message); }
     }
@@ -18312,7 +18430,13 @@ async function _enviarRecontactosV2(ahoraMs) {
       // dia real y el salto): asi los que-ya-escribieron pueden salir desde el arranque; el sub-cupo de los
       // que-nunca-escribieron sigue atado a la rampa BASE (no sube por el salto).
       const saltoViejoDia = await _saltoViejoDia(uid);
-      const topeDiario = _topeWarmup(Math.max(warmupDia, saltoViejoDia), topeMax);
+      // ===== TECHO DURO ANTI-BANEO (Diego 2026-08-11) =====
+      // "pasados los 20 riesgo de baneo y queda en rojo el numero porque no puedo asegurar nada".
+      // Es un TECHO, no un objetivo: la rampa de warm-up sigue mandando por debajo (una cuenta nueva
+      // arranca chica y sube), pero NUNCA pasa de RECONTACTO_TECHO_DIARIO aunque el warm-up o la
+      // columna `recontacto_tope_max` digan mas. Va en el codigo y no en la config porque una perilla
+      // que alguien sube a 300 sin querer es exactamente el riesgo que Diego pidio cerrar.
+      const topeDiario = Math.min(_topeWarmup(Math.max(warmupDia, saltoViejoDia), topeMax), RECONTACTO_TECHO_DIARIO);
       const cupoRestante = Math.max(0, topeDiario - enviadosHoy);
       if (cupoRestante <= 0) continue; // ya se cumplio el cupo del dia -> nada mas hoy
 
@@ -18573,7 +18697,16 @@ async function _enviarRecontactosV2(ahoraMs) {
 
         // Registrar + enviar (mismo flujo que legacy)
         const { data: msgRec } = await supabase.from('messages').insert({ conversation_id: conv.id, user_id: uid, role: 'ai', content: textoEnviar, content_original: (idiomaRec ? texto : null), idioma: idiomaRec, enviado_por: 'Agente IA', estado_envio: 'enviando' }).select('id').single();
-        await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
+        // EL RESULTADO DEL ENVIO SE MIRA (auditoria 2026-08-11, #16). Este es el motor que corre en
+        // TODAS las cuentas productivas. Antes el retorno se descartaba: un envio fallido igual subia
+        // recontacto_count (el lead gastaba un intento sin recibir nada), igual escribia last_message
+        // (la bandeja mentia) e igual sumaba a `recontacto_enviados_hoy`, que es el contador del que
+        // cuelga el techo de 20 -> el tope contaba envios que nunca salieron.
+        const _okRecV2 = await enviarWhatsapp(inst.instancia_nombre, contacto.phone, textoEnviar, msgRec ? msgRec.id : null);
+        if (!_okRecV2) {
+          console.warn('[recontacto v2] envio FALLIDO a conv ' + conv.id + ': no se cuenta el intento ni se toca la bandeja');
+          continue; // sin consumir cupo ni gastar un intento: se reintenta en la proxima tanda
+        }
         await _updConvMensaje({ last_message: textoEnviar, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
         await supabase.from('recontactos').insert({ user_id: uid, conversation_id: conv.id, contact_id: conv.contact_id, intento: countRec + 1, mensaje: textoEnviar, enviado_at: new Date().toISOString() });
         await supabase.from('conversations').update({ recontacto_count: countRec + 1 }).eq('id', conv.id);

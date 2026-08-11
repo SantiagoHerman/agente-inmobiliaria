@@ -105,6 +105,24 @@ vive bajo un IGSID/PSID que no se parece a un teléfono: hay que capturarlo y en
 - Si el lead nunca da el teléfono ni escribe: la conversación IG/MSN sigue su ciclo normal y a la
   inactividad va a **cerrado** (Fase 3b), con revive si vuelve a escribir.
 
+## FASE 9 — Perfil automático del contacto (Diego 2026-08-11)
+*"tenemos que lograr que se vaya armando automaticamente el perfil del contacto asi no depende de una
+carga manual, no quita que se modifique manualmente."*
+- La extracción que YA corre por turno (interés, presupuesto, nombre, fechas — 0 llamadas extra de IA)
+  se extiende para completar el perfil: teléfono (8a), email, ciudad/zona, presupuesto CON moneda,
+  y los campos generales de la ficha ("Más datos del cliente").
+- **REGLA DURA: lo automático SOLO completa campos VACÍOS. Lo manual nunca se pisa.** Un dato cargado
+  a mano (o corregido a mano) gana siempre; la extracción no lo toca. Editar a mano sigue igual que hoy.
+- Aplica a TODOS los canales (WhatsApp/Cloud/IG/Messenger). Misma filosofía que fichas_ia_v1
+  (la IA propone, la persona confirma) y que el resumen automático.
+
+## ORDEN DE EJECUCIÓN (Diego 2026-08-11: "primero integraciones y despues el resto")
+1. Revisión previa profunda (4 auditores de solo lectura sobre todo lo que el plan toca)
+2. **FASE 4 — Integraciones** (pantalla + escalera + tarjetas IG/MSN "esperando aprobación")
+3. FASE 0 (rate card, cuando el Chrome esté) · FASE 3 (arreglos obligatorios) · FASE 1 (topes+rojo)
+4. FASE 2 (pestañas) · FASE 5 (catálogo) · FASE 6 (botones) · FASE 7 (pase) · FASE 8 (unificación) · FASE 9 (perfil automático)
+5. Carril videos App Review en paralelo (guiones míos, graba Diego)
+
 ## CARRIL APARTE — App Review de Meta (desbloquea IG/Messenger de verdad)
 - Escribir los 2 guiones de video (Messenger con login Facebook; Instagram con login Instagram): login completo, usuario con acceso, ida y vuelta de mensajes, interfaz EN INGLÉS (el panel ya tiene i18n con 'en'), subtítulos.
 - Incluir `instagram_business_manage_comments` en el próximo envío (está en la app, nunca se pidió).

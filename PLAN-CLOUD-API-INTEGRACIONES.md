@@ -135,6 +135,21 @@ permiso para ese gasto… y aprobar cada contacto nuevo o cada informacion o fic
   reemplaza un dato cargado a mano se marca distinto y exige aprobación explícita de ese reemplazo.
 - Reusa lo construido: fichas con `confirmada=false` (patrón existente), el alta del importador CSV,
   la normalización de teléfonos.
+- **ETIQUETAS EN LA IMPORTACIÓN (Diego 2026-08-11):** *"si importo contactos de un telefono de
+  alquileres, a todos les pongo 'alquileres viejos' y en oportunidades los busco con esa etiqueta…
+  una etiqueta para cada contacto, o una para todos, o crear una nueva y que queden todos marcados.
+  En esa solapa no se pueden eliminar etiquetas."*
+  - En el paso de revisión: selector de etiqueta POR LOTE (una para todos) + override POR CONTACTO +
+    "crear nueva" inline (va al catálogo del tenant, `/api/etiquetas`). **Sin botón de borrar
+    etiquetas en esa solapa** — el catálogo solo se administra donde siempre.
+  - **Lo que faltaba y se agrega:** columna `contacts.etiquetas` (hoy las etiquetas viven SOLO en
+    `conversations.etiquetas` — verificado — y un importado no tiene conversación). Migración.
+  - **Propagación:** cuando a ese contacto se le crea una conversación (escribe o le escriben), las
+    etiquetas del contacto se copian a la conversación — así los filtros existentes las ven.
+  - **Oportunidades aprende a buscar por etiqueta de CONTACTO** (hoy su universo exige conversación,
+    `_resolverUniversoOportunidad` 14085 y buscar-leads 14180): segmento nuevo "etiqueta X" que trae
+    contactos con teléfono aunque no tengan conversación. Es LA pieza que hace posible el caso de uso.
+  - Aplica también al importador CSV existente (misma solapa, mismo selector).
 
 ## CORRECCIONES DE LA AUDITORÍA (2026-08-11 — 4 auditores, informes completos en
 ## AUDITORIA-PRE-PLAN-HALLAZGOS.md; los números # refieren a ese archivo)

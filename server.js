@@ -39047,12 +39047,11 @@ app.post('/api/meta/credenciales', async function(req, res) {
     // Upsert manual por (user_id, canal). El token/app_secret SOLO se pisan si el
     // usuario los reescribio (string no vacio); si vienen vacios en un registro
     // existente, se conserva el valor previo (no se sobreescribe con null).
-    const { data: existe } = await supabase
-      .from('messenger_credentials')
-      .select('id')
-      .eq('user_id', b.admin_id)
-      .eq('canal', canal)
-      .maybeSingle();
+    // Resolucion DETERMINISTICA (ver _credMetaFilaDe): el maybeSingle() de antes devolvia null
+    // con 2+ filas y el alta caia al INSERT, duplicando. Un error de lectura ahora CORTA con 500.
+    const _resAlta = await _credMetaFilaDe(b.admin_id, canal);
+    if (_resAlta.error) return res.status(500).json({ error: _resAlta.error });
+    const existe = _resAlta.fila;
     if (existe) {
       if (!fila.page_access_token) delete fila.page_access_token; // conservar token previo
       if (fila.app_secret === null && !b.app_secret) delete fila.app_secret; // conservar app_secret previo
@@ -39062,6 +39061,7 @@ app.post('/api/meta/credenciales', async function(req, res) {
       delete fila.page_id; delete fila.ig_user_id;
       const { error } = await supabase.from('messenger_credentials').update(fila).eq('id', existe.id);
       if (error) return res.status(500).json({ error: error.message });
+      await _credMetaDesactivarDuplicadas(_resAlta.duplicadas);
     } else {
       if (!fila.page_access_token) return res.status(400).json({ error: 'Falta el token de la pagina' });
       const { error } = await supabase.from('messenger_credentials').insert(fila);
@@ -39081,10 +39081,14 @@ app.get('/api/meta/credenciales', async function(req, res) {
     const { data: ase } = await supabase.from('asesores').select('admin_id').eq('auth_user_id', userId).maybeSingle();
     if (ase && ase.admin_id) ownerId = ase.admin_id;
 
+    // `.order('created_at')` + preferir la ACTIVA (ver el .find() de abajo): con filas duplicadas de
+    // un canal, el .find() sin orden podia devolver la INACTIVA y la pantalla decia "configurado pero
+    // inactivo" con el canal funcionando. Mismo criterio que _credMetaFilaDe y que _resolverCredMeta.
     const { data, error } = await supabase
       .from('messenger_credentials')
-      .select('canal, page_id, ig_user_id, verify_token, app_secret, page_access_token, activo')
-      .eq('user_id', ownerId);
+      .select('canal, page_id, ig_user_id, verify_token, app_secret, page_access_token, activo, created_at')
+      .eq('user_id', ownerId)
+      .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
     const mask = function(s) { if (!s) return ''; const v = String(s); return v.length <= 4 ? '****' : ('****' + v.slice(-4)); };
@@ -39101,8 +39105,14 @@ app.get('/api/meta/credenciales', async function(req, res) {
       };
     };
     const filas = data || [];
-    const fPage = filas.find(function(f){ return f.canal === 'page'; }) || null;
-    const fIg = filas.find(function(f){ return f.canal === 'instagram'; }) || null;
+    // Por canal: la ACTIVA si hay; si no, la mas reciente (las filas ya vienen ordenadas desc).
+    const _delCanal = function (canal) {
+      const _c = filas.filter(function (f) { return f.canal === canal; });
+      if (!_c.length) return null;
+      return _c.filter(function (f) { return f.activo === true; })[0] || _c[0];
+    };
+    const fPage = _delCanal('page');
+    const fIg = _delCanal('instagram');
     return res.json({ ok: true, page: armar(fPage), instagram: armar(fIg) });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
@@ -39241,6 +39251,134 @@ app.get('/api/meta/oauth/start', async function(req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
+// ============================================================================
+// LA FILA DE CREDENCIAL DE UN CANAL, RESUELTA DE FORMA DETERMINISTICA
+// ----------------------------------------------------------------------------
+// BUG QUE ARREGLA (auditoria 2026-08-11, verificado en vivo): los dos upserts de credenciales
+// (callback de IG ~39377 y alta manual ~39050) hacian
+//     .eq('user_id',…).eq('canal',…).maybeSingle()
+// destructurando SOLO `data` -> el `error` se ignoraba. Y la cuenta de prueba tiene DOS filas
+// canal='instagram' (una activa y una no, ambas del 29/06). Con 2 filas maybeSingle() devuelve
+// PGRST116 + data:null -> el codigo lo leia como "no existe" -> INSERT -> TERCERA fila.
+// O sea: el boton "Conectar Instagram" MULTIPLICABA filas en vez de actualizar, y despues
+// `_resolverCredMeta` elegia una cualquiera.
+//
+// COMO LO RESUELVE, sin borrar nada (Diego: backup antes de tocar datos):
+//   - Trae TODAS las filas de ese (user_id, canal), ordenadas por created_at DESC.
+//   - Prefiere la ACTIVA; si no hay activa, la mas reciente. Nunca "la que vino primero".
+//   - Devuelve tambien las duplicadas para que el caller las desactive (no las borra).
+// Ante error de base devuelve { error } y el caller corta: NUNCA se cae al INSERT por un error
+// de lectura, que es exactamente lo que producia la fila fantasma.
+async function _credMetaFilaDe(userId, canal) {
+  try {
+    const { data, error } = await supabase.from('messenger_credentials')
+      .select('id, activo, created_at')
+      .eq('user_id', userId).eq('canal', canal)
+      .order('created_at', { ascending: false });
+    if (error) return { error: error.message, fila: null, duplicadas: [] };
+    const filas = data || [];
+    if (!filas.length) return { error: null, fila: null, duplicadas: [] };
+    const elegida = filas.filter(function (f) { return f.activo === true; })[0] || filas[0];
+    const duplicadas = filas.filter(function (f) { return f.id !== elegida.id; });
+    if (duplicadas.length) {
+      console.warn('[meta creds] ' + duplicadas.length + ' fila(s) duplicada(s) de canal=' + canal +
+        ' para user ' + userId + ' -> se usa ' + elegida.id + ' y se desactivan las otras');
+    }
+    return { error: null, fila: elegida, duplicadas: duplicadas };
+  } catch (e) { return { error: e && e.message, fila: null, duplicadas: [] }; }
+}
+
+// Desactiva las filas duplicadas de un canal (NO borra: quedan para auditar). Best-effort.
+async function _credMetaDesactivarDuplicadas(duplicadas) {
+  if (!duplicadas || !duplicadas.length) return;
+  for (const d of duplicadas) {
+    try { await supabase.from('messenger_credentials').update({ activo: false }).eq('id', d.id); }
+    catch (e) { console.error('[meta creds] no se pudo desactivar duplicada ' + d.id + ':', e && e.message); }
+  }
+}
+
+// ============================================================================
+// GET /api/integraciones/estado -> el estado REAL de los 3 canales, en una sola llamada.
+// ----------------------------------------------------------------------------
+// Antes NO existia estado por canal (auditoria #39): los /estado de OAuth solo decian si la
+// PLATAFORMA estaba configurada (si Raices tiene las claves), no si ESTA CUENTA tiene el canal
+// conectado. La pantalla lo deducia de /api/meta/credenciales con un .find() sin orden.
+//
+// SOLO DUEÑO: acá viven tokens, tramites y medios de pago. La incoherencia vieja (IG/MSN lo veia
+// cualquier asesor, Cloud era dueño-only) se cierra del lado restrictivo (auditoria #47).
+app.get('/api/integraciones/estado', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el titular de la cuenta puede ver las integraciones.', solo_dueno: true });
+    const dueno = await _cloudApiDueno(uid);
+
+    // --- Messenger e Instagram: fila resuelta de forma deterministica (prefiere la activa) ---
+    const _canal = async function (canal) {
+      const r = await _credMetaFilaDe(dueno, canal);
+      if (r.error) return { conectado: false, error_lectura: true };
+      if (!r.fila) return { conectado: false, activo: false };
+      let extra = {};
+      try {
+        const { data } = await supabase.from('messenger_credentials')
+          .select('page_id, ig_user_id, created_at').eq('id', r.fila.id).maybeSingle();
+        if (data) extra = { cuenta_id: data.ig_user_id || data.page_id || null, conectado_el: data.created_at || null };
+      } catch (e) {}
+      return Object.assign({
+        conectado: true,
+        activo: r.fila.activo === true,
+        duplicadas: r.duplicadas.length   // >0 = hay filas viejas del mismo canal (se desactivan al reconectar)
+      }, extra);
+    };
+
+    // --- Cloud API: conectado + si el flag esta prendido para esta cuenta ---
+    let cloud = { habilitado: false, conectado: false };
+    try {
+      cloud.habilitado = await cloudApiActivo(dueno);
+      const { data } = await supabase.from('cloud_api_numbers')
+        .select('display_number, waba_id, phone_number_id, verificado, activo')
+        .eq('user_id', dueno).order('creado_at', { ascending: false }).limit(1).maybeSingle();
+      if (data) cloud = Object.assign(cloud, {
+        conectado: true, display_number: data.display_number || null, waba_id: data.waba_id || null,
+        par_numero_token_ok: data.verificado === true, activo: data.activo === true
+      });
+    } catch (e) {}
+
+    return res.json({
+      ok: true,
+      // Disponibilidad a nivel plataforma (si Raices tiene las claves cargadas), por canal.
+      plataforma: {
+        messenger: _metaOauthConfigurado(),
+        instagram: _igOauthConfigurado(),
+        cloud: _metaOauthConfigurado()   // el registro insertado reusa META_APP_ID/SECRET
+      },
+      messenger: await _canal('page'),
+      instagram: await _canal('instagram'),
+      cloud: cloud
+    });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/integraciones/cloud-api/habilitar { habilitar:true|false }
+// ----------------------------------------------------------------------------
+// Antes NO habia forma de prender cloud_api_v1 desde el producto: 0 escrituras en todo el repo
+// (auditoria #29), habia que hacer un UPDATE a mano en Supabase por cada cliente. Solo dueño.
+// Apagarlo NO borra la conexion ni el token: solo deja de usarse (mismo criterio conectar!=encender).
+app.post('/api/integraciones/cloud-api/habilitar', async function(req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el titular de la cuenta puede activar la WhatsApp API oficial.', solo_dueno: true });
+    const dueno = await _cloudApiDueno(uid);
+    const habilitar = (req.body && req.body.habilitar) === true;
+    const { error } = await supabase.from('business_settings')
+      .update({ cloud_api_v1: habilitar }).eq('user_id', dueno);
+    if (error) return res.status(500).json({ error: error.message });
+    console.log('[integraciones] cloud_api_v1=' + habilitar + ' para la cuenta ' + dueno);
+    return res.json({ ok: true, habilitado: habilitar });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
 // GET /api/meta/oauth/estado — el front pregunta si el flujo OAuth de Meta esta DISPONIBLE
 // (credenciales de la app cargadas en el backend). Default = apagado: si faltan META_APP_ID /
 // META_APP_SECRET devuelve disponible:false y el boton del front no arranca nada. NO toca el webhook.
@@ -39374,11 +39512,16 @@ app.get('/api/meta/ig/oauth/callback', async function(req, res) {
     //    META_IG_APP_SECRET (env). activo=false: el cliente lo activa desde Integraciones (no auto-encender).
     const fila = { user_id: uid, canal: 'instagram', ig_user_id: igUserId, page_access_token: String(igToken), app_secret: String(process.env.META_IG_APP_SECRET || ''), activo: false };
     try {
-      const { data: existe } = await supabase.from('messenger_credentials').select('id, activo').eq('user_id', uid).eq('canal', 'instagram').maybeSingle();
+      // Resolucion DETERMINISTICA (ver _credMetaFilaDe): antes un maybeSingle() con 2 filas
+      // devolvia null y caia al INSERT, creando una tercera. Ahora un error de lectura CORTA.
+      const _res = await _credMetaFilaDe(uid, 'instagram');
+      if (_res.error) { console.error('ig oauth save lectura:', _res.error); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error leyendo la conexion. Reintentá.', false)); }
+      const existe = _res.fila;
       if (existe) {
         if (typeof existe.activo === 'boolean') fila.activo = existe.activo;
         const { error } = await supabase.from('messenger_credentials').update(fila).eq('id', existe.id);
         if (error) { console.error('ig oauth save update:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+        await _credMetaDesactivarDuplicadas(_res.duplicadas);
       } else {
         const { error } = await supabase.from('messenger_credentials').insert(fila);
         if (error) { console.error('ig oauth save insert:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
@@ -42482,6 +42625,49 @@ app.get('/api/cloud-api/estado', async function(req, res) {
       if (!error) fila = data || null;
     } catch (e) { fila = null; } // tabla ausente -> como desconectado
     if (!fila) return res.json({ ok: true, habilitado: true, conectado: false });
+
+    // ESCALERA DEL TRAMITE: se consulta a Meta solo si hay con que (numero + token) y solo si el
+    // caller lo pide (?tramite=1), para no meterle una llamada externa a cada poll del panel.
+    let tramite = null;
+    if (String((req.query && req.query.tramite) || '') === '1' && fila.phone_number_id && fila.token) {
+      const _t = await _cloudApiEstadoTramite(fila.phone_number_id, fila.token);
+      if (_t.ok) {
+        tramite = {
+          // 'ok' | 'pendiente' | 'rechazado' | 'desconocido'
+          numero_verificado: _t.code_verification_status === 'VERIFIED' ? 'ok'
+            : (_t.code_verification_status ? 'pendiente' : 'desconocido'),
+          code_verification_status: _t.code_verification_status,
+          nombre_aprobado: (_t.name_status === 'APPROVED' || _t.name_status === 'AVAILABLE_WITHOUT_REVIEW') ? 'ok'
+            : (_t.name_status === 'DECLINED' ? 'rechazado' : (_t.name_status ? 'pendiente' : 'desconocido')),
+          name_status: _t.name_status,
+          verified_name: _t.verified_name,
+          quality_rating: _t.quality_rating,
+          messaging_limit_tier: _t.messaging_limit_tier,
+          // NO detectable por Graph (ver _cloudApiEstadoTramite): el panel lo pide a mano.
+          medio_de_pago: 'no_detectable',
+          // Exige business_management, permiso hoy RECHAZADO en la app -> no se afirma que falte.
+          portafolio: 'no_verificable'
+        };
+      } else {
+        tramite = { numero_verificado: 'desconocido', nombre_aprobado: 'desconocido', medio_de_pago: 'no_detectable', portafolio: 'no_verificable', error_lectura: true };
+      }
+    }
+
+    // Plantillas aprobadas: el escalon 6 y lo que Oportunidades puede ofrecer. Del cache local
+    // (cloud_api_templates), que se refresca cuando alguien abre la pantalla de plantillas.
+    let plantillas = { aprobadas: 0, pendientes: 0, rechazadas: 0, total: 0 };
+    try {
+      const { data: _pl } = await supabase.from('cloud_api_templates')
+        .select('estado_aprobacion').eq('user_id', dueno);
+      (_pl || []).forEach(function (p) {
+        plantillas.total++;
+        const e = String(p.estado_aprobacion || '').toUpperCase();
+        if (e === 'APPROVED') plantillas.aprobadas++;
+        else if (e === 'REJECTED') plantillas.rechazadas++;
+        else plantillas.pendientes++;
+      });
+    } catch (ePl) {}
+
     return res.json({
       ok: true,
       habilitado: true,
@@ -42489,9 +42675,15 @@ app.get('/api/cloud-api/estado', async function(req, res) {
       display_number: fila.display_number || null,
       waba_id: fila.waba_id || null,
       phone_number_id: fila.phone_number_id || null,
+      // OJO: `verificado` significa "el par numero+token respondio un GET a Meta", NO "numero
+      // verificado por Meta" (eso es tramite.numero_verificado). Se renombra en la respuesta para
+      // que la pantalla no los confunda; se deja el viejo por compatibilidad con el front actual.
       verificado: fila.verificado === true,
+      par_numero_token_ok: fila.verificado === true,
       activo: fila.activo === true,
-      token_mask: _cloudApiTokenMask(fila.token) // NUNCA el token entero
+      token_mask: _cloudApiTokenMask(fila.token), // NUNCA el token entero
+      tramite: tramite,
+      plantillas: plantillas
     });
   } catch (e) {
     console.error('[cloud-api] GET estado:', e && e.message);
@@ -42508,6 +42700,49 @@ app.get('/api/cloud-api/estado', async function(req, res) {
 // el campo; si Meta rechaza, se reintenta con el set de campos ORIGINAL (display_phone_number,
 // verified_name) y se sigue sin WABA. Peor caso = exactamente el comportamiento anterior.
 // Devuelve { ok:true, display, wabaId } | { ok:false, errorJson }.
+// ============================================================================
+// ESCALERA DEL TRAMITE: los datos que SOLO Meta sabe.
+// ----------------------------------------------------------------------------
+// Pide a Graph los campos del tramite que la escalera de Integraciones necesita y que hoy NO se
+// piden en ningun lado (auditoria 2026-08-11, hallazgo #28/#43):
+//   - code_verification_status -> VERIFIED | NOT_VERIFIED | EXPIRED   (escalon "numero verificado")
+//   - name_status              -> APPROVED | PENDING_REVIEW | DECLINED | AVAILABLE_WITHOUT_REVIEW
+//                                                                     (escalon "nombre aprobado")
+//   - quality_rating / messaging_limit_tier -> salud del numero, para mostrar al lado
+//
+// HONESTO CON LO QUE NO SE PUEDE: el medio de pago (tarjeta) NO tiene campo en Graph. No se puede
+// detectar; se infiere del error 131042 al intentar un envio, o queda como tilde manual. Y el
+// portafolio comercial exige `business_management`, permiso HOY RECHAZADO en la app -> si falla, se
+// reporta 'no_verificable', NUNCA 'no hecho' (mentirle a Diego sobre un tramite que si hizo es peor
+// que no saber).
+//
+// DEFENSIVA: cualquier fallo devuelve { ok:false } y la escalera muestra 'desconocido' en esos
+// escalones, sin romper el resto del endpoint.
+async function _cloudApiEstadoTramite(phone_number_id, token) {
+  try {
+    const url = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(phone_number_id) +
+      '?fields=display_phone_number,verified_name,code_verification_status,name_status,quality_rating,messaging_limit_tier';
+    const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+    const j = await r.json().catch(function () { return null; });
+    if (!r.ok || !j || j.error) {
+      console.warn('[cloud-api] estado del tramite no disponible:', JSON.stringify(j && j.error ? j.error : {}).slice(0, 200));
+      return { ok: false };
+    }
+    return {
+      ok: true,
+      display_phone_number: j.display_phone_number || null,
+      verified_name: j.verified_name || null,
+      code_verification_status: j.code_verification_status || null,
+      name_status: j.name_status || null,
+      quality_rating: j.quality_rating || null,
+      messaging_limit_tier: j.messaging_limit_tier || null
+    };
+  } catch (e) {
+    console.warn('[cloud-api] estado del tramite error:', e && e.message);
+    return { ok: false };
+  }
+}
+
 async function _cloudApiDatosNumero(phone_number_id, token) {
   const base = 'https://graph.facebook.com/' + CLOUD_API_GRAPH_VERSION + '/' + encodeURIComponent(phone_number_id);
   // Intento 1: con el WABA asociado.
@@ -42521,7 +42756,7 @@ async function _cloudApiDatosNumero(phone_number_id, token) {
         if (j.whatsapp_business_account && j.whatsapp_business_account.id) wabaId = String(j.whatsapp_business_account.id);
         else if (typeof j.whatsapp_business_account === 'string') wabaId = j.whatsapp_business_account;
       } catch (eW) {}
-      return { ok: true, display: j.display_phone_number || null, wabaId: wabaId };
+      return { ok: true, display: j.display_phone_number || null, wabaId: wabaId, verifiedName: j.verified_name || null };
     }
     console.warn('[cloud-api] Meta no devolvio whatsapp_business_account (se reintenta sin ese campo):', JSON.stringify(j && j.error ? j.error : {}).slice(0, 200));
   } catch (e) {

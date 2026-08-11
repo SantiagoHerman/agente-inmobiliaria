@@ -14116,21 +14116,10 @@ app.post('/api/whatsapp/grupo-todos', async (req, res) => {
 // error controlado). Auth: verificarUsuario + resolver dueño (como recontacto).
 // ----------------------------------------------------------------------------
 
-// ¿Este error de PostgREST es "esa columna no existe"?
-//
-// POR QUE HACE FALTA: postgrest-js NO tira excepcion, devuelve { data, error }. Y cuando una columna
-// del payload no existe, el error es 42703 (PostgreSQL) o PGRST204 (PostgREST no la encuentra en su
-// cache de esquema, que ademas no se refresca solo con un ADD COLUMN). Un write que menciona una
-// columna nueva falla ENTERO hasta que corre la migracion, y eso ata el deploy del codigo al orden
-// exacto de la migracion. Con esto se puede reintentar sin los campos nuevos y degradar al
-// comportamiento anterior en vez de romper.
-function _esColumnaAusente(error) {
-  if (!error) return false;
-  const c = String(error.code || '');
-  if (c === '42703' || c === 'PGRST204') return true;
-  // El mensaje se chequea tambien porque el code no siempre viaja (segun la version de PostgREST).
-  return /column .* does not exist|could not find the .* column/i.test(String(error.message || ''));
-}
+// El helper que detecta "esa columna no existe" es `_esColumnaAusente` y vive mas abajo (31187),
+// donde nacio con los endpoints de Contactos. Las declaraciones de funcion se izan, asi que se puede
+// usar desde aca. NO se define una segunda con el mismo nombre: en JS la ultima gana en silencio, y
+// una copia con otro criterio seria un bug imposible de ver leyendo el call site.
 
 // Helper: resuelve el ownerId (dueño) a partir del uid autenticado. Si es asesor,
 // devuelve su admin_id; si es el dueño, devuelve su propio uid. Mismo criterio que
@@ -31187,7 +31176,11 @@ const CONTACTOS_COLS_REDES = CONTACTOS_COLS_FULL + ', instagram, facebook, budge
 function _esColumnaAusente(err) {
   if (!err) return false;
   var m = String((err && (err.message || err.details || err.hint)) || '').toLowerCase();
-  return (err.code === 'PGRST204') || (m.indexOf('column') >= 0 && (m.indexOf('does not exist') >= 0 || m.indexOf('schema cache') >= 0 || m.indexOf('could not find') >= 0));
+  // 42703 = el codigo de PostgreSQL para "undefined column". Se agrego el 11/08 porque este helper
+  // ahora tambien lo usan los writes de Oportunidades, donde el error llega con code y no solo con
+  // mensaje. PGRST204 es el otro camino: PostgREST no la encuentra en su cache de esquema (que no se
+  // refresca solo con un ADD COLUMN, hace falta el NOTIFY).
+  return (err.code === 'PGRST204') || (String(err.code || '') === '42703') || (m.indexOf('column') >= 0 && (m.indexOf('does not exist') >= 0 || m.indexOf('schema cache') >= 0 || m.indexOf('could not find') >= 0));
 }
 
 // GET /api/contactos — listado paginado de VERDAD (keyset por id), busqueda de texto y filtros en el SERVIDOR.

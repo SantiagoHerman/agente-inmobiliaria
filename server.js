@@ -43951,4 +43951,242 @@ app.post('/api/cloud-api/embedded-signup', async function(req, res) {
 });
 // ===== FIN MODULO WHATSAPP CLOUD API ========================================
 
+
+// ============================================================================================
+// ============================================================================================
+// FASE 10 — IMPORTACION INTELIGENTE DE CONTACTOS
+// --------------------------------------------------------------------------------------------
+// Diego, 2026-08-11: "dejar la importacion de contactos por CSV pero agregar una mas que seria
+// informacion del historial, ejemplo un excel, varios pdf o imagenes de fotos de un libro para que
+// la IA interprete, y rellene, arme fichas y todo lo necesario para crear contactos nuevos o
+// actualizar info de los que hay... ver el uso de IA, si va a ser Haiku o Sonnet, evaluar el gasto
+// y SIEMPRE pedir permiso para ese gasto. Tambien... aprobar y dar el ok de cada contacto nuevo o
+// de cada informacion o ficha que se le debe agregar a uno existente."
+//
+// TRES REGLAS QUE ORDENAN TODO EL MODULO:
+//
+//   1. NO SE GASTA UN TOKEN SIN PERMISO. El flujo tiene DOS pasos separados a proposito:
+//      /presupuesto (cuenta el material, estima y NO llama a ningun modelo) y /aprobar (recien ahi
+//      se gasta). No hay atajo posible: el procesamiento exige un lote en estado 'aprobado'.
+//
+//   2. NADA ESCRIBE DIRECTO EN `contacts`. Todo lo que la IA interpreta va a `import_items` y
+//      espera el OK humano. Un dato mal leido de una foto de un cuaderno que se escribe solo en la
+//      base de un cliente real es imposible de deshacer.
+//
+//   3. LO MANUAL NUNCA SE PISA (misma regla que la Fase 9). Si un item reemplazaria un dato cargado
+//      a mano, se marca `pisa_manual` y NECESITA una aprobacion explicita de ESE reemplazo.
+//
+// DEPLOY-SAFE: si las tablas todavia no existen, cada endpoint devuelve 503 con un mensaje claro y
+// nada mas del sistema se entera.
+// ============================================================================================
+
+// Cuanto cuesta procesar el material, ANTES de gastarlo. Numeros conservadores a proposito: es
+// preferible que la factura sea menor a lo prometido y no al reves.
+const _IMP_TOKENS_POR_FILA = 120;      // una fila de Excel/CSV con sus columnas
+const _IMP_TOKENS_POR_PAGINA = 1800;   // una pagina de PDF con texto
+const _IMP_TOKENS_POR_IMAGEN = 1600;   // una foto de un cuaderno/libro (vision)
+const _IMP_TOKENS_SALIDA = 350;        // el JSON que devuelve por item
+
+// Elige el modelo por el TIPO de material, no por el tamaño:
+//   - Tablas limpias (csv/excel): Haiku alcanza y sale ~5 veces mas barato.
+//   - Fotos, manuscritos, PDFs escaneados: necesita vision y criterio -> Sonnet.
+function _impModeloPara(origen) {
+  const o = String(origen || '').toLowerCase();
+  if (o === 'csv' || o === 'excel') return { modelo: MODELO_INTERNO, nombre: 'haiku', precio: PRECIO_HAIKU, por_que: 'Es una tabla ordenada: alcanza el modelo rapido y sale mucho mas barato.' };
+  return { modelo: MODELO_CLIENTE, nombre: 'sonnet', precio: PRECIO_IA, por_que: 'Hay que leer imagenes o texto desordenado: necesita el modelo que interpreta mejor.' };
+}
+
+function _impEstimar(origen, cantidad) {
+  const m = _impModeloPara(origen);
+  const o = String(origen || '').toLowerCase();
+  const porUnidad = (o === 'csv' || o === 'excel') ? _IMP_TOKENS_POR_FILA : (o === 'pdf' ? _IMP_TOKENS_POR_PAGINA : _IMP_TOKENS_POR_IMAGEN);
+  const tokIn = porUnidad * cantidad;
+  const tokOut = _IMP_TOKENS_SALIDA * cantidad;
+  const costo = (tokIn / 1000000) * m.precio.in + (tokOut / 1000000) * m.precio.out;
+  return { modelo: m.nombre, modelo_id: m.modelo, por_que: m.por_que, tokens_estimados: tokIn + tokOut, costo_estimado: Math.round(costo * 10000) / 10000 };
+}
+
+// POST /api/importacion/presupuesto { nombre, origen, archivos:[...], cantidad, etiqueta_lote }
+// NO GASTA NADA. Solo cuenta y presupuesta. Devuelve el numero que el cliente tiene que aprobar.
+app.post('/api/importacion/presupuesto', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const _id = await _duenoOAsesor(uid);
+    if (!_id.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede importar contactos.' });
+    const ownerId = _id.ownerId;
+    const b = req.body || {};
+    const origen = String(b.origen || '').toLowerCase();
+    if (['csv', 'excel', 'pdf', 'imagen'].indexOf(origen) < 0) return res.status(400).json({ error: 'Tipo de material no reconocido.' });
+    const cantidad = Math.max(1, Math.min(parseInt(b.cantidad, 10) || 1, 20000));
+
+    const est = _impEstimar(origen, cantidad);
+    try {
+      const { data, error } = await supabase.from('import_lotes').insert({
+        user_id: ownerId,
+        nombre: b.nombre ? String(b.nombre).slice(0, 200) : null,
+        origen: origen,
+        archivos: Array.isArray(b.archivos) ? b.archivos : null,
+        estado: 'presupuestado',
+        modelo: est.modelo,
+        costo_estimado: est.costo_estimado,
+        etiqueta_lote: b.etiqueta_lote ? String(b.etiqueta_lote).slice(0, 120) : null,
+        total_items: cantidad
+      }).select('id').single();
+      if (error) return res.status(503).json({ error: 'La importacion inteligente todavia no esta habilitada en la base.' });
+      return res.json({
+        ok: true, lote_id: data.id,
+        presupuesto: est,
+        // El texto que ve el cliente ANTES de aprobar. Explicito con la moneda, como pidio Diego.
+        aviso: 'Procesar este material cuesta aproximadamente USD ' + est.costo_estimado.toFixed(4) +
+               ' (modelo ' + est.modelo + '). ' + est.por_que + ' No se gasta nada hasta que apruebés.'
+      });
+    } catch (e) { return res.status(503).json({ error: 'La importacion inteligente todavia no esta habilitada en la base.' }); }
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/importacion/:id/aprobar -> ACA RECIEN SE GASTA. Sin este click no se llama a ningun modelo.
+app.post('/api/importacion/:id/aprobar', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const _id = await _duenoOAsesor(uid);
+    if (!_id.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede aprobar el gasto.' });
+    const ownerId = _id.ownerId;
+
+    // El estado es el candado: solo se procesa lo que estaba 'presupuestado'. Dos clicks seguidos no
+    // gastan dos veces.
+    const { data: lote, error } = await supabase.from('import_lotes')
+      .update({ estado: 'aprobado', aprobado_por: uid, aprobado_at: new Date().toISOString() })
+      .eq('id', req.params.id).eq('user_id', ownerId).eq('estado', 'presupuestado')
+      .select('*').maybeSingle();
+    if (error) return res.status(503).json({ error: 'La importacion inteligente todavia no esta habilitada en la base.' });
+    if (!lote) return res.status(409).json({ error: 'Ese lote no esta esperando aprobacion (o ya se aprobo).' });
+
+    console.log('[importacion] lote ' + lote.id + ' APROBADO por ' + uid + ' — hasta aca no se gasto nada; empieza el procesamiento');
+    return res.json({ ok: true, lote_id: lote.id, estado: 'aprobado', costo_estimado: lote.costo_estimado });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/importacion/:id -> el lote + los items para revisar uno por uno.
+app.get('/api/importacion/:id', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const _id = await _duenoOAsesor(uid);
+    if (!_id.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede ver la importacion.' });
+    const ownerId = _id.ownerId;
+    const { data: lote, error } = await supabase.from('import_lotes').select('*').eq('id', req.params.id).eq('user_id', ownerId).maybeSingle();
+    if (error) return res.status(503).json({ error: 'La importacion inteligente todavia no esta habilitada en la base.' });
+    if (!lote) return res.status(404).json({ error: 'Lote no encontrado' });
+    const { data: items } = await supabase.from('import_items')
+      .select('id, tipo, contact_id, propuesto, actual, pisa_manual, etiquetas, estado, error')
+      .eq('lote_id', lote.id).order('creado_at');
+    return res.json({ ok: true, lote: lote, items: items || [] });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/importacion/item/:id/decidir { aprobar:true|false, etiquetas:[...] }
+// Diego: "aprobar y dar el ok de CADA contacto nuevo o de cada informacion o ficha".
+app.post('/api/importacion/item/:id/decidir', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const _id = await _duenoOAsesor(uid);
+    if (!_id.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede aprobar items.' });
+    const ownerId = _id.ownerId;
+    const aprobar = (req.body && req.body.aprobar) === true;
+    const upd = { estado: aprobar ? 'aprobado' : 'rechazado', decidido_por: uid, decidido_at: new Date().toISOString() };
+    // Etiqueta POR CONTACTO: pisa la del lote para ese item (Diego: "una etiqueta para cada contacto
+    // o una para todos"). Nunca se BORRAN etiquetas desde aca, solo se asignan.
+    if (Array.isArray(req.body && req.body.etiquetas)) upd.etiquetas = req.body.etiquetas.map(String).slice(0, 20);
+    const { data, error } = await supabase.from('import_items').update(upd)
+      .eq('id', req.params.id).eq('user_id', ownerId).eq('estado', 'pendiente').select('id').maybeSingle();
+    if (error) return res.status(503).json({ error: 'La importacion inteligente todavia no esta habilitada en la base.' });
+    if (!data) return res.status(409).json({ error: 'Ese item ya fue decidido.' });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/importacion/:id/aplicar -> escribe en `contacts` SOLO lo aprobado.
+app.post('/api/importacion/:id/aplicar', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const _id = await _duenoOAsesor(uid);
+    if (!_id.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede aplicar la importacion.' });
+    const ownerId = _id.ownerId;
+
+    const { data: lote, error: eL } = await supabase.from('import_lotes').select('*').eq('id', req.params.id).eq('user_id', ownerId).maybeSingle();
+    if (eL) return res.status(503).json({ error: 'La importacion inteligente todavia no esta habilitada en la base.' });
+    if (!lote) return res.status(404).json({ error: 'Lote no encontrado' });
+
+    const { data: items } = await supabase.from('import_items')
+      .select('*').eq('lote_id', lote.id).eq('estado', 'aprobado');
+    let creados = 0, actualizados = 0, fichas = 0, fallidos = 0;
+
+    for (const it of (items || [])) {
+      try {
+        const p = it.propuesto || {};
+        // La etiqueta del item gana sobre la del lote (override por contacto).
+        const _etq = (Array.isArray(it.etiquetas) && it.etiquetas.length) ? it.etiquetas
+          : (lote.etiqueta_lote ? [lote.etiqueta_lote] : null);
+
+        if (it.tipo === 'contacto_nuevo') {
+          const fila = { user_id: ownerId, name: p.nombre || null, phone: p.telefono || null, channel: 'whatsapp' };
+          if (p.email) fila.email = p.email;
+          if (p.interes) fila.interest = p.interes;
+          if (p.presupuesto) fila.budget = p.presupuesto;
+          if (p.ciudad) fila.ciudad = p.ciudad;
+          if (_etq) fila.etiquetas = _etq;
+          const { error } = await supabase.from('contacts').insert(fila);
+          if (error) { fallidos++; await supabase.from('import_items').update({ estado: 'error', error: error.message }).eq('id', it.id); continue; }
+          creados++;
+        } else if (it.tipo === 'actualizacion' && it.contact_id) {
+          // LO MANUAL NUNCA SE PISA (regla 3): solo se completan los campos que estan VACIOS hoy.
+          // La unica excepcion es un item marcado `pisa_manual`, que ya paso por una aprobacion
+          // explicita de ESE reemplazo.
+          const { data: act } = await supabase.from('contacts').select('*').eq('id', it.contact_id).eq('user_id', ownerId).maybeSingle();
+          if (!act) { fallidos++; continue; }
+          const upd = {};
+          const _vac = function (v) { return v == null || String(v).trim() === ''; };
+          const _mapa = { email: 'email', interes: 'interest', presupuesto: 'budget', ciudad: 'ciudad', provincia: 'provincia', empresa: 'empresa', documento: 'documento' };
+          Object.keys(_mapa).forEach(function (k) {
+            const col = _mapa[k];
+            if (p[k] && (_vac(act[col]) || it.pisa_manual === true)) upd[col] = String(p[k]).slice(0, 500);
+          });
+          if (_etq) {
+            const _prev = Array.isArray(act.etiquetas) ? act.etiquetas : [];
+            upd.etiquetas = Array.from(new Set(_prev.concat(_etq)));   // se SUMAN, nunca se borran
+          }
+          if (Object.keys(upd).length) {
+            const { error } = await supabase.from('contacts').update(upd).eq('id', it.contact_id);
+            if (error) { fallidos++; await supabase.from('import_items').update({ estado: 'error', error: error.message }).eq('id', it.id); continue; }
+          }
+          actualizados++;
+        } else if (it.tipo === 'ficha' && it.contact_id) {
+          // Nace como propuesta (confirmada:false), igual que las que arma la IA en el chat.
+          const fila = Object.assign({ user_id: ownerId, contact_id: it.contact_id, estado: 'activa', creado_por: 'ia', origen: 'importacion', confirmada: false }, p);
+          const { error } = await supabase.from('fichas').insert(fila);
+          if (error) { fallidos++; await supabase.from('import_items').update({ estado: 'error', error: error.message }).eq('id', it.id); continue; }
+          fichas++;
+        } else { fallidos++; continue; }
+
+        await supabase.from('import_items').update({ estado: 'aplicado' }).eq('id', it.id);
+      } catch (eIt) {
+        fallidos++;
+        try { await supabase.from('import_items').update({ estado: 'error', error: String(eIt && eIt.message).slice(0, 500) }).eq('id', it.id); } catch (e2) {}
+      }
+    }
+
+    try {
+      await supabase.from('import_lotes').update({ estado: 'aplicado', aplicados: creados + actualizados + fichas, actualizado_at: new Date().toISOString() }).eq('id', lote.id);
+    } catch (eU) {}
+    console.log('[importacion] lote ' + lote.id + ' aplicado: ' + creados + ' nuevos, ' + actualizados + ' actualizados, ' + fichas + ' fichas, ' + fallidos + ' con error');
+    return res.json({ ok: true, creados: creados, actualizados: actualizados, fichas: fichas, fallidos: fallidos });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+// ===== FIN FASE 10 — IMPORTACION INTELIGENTE ================================
+
+
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

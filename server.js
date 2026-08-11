@@ -16972,6 +16972,30 @@ function _canalAdmiteRecontacto(channel) {
   return CANALES_SIN_RECONTACTO.indexOf(String(channel || '').toLowerCase()) < 0;
 }
 
+// ============================================================================================
+// FASE 7 — EL PASE A LA LINEA COMERCIAL
+// --------------------------------------------------------------------------------------------
+// Diego, 2026-08-11: "primero pedirle que escriba a este otro numero y la IA lo recibe, ya como
+// contacto porque entro en conversacion pero dentro de API, entonces la IA ya tiene la info del
+// lead. Si este no escribe en X tiempo la IA le manda un mensaje muy breve pero como si fuera
+// humano, sin plantilla, siguiendo la charla."
+//
+// EL RELOJ: en Instagram y Messenger la ventana de Meta es de 24 h y NO hay plantillas pagas para
+// reabrirla (a diferencia de Cloud API). O sea: si el lead no se muda a WhatsApp dentro de ese
+// plazo, se pierde y no hay forma de recuperarlo. Por eso el pase se ofrece TEMPRANO, no como
+// ultimo recurso.
+//
+// POR QUE 2 HORAS EN HORARIO DE OFICINA: es el supuesto del plan. Suficiente para que alguien que
+// estaba ocupado conteste solo (y no gastemos un mensaje al pedo), y lo bastante corto para que
+// entren varios intentos antes de que venza la ventana de 24 h.
+const PASE_ESPERA_MIN = 120;
+
+// El riesgo real de que Evolution le escriba PRIMERO a alguien que nunca le escribio a ESE numero
+// es que lo reporten -> es el mecanismo por el que se banea. Lo que lo hace aceptable no es que el
+// mensaje sea distinto cada vez (eso ayuda pero no alcanza): es que el lead ACABA de interactuar y
+// que el volumen es chico. Por eso el tope, que es la garantia de verdad.
+const PASE_TECHO_DIARIO = 10;
+
 var _inactividadEnCurso = false;
 async function revisarInactividad() {
   // RACE #6: guard de no-solapamiento (mismo patron que escalarLeadsEnColaVencidos / _escalarEnCurso). Dos ticks
@@ -38717,6 +38741,115 @@ async function _cronPingCache() {
   } catch (e) { console.error('[PING-CACHE] cron:', e && e.message); }
 }
 setInterval(_cronPingCache, _PING_CADA_MIN * 60 * 1000);
+
+// ============================================================================================
+// FASE 7 — CRON DEL PASE A LA LINEA COMERCIAL
+// --------------------------------------------------------------------------------------------
+// Busca leads de Instagram/Messenger que YA dieron su telefono (lo capturo la extraccion, Fase 8)
+// y que NO escribieron todavia al WhatsApp comercial. Les manda UN mensaje corto desde la linea
+// comercial, como lo pidio Diego: "Hola Pablo, te escribo desde la linea comercial de Anton para
+// derivarte con un asesor".
+//
+// CUATRO CANDADOS, porque esto es Evolution escribiendole PRIMERO a alguien:
+//   1. Solo leads que interactuaron (tienen conversacion viva en IG/MSN y dieron el numero).
+//   2. Solo si pasaron PASE_ESPERA_MIN y NO escribieron al WhatsApp (si ya escribieron, no hace falta).
+//   3. UNA sola vez por lead (marca `pase_enviado_at` en el contacto).
+//   4. Tope diario por cuenta (PASE_TECHO_DIARIO).
+// Y el mensaje varia: identifica el negocio, que es lo que hace que la persona NO lo reporte.
+//
+// DEPLOY-SAFE: si las columnas de la Fase 8 no existen, la query falla y el cron queda en no-op.
+var _paseEnCurso = false;
+async function _cronPaseLineaComercial() {
+  if (_paseEnCurso) return;
+  _paseEnCurso = true;
+  try {
+    if (_pausaGlobal === true) return;   // kill-switch global del Maestro
+    // Contactos de IG/MSN con telefono capturado y sin pase enviado.
+    let cands = [];
+    try {
+      const { data, error } = await supabase.from('contacts')
+        .select('id, user_id, name, nombre_manual, telefono_capturado, contacto_principal_id, channel')
+        .not('telefono_capturado', 'is', null)
+        .is('pase_enviado_at', null)
+        .in('channel', ['instagram', 'messenger'])
+        .limit(200);
+      if (error) return;   // columnas ausentes -> no-op
+      cands = data || [];
+    } catch (eSel) { return; }
+    if (!cands.length) return;
+
+    const _enviadosHoy = {};
+    for (const ct of cands) {
+      try {
+        // Candado 4: tope diario por cuenta.
+        if (_enviadosHoy[ct.user_id] === undefined) {
+          try {
+            const _hoyArg = new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+            const _desde = new Date(new Date(_hoyArg + 'T00:00:00.000Z').getTime() + 3 * 3600e3).toISOString();
+            const { count } = await supabase.from('contacts')
+              .select('id', { count: 'exact', head: true })
+              .eq('user_id', ct.user_id).gte('pase_enviado_at', _desde);
+            _enviadosHoy[ct.user_id] = count || 0;
+          } catch (eC) { _enviadosHoy[ct.user_id] = 0; }
+        }
+        if (_enviadosHoy[ct.user_id] >= PASE_TECHO_DIARIO) continue;
+
+        // Candado 2a: que hayan pasado PASE_ESPERA_MIN desde el ultimo mensaje del lead.
+        const { data: _cv } = await supabase.from('conversations')
+          .select('id, last_message_at, updated_at, status').eq('contact_id', ct.id)
+          .order('updated_at', { ascending: false }).limit(1).maybeSingle();
+        if (!_cv) continue;
+        if (_cv.status === 'cerrado') continue;
+        const _ult = new Date(_cv.last_message_at || _cv.updated_at).getTime();
+        if (!_ult || (Date.now() - _ult) < PASE_ESPERA_MIN * 60000) continue;
+
+        // Candado 2b: si YA escribio al WhatsApp, no hace falta el pase. Se detecta porque el
+        // enlace de la Fase 8 encontro su contacto de WhatsApp.
+        if (ct.contacto_principal_id) {
+          try { await supabase.from('contacts').update({ pase_enviado_at: new Date().toISOString() }).eq('id', ct.id); } catch (eM) {}
+          continue;
+        }
+
+        // Horario: no escribirle a nadie de madrugada.
+        const _hArg = new Date(Date.now() - 3 * 3600e3).getUTCHours();
+        if (_hArg < 9 || _hArg >= 20) continue;
+
+        const _inst = nombreInstancia(ct.user_id);
+        if (!_inst) continue;
+        if (!(await instanciaConectada(_inst))) continue;   // ante duda, no enviar
+
+        // El mensaje: corto, humano, con el negocio identificado (eso es lo que evita el reporte).
+        let _negocio = '';
+        try {
+          const { data: _bs } = await supabase.from('business_settings').select('company_name').eq('user_id', ct.user_id).maybeSingle();
+          _negocio = (_bs && _bs.company_name) ? String(_bs.company_name) : '';
+        } catch (eB) {}
+        const _nom = String(ct.nombre_manual || ct.name || '').trim().split(' ')[0];
+        const _variantes = [
+          'Hola' + (_nom ? ' ' + _nom : '') + ', te escribo desde la línea comercial de ' + _negocio + ' para seguir por acá lo que estabas viendo.',
+          'Hola' + (_nom ? ' ' + _nom : '') + '! Soy de ' + _negocio + ', te escribo por acá para derivarte con un asesor.',
+          (_nom ? _nom + ', ' : '') + 'te escribo desde ' + _negocio + ' para continuar la charla por este medio.',
+        ];
+        const _txt = _variantes[Math.floor(Math.random() * _variantes.length)];
+
+        const { data: _msg } = await supabase.from('messages')
+          .insert({ conversation_id: _cv.id, user_id: ct.user_id, role: 'ai', content: _txt, enviado_por: 'Agente IA', estado_envio: 'enviando' })
+          .select('id').single();
+        const _ok = await enviarWhatsapp(_inst, ct.telefono_capturado, _txt, _msg ? _msg.id : null);
+        if (!_ok) { console.warn('[pase] fallo el envio a ' + ct.telefono_capturado + ' (cuenta ' + ct.user_id + ')'); continue; }
+
+        await supabase.from('contacts').update({ pase_enviado_at: new Date().toISOString() }).eq('id', ct.id);
+        _enviadosHoy[ct.user_id]++;
+        console.log('[pase] linea comercial -> ' + ct.telefono_capturado + ' (cuenta ' + ct.user_id + ')');
+        // Espaciado anti-baneo, igual que el recontacto.
+        await new Promise(function (r) { setTimeout(r, 45000 + Math.floor(Math.random() * 75000)); });
+      } catch (eIt) { console.error('[pase] item:', eIt && eIt.message); }
+    }
+  } catch (e) { console.error('[pase] cron:', e && e.message); }
+  finally { _paseEnCurso = false; }
+}
+setInterval(_cronPaseLineaComercial, 20 * 60 * 1000);   // cada 20 min
+
 setTimeout(revisarSaludSistema, 75 * 1000);       // primer chequeo a los 75s del arranque
 
 // ============================================================================

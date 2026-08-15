@@ -22592,6 +22592,62 @@ async function geocodificarOSM(direccion, ciudad) {
   } catch (e) { return null; }
 }
 
+// Busca VARIOS candidatos para el buscador de direcciones del mapa de Inventario.
+//
+// POR QUE NO REUSA geocodificarTextoOSM: esa devuelve UNO solo, el que ella decide. Para un buscador
+// donde la persona ELIGE hace falta la lista — "Avenida 3 1200" en Villa Gesell puede ser tres
+// lugares distintos y quien sabe cual es la propiedad es el que la cargo, no nosotros.
+//
+// POR QUE NO SE LLAMA A NOMINATIM DESDE EL NAVEGADOR: su politica de uso exige User-Agent
+// identificable y como maximo 1 request por segundo. Desde el front no hay forma de controlar
+// ninguna de las dos y nos banean la IP para TODAS las cuentas. Por eso sale por el server, que ya
+// tiene `_osmThrottle` y `_OSM_UA`.
+//
+// Sin cache a proposito: el cache de `geocode_cache` guarda UN resultado por consulta y aca hacen
+// falta varios. Es una busqueda manual, la dispara una persona escribiendo: el volumen es minimo.
+async function buscarDireccionesOSM(texto, ciudad, limite) {
+  try {
+    var q = String(texto || '').trim();
+    if (q.length < 3) return [];
+    var ciu = String(ciudad || '').trim();
+    var lim = Math.max(1, Math.min(parseInt(limite, 10) || 6, 10));
+    await _osmThrottle();
+    var url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&countrycodes=ar&limit=' + lim +
+      '&q=' + encodeURIComponent(q + (ciu ? ', ' + ciu : '') + ', Argentina');
+    var r = await fetchScrape(url, { headers: { 'User-Agent': _OSM_UA } });
+    if (!r.ok) return [];
+    var arr = await r.json();
+    if (!Array.isArray(arr)) return [];
+    return arr.map(function (x) {
+      var lat = parseFloat(x.lat), lng = parseFloat(x.lon);
+      if (isNaN(lat) || isNaN(lng)) return null;
+      var a = x.address || {};
+      return {
+        lat: lat, lng: lng,
+        display: String(x.display_name || ''),
+        // Etiqueta corta para la lista: la calle con altura si Nominatim la trae.
+        corto: [a.road ? (a.road + (a.house_number ? ' ' + a.house_number : '')) : null,
+                a.city || a.town || a.village || a.suburb || null].filter(Boolean).join(', ') || String(x.display_name || '').split(',').slice(0, 2).join(','),
+        tipo: String(x.type || '')
+      };
+    }).filter(Boolean);
+  } catch (e) { return []; }
+}
+
+// GET /api/geocodificar?q=...&ciudad=...  -> { ok, resultados:[{lat,lng,display,corto,tipo}] }
+// Lo usa el buscador del mapa en Inventario. Solo lectura: no escribe nada, no toca la propiedad.
+// Lo puede usar DUEÑO o ASESOR (los dos cargan inventario).
+app.get('/api/geocodificar', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const q = String((req.query && req.query.q) || '').trim();
+    if (q.length < 3) return res.json({ ok: true, resultados: [] });
+    const resultados = await buscarDireccionesOSM(q, (req.query && req.query.ciudad) || '', (req.query && req.query.limite) || 6);
+    return res.json({ ok: true, resultados: resultados });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
 // Geocodifica TEXTO LIBRE de un lead ("Avenida 2 entre 20 y 21", "la terminal") con cache en
 // geocode_cache (no re-pagamos ni re-pedimos lo mismo dos veces; el cache es compartido porque
 // unas coordenadas son un dato geografico publico, no PII). 1) estructurada; 2) libre country=ar

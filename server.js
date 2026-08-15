@@ -4047,6 +4047,17 @@ async function avisarDuenoColaSinAsesor(convId, user_id) {
     }
     // 2) Push al dueno (sus device_tokens estan keyed por su propio auth user_id = user_id del admin).
     try { await enviarPushAsesor(user_id, 'Lead en espera', null, _texto); } catch (ePush) { console.error('aviso cola push:', ePush && ePush.message); }
+    // 2b) Push a los ADMINISTRADORES activos de la cuenta (opcion B, Diego 2026-08-15: el admin que
+    //     atiende todo tiene que enterarse del lead en espera igual que el dueno). Mismo criterio que
+    //     _pushDuenoAdmins (rol legacy o visibilidad 'generales'). enviarPushAsesor ya espeja el push a
+    //     WhatsApp si el usuario tiene whatsapp_notif cargado y la cuenta tiene notif_dm_wa_on.
+    try {
+      const { data: _ases } = await supabase.from('asesores').select('auth_user_id, rol, visibilidad').eq('admin_id', user_id).eq('activo', true);
+      const _admins = (_ases || []).filter(function (a) { return a && a.auth_user_id && a.auth_user_id !== user_id && esAdministrador(a); });
+      for (let _i = 0; _i < _admins.length; _i++) {
+        try { await enviarPushAsesor(_admins[_i].auth_user_id, 'Lead en espera', null, _texto); } catch (eA) {}
+      }
+    } catch (eAdm) { /* sin administradores o error de lectura -> el aviso al dueno ya salio igual */ }
     // 3) Marcar el flag persistente (best-effort: si la columna no existe, falla en silencio).
     try { await supabase.from('conversations').update({ cola_avisada: true }).eq('id', convId); } catch (eMark) { /* columna ausente: el Set en memoria ya dedupea */ }
   } catch (e) { console.error('avisarDuenoColaSinAsesor:', e && e.message); }

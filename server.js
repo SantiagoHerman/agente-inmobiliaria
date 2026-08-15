@@ -22605,32 +22605,71 @@ async function geocodificarOSM(direccion, ciudad) {
 //
 // Sin cache a proposito: el cache de `geocode_cache` guarda UN resultado por consulta y aca hacen
 // falta varios. Es una busqueda manual, la dispara una persona escribiendo: el volumen es minimo.
+async function _osmBuscarCrudo(q, ciu, lim, etiquetaExtra) {
+  await _osmThrottle();
+  var url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&countrycodes=ar&limit=' + lim +
+    '&q=' + encodeURIComponent(q + (ciu ? ', ' + ciu : '') + ', Argentina');
+  var r = await fetchScrape(url, { headers: { 'User-Agent': _OSM_UA } });
+  if (!r.ok) return [];
+  var arr = await r.json();
+  if (!Array.isArray(arr)) return [];
+  return arr.map(function (x) {
+    var lat = parseFloat(x.lat), lng = parseFloat(x.lon);
+    if (isNaN(lat) || isNaN(lng)) return null;
+    var a = x.address || {};
+    var corto = [a.road ? (a.road + (a.house_number ? ' ' + a.house_number : '')) : null,
+                 a.city || a.town || a.village || a.suburb || null].filter(Boolean).join(', ')
+                || String(x.display_name || '').split(',').slice(0, 2).join(',');
+    return {
+      lat: lat, lng: lng,
+      display: String(x.display_name || ''),
+      corto: etiquetaExtra ? (corto + ' ' + etiquetaExtra) : corto,
+      tipo: String(x.type || '')
+    };
+  }).filter(Boolean);
+}
+
 async function buscarDireccionesOSM(texto, ciudad, limite) {
   try {
     var q = String(texto || '').trim();
     if (q.length < 3) return [];
     var ciu = String(ciudad || '').trim();
     var lim = Math.max(1, Math.min(parseInt(limite, 10) || 6, 10));
-    await _osmThrottle();
-    var url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&countrycodes=ar&limit=' + lim +
-      '&q=' + encodeURIComponent(q + (ciu ? ', ' + ciu : '') + ', Argentina');
-    var r = await fetchScrape(url, { headers: { 'User-Agent': _OSM_UA } });
-    if (!r.ok) return [];
-    var arr = await r.json();
-    if (!Array.isArray(arr)) return [];
-    return arr.map(function (x) {
-      var lat = parseFloat(x.lat), lng = parseFloat(x.lon);
-      if (isNaN(lat) || isNaN(lng)) return null;
-      var a = x.address || {};
-      return {
-        lat: lat, lng: lng,
-        display: String(x.display_name || ''),
-        // Etiqueta corta para la lista: la calle con altura si Nominatim la trae.
-        corto: [a.road ? (a.road + (a.house_number ? ' ' + a.house_number : '')) : null,
-                a.city || a.town || a.village || a.suburb || null].filter(Boolean).join(', ') || String(x.display_name || '').split(',').slice(0, 2).join(','),
-        tipo: String(x.type || '')
-      };
-    }).filter(Boolean);
+
+    var directo = await _osmBuscarCrudo(q, ciu, lim, '');
+    if (directo.length) return directo;
+
+    // ===== ESQUINAS: el caso que MAS importa en este inventario =====
+    // Nominatim NO resuelve intersecciones: "Avenida 3 y Paseo 104" devuelve 0, aunque cada calle
+    // por separado exista. Medido en produccion el 2026-08-15.
+    //
+    // Y las direcciones de este inventario estan escritas asi: "paseo 141 bis y av. 3",
+    // "alameda 309bis y calle 201". Es la forma normal de nombrar un lugar en la costa, donde
+    // muchisimas propiedades no tienen altura. Sin esto el buscador es inutil justo donde mas se usa.
+    //
+    // Que hace: parte por "y" / "esq" / "esquina" / "&" y busca CADA calle por separado, devolviendo
+    // las dos marcadas. La persona elige una y arrastra el pin hasta la esquina — que es una
+    // correccion de 20 metros, no de 20 cuadras. Es honesto: no inventamos el cruce, damos las dos
+    // calles reales y que decida el que conoce la propiedad.
+    var partes = q.split(/\s+(?:y|e|esq\.?|esquina|&)\s+/i)
+      .map(function (s) { return String(s || '').trim(); })
+      .filter(function (s) { return s.length >= 3; });
+    if (partes.length >= 2) {
+      var salida = [];
+      for (var i = 0; i < Math.min(partes.length, 2); i++) {
+        var res = await _osmBuscarCrudo(partes[i], ciu, 2, '· una calle de la esquina');
+        salida = salida.concat(res);
+      }
+      if (salida.length) return salida.slice(0, lim);
+    }
+
+    // Ultimo intento: sacar la altura. "Avenida 3 1200" anda, pero "Los Pinos 1450 Dto 3" no.
+    var sinAltura = q.replace(/\b\d+\s*(bis)?\b/gi, ' ').replace(/\s+/g, ' ').trim();
+    if (sinAltura.length >= 3 && sinAltura !== q) {
+      var res2 = await _osmBuscarCrudo(sinAltura, ciu, lim, '· sin la altura');
+      if (res2.length) return res2;
+    }
+    return [];
   } catch (e) { return []; }
 }
 

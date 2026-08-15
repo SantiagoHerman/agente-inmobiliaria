@@ -42618,6 +42618,39 @@ async function _cloudApiEsDueno(uid) {
   } catch (e) { return false; }
 }
 
+// ===== GATE DE SUSCRIPCION PARA CLOUD API =====
+//
+// El modulo Cloud API nacio SIN este chequeo: una cuenta suspendida, pausada o en la papelera podia
+// seguir configurando el canal oficial, crear plantillas en Meta y disparar /enviar-prueba. O sea
+// que un cliente que dejo de pagar seguia usando la infraestructura, y ademas creando activos en
+// Meta a nombre de Raices.
+//
+// NO se inventa un criterio nuevo: reusa `debeBloquearAcceso` (1389), la MISMA funcion con la que
+// el resto del sistema corta el WhatsApp saliente, mas los dos motivos que usa el cron de reportes
+// (papelera y crm_pausado). Un solo criterio de bloqueo en todo el sistema.
+//
+// SOLO se aplica a lo que ESCRIBE o GASTA. Los GET (estado, plantillas, catalogo) quedan abiertos a
+// proposito: una cuenta suspendida tiene que poder VER como quedo su canal — esconderselo no cobra
+// mas rapido y hace imposible el soporte.
+//
+// FAIL-OPEN, igual que el resto del sistema: si el chequeo no se puede resolver (error de red, tabla
+// ausente), NO se bloquea. Cortarle el canal a un cliente que SI paga por un hipo de la base es peor
+// que dejar pasar un rato a uno que no.
+async function _cloudApiBloqueado(ownerId) {
+  if (_pausaGlobal === true) return 'El sistema esta en pausa general.';
+  try {
+    const bs = await supabase.from('business_settings').select('crm_pausado, eliminado_at').eq('user_id', ownerId).maybeSingle();
+    if (bs && !bs.error && bs.data) {
+      if (bs.data.eliminado_at) return 'La cuenta esta en la papelera.';
+      if (bs.data.crm_pausado === true) return 'La cuenta esta pausada.';
+    }
+  } catch (eB) { /* no se pudo confirmar por esta via -> sigue al chequeo de suscripcion */ }
+  try {
+    if (await debeBloquearAcceso(ownerId)) return 'La suscripcion no esta activa. Revisa tu plan en el panel.';
+  } catch (eS) { /* fail-open a proposito */ }
+  return null;
+}
+
 // ===== Normalizar destinatario (solo digitos, como espera Meta) =====
 function _cloudApiNumero(n) { return String(n == null ? '' : n).replace(/[^0-9]/g, ''); }
 // AR (gotcha real): WhatsApp Cloud entrega el wa_id del ENTRANTE con el "9" (549 + area + numero = 13 digitos),
@@ -43474,6 +43507,7 @@ app.post('/api/cloud-api/conectar', async function(req, res) {
     if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede configurar la WhatsApp API oficial.' });
     const dueno = await _cloudApiDueno(uid);
     if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    { const _blq = await _cloudApiBloqueado(dueno); if (_blq) return res.status(402).json({ error: _blq, bloqueado: true }); }
 
     const b = req.body || {};
     const waba_id = b.waba_id ? String(b.waba_id).trim() : '';
@@ -43566,6 +43600,7 @@ app.post('/api/cloud-api/activar', async function(req, res) {
     if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede activar o desactivar la WhatsApp API oficial.' });
     const dueno = await _cloudApiDueno(uid);
     if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    { const _blq = await _cloudApiBloqueado(dueno); if (_blq) return res.status(402).json({ error: _blq, bloqueado: true }); }
 
     const b = req.body || {};
     if (typeof b.activo !== 'boolean') return res.status(400).json({ error: 'Falta el campo activo (true/false).' });
@@ -43755,6 +43790,7 @@ app.post('/api/cloud-api/catalogo/pedir', async function(req, res) {
     if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el titular de la cuenta puede pedir plantillas.', solo_dueno: true });
     const dueno = await _cloudApiDueno(uid);
     if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'La WhatsApp API oficial no esta activada en esta cuenta.' });
+    { const _blq = await _cloudApiBloqueado(dueno); if (_blq) return res.status(402).json({ error: _blq, bloqueado: true }); }
     const cfg = await _cloudApiConfigDeCuenta(dueno);
     if (!cfg || !cfg.waba_id || !cfg.token) return res.status(400).json({ error: 'Primero hay que conectar el numero: sin WABA y token no se pueden crear plantillas.' });
 
@@ -43803,6 +43839,7 @@ app.post('/api/cloud-api/plantillas', async function(req, res) {
     if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede crear plantillas de la WhatsApp API oficial.' });
     const dueno = await _cloudApiDueno(uid);
     if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    { const _blq = await _cloudApiBloqueado(dueno); if (_blq) return res.status(402).json({ error: _blq, bloqueado: true }); }
     const cfg = await _cloudApiConfigDeCuenta(dueno);
     if (!cfg) return res.status(400).json({ error: 'No hay un numero conectado.' });
     if (!cfg.waba_id) return res.status(400).json({ error: 'La conexion no tiene WABA ID cargado (hace falta para crear plantillas).' });
@@ -43895,6 +43932,7 @@ app.post('/api/cloud-api/enviar-prueba', async function(req, res) {
     if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede enviar mensajes de prueba.' });
     const dueno = await _cloudApiDueno(uid);
     if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    { const _blq = await _cloudApiBloqueado(dueno); if (_blq) return res.status(402).json({ error: _blq, bloqueado: true }); }
     const b = req.body || {};
     if (!b.destinatario) return res.status(400).json({ error: 'Falta el destinatario' });
     if (!b.plantilla) return res.status(400).json({ error: 'Falta la plantilla' });
@@ -43960,6 +43998,7 @@ app.post('/api/cloud-api/embedded-signup', async function(req, res) {
     if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el dueño de la cuenta puede conectar la WhatsApp API oficial.' });
     const dueno = await _cloudApiDueno(uid);
     if (!(await cloudApiActivo(dueno))) return res.status(403).json({ error: 'El modulo de WhatsApp API oficial no esta habilitado en esta cuenta.' });
+    { const _blq = await _cloudApiBloqueado(dueno); if (_blq) return res.status(402).json({ error: _blq, bloqueado: true }); }
     if (!META_APP_ID || !META_APP_SECRET) return res.status(503).json({ error: 'Falta configurar credenciales de Meta (META_APP_ID / META_APP_SECRET) en el backend.' });
     const b = req.body || {};
     const code = b.code ? String(b.code) : '';

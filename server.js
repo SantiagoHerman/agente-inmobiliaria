@@ -44237,6 +44237,370 @@ function _impEstimar(origen, cantidad) {
   return { modelo: m.nombre, modelo_id: m.modelo, por_que: m.por_que, tokens_estimados: tokIn + tokOut, costo_estimado: Math.round(costo * 10000) / 10000 };
 }
 
+// ============================================================================================
+// EL MOTOR DE LECTURA — lo que le faltaba a la Fase 10 (Diego 2026-08-15)
+// --------------------------------------------------------------------------------------------
+// Hasta hoy este modulo sabia presupuestar, cobrar la aprobacion y aplicar lo aprobado, pero NO
+// habia nada que LEYERA el material: un lote aprobado se quedaba en 'aprobado' para siempre.
+// Esto es el pedazo que faltaba.
+//
+// COMO CORRE: /aprobar dispara _impProcesarLote EN SEGUNDO PLANO — leer 300 filas o 20 fotos
+// puede tardar minutos y la respuesta HTTP no puede quedarse esperando. El lote viaja
+// aprobado -> procesando -> listo | error, y el front lo sigue con el GET de siempre.
+//
+// LAS TRES REGLAS DEL MODULO QUEDAN INTACTAS:
+//   1. Solo procesa lotes en estado 'aprobado' (el candado del gasto no se toca).
+//   2. Todo lo leido cae en import_items 'pendiente'. NADA escribe en `contacts`.
+//   3. Si un dato propuesto reemplazaria un valor que YA existe y es distinto -> pisa_manual=true.
+// ============================================================================================
+
+const _IMP_MAX_BYTES = 20 * 1024 * 1024;   // tope por archivo: protege la memoria del server
+const _IMP_FILAS_POR_LLAMADA = 60;         // tablas: filas por llamada (tandas mas grandes se truncan)
+const _IMP_MAX_ITEMS = 2000;               // techo duro de items por lote
+
+// Telefono COMPARABLE: solo digitos y los ultimos 10, asi "+54 9 223 562-4061" y "2235624061" son
+// el mismo numero. Es solo para comparar — el telefono se guarda tal cual vino.
+function _impNormTel(t) {
+  var d = String(t || '').replace(/\D/g, '');
+  return d.length > 10 ? d.slice(-10) : d;
+}
+
+function _impDesescaparXml(s) {
+  return String(s || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'").replace(/&#(\d+);/g, function (_m, n) { return String.fromCharCode(parseInt(n, 10)); })
+    .replace(/&amp;/g, '&');   // el &amp; va ULTIMO o desarma las otras entidades
+}
+
+// Lector minimo de ZIP — un .xlsx ES un zip con XMLs adentro. Se hace a mano A PROPOSITO: sumarle
+// una dependencia nueva a un backend en produccion solo para leer una planilla no vale el riesgo,
+// y para sacar el texto de las celdas alcanza con esto. zlib ya viene con Node.
+function _impUnzip(buf) {
+  var zlib = require('zlib');
+  var out = {};
+  // El "End of Central Directory" vive al final del archivo: se busca su firma hacia atras.
+  var eocd = -1;
+  for (var i = buf.length - 22; i >= 0 && i > buf.length - 65558; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('El archivo no parece un .xlsx valido.');
+  var nEntradas = buf.readUInt16LE(eocd + 10);
+  var pos = buf.readUInt32LE(eocd + 16);
+  for (var e = 0; e < nEntradas; e++) {
+    if (pos + 46 > buf.length || buf.readUInt32LE(pos) !== 0x02014b50) break;
+    var metodo = buf.readUInt16LE(pos + 10);
+    var compSize = buf.readUInt32LE(pos + 20);
+    var lenNom = buf.readUInt16LE(pos + 28);
+    var lenExtra = buf.readUInt16LE(pos + 30);
+    var lenCom = buf.readUInt16LE(pos + 32);
+    var offLocal = buf.readUInt32LE(pos + 42);
+    var nombre = buf.toString('utf8', pos + 46, pos + 46 + lenNom);
+    try {
+      // El header LOCAL repite los largos y pueden diferir del central -> hay que releerlos ahi.
+      var lnNom = buf.readUInt16LE(offLocal + 26);
+      var lnExtra = buf.readUInt16LE(offLocal + 28);
+      var ini = offLocal + 30 + lnNom + lnExtra;
+      var datos = buf.slice(ini, ini + compSize);
+      out[nombre] = (metodo === 0) ? datos : zlib.inflateRawSync(datos);
+    } catch (eD) { /* entrada ilegible: se saltea y el resto del zip sigue sirviendo */ }
+    pos += 46 + lenNom + lenExtra + lenCom;
+  }
+  return out;
+}
+
+// .xlsx -> filas de texto separadas por tabulacion (una fila por linea).
+function _impXlsxAFilas(buf) {
+  var z = _impUnzip(buf);
+  // sharedStrings: Excel guarda los textos repetidos UNA vez y las celdas apuntan por indice.
+  var compartidas = [];
+  if (z['xl/sharedStrings.xml']) {
+    var xml = z['xl/sharedStrings.xml'].toString('utf8');
+    var reSi = /<si>([\s\S]*?)<\/si>/g, ms;
+    while ((ms = reSi.exec(xml))) {
+      // Un <si> puede traer varios <t> (texto con formato mezclado): se concatenan.
+      var partes = ms[1].match(/<t[^>]*>([\s\S]*?)<\/t>/g) || [];
+      compartidas.push(partes.map(function (p) { return _impDesescaparXml(p.replace(/<[^>]+>/g, '')); }).join(''));
+    }
+  }
+  // Con la primera hoja alcanza: una lista de contactos no vive repartida en cinco pestañas.
+  var hojaKey = Object.keys(z).filter(function (k) { return /^xl\/worksheets\/sheet\d+\.xml$/.test(k); }).sort()[0];
+  if (!hojaKey) throw new Error('El .xlsx no tiene hojas legibles.');
+  var hoja = z[hojaKey].toString('utf8');
+  var filas = [];
+  var reFila = /<row[^>]*>([\s\S]*?)<\/row>/g, mf;
+  while ((mf = reFila.exec(hoja))) {
+    var celdas = [];
+    var reC = /<c([^>]*)\/>|<c([^>]*)>([\s\S]*?)<\/c>/g, mc;
+    while ((mc = reC.exec(mf[1]))) {
+      var attrs = mc[1] || mc[2] || '';
+      var cuerpo = mc[3] || '';
+      var tipo = (attrs.match(/\bt="([^"]+)"/) || [])[1] || '';
+      var val = '';
+      if (tipo === 's') {
+        var idx = parseInt((cuerpo.match(/<v>([\s\S]*?)<\/v>/) || [])[1], 10);
+        val = (idx >= 0 && compartidas[idx] != null) ? compartidas[idx] : '';
+      } else if (tipo === 'inlineStr') {
+        var ts = cuerpo.match(/<t[^>]*>([\s\S]*?)<\/t>/g) || [];
+        val = ts.map(function (p) { return _impDesescaparXml(p.replace(/<[^>]+>/g, '')); }).join('');
+      } else {
+        val = _impDesescaparXml((cuerpo.match(/<v>([\s\S]*?)<\/v>/) || [])[1] || '');
+      }
+      celdas.push(String(val).replace(/[\r\n\t]+/g, ' ').trim());
+    }
+    if (celdas.some(function (c) { return c !== ''; })) filas.push(celdas.join('\t'));
+  }
+  return filas;
+}
+
+async function _impDescargar(url) {
+  var ctrl = new AbortController();
+  var reloj = setTimeout(function () { ctrl.abort(); }, 60000);
+  try {
+    var r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error('No se pudo bajar el archivo (HTTP ' + r.status + ')');
+    var largo = parseInt(r.headers.get('content-length') || '0', 10);
+    if (largo && largo > _IMP_MAX_BYTES) throw new Error('El archivo pesa mas de 20 MB.');
+    var ab = await r.arrayBuffer();
+    if (ab.byteLength > _IMP_MAX_BYTES) throw new Error('El archivo pesa mas de 20 MB.');
+    return { buf: Buffer.from(ab), mime: String(r.headers.get('content-type') || '').split(';')[0].trim() };
+  } finally { clearTimeout(reloj); }
+}
+
+function _impMimePorNombre(n) {
+  if (/\.png$/.test(n)) return 'image/png';
+  if (/\.webp$/.test(n)) return 'image/webp';
+  if (/\.gif$/.test(n)) return 'image/gif';
+  return 'image/jpeg';
+}
+
+// Parte el material en TANDAS: cada tanda es UNA llamada al modelo. Se parte a proposito — mandar
+// 800 filas juntas da respuestas truncadas y termina saliendo mas caro por los reintentos.
+function _impTandasDe(origen, bajado, arch) {
+  var nombre = String((arch && arch.nombre) || '').toLowerCase();
+
+  if (origen === 'imagen') {
+    var mt = (bajado.mime && /^image\//.test(bajado.mime)) ? bajado.mime : _impMimePorNombre(nombre);
+    // UNA foto por llamada: la hoja de un cuaderno es densa y mezclar dos confunde al modelo.
+    return [[
+      { type: 'image', source: { type: 'base64', media_type: mt, data: bajado.buf.toString('base64') } },
+      { type: 'text', text: 'Leé esta foto y devolvé los contactos que encuentres.' }
+    ]];
+  }
+  if (origen === 'pdf') {
+    return [[
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: bajado.buf.toString('base64') } },
+      { type: 'text', text: 'Leé este PDF y devolvé los contactos que encuentres.' }
+    ]];
+  }
+
+  // csv / excel -> filas de texto. Si dice ser excel pero en realidad es un csv (pasa seguido
+  // cuando alguien renombra el archivo), el catch lo lee como texto plano en vez de fallar.
+  var filas = null;
+  if (origen === 'excel' || /\.xlsx?$/.test(nombre)) {
+    try { filas = _impXlsxAFilas(bajado.buf); } catch (eX) { filas = null; }
+  }
+  if (!filas) {
+    filas = bajado.buf.toString('utf8').split(/\r?\n/).filter(function (l) { return l.trim() !== ''; });
+  }
+  var tandas = [];
+  // La primera fila suele ser el encabezado: se REPITE en cada tanda para que el modelo sepa que
+  // significa cada columna aunque la tanda arranque por el medio de la planilla.
+  var encabezado = filas.length ? filas[0] : '';
+  for (var i = 0; i < filas.length; i += _IMP_FILAS_POR_LLAMADA) {
+    var trozo = filas.slice(i, i + _IMP_FILAS_POR_LLAMADA);
+    if (i > 0 && encabezado) trozo = [encabezado].concat(trozo);
+    tandas.push([{ type: 'text', text: 'Tabla (columnas separadas por tabulacion):\n\n' + trozo.join('\n') }]);
+  }
+  return tandas;
+}
+
+const _IMP_PROMPT = [
+  'Ordenás material viejo de una inmobiliaria para cargarlo al CRM. Te paso material crudo (una',
+  'tabla, un PDF o la foto de un cuaderno) y devolvés los CONTACTOS que encuentres.',
+  '',
+  'REGLAS:',
+  '- NO INVENTES NADA. Si un dato no está, dejalo vacío. Es mil veces preferible un contacto con',
+  '  solo el teléfono que uno con datos imaginados: esto se carga en la base de un cliente real.',
+  '- Un objeto por PERSONA. Si la misma persona aparece dos veces, unificala en una sola.',
+  '- El teléfono es lo más importante: copialo TAL CUAL está escrito, con el formato que tenga.',
+  '- Si una fila no tiene ni nombre ni teléfono, ignorala (es un encabezado, un total o una nota).',
+  '- `notas` es para lo que no entra en ningún campo: qué buscaba, cuándo llamó, referencias.',
+  '- Si algo se lee mal, ponelo igual y bajá `confianza`. Un humano revisa TODO antes de guardarse.',
+  '',
+  'Devolvé SOLO este JSON, sin una palabra alrededor:',
+  '{"contactos":[{"nombre":"","telefono":"","email":"","interes":"","presupuesto":"","ciudad":"","provincia":"","empresa":"","documento":"","notas":"","confianza":0.0}]}',
+  'Si no encontrás ningún contacto: {"contactos":[]}'
+].join('\n');
+
+// El modelo a veces envuelve el JSON en ``` o le pone una frase adelante. Se busca el objeto por
+// llaves en vez de confiar en que la respuesta sea JSON puro.
+function _impParsearJson(txt) {
+  var s = String(txt || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  var ini = s.indexOf('{'), fin = s.lastIndexOf('}');
+  if (ini < 0 || fin <= ini) return [];
+  try {
+    var o = JSON.parse(s.slice(ini, fin + 1));
+    return Array.isArray(o && o.contactos) ? o.contactos : [];
+  } catch (e) { return []; }
+}
+
+async function _impLeerConIA(modeloId, bloques) {
+  var r = await llamarIAConFailover({
+    model: modeloId,
+    max_tokens: 8000,
+    system: _IMP_PROMPT,
+    messages: [{ role: 'user', content: bloques }]
+  }, 'importacion');
+  var txt = '';
+  try { (r.content || []).forEach(function (b) { if (b.type === 'text') txt += b.text; }); } catch (e) {}
+  return { contactos: _impParsearJson(txt), usage: (r && r.usage) || {} };
+}
+
+// Indice de los contactos que YA tiene la cuenta, por telefono comparable. Pagina de a 1000 porque
+// PostgREST corta ahi en silencio y Anton tiene 1.2k: sin paginar, los del final "no existirian" y
+// se cargarian duplicados.
+async function _impIndicePorTelefono(ownerId) {
+  var idx = {}, desde = 0;
+  for (;;) {
+    var r = await supabase.from('contacts')
+      .select('id, name, phone, email, interest, budget, ciudad, provincia, empresa, documento, notes')
+      .eq('user_id', ownerId).range(desde, desde + 999);
+    if (r.error || !r.data || !r.data.length) break;
+    r.data.forEach(function (c) { var t = _impNormTel(c.phone); if (t && !idx[t]) idx[t] = c; });
+    if (r.data.length < 1000) break;
+    desde += 1000;
+  }
+  return idx;
+}
+
+// Los campos que el paso de aplicado sabe escribir. Mantener esta lista alineada con /aplicar:
+// proponer un campo que despues no se guarda seria mentirle al que aprueba.
+const _IMP_CAMPOS = {
+  nombre: 'name', telefono: 'phone', email: 'email', interes: 'interest', presupuesto: 'budget',
+  ciudad: 'ciudad', provincia: 'provincia', empresa: 'empresa', documento: 'documento', notas: 'notes'
+};
+
+// Decide si lo leido es un contacto NUEVO o una ACTUALIZACION de uno que ya existe, y arma el diff
+// que el humano va a ver. Devuelve null cuando no hay nada que ofrecer.
+function _impResolverItem(c, indiceTel) {
+  var propuesto = {};
+  Object.keys(_IMP_CAMPOS).forEach(function (k) {
+    var v = c && c[k];
+    if (v != null && String(v).trim() !== '') propuesto[k] = String(v).trim().slice(0, 1000);
+  });
+  // Sin nombre NI telefono no hay contacto que cargar.
+  if (!propuesto.nombre && !propuesto.telefono) return null;
+
+  var tel = _impNormTel(propuesto.telefono);
+  var existente = tel ? indiceTel[tel] : null;
+  if (!existente) return { tipo: 'contacto_nuevo', contact_id: null, propuesto: propuesto, actual: null, pisa_manual: false };
+
+  // Ya existe. El telefono se saca de la propuesta: es POR EL telefono que lo encontramos, asi que
+  // volver a proponerlo solo lograria marcar un falso "pisa_manual" por diferencia de formato.
+  delete propuesto.telefono;
+  var actual = {}, aporta = false, pisa = false;
+  Object.keys(propuesto).forEach(function (k) {
+    var hoy = existente[_IMP_CAMPOS[k]];
+    var vacio = (hoy == null || String(hoy).trim() === '');
+    actual[k] = vacio ? null : String(hoy);
+    if (vacio) { aporta = true; return; }
+    if (String(hoy).trim().toLowerCase() !== String(propuesto[k]).trim().toLowerCase()) { aporta = true; pisa = true; }
+  });
+  // No aporta nada nuevo -> no se le hace perder el tiempo al que revisa.
+  if (!aporta) return null;
+  return { tipo: 'actualizacion', contact_id: existente.id, propuesto: propuesto, actual: actual, pisa_manual: pisa };
+}
+
+// Guarda el motivo del fallo. La columna `error` de import_lotes es NUEVA: si todavia no se corrio
+// la migracion, se reintenta sin ella (mismo patron deploy-safe que el resto del archivo) y el
+// motivo queda al menos en el log.
+async function _impMarcarError(loteId, motivo) {
+  var base = { estado: 'error', actualizado_at: new Date().toISOString() };
+  try {
+    var r = await supabase.from('import_lotes')
+      .update(Object.assign({}, base, { error: String(motivo || '').slice(0, 500) })).eq('id', loteId);
+    if (r.error && _esColumnaAusente(r.error)) await supabase.from('import_lotes').update(base).eq('id', loteId);
+  } catch (e) {
+    try { await supabase.from('import_lotes').update(base).eq('id', loteId); } catch (e2) {}
+  }
+}
+
+// EL ORQUESTADOR. Corre en segundo plano; nunca tira para arriba (si explota, el lote queda en
+// 'error' con el motivo y el resto del sistema ni se entera).
+async function _impProcesarLote(loteId) {
+  var lote = null;
+  try {
+    // Se relee con estado='aprobado' como candado: si el motor se dispara dos veces, la segunda no
+    // encuentra nada que hacer y no se gasta dos veces.
+    var q = await supabase.from('import_lotes').select('*').eq('id', loteId).eq('estado', 'aprobado').maybeSingle();
+    if (q.error || !q.data) return;
+    lote = q.data;
+    await supabase.from('import_lotes').update({ estado: 'procesando', actualizado_at: new Date().toISOString() }).eq('id', lote.id);
+
+    var origen = String(lote.origen || '').toLowerCase();
+    var m = _impModeloPara(origen);
+    var archivos = Array.isArray(lote.archivos) ? lote.archivos : [];
+    if (!archivos.length) { await _impMarcarError(lote.id, 'El lote no tiene archivos para leer.'); return; }
+
+    var indiceTel = await _impIndicePorTelefono(lote.user_id);
+    var tokIn = 0, tokOut = 0, items = 0, fallosIA = 0, vistos = {};
+
+    for (var a = 0; a < archivos.length && items < _IMP_MAX_ITEMS; a++) {
+      var arch = archivos[a];
+      if (!arch || !arch.url) continue;
+      var tandas;
+      try {
+        var bajado = await _impDescargar(arch.url);
+        tandas = _impTandasDe(origen, bajado, arch);
+      } catch (eArch) {
+        console.error('[importacion] lote ' + lote.id + ' archivo "' + (arch.nombre || '?') + '": ' + (eArch && eArch.message));
+        continue;   // un archivo ilegible no tumba el lote entero
+      }
+
+      for (var t = 0; t < tandas.length && items < _IMP_MAX_ITEMS; t++) {
+        var leido;
+        try {
+          leido = await _impLeerConIA(m.modelo, tandas[t]);
+        } catch (eIA) {
+          fallosIA++;
+          console.error('[importacion] lote ' + lote.id + ' tanda ' + (t + 1) + '/' + tandas.length + ': ' + (eIA && eIA.message));
+          continue;
+        }
+        tokIn += (leido.usage.input_tokens || 0);
+        tokOut += (leido.usage.output_tokens || 0);
+
+        for (var k = 0; k < leido.contactos.length && items < _IMP_MAX_ITEMS; k++) {
+          var res = _impResolverItem(leido.contactos[k], indiceTel);
+          if (!res) continue;
+          // Dedupe DENTRO del lote: el mismo telefono en dos hojas no genera dos items.
+          var clave = _impNormTel(res.propuesto.telefono) || ('n:' + String(res.propuesto.nombre || '').trim().toLowerCase());
+          if (!clave || vistos[clave]) continue;
+          vistos[clave] = true;
+          var ins = await supabase.from('import_items').insert({
+            lote_id: lote.id, user_id: lote.user_id, tipo: res.tipo, contact_id: res.contact_id,
+            propuesto: res.propuesto, actual: res.actual, pisa_manual: res.pisa_manual, estado: 'pendiente'
+          });
+          if (ins.error) { console.error('[importacion] insert item: ' + ins.error.message); continue; }
+          items++;
+        }
+      }
+    }
+
+    // Costo REAL medido sobre los tokens que efectivamente se usaron (no el estimado).
+    var costo = (tokIn / 1000000) * m.precio.in + (tokOut / 1000000) * m.precio.out;
+    await supabase.from('import_lotes').update({
+      estado: 'listo',
+      total_items: items,
+      costo_real: Math.round(costo * 10000) / 10000,
+      actualizado_at: new Date().toISOString()
+    }).eq('id', lote.id);
+    console.log('[importacion] lote ' + lote.id + ' LISTO: ' + items + ' items para revisar, USD ' +
+      costo.toFixed(4) + ' real (estimado ' + lote.costo_estimado + ')' + (fallosIA ? ' — ' + fallosIA + ' tandas fallaron' : ''));
+  } catch (e) {
+    console.error('[importacion] lote ' + loteId + ' FALLO: ' + (e && e.message));
+    await _impMarcarError(loteId, (e && e.message) || 'Error desconocido');
+  }
+}
+
 // POST /api/importacion/presupuesto { nombre, origen, archivos:[...], cantidad, etiqueta_lote }
 // NO GASTA NADA. Solo cuenta y presupuesta. Devuelve el numero que el cliente tiene que aprobar.
 app.post('/api/importacion/presupuesto', async function (req, res) {
@@ -44295,7 +44659,15 @@ app.post('/api/importacion/:id/aprobar', async function (req, res) {
     if (!lote) return res.status(409).json({ error: 'Ese lote no esta esperando aprobacion (o ya se aprobo).' });
 
     console.log('[importacion] lote ' + lote.id + ' APROBADO por ' + uid + ' — hasta aca no se gasto nada; empieza el procesamiento');
-    return res.json({ ok: true, lote_id: lote.id, estado: 'aprobado', costo_estimado: lote.costo_estimado });
+
+    // EL MOTOR ARRANCA ACA, en segundo plano. Leer 300 filas o 20 fotos puede tardar minutos y la
+    // respuesta HTTP no puede quedarse esperando: el front sigue el avance con el GET del lote
+    // (aprobado -> procesando -> listo | error).
+    setImmediate(function () {
+      _impProcesarLote(lote.id).catch(function (e) { console.error('[importacion] motor:', e && e.message); });
+    });
+
+    return res.json({ ok: true, lote_id: lote.id, estado: 'procesando', costo_estimado: lote.costo_estimado });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -44369,6 +44741,12 @@ app.post('/api/importacion/:id/aplicar', async function (req, res) {
           if (p.interes) fila.interest = p.interes;
           if (p.presupuesto) fila.budget = p.presupuesto;
           if (p.ciudad) fila.ciudad = p.ciudad;
+          // Estos cuatro se agregaron con el motor de lectura (2026-08-15): la IA los venia leyendo
+          // del material y se descartaban en silencio al guardar.
+          if (p.provincia) fila.provincia = p.provincia;
+          if (p.empresa) fila.empresa = p.empresa;
+          if (p.documento) fila.documento = p.documento;
+          if (p.notas) fila.notes = p.notas;
           if (_etq) fila.etiquetas = _etq;
           const { error } = await supabase.from('contacts').insert(fila);
           if (error) { fallidos++; await supabase.from('import_items').update({ estado: 'error', error: error.message }).eq('id', it.id); continue; }
@@ -44381,7 +44759,7 @@ app.post('/api/importacion/:id/aplicar', async function (req, res) {
           if (!act) { fallidos++; continue; }
           const upd = {};
           const _vac = function (v) { return v == null || String(v).trim() === ''; };
-          const _mapa = { email: 'email', interes: 'interest', presupuesto: 'budget', ciudad: 'ciudad', provincia: 'provincia', empresa: 'empresa', documento: 'documento' };
+          const _mapa = { email: 'email', interes: 'interest', presupuesto: 'budget', ciudad: 'ciudad', provincia: 'provincia', empresa: 'empresa', documento: 'documento', notas: 'notes' };
           Object.keys(_mapa).forEach(function (k) {
             const col = _mapa[k];
             if (p[k] && (_vac(act[col]) || it.pisa_manual === true)) upd[col] = String(p[k]).slice(0, 500);

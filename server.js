@@ -6637,10 +6637,17 @@ function _ragNorm(s) {
 // Cache del sondeo de esquema de las columnas *_moneda (null = sin sondear, true/false = resultado).
 // Evita un query fallido por cada mensaje del agente mientras la migracion no este corrida.
 let _monColsOk = null, _monColsTs = 0;
+// MONEDAS RECONOCIDAS (Diego 2026-08-15: "pesos, dolares, euros y bitcoin o alguna cripto — que sea
+// amplio"). Espejo de `MONEDAS` en lib/ui.tsx del front: si se agrega una alla, se agrega aca.
+//
+// OJO CON EL BUG QUE ESTO ARREGLA: antes cualquier moneda que no fuera USD/ARS caia al DEFAULT de la
+// operacion — un precio cargado en EUR se le cotizaba al lead como "USD ..." o "$...". Mismo tipo de
+// incidente que el del scraper (la IA cotizando en la moneda equivocada), pero del lado del prompt.
+var _MON_PREFIJOS = { USD: 'USD ', ARS: '$', EUR: 'EUR ', PYG: 'Gs ', BTC: 'BTC ', USDT: 'USDT ' };
 function _monPrefijo(col, defCodigo) {
   var m = String(col == null ? '' : col).trim().toUpperCase();
-  if (m !== 'USD' && m !== 'ARS') m = String(defCodigo || 'USD').toUpperCase();
-  return (m === 'USD') ? 'USD ' : '$';
+  if (!_MON_PREFIJOS[m]) m = String(defCodigo || 'USD').toUpperCase();
+  return _MON_PREFIJOS[m] || 'USD ';
 }
 // Operaciones ACTIVAS de una propiedad (MISMA logica que el armado del inventario del prompt: venta no vendida,
 // anual no alquilada, temporal). Devuelve [{op,label,precio(Number),moneda,raw,sufijo}].
@@ -14914,7 +14921,7 @@ function _mtchPrecioMoneda(p) {
       var c = cands[i];
       if (!c.on || c.v == null || c.v === '') continue;
       var n = Number(c.v);
-      if (isFinite(n) && n > 0) return { precio: n, moneda: (c.m === 'USD' || c.m === 'ARS') ? c.m : null };
+      if (isFinite(n) && n > 0) return { precio: n, moneda: _MON_PREFIJOS[String(c.m || '').toUpperCase()] ? String(c.m).toUpperCase() : null };
     }
     if (typeof p.price === 'number' && isFinite(p.price)) return { precio: p.price, moneda: null };
     var nums = _ppNumeros(String(p.price == null ? '' : p.price));
@@ -36175,6 +36182,10 @@ function _sInvMoneda(v){
   var m = String(v == null ? '' : v).trim().toUpperCase();
   if (m === 'USD' || m === 'U$S' || m === 'US$' || m === 'U$D' || m === 'DOLAR' || m === 'DOLARES') return 'USD';
   if (m === 'ARS' || m === '$' || m === 'PESO' || m === 'PESOS') return 'ARS';
+  // EUR se reconoce para que un sitio que publica en euros no caiga al default y se cotice mal
+  // (mismo bug que _monPrefijo tenia). Cripto NO va aca a proposito: esto parsea texto de sitios
+  // inmobiliarios scrapeados, y ahi un "BTC" suelto es mas probable que sea ruido que un precio.
+  if (m === 'EUR' || m === '€' || m === 'EURO' || m === 'EUROS') return 'EUR';
   return null;
 }
 function _sInvChequearPrecios(fila, it, tieneCols){

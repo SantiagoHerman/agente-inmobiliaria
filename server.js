@@ -38459,15 +38459,41 @@ app.patch('/api/maestro/empleados/:id', async function(req, res){
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 
-// Baja LOGICA de un empleado (activo=false) + revoca todas sus sesiones vivas. Nunca DELETE.
+// PAUSAR un empleado (activo=false) + revoca todas sus sesiones vivas. Nunca DELETE: la fila queda
+// entera (usuario, clave, 2FA, permisos) para poder reactivarlo despues sin rehacer nada.
+// El corte es INMEDIATO por dos puertas: requiereSeccion() lo saca de las sesiones abiertas apenas
+// pide algo, y el login filtra por activo=true asi que tampoco puede volver a entrar.
+// La ruta sigue llamandose /baja por compatibilidad con el front ya desplegado; en pantalla la
+// palabra es "pausar", que es lo que realmente hace.
 app.post('/api/maestro/empleados/:id/baja', async function(req, res){
   try{
     if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
     var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
     var up = await supabase.from('maestro_usuarios').update({ activo: false }).eq('id', req.params.id);
-    if (up && up.error) return res.status(503).json({ error: 'No se pudo dar de baja: ' + up.error.message });
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo pausar: ' + up.error.message });
     try { await supabase.from('maestro_sesiones').update({ revocada: true, revocada_por: 'superadmin', revocada_at: new Date().toISOString() }).eq('maestro_usuario_id', req.params.id).eq('revocada', false); } catch(eR){}
-    return res.json({ ok: true });
+    console.log('[maestro] empleado ' + req.params.id + ' PAUSADO (sesiones revocadas)');
+    return res.json({ ok: true, activo: false });
+  }catch(e){ return res.status(500).json({ error: e && e.message }); }
+});
+
+// REACTIVAR un empleado pausado (activo=true). Era el camino de vuelta que faltaba: hasta hoy
+// pausar a alguien era un viaje de ida y la unica forma de revertirlo era entrar a la base a mano.
+//
+// NO se le reabren las sesiones viejas a proposito: quedan revocadas y tiene que volver a entrar
+// con su clave y su 2FA. Reactivar da permiso a entrar, no devuelve una sesion que ya se cerro.
+// Conserva TODO lo suyo: usuario, clave, secreto 2FA y permisos por seccion — no hay que rehacer
+// nada ni volver a escanear el QR.
+app.post('/api/maestro/empleados/:id/alta', async function(req, res){
+  try{
+    if (!MAESTRO_ENABLED || !maestroAuth(req)) return res.status(401).json({ error: 'No autorizado' });
+    var _g = await requiereSeccion(req, '__admin__'); if (_g) return res.status(_g.status).json({ error: _g.error });
+    var up = await supabase.from('maestro_usuarios').update({ activo: true }).eq('id', req.params.id)
+      .select('id, usuario, permisos, activo, totp_confirmado, inactividad_min, tope_abs_min').maybeSingle();
+    if (up && up.error) return res.status(503).json({ error: 'No se pudo reactivar: ' + up.error.message });
+    if (!up.data) return res.status(404).json({ error: 'Empleado no encontrado' });
+    console.log('[maestro] empleado ' + req.params.id + ' REACTIVADO (tiene que volver a loguearse)');
+    return res.json({ ok: true, activo: true, empleado: up.data });
   }catch(e){ return res.status(500).json({ error: e && e.message }); }
 });
 

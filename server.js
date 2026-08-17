@@ -18444,9 +18444,11 @@ async function procesarOportunidades() {
   try {
     const ahoraMs = Date.now();
     const ahoraIso = new Date().toISOString();
-    const CAP_TANDA = 4;         // tope DURO de envios por tanda por oportunidad (anti-baneo), igual que recontacto v2
-    const GAP_MIN_MS = 45000;    // gap 45-120s entre envios (anti-baneo), igual que recontacto v2
-    const GAP_RANGO_MS = 75000;
+    const CAP_TANDA = 2;         // tope DURO por tanda. Baja de 4 a 2: con el goteo la tanda ya sale chica,
+                                 // esto es solo la red por si el calculo diera alto (Diego: "pinta spam").
+    const GAP_MIN_MS = 90000;    // gap 90-210s entre envios. Antes 45-120s: cuatro seguidos entraban en 4
+                                 // minutos y se leia como una rafaga automatica, que es lo que se banea.
+    const GAP_RANGO_MS = 120000;   // 90s + 0..120s = entre 1m30 y 3m30 entre mensajes
     const hoyStr = (function(){ const a = new Date(); const u = a.getTime() + a.getTimezoneOffset()*60000; const arg = new Date(u - 3*60*60000); return arg.toISOString().slice(0,10); })();
 
     // 1) Traer oportunidades ACTIVAS (en_cola/enviando) de todo el sistema, ordenadas por prioridad. Si la tabla no
@@ -18478,7 +18480,10 @@ async function procesarOportunidades() {
         // Config de la cuenta (flag + horario + pausas). 1 sola lectura por cuenta.
         let bs = _bsCache[uid];
         if (bs === undefined) {
-          try { const { data } = await supabase.from('business_settings').select('user_id, oportunidades_v1, horario_oficina, crm_pausado, agente_pausado, eliminado_at').eq('user_id', uid).maybeSingle(); bs = data || null; }
+          // `recontacto_warmup_dia` y `recontacto_tope_max`: el warm-up se COMPARTE con recontacto.
+          // Los envios salen del MISMO WhatsApp, asi que calentar el numero por separado en cada
+          // modulo seria mentirse: la rampa tiene que ser una sola por cuenta.
+          try { const { data } = await supabase.from('business_settings').select('user_id, oportunidades_v1, horario_oficina, crm_pausado, agente_pausado, eliminado_at, recontacto_warmup_dia, recontacto_tope_max').eq('user_id', uid).maybeSingle(); bs = data || null; }
           catch (eBs) { bs = null; }
           _bsCache[uid] = bs;
         }
@@ -18555,9 +18560,27 @@ async function procesarOportunidades() {
         const cupoDiaRestante = Math.min(Math.max(0, maxDia - enviadosHoy), _cupoCuenta);
         if (cupoDiaRestante <= 0) continue; // ya cumplio el cupo del dia -> nada mas hoy (retoma manana)
 
-        // Cuantos mandar en ESTA tanda: min(CAP por tanda, cupo del dia restante).
-        const nTanda = Math.min(CAP_TANDA, cupoDiaRestante);
-        if (nTanda <= 0) continue;
+        // ===== GOTEO Y WARM-UP, IGUAL QUE RECONTACTO (Diego 2026-08-17) =====
+        // "de oportunidades salieron 4 mensajes uno atras del otro, eso no tiene goteo, pinta spam."
+        // Tenia razon: salieron 17:02, 17:04, 17:05 y 17:06. El viejo `min(CAP_TANDA, cupo)` mandaba
+        // los 4 de la tanda de una y despues silencio 15 minutos. Eso no es goteo, es una rafaga.
+        //
+        // AHORA es el MISMO metodo que recontacto v2: repartir el cupo que queda del dia entre las
+        // tandas que quedan de la franja horaria, con +-40% de aleatorio para que no salgan a
+        // intervalos de reloj. Que una tanda mande CERO es normal y buscado.
+        //
+        // WARM-UP: se comparte el dia de actividad de la cuenta (`recontacto_warmup_dia`), asi un
+        // numero nuevo no arranca mandando el tope el primer dia. Es el MISMO contador: los envios
+        // salen del mismo WhatsApp, calentarlo por separado en cada modulo no tendria sentido.
+        const _minRest = _minutosRestantesFranja(op.horario === 'siempre' ? null : (_horarioOwner || { desde: '9:00', hasta: '20:00' }));
+        const _tandasRest = Math.max(1, Math.ceil((_minRest > 0 ? _minRest : 60) / 15));
+        const _rampa = _topeWarmup((bs && bs.recontacto_warmup_dia) || 1, _techo);
+        const _cupoConRampa = Math.min(cupoDiaRestante, Number.isFinite(_rampa) ? _rampa : cupoDiaRestante);
+        let _nObj = _cupoConRampa / _tandasRest;
+        let nTanda = Math.round(_nObj * (1 + (Math.random() - 0.5) * 0.8));   // +-40%
+        if (!Number.isFinite(nTanda) || nTanda < 0) nTanda = 0;
+        nTanda = Math.min(nTanda, _cupoConRampa, CAP_TANDA);
+        if (nTanda <= 0) continue;   // esta tanda no manda: es el goteo funcionando, no un error
 
         // Resolver el universo y EXCLUIR a los ya enviados (dedupe). Un envio va UNA sola vez.
         let universo = [];
@@ -18657,6 +18680,31 @@ async function procesarOportunidades() {
             await new Promise(function (r) { setTimeout(r, 3000); });
             continue; // no marcamos enviado si fallo -> se reintenta en la proxima tanda
           }
+          // ===== EL MENSAJE TIENE QUE QUEDAR EN LA CHARLA (Diego 2026-08-17) =====
+          // "necesito que los mensajes que vienen de oportunidades los identifiques, ya que recien se
+          //  envio un mensaje y la IA recibio una respuesta automatica sin seguir el contexto".
+          //
+          // MEDIDO EN PRODUCCION: a Kaiken I se le mando la promo 17:02 y su conversacion tenia TRES
+          // mensajes, ninguno de ellos la promo. Cuando contesto su autorespuesta, la IA vio un
+          // entrante salido de la nada y le dijo "creo que tu mensaje llego a un chat equivocado".
+          // La causa era esta linea que no existia: se registraba `oportunidad_envios` y el
+          // `last_message` de la conversacion, pero NUNCA una fila en `messages`. Para la IA, que lee
+          // `messages`, la promo jamas habia salido.
+          //
+          // `enviado_por` lleva el nombre de la oportunidad: asi el mensaje queda IDENTIFICADO como
+          // salido de una promo (no de una charla), tanto para la IA como para el asesor que abre el
+          // chat. Va ANTES del registro de envio a proposito: si algo falla, es preferible un mensaje
+          // repetido en la proxima tanda a un mensaje enviado que no figura en ningun lado.
+          try {
+            await supabase.from('messages').insert({
+              conversation_id: c.id,
+              user_id: op.user_id,
+              role: 'ai',
+              content: textoFinal || ('[' + mediaTipo + ']'),
+              enviado_por: ('Oportunidad: ' + String(op.nombre || 'sin nombre')).slice(0, 120),
+            });
+          } catch (eMsgOp) { console.warn('[oportunidades] no se pudo guardar el mensaje en la charla:', eMsgOp && eMsgOp.message); }
+
           // DEDUPE: registrar el envio (una sola vez).
           try { await supabase.from('oportunidad_envios').insert({ oportunidad_id: op.id, contact_id: c.contact_id, conversation_id: c.id, enviado_at: new Date().toISOString() }); } catch (eIns) {}
           // Actualizar last_message de la conv (best-effort, para que el asesor vea que salio algo).

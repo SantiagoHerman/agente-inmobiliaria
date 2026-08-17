@@ -14504,7 +14504,9 @@ app.post('/api/oportunidades', async (req, res) => {
     // estado: 'borrador' si lo piden explicito; si no, 'en_cola'.
     const estado = (b.estado === 'borrador') ? 'borrador' : 'en_cola';
     const _mediaObj = (b.media && typeof b.media === 'object' && b.media.url) ? { url: String(b.media.url).slice(0, 2000), tipo: (b.media.tipo ? String(b.media.tipo).slice(0, 20) : 'imagen') } : null;
-    const _maxDia = (Number.isFinite(Number(b.max_dia)) && Number(b.max_dia) > 0) ? Math.min(Number(b.max_dia), 5000) : null;
+    // El tope del canal se aplica ACA TAMBIEN, no solo en el worker: si el numero se guardara en 200
+    // y el worker lo recortara en silencio, la pantalla le mostraria al cliente un limite que no es.
+    const _maxDia = _capMaxDia(b.max_dia, b.canal_envio);
     const fila = {
       user_id: ownerId,
       nombre: (b.nombre != null) ? String(b.nombre).slice(0, 200) : null,
@@ -14584,7 +14586,11 @@ app.patch('/api/oportunidades/:id', async (req, res) => {
     if (b.mensaje != null) upd.mensaje = String(b.mensaje).slice(0, 5000);
     if (b.link != null) upd.link = String(b.link).slice(0, 2000);
     if (Object.prototype.hasOwnProperty.call(b, 'media')) upd.media = (b.media && typeof b.media === 'object' && b.media.url) ? { url: String(b.media.url).slice(0, 2000), tipo: (b.media.tipo ? String(b.media.tipo).slice(0, 20) : 'imagen') } : null;
-    if (Object.prototype.hasOwnProperty.call(b, 'max_dia')) upd.max_dia = (Number.isFinite(Number(b.max_dia)) && Number(b.max_dia) > 0) ? Math.min(Number(b.max_dia), 5000) : null;
+    // El canal puede venir en ESTE mismo PATCH o no venir: si no viene, manda el que ya tiene
+    // guardado. Sin ese fallback, editar solo el max_dia lo trataria como Evolution aunque la
+    // oportunidad salga por Cloud, y le recortaria el tope al cliente sin motivo.
+    const _canalPatch = Object.prototype.hasOwnProperty.call(b, 'canal_envio') ? b.canal_envio : actual.canal_envio;
+    if (Object.prototype.hasOwnProperty.call(b, 'max_dia')) upd.max_dia = _capMaxDia(b.max_dia, _canalPatch);
     if (b.horario != null) upd.horario = _normHorarioOportunidad(b.horario);   // mismo criterio que el POST
     // FASE 6: de que numero sale. Solo dos valores validos; cualquier otra cosa se ignora en vez de
     // guardarse, para que un typo no mande un broadcast por un canal que no existe.
@@ -16037,7 +16043,25 @@ const RECONTACTO_TOPE_MAX_DEFAULT = 300;
 // vuelve una garantia del sistema en vez de una config que alguien puede subir sin querer.
 const RECONTACTO_TECHO_DIARIO = 20;
 // Mismo criterio para el broadcast de Oportunidades: "oportunidades 10 por dia no mas".
-const OPORTUNIDADES_TECHO_DIARIO = 10;
+// TECHO DIARIO POR CANAL (Diego 2026-08-17: "en whatsapp business un tope de 30 mensajes diarios,
+// a diferencia de whatsapp cloud api, ahi sin limite").
+//   - WhatsApp Business (Evolution): 30/dia. Es un numero NO OFICIAL mandando en masa; el tope es lo
+//     que separa una promo de un baneo (a este cliente ya le costo uno).
+//   - Cloud API: sin tope nuestro. Es el canal oficial, con plantillas aprobadas por Meta, y Meta ya
+//     le pone SUS propios limites de calidad; duplicar el freno aca solo estorba.
+const OPORTUNIDADES_TECHO_DIARIO = 30;          // WhatsApp Business (Evolution)
+const OPORTUNIDADES_TECHO_CLOUD = Infinity;     // Cloud API: sin limite propio
+function _techoDiarioCanal(canal) {
+  return (String(canal || '') === 'cloud') ? OPORTUNIDADES_TECHO_CLOUD : OPORTUNIDADES_TECHO_DIARIO;
+}
+// Recorta el max_dia que llega del front al techo del canal. Por Cloud no hay techo propio, pero se
+// deja el limite historico de 5000 como freno de cordura (un 999999 pegado a mano no puede pasar).
+function _capMaxDia(valor, canal) {
+  const n = Number(valor);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const techo = _techoDiarioCanal(canal);
+  return Math.min(n, Number.isFinite(techo) ? techo : 5000);
+}
 const RECONTACTO_SUBCUPO_FRIO_DEFAULT = 30;
 const RECONTACTO_SALTO_VIEJO_DIA_DEFAULT = 3;
 const RECONTACTO_GRACIA_FRIO_HS = 48;
@@ -18516,15 +18540,18 @@ async function procesarOportunidades() {
             _enviadosCuentaHoy = count || 0;
           }
         } catch (eCC) { _enviadosCuentaHoy = 0; } // tabla/columna ausente -> no bloquea (el tope por oportunidad sigue)
-        const _cupoCuenta = Math.max(0, OPORTUNIDADES_TECHO_DIARIO - _enviadosCuentaHoy);
+        // El techo depende del CANAL por el que sale esta oportunidad, no de la cuenta.
+        const _techo = _techoDiarioCanal(op.canal_envio);
+        const _cupoCuenta = Math.max(0, _techo - _enviadosCuentaHoy);
         if (_cupoCuenta <= 0) {
-          console.log('[oportunidades] cuenta ' + op.user_id + ' llego al techo diario (' + OPORTUNIDADES_TECHO_DIARIO + '): nada mas hoy');
+          console.log('[oportunidades] cuenta ' + op.user_id + ' llego al techo diario (' + _techo + '): nada mas hoy');
           continue;
         }
 
-        // `maxDia` baja de 200 a OPORTUNIDADES_TECHO_DIARIO cuando no hay valor explicito: el default
-        // viejo era mas alto que el techo, o sea inutil.
-        const maxDia = (Number.isFinite(op.max_dia) && op.max_dia > 0) ? Math.min(op.max_dia, OPORTUNIDADES_TECHO_DIARIO) : OPORTUNIDADES_TECHO_DIARIO;
+        // `maxDia` baja de 200 al techo del canal cuando no hay valor explicito: el default viejo era
+        // mas alto que el techo, o sea inutil. Por Cloud el techo es Infinity, asi que ahi manda el
+        // max_dia que puso el cliente (y sin max_dia, no hay tope propio).
+        const maxDia = (Number.isFinite(op.max_dia) && op.max_dia > 0) ? Math.min(op.max_dia, _techo) : _techo;
         const cupoDiaRestante = Math.min(Math.max(0, maxDia - enviadosHoy), _cupoCuenta);
         if (cupoDiaRestante <= 0) continue; // ya cumplio el cupo del dia -> nada mas hoy (retoma manana)
 

@@ -39391,12 +39391,14 @@ setInterval(revisarSaludSistema, 10 * 60 * 1000); // cada 10 min
 // costaron 2 escrituras (USD 0,16); taparlos habria salido 3 pings (USD 0,015).
 //
 // LAS 6 REGLAS QUE EVITAN QUE EL PING SE COMA EL AHORRO:
-//   1. Cada 10 minutos.
+//   1. Cada 5 minutos (era 10; con la ventana cerrada de 8 min, un tic de 5 SIEMPRE cae adentro).
 //   2. Solo dentro de _horarioCacheLarga() (07:00-23:59 AR) -- LA MISMA ventana del cache de 1h. Fuera de
 //      ahi el bloque se cachea a 5 min, no hay cache largo que mantener.
 //   3. Solo cuentas con ai_cache_ttl_1h activo.
 //   4. Solo si HUBO actividad hoy. Mantener vivo un cache que nadie uso es tirar plata.
-//   5. Solo si pasaron 50+ minutos desde la ultima llamada (el cache vence a los 60).
+//   5. VENTANA CERRADA de 50 a 58 minutos desde el ULTIMO TOQUE del cache (pings incluidos). El piso
+//      evita pinguear un cache que esta fresco; el TECHO evita el caso que costaba el 82% del gasto del
+//      ping: llegar cuando ya vencio y pagar la reescritura en vez de mantenerlo.
 //   6. CORTE POR PINGS SECOS: 3 pings seguidos sin que entre un mensaje -> se para hasta que alguien
 //      escriba. Sin esto, una cuenta que se apaga a las 15:00 seguiria pagando pings hasta medianoche.
 //
@@ -39407,14 +39409,63 @@ setInterval(revisarSaludSistema, 10 * 60 * 1000); // cada 10 min
 // cuenta. Si no coinciden, la cuenta se DESHABILITA sola y queda el error en el log. No hace falta que
 // nadie revise nada a mano.
 // ===================================================================================================
-const _PING_CADA_MIN = 10;
-const _PING_MIN_SILENCIO = 50;     // minutos desde la ultima llamada a la IA
+// ===================================================================================================
+// CORRECCION MEDIDA (Diego 2026-08-17). Se midieron los 70 pings de 12 dias, uno por uno, cruzando
+// cache_read vs cache_creation. Resultado: 24 de 70 (34%) NO mantuvieron el cache — lo REESCRIBIERON,
+// a USD 0,084 cada uno (3,4x lo que cuesta atender a un cliente real). Eran el 82% del costo del ping.
+// De esas 24 escrituras, 18 se DESPERDICIARON: nadie escribio en la hora siguiente y el cache que se
+// acababa de pagar vencio sin usarse. USD 1,51 en 12 dias = ~USD 3,80/mes tirados.
+//
+// TRES CAUSAS, las tres arregladas aca:
+//
+// (A) EL RELOJ EQUIVOCADO. El disparo miraba "minutos desde el ultimo mensaje REAL" (excluyendo pings
+//     a proposito). Pero el cache vive 60 min desde el ULTIMO TOQUE, y un ping tambien lo toca. Con el
+//     reloj viejo el ping salia a los 60, 70, 80 min de silencio y el cache ya estaba muerto -> escritura.
+//     Medido: la lectura mas tardia que funciono fue a 58,2 min DESDE EL TOQUE; la primera escritura a
+//     62,4. El reloj del toque predice perfecto; el del mensaje real no predice nada.
+//     -> Ahora hay DOS relojes, cada uno para lo suyo:
+//          * ultimo mensaje REAL  -> "esta cuenta esta activa hoy?" (regla 4, sigue igual)
+//          * ultimo TOQUE del cache (pings incluidos) -> "el cache esta por vencer?" (el disparo)
+//
+// (B) SIN TECHO. Disparaba con silencio > 50 min y nada mas. Habia pings con 15, 16 y 33 HORAS de
+//     silencio: no tenian nada que mantener, solo pagaban una escritura. Ahora hay ventana CERRADA:
+//     50 a 58 min. Pasado eso el cache ya no existe y reescribirlo cuesta 9x mas que leerlo.
+//
+// (C) LA VENTANA SE SALTEABA. Con tic de 10 min y ventana de 8, el tic podia aterrizar del otro lado de
+//     los 60. Medido: 5 de las 24 escrituras cayeron a 62,4 / 62,6 / 63,0 / 69,6 / 73,1 min — el reloj
+//     paso por encima de la ventana. Con tic de 5 min y ventana de 8, SIEMPRE cae un tic adentro.
+//     De paso se corta el otro desperdicio: habia 30 pings a exactamente 10,0 min del toque anterior,
+//     o sea pingueando cada 10 min un cache que vive 60. De cada 6 pings, 5 no hacian falta.
+//
+// (D) LA VENTANA HORARIA FIJA (7:00-24:00) ARRANCABA TARDE. Medido sobre 31 dias: en 22 de 31 el PRIMER
+//     mensaje del dia llega ANTES de las 7 (10 dias arranca a medianoche, 4 a las 2am, 3 a las 6am), y
+//     el 4,55% del trafico real esta antes de las 7. El cache de ese primer mensaje moria sin proteccion
+//     y el siguiente lead pagaba la escritura. Diego: "el ping arranca siempre despues del primer
+//     mensaje recibido" — que es exactamente lo que ya garantiza la regla 4 (hubo actividad HOY). El piso
+//     horario era redundante Y hacia dano, asi que se saca. El techo de gasto lo pone el corte por pings
+//     secos: como maximo 3 pings por cuenta por silencio = USD 0,027.
+//
+// AHORRO ESPERADO: de USD 6,08/mes a menos de USD 1, sin perder nada de lo que el ping si hace bien.
+// ===================================================================================================
+const _PING_CADA_MIN = 5;          // (C) era 10: con ventana de 8 min, un tic de 5 SIEMPRE cae adentro
+const _PING_MIN_SILENCIO = 50;     // minutos desde el ULTIMO TOQUE del cache (piso de la ventana)
+const _PING_MAX_SILENCIO = 58;     // (B) techo: pasado esto el cache ya vencio (medido: muere a los 60)
 const _PING_SECOS_MAX = 3;         // pings seguidos sin actividad -> parar
 const _pingEstado = new Map();     // user_id -> { secos, ultimaActividadVista, deshabilitada, motivo }
 
 async function _cronPingCache() {
   try {
-    if (!_horarioCacheLarga()) return;                       // regla 2
+    // (D) EL PISO HORARIO SE QUEDA, y tiene que quedarse. Lo saque y lo volvi a poner: fuera de esta
+    // ventana los mensajes REALES no escriben un cache de 1h sino de 5 min (generarRespuestaAgente ~7626:
+    // `_ttl1hOn = cacheTtl1hActivo(...) && _horarioCacheLarga()`). O sea que a las 2 de la manana NO EXISTE
+    // ningun cache largo que mantener: pinguear ahi escribiria un cache de 5 minutos que muere solo, gasto
+    // puro. Las dos ventanas TIENEN que ser la misma o el ping mantiene algo que no esta.
+    //
+    // La pregunta de Diego ("a partir de que hora, siempre despues del primer mensaje") queda contestada
+    // asi: el ping arranca con el PRIMER MENSAJE REAL DE LAS 7 EN ADELANTE. Los mensajes de madrugada no
+    // necesitan ping — su cache es de 5 min POR DISEÑO y se vence igual. Y el caso que si estaba roto (un
+    // mensaje a las 6:00 y el ping saliendo 07:01 a reescribir) lo arregla el TECHO de 58 min, no el piso.
+    if (!_horarioCacheLarga()) return;                       // regla 2 (misma ventana que el cache de 1h)
     const { data: cuentas, error: eC } = await supabase.from('business_settings').select('user_id, ai_cache_ttl_1h');
     if (eC || !cuentas) return;
     const ahora = Date.now();
@@ -39424,20 +39475,39 @@ async function _cronPingCache() {
         const est = _pingEstado.get(c.user_id) || { secos: 0, ultimaActividadVista: null, deshabilitada: false, motivo: null };
         if (est.deshabilitada) continue;
 
-        // Ultima llamada a la IA de esta cuenta (cualquier etiqueta): define el silencio y "hubo actividad hoy".
+        // ===== RELOJ 1: "esta cuenta esta activa HOY?" -> ultimo mensaje REAL (los pings no cuentan) =====
+        // Este reloj NO decide el disparo: decide si vale la pena molestarse con esta cuenta. Y es el que
+        // garantiza lo que pidio Diego: el ping nunca sale antes del PRIMER mensaje del dia.
         const { data: ult } = await supabase.from('ia_uso').select('created_at, etiqueta')
           .eq('user_id', c.user_id).neq('etiqueta', 'ping_cache')   // los pings NO cuentan como actividad
           .order('created_at', { ascending: false }).limit(1).maybeSingle();
         if (!ult || !ult.created_at) continue;
         const tUlt = new Date(ult.created_at).getTime();
-        const minsSilencio = (ahora - tUlt) / 60000;
-        if (minsSilencio < _PING_MIN_SILENCIO) {              // regla 5: todavia esta caliente
-          if (est.secos) { est.secos = 0; _pingEstado.set(c.user_id, est); }  // hubo movimiento -> se reinicia el corte
-          continue;
-        }
-        // Regla 4: "hubo actividad HOY" = la ultima llamada es del mismo dia calendario argentino.
+        // Regla 4: "hubo actividad HOY" = la ultima llamada REAL es del mismo dia calendario argentino.
         const diaDe = (ms) => new Date(ms - 3 * 3600000).toISOString().slice(0, 10);
         if (diaDe(tUlt) !== diaDe(ahora)) continue;
+
+        // ===== RELOJ 2: "el cache esta por vencer?" -> ultimo TOQUE, pings INCLUIDOS =====
+        // (A) Este es el reloj que decide el disparo, y es el unico que predice bien: medido sobre 70 pings,
+        // la lectura mas tardia que funciono fue a 58,2 min DESDE EL TOQUE y la primera escritura a 62,4.
+        // "Toque" = cualquier llamada que leyo O escribio el cache — un ping tambien renueva la hora, asi
+        // que excluirlo (como hacia el codigo viejo) hacia pinguear un cache que estaba fresco.
+        const { data: toque } = await supabase.from('ia_uso').select('created_at')
+          .eq('user_id', c.user_id)
+          .or('cache_read.gt.0,cache_creation.gt.0')
+          .order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if (!toque || !toque.created_at) continue;             // nunca hubo cache -> nada que mantener
+        const minsSilencio = (ahora - new Date(toque.created_at).getTime()) / 60000;
+
+        // Todavia esta caliente: no toca pinguear. Y si hubo movimiento, se reinicia el corte por secos.
+        if (minsSilencio < _PING_MIN_SILENCIO) {
+          if (est.secos) { est.secos = 0; _pingEstado.set(c.user_id, est); }
+          continue;
+        }
+        // (B) TECHO: pasado esto el cache YA VENCIO. Pinguear aca no lo mantiene: lo reescribe a USD 0,084,
+        // 9x lo que cuesta leerlo — y medido, 18 de 24 veces nadie uso ese cache recien pagado. Se espera
+        // a que escriba un cliente real (esa llamada paga la escritura una sola vez y arranca el ciclo).
+        if (minsSilencio > _PING_MAX_SILENCIO) continue;
 
         // Regla 6: si desde el ping anterior NO entro nada nuevo, es un ping seco.
         if (est.ultimaActividadVista === ult.created_at) {

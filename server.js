@@ -31601,6 +31601,16 @@ app.get('/api/contactos', async function (req, res) {
       const canalCsv = _leadsCsv(qp.canal);
       if (canalCsv.length) q = q.in('channel', canalCsv);
 
+      // ---- ETIQUETAS (csv de IDS de etiqueta) — Diego 2026-08-17 ----
+      // Filtra sobre `contacts.etiquetas`, la MISMA columna y el MISMO criterio (por id) que el
+      // segmento por etiqueta de Oportunidades (~L14324). Por eso hace falta que la importacion
+      // guarde el id y no el nombre (ver _etiquetaIdPorNombre): si guardara el nombre, este filtro
+      // devolveria vacio igual que devolvia el de Oportunidades.
+      // No hace falta defensa por columna ausente: una cuenta sin `contacts.etiquetas` no tiene
+      // etiquetas que elegir, asi que nunca llega un id por aca.
+      const etqCsv = _leadsCsv(qp.etiqueta);
+      if (etqCsv.length) q = q.overlaps('etiquetas', etqCsv);
+
       // presupuesto cargado: usa contacts.budget (columna confirmada por el pedido), no el de `conversations`.
       if (qp.presupuesto === '1') q = q.not('budget', 'is', null).neq('budget', '');
 
@@ -31990,6 +32000,77 @@ async function _aplicarDatosGeneralesContacto(contactId, ownerId, body) {
     return { ok: true, aplicados: Object.keys(upd) };
   } catch (e) { return { ok: false, error: e && e.message, aplicados: [] }; }
 }
+
+// ============================================================================================
+// BORRAR CONTACTOS — uno o varios (Diego 2026-08-17: "agregame como eliminar los contactos
+// tanto individual como en grupo").
+// --------------------------------------------------------------------------------------------
+// ESTO NO SE PUEDE DESHACER, asi que el endpoint es deliberadamente estrecho:
+//
+//   1. SOLO EL DUEÑO. Un asesor no borra la base del cliente ni por error ni a proposito.
+//   2. SOLO CONTACTOS DE SU CUENTA. Cada id se valida contra `user_id` ANTES de tocar nada; un
+//      id de otro tenant simplemente no aparece en la lista validada y no se borra.
+//   3. TOPE DE 500 POR LLAMADA. Un "seleccionar todo" sobre 1.200 contactos tiene que ser una
+//      decision repetida, no un solo click que se lleva la base entera.
+//
+// ORDEN DE BORRADO: primero lo que CUELGA del contacto (mensajes -> citas -> fichas ->
+// conversaciones) y recien despues el contacto. Al reves, una FK deja al contacto vivo y todo lo
+// demas colgado. Cada tramo es best-effort: si una tabla no existe en esta cuenta, se sigue.
+// Se devuelve `borrados` contado sobre lo que REALMENTE volvio borrado de `contacts`.
+// ============================================================================================
+app.post('/api/contactos/eliminar', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado' });
+    const _id = await _duenoOAsesor(uid);
+    if (!_id || !_id.esDueno) return res.status(403).json({ error: 'Solo el titular de la cuenta puede eliminar contactos.' });
+    const ownerId = _id.ownerId;
+
+    const idsRaw = (req.body && req.body.ids) || [];
+    const ids = (Array.isArray(idsRaw) ? idsRaw : [idsRaw]).map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'No hay contactos para eliminar.' });
+    if (ids.length > 500) return res.status(400).json({ error: 'Son demasiados de una vez. Eliminá de a 500 como máximo.' });
+
+    // Validacion de pertenencia: lo que no sea de esta cuenta no entra a la lista que se borra.
+    const { data: propios, error: eSel } = await supabase.from('contacts').select('id').eq('user_id', ownerId).in('id', ids);
+    if (eSel) return res.status(500).json({ error: 'No se pudieron leer los contactos.' });
+    const idsOk = (propios || []).map(function (c) { return c.id; });
+    if (!idsOk.length) return res.json({ ok: true, borrados: 0, ajenos: ids.length });
+
+    // Conversaciones del contacto -> sus mensajes cuelgan de ahi.
+    let convIds = [];
+    try {
+      const { data } = await supabase.from('conversations').select('id').eq('user_id', ownerId).in('contact_id', idsOk);
+      convIds = (data || []).map(function (c) { return c.id; });
+    } catch (e) {}
+
+    if (convIds.length) {
+      for (let i = 0; i < convIds.length; i += 200) {
+        const trozo = convIds.slice(i, i + 200);
+        try { await supabase.from('messages').delete().in('conversation_id', trozo); } catch (e) {}
+        try { await supabase.from('citas').delete().in('conversation_id', trozo); } catch (e) {}
+      }
+    }
+    for (let i = 0; i < idsOk.length; i += 200) {
+      const trozo = idsOk.slice(i, i + 200);
+      try { await supabase.from('fichas').delete().eq('user_id', ownerId).in('contact_id', trozo); } catch (e) {}
+      try { await supabase.from('conversations').delete().eq('user_id', ownerId).in('contact_id', trozo); } catch (e) {}
+    }
+
+    let borrados = 0; let errMsg = null;
+    for (let i = 0; i < idsOk.length; i += 200) {
+      const trozo = idsOk.slice(i, i + 200);
+      try {
+        const { data, error } = await supabase.from('contacts').delete().eq('user_id', ownerId).in('id', trozo).select('id');
+        if (error) { errMsg = error.message; continue; }
+        borrados += (data || []).length;
+      } catch (e) { errMsg = e && e.message; }
+    }
+    if (!borrados && errMsg) return res.status(500).json({ error: 'No se pudieron eliminar: ' + errMsg });
+    console.log('[contactos] ' + ownerId + ' elimino ' + borrados + ' contacto(s)');
+    return res.json({ ok: true, borrados: borrados, ajenos: ids.length - idsOk.length, conversaciones: convIds.length });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
 
 app.post('/api/contactos', async function (req, res) {
   try {

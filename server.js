@@ -2157,6 +2157,51 @@ function esAdministrador(ase) {
   return Array.isArray(ase.visibilidad) && ase.visibilidad.indexOf('generales') >= 0;
 }
 
+// ============================================================================================
+// EL ADMIN ES EL ULTIMO RECURSO, NO EL EXCLUIDO (Diego 2026-08-17)
+// --------------------------------------------------------------------------------------------
+// EL PROBLEMA: el filtro .or('rol.is.null,rol.neq.administrador') saca a los administradores del
+// reparto AUTOMATICO (FIX #2, 2026-07-23) en 5 lugares. En una cuenta de UNA SOLA persona con
+// visibilidad "Todos" eso deja CERO candidatos — porque el server sincroniza el rol: visibilidad
+// con 'generales' => rol='administrador' (~19660). Resultado: "ver todo" y "recibir leads" pasan a
+// ser EXCLUYENTES, estadoDeptoParaReparto devuelve 'sin_miembros' para TODOS los deptos y el
+// reparto muere en silencio. Le paso a Diego en Raices CRM: puso su usuario en "Todos", el sistema
+// le dijo que no tenia a quien derivar, y tuvo que volver atras.
+//
+// LA REGLA NUEVA — ESTRUCTURAL, y esto es lo importante: el admin se excluye SOLO si existe al
+// menos un NO-admin en el UNIVERSO (activo + miembro, segun el .in() que arme cada caller). Si el
+// universo no-admin es VACIO, se repite la MISMA query SIN el filtro de rol.
+//
+// POR QUE ESTRUCTURAL Y NO "POR DISPONIBILIDAD": la version "excluir al admin solo si hay alguien
+// DISPONIBLE" romperia la espera. Anton, viernes 20:01, los 8 de Captacion fuera de horario: hoy el
+// lead ESPERA al sabado ('todos_pausa'); con el criterio de disponibilidad un admin se lo llevaria a
+// las 3 de la manana. El universo no-admin NO cambia por pausas ni horarios, asi que en una cuenta
+// con asesores normales este fallback NUNCA dispara.
+//
+// GARANTIA MATEMATICA: solo puede convertir un "no hay nadie" (lo que devuelve HOY) en "esta el
+// admin". NUNCA le saca un lead a un asesor normal.
+//
+// LOS FILTROS DE DISPONIBILIDAD SIGUEN CORRIENDO DESPUES, en JS, sobre el resultado (~3944, ~2205,
+// ~20146): un admin en 'pausa' o en 'no_recibe' NO recibe. Eso le devuelve al dueno la palanca
+// correcta: si quiere "ve todo y NO recibe", pone disponibilidad='no_recibe' — que es el mecanismo
+// diseñado para eso — en vez de depender de un efecto colateral del rol.
+//
+// `armar` es un THUNK y tiene que serlo: los query builders de supabase-js son thenables de UN SOLO
+// USO, no se pueden re-await. Devuelve el MISMO shape {data,error} que la query original, asi el
+// manejo de error de cada caller queda EXACTAMENTE igual que hoy.
+//
+// KILL-SWITCH sin deploy ni migracion: ADMIN_ULTIMO_RECURSO=off en Railway y vuelve al comportamiento
+// anterior con un restart.
+// ============================================================================================
+async function _asesoresSinAdminsSalvoQueSeanLosUnicos(armar) {
+  const _FILTRO = 'rol.is.null,rol.neq.administrador';
+  if (String(process.env.ADMIN_ULTIMO_RECURSO || '').toLowerCase() === 'off') return await armar().or(_FILTRO);
+  const conFiltro = await armar().or(_FILTRO);
+  if (conFiltro.error) return conFiltro;                                  // error: lo maneja el caller (identico a hoy)
+  if (Array.isArray(conFiltro.data) && conFiltro.data.length) return conFiltro;
+  return await armar();                                                   // universo no-admin vacio -> sin filtro de rol
+}
+
 // M19: REPARTO EQUITATIVO compartido. Dado un array de ids de asesores candidatos, devuelve el id con MENOR
 // carga = menor cantidad de conversations asignadas con status='listo_humano' (D1=B). Mismo criterio exacto que
 // antes estaba duplicado en elegirAsesorActivo y elegirAsesorParaDepartamento. idsCandidatos vacio/nulo -> null.
@@ -2196,10 +2241,12 @@ async function asesorMenorCarga(idsCandidatos) {
 // queda EXACTAMENTE como antes (solo excluye rol='administrador') para no cambiar el comportamiento actual.
 async function elegirAsesorActivo(admin_id) {
   try {
-    let q = supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
     let v2 = false;
     try { v2 = await repartoV2Activo(admin_id, null); } catch (eV2) { v2 = false; }
-    let { data: activos } = await q;
+    // ADMIN ULTIMO RECURSO (2026-08-17): si no hay NINGUN no-admin en la cuenta, se consideran los admins.
+    let { data: activos } = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+      return supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true);
+    });
     if (v2 && Array.isArray(activos)) {
       // ADITIVO solo con flag ON: descartar a los que no reciben (disponibilidad='no_recibe') y a los pausados ('pausa').
       activos = activos.filter(function(a){ return a.disponibilidad !== 'no_recibe' && a.disponibilidad !== 'pausa'; });
@@ -3909,24 +3956,30 @@ async function elegirAsesorParaDepartamento(user_id, departamentoId, excluirIds)
     //    defensivo: deja pasar rol='asesor' y rol NULL (legacy).
     // ETAPA 9a: ademas traemos horario_modo/horario_json (DEFENSIVO: si las columnas no existen, reintentamos sin ellas).
     // ETAPA 9b: ademas traemos es_ia (DEFENSIVO: si la columna no existe, reintentamos sin ella).
+    // ADMIN ULTIMO RECURSO (2026-08-17): el FIX #2 de arriba sigue valiendo — un admin no recibe leads
+    // solo MIENTRAS haya algun no-admin en el depto. Si el depto no tiene NINGUN no-admin, se considera
+    // al admin (si no, un depto de una sola persona queda 'sin_miembros' y el reparto muere). El retry
+    // defensivo lleva el MISMO tratamiento: si no, el bug revive cuando falten las columnas horario_*.
     let ases = null;
     try {
-      const r = await supabase.from('asesores')
-        .select('id, disponibilidad, horario_modo, horario_json, es_ia')
-        .eq('admin_id', user_id)
-        .eq('activo', true)
-        .or('rol.is.null,rol.neq.administrador')
-        .in('id', idsMiembros);
+      const r = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+        return supabase.from('asesores')
+          .select('id, disponibilidad, horario_modo, horario_json, es_ia')
+          .eq('admin_id', user_id)
+          .eq('activo', true)
+          .in('id', idsMiembros);
+      });
       if (r.error) throw r.error;
       ases = r.data;
     } catch (eHor) {
       // columnas horario_*/es_ia ausentes u otro error: reintentar con el set minimo (sin esas columnas)
-      const r2 = await supabase.from('asesores')
-        .select('id, disponibilidad')
-        .eq('admin_id', user_id)
-        .eq('activo', true)
-        .or('rol.is.null,rol.neq.administrador')
-        .in('id', idsMiembros);
+      const r2 = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+        return supabase.from('asesores')
+          .select('id, disponibilidad')
+          .eq('admin_id', user_id)
+          .eq('activo', true)
+          .in('id', idsMiembros);
+      });
       ases = r2.data;
     }
     // ETAPA 9a: horario de oficina de la cuenta (para los asesores en modo 'oficina'). Una sola query, DEFENSIVO.
@@ -4303,7 +4356,13 @@ async function estadoDeptoParaReparto(user_id, departamentoId) {
     // clasificado 'todos_pausa' (esperando a alguien que NUNCA va a recibir) en vez de 'sin_miembros'.
     let ases = null;
     try {
-      const r = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', user_id).eq('activo', true).or('rol.is.null,rol.neq.administrador').in('id', idsReciben);
+      // ADMIN ULTIMO RECURSO (2026-08-17): mismo criterio que el picker de arriba. Sin esto, un depto
+      // cuyo unico miembro es un admin quedaba 'sin_miembros' (estructural: avisa y NO espera) cuando en
+      // realidad hay alguien que puede recibir. Si el admin esta en pausa, ahora clasifica 'todos_pausa'
+      // (transitorio, espera) — que es lo correcto: vuelve de la pausa.
+      const r = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+        return supabase.from('asesores').select('id, disponibilidad').eq('admin_id', user_id).eq('activo', true).in('id', idsReciben);
+      });
       ases = r.error ? null : r.data;
     } catch (eA) { ases = null; }
     if (ases == null) return { estado: 'todos_pausa', asesor: null }; // no se pudo leer disponibilidad: tratar como transitorio (conservador)
@@ -16286,16 +16345,21 @@ async function proximoTurnoDisponible(ownerId, deptoId) {
       if (!idsPermitidos.length) return sinCalcular('depto_sin_miembros_que_reciben');
     }
 
-    // 2) Asesores de la cuenta (activos, sin admins). El horario se evalua abajo, dia por dia.
+    // 2) Asesores de la cuenta (activos, sin admins salvo que sean los unicos). El horario se evalua
+    //    abajo, dia por dia. ADMIN ULTIMO RECURSO (2026-08-17): esta funcion no decide nada (solo
+    //    informa al lead cuando entra el proximo asesor y alimenta /api/diagnostico), pero se alinea
+    //    con el picker igual: dejarla desalineada es EXACTAMENTE la clase de bug que causo este lio
+    //    — el tablero diciendo "sin asesores elegibles" mientras el reparto asigna.
     let ases = null;
     try {
-      let q = supabase.from('asesores')
-        .select('id, nombre, disponibilidad, horario_modo, horario_json, es_ia')
-        .eq('admin_id', ownerId)
-        .eq('activo', true)
-        .or('rol.is.null,rol.neq.administrador');
-      if (idsPermitidos) q = q.in('id', idsPermitidos);
-      const r = await q;
+      const r = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+        let q = supabase.from('asesores')
+          .select('id, nombre, disponibilidad, horario_modo, horario_json, es_ia')
+          .eq('admin_id', ownerId)
+          .eq('activo', true);
+        if (idsPermitidos) q = q.in('id', idsPermitidos);
+        return q;
+      });
       if (r.error) throw r.error;
       ases = r.data;
     } catch (eHor) {
@@ -16560,8 +16624,13 @@ app.get('/api/diagnostico/salud-derivacion', async (req, res) => {
         plantel.administradores = t.filter(function (a) { return a.rol === 'administrador'; }).length;
         plantel.ia = t.filter(function (a) { return a.es_ia === true; }).length;
         plantel.en_pausa = t.filter(function (a) { return a.disponibilidad === 'pausa' || a.disponibilidad === 'no_recibe'; }).length;
-        plantel.elegibles = t.filter(function (a) {
-          return a.rol !== 'administrador' && a.es_ia !== true && a.disponibilidad !== 'no_recibe';
+        // ADMIN ULTIMO RECURSO (2026-08-17): el MISMO criterio que el reparto. Sin esto el tablero
+        // reportaria "elegibles: 0" mientras el reparto asigna sin problemas — y este tablero se
+        // construyo justo para cazar configuraciones rotas, no para inventarlas.
+        const _noAdmins = t.filter(function (a) { return a.rol !== 'administrador'; });
+        const _baseEleg = _noAdmins.length ? _noAdmins : t;   // si NO hay no-admins, cuentan los admins
+        plantel.elegibles = _baseEleg.filter(function (a) {
+          return a.es_ia !== true && a.disponibilidad !== 'no_recibe';
         }).length;
       }
     } catch (eP) { /* queda en null: "no se pudo leer", distinto de cero */ }
@@ -20134,10 +20203,18 @@ app.post('/api/asesores/activar', async (req, res) => {
       // sin esa columna (set legacy) y no se filtra (comportamiento ACTUAL EXACTO).
       let act0 = null;
       try {
-        const r = await supabase.from('asesores').select('id, disponibilidad, es_ia').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+        // ADMIN ULTIMO RECURSO (2026-08-17): sin esto, en una cuenta de una sola persona (admin) el
+        // usuario toca "activar" y drena CERO leads — arreglo a medias. Los leads CON departamento
+        // siguen exigiendo membresia 'recibe' del depto (gate mas abajo), asi que no se le cae la cola
+        // de un depto donde solo mira.
+        const r = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+          return supabase.from('asesores').select('id, disponibilidad, es_ia').eq('admin_id', admin_id).eq('activo', true);
+        });
         if (r.error) throw r.error; act0 = r.data;
       } catch (eIaCol) {
-        const r2 = await supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true).or('rol.is.null,rol.neq.administrador');
+        const r2 = await _asesoresSinAdminsSalvoQueSeanLosUnicos(function () {
+          return supabase.from('asesores').select('id, disponibilidad').eq('admin_id', admin_id).eq('activo', true);
+        });
         act0 = r2.data;
       }
       activos = act0;
@@ -20795,6 +20872,31 @@ app.get('/api/equipo/avisos-config', async function(req, res) {
 
 // GET /api/etiquetas -> { ok, etiquetas:[{id,nombre,color}] }. Catalogo de etiquetas del tenant. Lo leen DUEÑO y ASESOR
 // (ambos las muestran/asignan en la lista de leads). Defensivo: si la columna no existe todavia, devuelve [].
+// NOMBRE DE ETIQUETA -> ID (Diego 2026-08-17: cargo contactos con la etiqueta "Hoteles Costa" y en
+// Oportunidades el segmento no levantaba NINGUN lead).
+//
+// LA CAUSA: los dos importadores guardaban el NOMBRE en `contacts.etiquetas`, y el segmento de
+// Oportunidades filtra por ID (`etq:<id>` -> .overlaps('etiquetas', _etqIds), server.js ~14324).
+// Nombre contra id no coinciden nunca, asi que el filtro devolvia vacio SIEMPRE.
+//
+// Se resuelve ACA, del lado del servidor, y no en cada pantalla: asi el CSV y la importacion con IA
+// quedan arreglados de una y ningun front nuevo puede volver a meter un nombre por descuido.
+// Si el nombre no esta en el catalogo devuelve null y el que llama no escribe etiqueta: es preferible
+// un contacto sin etiqueta a uno con una etiqueta que ningun filtro va a encontrar.
+async function _etiquetaIdPorNombre(ownerId, nombre) {
+  const n = String(nombre || '').trim();
+  if (!n) return null;
+  try {
+    const r = await supabase.from('business_settings').select('etiquetas').eq('user_id', ownerId).maybeSingle();
+    if (r.error || !r.data || !Array.isArray(r.data.etiquetas)) return null;
+    // Por id (si ya vino un id, se devuelve tal cual) o por nombre sin distinguir mayusculas.
+    const porId = r.data.etiquetas.find(function (e) { return e && String(e.id) === n; });
+    if (porId) return String(porId.id);
+    const porNom = r.data.etiquetas.find(function (e) { return e && String(e.nombre || '').trim().toLowerCase() === n.toLowerCase(); });
+    return porNom ? String(porNom.id) : null;
+  } catch (e) { return null; }
+}
+
 app.get('/api/etiquetas', async function(req, res) {
   try {
     const ident = await _equipoIdentidad(req);
@@ -25066,7 +25168,9 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     // Se usa la MISMA columna que la importacion con IA (`contacts.etiquetas`, nombres de etiqueta,
     // ver /api/importacion/:id/aplicar) para que los dos caminos se filtren igual en Oportunidades.
     // ESTO NO GASTA UN TOKEN: es texto que viaja en el body y un update. El CSV sigue costando $0.
-    const etiquetaLote = String((req.body && req.body.etiqueta_lote) || '').trim().slice(0, 80);
+    // Lo que llega es el NOMBRE; lo que hay que guardar es el ID (ver _etiquetaIdPorNombre).
+    const etiquetaNombre = String((req.body && req.body.etiqueta_lote) || '').trim().slice(0, 80);
+    const etiquetaLote = etiquetaNombre ? await _etiquetaIdPorNombre(user_id, etiquetaNombre) : null;
     const nombreLote = String((req.body && req.body.nombre_lote) || '').trim().slice(0, 200);
 
     // 1) Normalizar + DEDUP por telefono dentro del request. `nombre` (con fallback a tel) es SOLO para crear
@@ -25224,13 +25328,14 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
       try {
         await supabase.from('import_lotes').insert({
           user_id: user_id, nombre: nombreLote || null, origen: 'csv', estado: 'aplicado',
-          costo_estimado: 0, costo_real: 0, etiqueta_lote: etiquetaLote || null,
+          // Acá va el NOMBRE, no el id: esta columna es para leerla (es la que muestra la pantalla).
+          costo_estimado: 0, costo_real: 0, etiqueta_lote: etiquetaNombre || null,
           total_items: telefonos.length, aplicados: creados,
         });
       } catch (e) { console.log('[importar-leads] no se pudo registrar el lote:', e && e.message); }
     }
 
-    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos, rechazados_formato: rechazadosFormato.length, etiqueta: etiquetaLote || null });
+    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos, rechazados_formato: rechazadosFormato.length, etiqueta: (etiquetaLote ? etiquetaNombre : null) });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 
@@ -44898,8 +45003,17 @@ app.post('/api/importacion/:id/aplicar', async function (req, res) {
       try {
         const p = it.propuesto || {};
         // La etiqueta del item gana sobre la del lote (override por contacto).
-        const _etq = (Array.isArray(it.etiquetas) && it.etiquetas.length) ? it.etiquetas
-          : (lote.etiqueta_lote ? [lote.etiqueta_lote] : null);
+        // Se guarda el ID, no el nombre: el segmento de Oportunidades filtra por id y con el nombre
+        // no levantaba NUNCA (ver _etiquetaIdPorNombre). Un nombre que no esta en el catalogo se
+        // descarta antes que escribir una etiqueta que ningun filtro va a encontrar.
+        const _etqNombres = (Array.isArray(it.etiquetas) && it.etiquetas.length) ? it.etiquetas
+          : (lote.etiqueta_lote ? [lote.etiqueta_lote] : []);
+        const _etq0 = [];
+        for (const _n of _etqNombres) {
+          const _id = await _etiquetaIdPorNombre(ownerId, _n);
+          if (_id && _etq0.indexOf(_id) < 0) _etq0.push(_id);
+        }
+        const _etq = _etq0.length ? _etq0 : null;
 
         if (it.tipo === 'contacto_nuevo') {
           const fila = { user_id: ownerId, name: p.nombre || null, phone: p.telefono || null, channel: 'whatsapp' };

@@ -5215,6 +5215,60 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (!_cv) return { ok: false };
     if (_cv.asesor_id || _cv.admin_tomo === true) return { ok: false, yaTomado: true }; // ya hay humano a cargo
     if (_cv.ai_enabled === false) return { ok: false }; // IA apagada: un humano ya intervino
+
+    // ==========================================================================================
+    // EL ESCALON QUE FALTABA (Diego 2026-08-17)
+    // ------------------------------------------------------------------------------------------
+    // Diego diseño el sistema para que un lead NO se derive estando en "en conversacion": primero
+    // sube a "interesado" y RECIEN AHI se deriva. Esa regla NUNCA llego al codigo. Verificado con
+    // grep sobre las 44k lineas: no habia UNA sola linea que escribiera status='interesado'. Los
+    // comentarios decian "MANTIENE status='interesado'" — pero mantener no es poner: si el lead
+    // llegaba en 'en_conversacion', se derivaba en 'en_conversacion' y se quedaba ahi para siempre.
+    //
+    // MEDIDO antes del arreglo: 72 de 139 derivaciones (52%) salieron desde 'en_conversacion',
+    // en 62 conversaciones de 3 cuentas.
+    //
+    // EL CASO QUE LO DESTAPO (Facundo Celasco, Raices CRM, 16/08). Registro de ia_decisiones:
+    //   23:17:52  con 2 mensajes -> propone 'interesado' -> FRENADO por la regla de los 3 (correcto)
+    //   23:30:32  con 3 mensajes -> propone 'listo_humano' -> se va a rotar y NO escribe estado
+    // La puerta de los 3 mensajes se abrio, pero nadie la cruzo: en ese mismo turno el clasificador
+    // ya lo habia juzgado un escalon mas arriba, y ese escalon con v4 no escribe el estado. El lead
+    // se cayo ENTRE los dos escalones.
+    //
+    // POR QUE ACA Y NO EN LA RAMA v4: por esta funcion pasan LOS DOS caminos de derivacion — la tool
+    // derivar_a_humano del agente (~12978) y la clasificacion v4 (~13291 -> _v4RutearARotacion).
+    // Parchear una sola rama tapa 8 de 72 casos; hacerlo aca los tapa a los 72.
+    //
+    // SOLO sube el escalon que falta. NO toca ai_enabled (la IA sigue atendiendo: con v4 rotar es
+    // OFRECER, no asignar) ni asesor_id. El pase final a 'listo_humano' lo sigue haciendo el asesor
+    // cuando escribe (_finalizarRotacionV3), sin cambios.
+    //
+    // El UPDATE es CONDICIONAL por status (.eq('status', _cv.status)): si entre la lectura y la
+    // escritura la conversacion cambio de estado, no se pisa nada. Anti-carrera con el clasificador
+    // y con el asesor que entra a escribir en el mismo instante.
+    //
+    // La temperatura se calcula con los MISMOS helpers que usa el clasificador (~13319), asi el lead
+    // queda indistinguible de uno promovido por el camino normal en vez de quedar "frio" en Interesado.
+    // Todo el bloque es best-effort: si algo falla, la derivacion sigue exactamente como hoy.
+    if (_cv.status === 'en_conversacion' || _cv.status === 'nuevo') {
+      try {
+        const _estadoPrevio = _cv.status;
+        const _tempInt = await _tempConDecayParaConv(convId, temperaturaPorEstado('interesado'), ownerId);
+        const _upEst = await supabase.from('conversations')
+          .update({ status: 'interesado', temperatura: _tempInt, updated_at: nowIso })
+          .eq('id', convId).eq('status', _estadoPrevio)
+          .select('id').maybeSingle();
+        if (_upEst && !_upEst.error && _upEst.data) {
+          _cv.status = 'interesado'; // el resto de la funcion ve el estado ya subido
+          console.log('[derivacion] conv ' + convId + ': ' + _estadoPrevio + ' -> interesado antes de derivar (escalon que faltaba)');
+          // Los DOS historiales, igual que el camino normal. Fire-and-forget: tabla ausente -> no-op.
+          try { registrarCambioEstadoConv(convId, _estadoPrevio, 'interesado', 'La IA', 'paso previo a derivar', ownerId).catch(function () {}); } catch (eH1) {}
+          try { registrarCambioEstado({ conversation_id: convId, user_id: ownerId, estado_anterior: _estadoPrevio, estado_nuevo: 'interesado', origen: 'ia', motivo: 'paso previo a derivar' }).catch(function () {}); } catch (eH2) {}
+        }
+      } catch (eEst) { console.error('[derivacion] no se pudo subir a interesado: ' + (eEst && eEst.message)); }
+    }
+    // ==========================================================================================
+
     // FIX ping-pong: arranque LIMPIO de la vuelta de rotacion (reset del set de "ya intentados"). Aditivo/best-effort:
     // si la columna derivacion_intentados no existe (migracion no corrida), este catch lo traga (no-op) y todo sigue
     // como hoy. Asi una rotacion nueva nunca hereda intentados viejos (ademas de _limpiarRotacionV3 al terminar).
@@ -25006,6 +25060,15 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     const _normCat = function (c) { return (c === 'viejo') ? 'viejo' : 'frio'; };
     const catBody = (req.body && req.body.categoria != null) ? _normCat(req.body.categoria) : 'frio';
 
+    // ETIQUETA Y NOMBRE DEL LOTE (Diego 2026-08-17: "lo importante es que se le pueda dar un nombre a
+    // la importacion, una etiqueta a cada contacto... la verificacion tiene que estar").
+    // El CSV no tenia NADA de esto: entraban 300 contactos indistinguibles del resto de la base.
+    // Se usa la MISMA columna que la importacion con IA (`contacts.etiquetas`, nombres de etiqueta,
+    // ver /api/importacion/:id/aplicar) para que los dos caminos se filtren igual en Oportunidades.
+    // ESTO NO GASTA UN TOKEN: es texto que viaja en el body y un update. El CSV sigue costando $0.
+    const etiquetaLote = String((req.body && req.body.etiqueta_lote) || '').trim().slice(0, 80);
+    const nombreLote = String((req.body && req.body.nombre_lote) || '').trim().slice(0, 200);
+
     // 1) Normalizar + DEDUP por telefono dentro del request. `nombre` (con fallback a tel) es SOLO para crear
     // contactos nuevos (siempre hace falta algo para mostrar); `nombreCsv` es el nombre CRUDO tal cual vino en
     // el archivo (puede venir vacio) y es el UNICO que se usa para actualizar un contacto EXISTENTE -- si se
@@ -25061,10 +25124,46 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
     const nuevosTel = telefonos.filter(function (t) { return !idPorTel[t]; });
     let creados = 0;
     await porLotes(nuevosTel, async function (lote) {
-      const filas = lote.map(function (t) { return { user_id: user_id, name: porTel[t].nombre, phone: t, channel: 'whatsapp' }; });
-      try { const { data, error } = await supabase.from('contacts').insert(filas).select('id, phone');
-        if (!error && Array.isArray(data)) { data.forEach(function (c) { if (c && c.phone) { idPorTel[String(c.phone)] = c.id; creados++; } }); } } catch (e) {}
+      const _base = function (t) { return { user_id: user_id, name: porTel[t].nombre, phone: t, channel: 'whatsapp' }; };
+      const filas = lote.map(function (t) {
+        const f = _base(t);
+        if (etiquetaLote) f.etiquetas = [etiquetaLote];
+        return f;
+      });
+      const _guardar = function (data) {
+        if (!Array.isArray(data)) return;
+        data.forEach(function (c) { if (c && c.phone) { idPorTel[String(c.phone)] = c.id; creados++; } });
+      };
+      try {
+        const { data, error } = await supabase.from('contacts').insert(filas).select('id, phone');
+        if (!error) { _guardar(data); return; }
+        // FAIL-SAFE: `contacts.etiquetas` es una columna de la Fase 10. Si la cuenta todavia no corrio
+        // esa migracion, mandarla hace fallar el lote ENTERO y no se importa NADA. Antes de este cambio
+        // el insert no la mandaba nunca, asi que sin esta red se le rompe el CSV a quien no migro.
+        if (!etiquetaLote) return;
+        const r2 = await supabase.from('contacts').insert(lote.map(_base)).select('id, phone');
+        if (!r2.error) _guardar(r2.data);
+      } catch (e) {}
     });
+
+    // 3a) La etiqueta tambien a los que YA EXISTIAN. Se SUMA a las que ya tenian, nunca se pisa
+    // (mismo criterio que /api/importacion/:id/aplicar). Sin esto, reimportar una lista para
+    // etiquetarla no haria nada: los repetidos son justamente los que ya estan.
+    if (etiquetaLote && existentesTel.length) {
+      await porLotes(existentesTel, async function (lote) {
+        const ids = lote.map(function (t) { return idPorTel[t]; }).filter(Boolean);
+        if (!ids.length) return;
+        try {
+          const { data: actuales, error: eSel } = await supabase.from('contacts').select('id, etiquetas').eq('user_id', user_id).in('id', ids);
+          if (eSel) return;   // sin la columna no hay nada que actualizar: se sigue sin romper el import
+          await Promise.all((actuales || []).map(async function (c) {
+            const prev = Array.isArray(c.etiquetas) ? c.etiquetas : [];
+            if (prev.indexOf(etiquetaLote) >= 0) return;
+            try { await supabase.from('contacts').update({ etiquetas: prev.concat([etiquetaLote]) }).eq('id', c.id); } catch (e) {}
+          }));
+        } catch (e) {}
+      });
+    }
 
     // 3b) Actualizar EXISTENTES (opt-in): solo pisa `name` (no `nombre_manual`, para no tapar un nombre que el
     // equipo ya haya editado a mano) y SOLO si el CSV trajo un nombre real para ese telefono (nombreCsv no
@@ -25114,7 +25213,24 @@ app.post('/api/whatsapp/importar-leads', async function(req, res) {
 
     // NOTA: se saco la recuperacion de historial via Evolution (era 1 llamada HTTP por lead, en serie, sin timeout ->
     // colgaba el import con archivos grandes). El historial, si hace falta, se puede recuperar despues por-lead.
-    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos, rechazados_formato: rechazadosFormato.length });
+
+    // 6) EL NOMBRE DE LA IMPORTACION queda registrado en `import_lotes`, la MISMA tabla que usa la
+    // importacion con IA -- si no se guardara en ningun lado, pedirle un nombre al usuario seria
+    // pedirle algo para tirarlo a la basura. Va con costo 0 y estado 'aplicado': el CSV no presupuesta
+    // ni aprueba gasto, entra y sale en el mismo request.
+    // BEST-EFFORT A PROPOSITO: si la tabla no existe (cuenta sin la migracion de la Fase 10) o falla,
+    // los contactos YA se importaron. Perder el registro del lote no puede tirar abajo la respuesta.
+    if (nombreLote || etiquetaLote) {
+      try {
+        await supabase.from('import_lotes').insert({
+          user_id: user_id, nombre: nombreLote || null, origen: 'csv', estado: 'aplicado',
+          costo_estimado: 0, costo_real: 0, etiqueta_lote: etiquetaLote || null,
+          total_items: telefonos.length, aplicados: creados,
+        });
+      } catch (e) { console.log('[importar-leads] no se pudo registrar el lote:', e && e.message); }
+    }
+
+    return res.json({ ok: true, total: leadsRaw.length, unicos: telefonos.length, creados: creados, yaExistian: telefonos.length - creados, enRecontacto: enRecontacto, actualizados: actualizados, invalidos: invalidos, rechazados_formato: rechazadosFormato.length, etiqueta: etiquetaLote || null });
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 

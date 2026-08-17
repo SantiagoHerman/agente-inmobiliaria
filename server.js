@@ -35695,7 +35695,29 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
     if (!uid) return res.status(400).json({ error: 'No se pudo crear el usuario (sin id)' });
     // 2) business_settings (rollback del auth user si falla)
     // ui_moderno: true -> las cuentas NUEVAS arrancan SIEMPRE en el panel moderno (el viejo se retiro).
-    var ins = await supabase.from('business_settings').insert({ user_id: uid, company_name: company, rubro: rubro, whatsapp_contacto: whatsapp, ui_moderno: true });
+    // FLAGS DE ARRANQUE DE UNA CUENTA NUEVA. Tienen que estar IGUALES que en el registro publico
+    // (frontend app/register/page.tsx): son los DOS unicos caminos por los que nace una cuenta, y si se
+    // desincronizan una cuenta arranca distinta segun por donde entro.
+    //
+    // POR QUE SE ESCRIBEN EXPLICITAMENTE y no alcanza el default de la base: las columnas se crearon con
+    // DEFAULT false, asi que una cuenta nueva nace con un false EXPLICITO — y el backend lee `=== true` y
+    // respeta ese false como "lo apagaron a proposito". Hay que escribir el true al crear la fila.
+    //
+    // derivacion_v3 (Diego 2026-08-02: "asegurate de que este en todas las futuras cuentas nuevas"):
+    //   ESTE CAMINO NO LO TENIA. El registro publico si. O sea que un cliente creado desde el Maestro
+    //   nacia SIN derivacion: la IA le prometia al lead "te paso con un asesor" y no tenia la herramienta
+    //   para hacerlo — el lead quedaba en Interesado para siempre, sin error y sin aviso. Es exactamente
+    //   lo que le paso a Andres Galdames (46 conversaciones, cero derivaciones).
+    // oportunidades_v1 (Diego 2026-08-17: "oportunidades v1 en las futuras cuentas"):
+    //   Prenderlo NO manda nada. El cron recorre las oportunidades que YA EXISTEN; sin ninguna creada no
+    //   sale un mensaje ni se gasta un token. Y el candado anti-baneo sigue vivo: ante desconexion
+    //   sostenida de WhatsApp el sistema lo apaga solo hasta que el dueno lo reactive.
+    var ins = await supabase.from('business_settings').insert({
+      user_id: uid, company_name: company, rubro: rubro, whatsapp_contacto: whatsapp,
+      ui_moderno: true,           // las cuentas nuevas arrancan en el panel moderno (el viejo se retiro)
+      derivacion_v3: true,
+      oportunidades_v1: true
+    });
     if (ins.error) {
       try { await supabase.auth.admin.deleteUser(uid); } catch(eD){}
       return res.status(400).json({ error: ins.error.message });

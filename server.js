@@ -14516,7 +14516,12 @@ app.post('/api/oportunidades', async (req, res) => {
       media: _mediaObj,
       link: (b.link != null) ? String(b.link).slice(0, 2000) : null,
       max_dia: _maxDia,
-      horario: (b.horario != null) ? String(b.horario).slice(0, 40) : 'oficina',
+      // HORARIO (Diego 2026-08-17: "no salio ningun mensaje desde oportunidades").
+      // ESTABA ROTO: el front manda un OBJETO { desde, hasta } con la franja que eligio el cliente y
+      // aca se hacia String(objeto) -> se guardaba el literal "[object Object]". Las horas elegidas
+      // se tiraban a la basura, y el worker (que compara con 'siempre') caia al horario de oficina
+      // de la cuenta; con horario_oficina en null eso es NUNCA -> la oportunidad no salia jamas.
+      horario: _normHorarioOportunidad(b.horario),
       ritmo: (b.ritmo != null) ? String(b.ritmo).slice(0, 40) : 'normal',
       // FASE 6: de que numero sale. Default 'evolution' = como funciona hoy, para que una oportunidad
       // creada sin elegir nada se comporte EXACTAMENTE igual que antes de este cambio.
@@ -14580,7 +14585,7 @@ app.patch('/api/oportunidades/:id', async (req, res) => {
     if (b.link != null) upd.link = String(b.link).slice(0, 2000);
     if (Object.prototype.hasOwnProperty.call(b, 'media')) upd.media = (b.media && typeof b.media === 'object' && b.media.url) ? { url: String(b.media.url).slice(0, 2000), tipo: (b.media.tipo ? String(b.media.tipo).slice(0, 20) : 'imagen') } : null;
     if (Object.prototype.hasOwnProperty.call(b, 'max_dia')) upd.max_dia = (Number.isFinite(Number(b.max_dia)) && Number(b.max_dia) > 0) ? Math.min(Number(b.max_dia), 5000) : null;
-    if (b.horario != null) upd.horario = String(b.horario).slice(0, 40);
+    if (b.horario != null) upd.horario = _normHorarioOportunidad(b.horario);   // mismo criterio que el POST
     // FASE 6: de que numero sale. Solo dos valores validos; cualquier otra cosa se ignora en vez de
     // guardarse, para que un typo no mande un broadcast por un canal que no existe.
     if (b.canal_envio != null) {
@@ -18372,6 +18377,43 @@ async function enviarRecontactosPendientes() {
 // NUNCA rompe el boot ni otros crons. Corre cada 15 min (setInterval, mas abajo).
 // ============================================================================
 var _oportunidadesEnCurso = false;
+// Normaliza el `horario` de una oportunidad a algo que la columna (text) puede guardar y el worker
+// puede volver a leer. Tres formas validas, y NINGUNA se pierde por el camino:
+//   'siempre'                -> manda a cualquier hora
+//   '{"desde":"9:00",...}'   -> franja propia de la oportunidad (es lo que manda la pantalla)
+//   'oficina'                -> se rige por el horario de oficina de la cuenta (default de siempre)
+function _normHorarioOportunidad(h) {
+  if (h == null) return 'oficina';
+  if (typeof h === 'object') {
+    const d = String(h.desde || '').trim(), ha = String(h.hasta || '').trim();
+    if (d && ha) return JSON.stringify({ desde: d, hasta: ha }).slice(0, 80);
+    return 'oficina';
+  }
+  const s = String(h).slice(0, 80);
+  return (s === '[object Object]') ? 'oficina' : s;   // dato viejo corrupto -> default sano
+}
+
+// Lee lo que guardo _normHorarioOportunidad y decide si AHORA se puede mandar.
+// Devuelve true/false, o null = "no tiene franja propia, decide el horario de oficina".
+function _franjaPropiaPermiteAhora(horario) {
+  const s = String(horario || '');
+  if (s.indexOf('{') !== 0) return null;
+  let cfg = null;
+  try { cfg = JSON.parse(s); } catch (e) { return null; }
+  if (!cfg || !cfg.desde || !cfg.hasta) return null;
+  const _min = function (t) {
+    const m = String(t).match(/^(\d{1,2}):(\d{2})/);
+    return m ? (parseInt(m[1], 10) * 60 + parseInt(m[2], 10)) : null;
+  };
+  const d = _min(cfg.desde), h = _min(cfg.hasta);
+  if (d == null || h == null) return null;
+  // Hora local Argentina (UTC-3), MISMO criterio que dentroHorarioOficinaEn.
+  const ahora = new Date();
+  const arg = new Date(ahora.getTime() + ahora.getTimezoneOffset() * 60000 - 3 * 60 * 60000);
+  const m = arg.getHours() * 60 + arg.getMinutes();
+  return (h >= d) ? (m >= d && m < h) : (m >= d || m < h);   // franja que cruza medianoche
+}
+
 async function procesarOportunidades() {
   if (_oportunidadesEnCurso) return; // guard anti-solape (una tanda puede tardar por el gap 45-120s)
   _oportunidadesEnCurso = true;
@@ -18423,8 +18465,12 @@ async function procesarOportunidades() {
         // HORARIO: la oportunidad respeta el horario de oficina de la cuenta (horario='oficina' por default). Si esta
         // fuera de horario -> no mandar en esta tanda (se retoma en la proxima corrida dentro de horario).
         const _horarioOwner = bs && bs.horario_oficina ? bs.horario_oficina : null;
-        if (op.horario !== 'siempre') { // 'siempre' = ignorar horario (no default); cualquier otro valor respeta oficina
-          if (!dentroHorarioOficina(_horarioOwner)) continue;
+        // 'siempre' = a cualquier hora. Si la oportunidad trae SU PROPIA franja, manda esa (es la que
+        // eligio el cliente en la pantalla). Recien si no tiene ninguna, se cae al horario de oficina.
+        if (op.horario !== 'siempre') {
+          const _propia = _franjaPropiaPermiteAhora(op.horario);
+          if (_propia === false) continue;
+          if (_propia === null && !dentroHorarioOficina(_horarioOwner)) continue;
         }
         // PROGRAMACION: no arrancar antes de programado_para.
         if (op.programado_para && new Date(op.programado_para).getTime() > ahoraMs) continue;

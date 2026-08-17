@@ -15307,8 +15307,15 @@ async function _ejecutarMatchingPropiedad(ownerId, prop, label) {
   if (!oportunidad) {
     var prioridad = 1;
     try { var mx = await supabase.from('oportunidades').select('prioridad').eq('user_id', ownerId).order('prioridad', { ascending: false }).limit(1).maybeSingle(); if (mx && mx.data && Number.isFinite(Number(mx.data.prioridad))) prioridad = Number(mx.data.prioridad) + 1; } catch (eMx) {}
-    var fila = { user_id: ownerId, nombre: nombreOp, estado: 'borrador', prioridad: prioridad, segmentos: [], custom_ids: convIds, mensaje: null, media: null, link: null, max_dia: null, horario: 'oficina', ritmo: 'normal', programado_para: null, total: convIds.length, enviados: 0, enviados_hoy: 0 };
+    var fila = { user_id: ownerId, nombre: nombreOp, estado: 'borrador', prioridad: prioridad, segmentos: [], custom_ids: convIds, mensaje: null, media: null, link: null, max_dia: null, horario: 'oficina', ritmo: 'normal', programado_para: null, total: convIds.length, enviados: 0, enviados_hoy: 0, origen: 'automatch' };
     var ins = await supabase.from('oportunidades').insert(fila).select('id').maybeSingle();
+    // DEPLOY-SAFE: `origen` es una columna nueva (migracion-oportunidades-origen.sql). Si la cuenta
+    // todavia no la corrio, el insert falla ENTERO con 42703 y se perderia la sugerencia. Se reintenta
+    // sin la columna: peor es no avisarle al cliente que tiene leads esperando.
+    if (ins && ins.error && String(ins.error.message || '').indexOf('origen') >= 0) {
+      delete fila.origen;
+      ins = await supabase.from('oportunidades').insert(fila).select('id').maybeSingle();
+    }
     if (ins && ins.error) throw new Error(ins.error.message);
     oportunidad = (ins && ins.data) ? ins.data : null;
   }
@@ -18468,6 +18475,13 @@ async function procesarOportunidades() {
     const _porCuenta = {}; // user_id -> primera (menor prioridad) oportunidad activa
     for (const op of activas) {
       if (!op || !op.user_id) continue;
+      // UNA SUGERENCIA NO SE ENVIA (Diego 2026-08-17). El auto-match arma la LISTA de destinatarios,
+      // no el texto: nace sin mensaje y esperando a que una persona la convierta en campaña.
+      // Se descarta ACA, antes de elegir la de menor prioridad, y no mas abajo con un `continue`:
+      // se procesa UNA oportunidad por cuenta, asi que si una sugerencia se quedara con el lugar,
+      // saltearia la cuenta entera esa tanda y las campanas de verdad no saldrian nunca.
+      // Sin la columna (migracion sin correr) `origen` es undefined -> se comporta igual que hoy.
+      if (String(op.origen || '') === 'automatch') continue;
       if (!_porCuenta[op.user_id]) _porCuenta[op.user_id] = op; // ya vienen ordenadas por prioridad -> la primera es la menor
     }
 

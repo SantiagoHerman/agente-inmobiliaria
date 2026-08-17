@@ -27883,6 +27883,10 @@ async function guardarDesarrolladora(user_id, b, opts) {
     estado_obra: _invStr(dev.estado_obra),
     avance_pct: _invInt(dev.avance_pct),
     fecha_entrega: _invStr(dev.fecha_entrega),
+    // UBICACION EXACTA (mapa del form, 2026-08-15). Van SIEMPRE, incluso en null: es lo que hace
+    // que "Quitar ubicación" realmente borre el pin en vez de dejar el viejo.
+    lat: _invNum(dev.lat),
+    lng: _invNum(dev.lng),
     dev_data: {
       amenities: devData.amenities || [],
       planes: devData.planes || [],
@@ -27927,7 +27931,9 @@ async function guardarDesarrolladora(user_id, b, opts) {
       nombre: filaDev.nombre, tipo: filaDev.tipo, zona: filaDev.zona,
       direccion: filaDev.direccion, entre_calles: filaDev.entre_calles, ciudad: filaDev.ciudad,
       descripcion: filaDev.descripcion, link: filaDev.link, estado_obra: filaDev.estado_obra,
-      avance_pct: filaDev.avance_pct, fecha_entrega: filaDev.fecha_entrega, dev_data: _devDataUpd
+      avance_pct: filaDev.avance_pct, fecha_entrega: filaDev.fecha_entrega,
+      lat: filaDev.lat, lng: filaDev.lng,   // ubicacion exacta del mapa (2026-08-15)
+      dev_data: _devDataUpd
     };
     var dUpd = await supabase.from('developments').update(filaDevUpd).eq('id', devEditId).eq('user_id', user_id).select('id').maybeSingle();
     if (dUpd.error) {
@@ -28145,6 +28151,24 @@ app.post('/api/inventario/guardar', async function (req, res) {
           }
           complejo_id = gIns.data && gIns.data.id;
         }
+      }
+
+      // 1b) UBICACION EXACTA del complejo (mapa del form, 2026-08-15). Va en el COMPLEJO y no en la
+      //     unidad a proposito: todas las habitaciones/cabañas estan en la misma direccion, ponerle
+      //     coordenadas a cada una seria repetir el mismo punto y abrir la puerta a que se
+      //     desincronicen.
+      //     DEPLOY-SAFE: las columnas lat/lng son nuevas (migracion-hotel-mapa.sql). Si todavia no
+      //     se corrio, el update falla con 42703 y se ignora — el resto del guardado sigue igual.
+      //     Se mandan SIEMPRE que el form las incluya, incluso en null: es lo que hace que
+      //     "Quitar ubicación" realmente borre el pin.
+      if (complejo_id && (typeof grupo.lat !== 'undefined' || typeof grupo.lng !== 'undefined')) {
+        try {
+          var _geo = { lat: _invNum(grupo.lat), lng: _invNum(grupo.lng) };
+          var _upGeo = await supabase.from('hotel_complejos').update(_geo).eq('id', complejo_id).eq('user_id', user_id);
+          if (_upGeo && _upGeo.error && !_esColumnaAusente(_upGeo.error)) {
+            console.error('[inventario] hotel geo: ' + _upGeo.error.message);
+          }
+        } catch (eGeo) { /* columnas ausentes u otro error: no bloquea el guardado */ }
       }
 
       // 2) Unidad -> hotel_unidades (tabla propia de hotel; complejo_id, atributos jsonb)

@@ -5339,6 +5339,7 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     // correcto. Sin ninguno -> sin depto (elegirAsesorActivo pool general como cobertura).
     let _deptoId = null;
     let _hintResolvio = false; // el hint matcheo un depto valido (para decidir si pisar el depto viejo de la conv)
+    let _hintSinConfirmar = null; // ARREGLO B: hint que matcheo un depto real pero que la validacion no pudo respaldar.
     if (opts.deptoHint) {
       try {
         // FIX ACENTOS (Diego 2026-07-27): antes comparaba el nombre TAL CUAL. Si la IA escribia "Administracion"
@@ -5361,13 +5362,44 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
         if (_m) {
           // VALIDACION DEL AREA (gated derivacion_validada_v1): el nombre matcheo un depto real, pero eso NO
           // significa que corresponda. La IA lo escribe a mano y puede inventarlo (caso Max). Si lo que dijo el
-          // LEAD no respalda ese area, se DESCARTA el hint: el lead se deriva IGUAL (nunca se frena una
-          // derivacion), pero sin departamento -> cae al pool general en vez de a un area equivocada.
+          // LEAD no respalda ese area, el hint queda SIN CONFIRMAR.
+          //
+          // ============ ARREGLO B (Diego 2026-08-18): EL FILTRO PIERDE EL PODER DE VETO ============
+          // ANTES: sin respaldo -> hint DESCARTADO -> _deptoId=null -> POOL GENERAL. Y ademas se bloqueaba a
+          // proposito la caida al es_default (ver el if de mas abajo), o sea que el pool general no era un
+          // accidente: era la salida garantizada. Eso es PEOR en todo sentido que equivocarse de area, porque
+          // elegirAsesorActivo (~2242) NO mira horarios, NO mira membresia de departamento, y el anti-ping-pong
+          // (derivacion_intentados) vive DENTRO del if (_deptoId) (~5798) => en el pool general no existe.
+          //
+          // CASO MEDIDO que lo destapo -- "Cariiii", Anton, 17-18/08/2026:
+          //   Sonnet leyo la conversacion entera y pidio "Venta". Estaba BIEN: la lead hablaba de invertir, de
+          //   30-40 mil dolares y de un dpto. El filtro lo veto porque el criterio de Venta exige literalmente
+          //   las raices venta/compr/propi/preci y ninguna de esas letras aparecia en lo que ella escribio.
+          //   Resultado: 123 pases automaticos en 18 HORAS seguidas rebotando entre 2 asesores que ni siquiera
+          //   comparten departamento (toda la madrugada), ~120 avisos a esos dos, y la lead esperando desde las
+          //   20:00 un "aguardame un momento" que nunca llego. Lo corto una persona a mano al otro dia.
+          //   Contraprueba de ESA MISMA NOCHE, misma cuenta: la conv 547cf6f7, que SI tenia departamento, roto
+          //   por los 6 del area sin repetir a nadie y se resolvio en 36 minutos. El sistema con depto funciona.
+          //
+          // AHORA: la validacion solo DEGRADA la prioridad del hint, no lo tira. Precedencia sin respaldo:
+          //   (1) el departamento que la conv YA tenia  (el clasificador lo dedujo con mas contexto que 4 palabras)
+          //   (2) el hint sin confirmar                 (lo dijo Sonnet leyendo todo; el filtro son 4 raices)
+          //   (3) el es_default                         (desbloqueado, ver abajo)
+          // El lead SIEMPRE termina en un area. Errar de area lo arregla un humano en un click; el pool general
+          // costo 18 horas. Se deja la conv PRIMERO justamente para no dejar pasar un hint inventado (caso Max)
+          // por encima de un area ya deducida: ese era el motivo original de la validacion y se conserva.
+          // KILL-SWITCH: AREA_SIN_RESPALDO_AL_POOL=on en Railway restaura el veto duro de antes.
+          // =========================================================================================
           let _valOn = false;
           try { _valOn = await derivacionValidadaActiva(ownerId); } catch (eV) { _valOn = false; }
           if (_valOn && !(await _areaTieneRespaldo(convId, _m))) {
-            console.log('[DERIVACION] hint "' + opts.deptoHint + '" DESCARTADO (sin respaldo en lo que dijo el lead) conv=' + convId);
             opts._hintDescartado = _m.nombre || String(opts.deptoHint); // queda para el registro de decisiones
+            if (String(process.env.AREA_SIN_RESPALDO_AL_POOL || '').toLowerCase() === 'on') {
+              console.log('[DERIVACION] hint "' + opts.deptoHint + '" DESCARTADO (sin respaldo; kill-switch AREA_SIN_RESPALDO_AL_POOL=on) conv=' + convId);
+            } else {
+              _hintSinConfirmar = _m.id; // no manda sobre el depto de la conv, pero evita el pool general
+              console.log('[DERIVACION] hint "' + opts.deptoHint + '" SIN RESPALDO en lo que dijo el lead: NO se descarta, queda detras del depto de la conv (arreglo B) conv=' + convId);
+            }
           } else {
             _deptoId = _m.id; _hintResolvio = true;
           }
@@ -5375,10 +5407,17 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
       } catch (eH) { /* si falla la query de departamentos, caemos al depto de la conv abajo */ }
     }
     if (!_deptoId) _deptoId = _cv.departamento_id || null; // sin hint valido -> depto de la conv
-    // Si el hint se DESCARTO por falta de respaldo, tampoco vale caer al es_default: seria elegir un area
-    // inventada por otra via (en Anton el default es "Venta", asi que un lead sin intencion clara terminaria
-    // igual en un area que no pidio). Sin respaldo y sin depto propio -> SIN departamento, al pool general.
-    if (!_deptoId && !opts._hintDescartado) {
+    // ARREGLO B (2026-08-18): el hint SIN CONFIRMAR entra aca -- detras del depto propio de la conv y delante
+    // del default. Antes no entraba en ningun lado y el lead se iba al pool general (ver el bloque de arriba).
+    if (!_deptoId && _hintSinConfirmar) {
+      _deptoId = _hintSinConfirmar;
+      console.log('[DERIVACION] conv ' + convId + ': sin depto propio -> se usa el hint sin confirmar en vez del pool general (arreglo B)');
+    }
+    // ARREGLO B: el es_default vuelve a ser salida valida. La condicion "&& !opts._hintDescartado" que habia aca
+    // era la que garantizaba el pool general cuando la validacion fallaba. Se saca: cualquier area es mejor que
+    // el pool general, que no mira horarios ni tiene anti-ping-pong. Si igual no hay default activo, el
+    // comportamiento es el de siempre (sin depto) -- eso no lo cambia este arreglo.
+    if (!_deptoId) {
       try { const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); _deptoId = _dd && _dd.id ? _dd.id : null; } catch (eDD) {}
     }
     // Persistir el depto en la conv (mejora el reparto). Best-effort. Escribir cuando: la conv NO tenia depto, o el

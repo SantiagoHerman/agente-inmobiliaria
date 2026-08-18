@@ -2113,6 +2113,7 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
     // para que un nuevo ciclo de espera vuelva a escalar desde p1. Best-effort/0 IA.
     try { await supabase.from('conversations').update({ sla_avisos: {} }).eq('id', conv.id); } catch (eSlaClr) {}
     try { _slaAvisoMem.delete(conv.id + ':p1'); _slaAvisoMem.delete(conv.id + ':p2'); _slaAvisoMem.delete(conv.id + ':p3'); } catch (eMemClr) {}
+    try { _slaDesdeMem.delete(conv.id); } catch (eDesClr) {} // RELOJ SLA: el humano contesto -> la proxima espera re-arma el reloj
     console.log('Mensaje saliente (celular) guardado en conversacion ' + conv.id);
   } catch (e) { console.error('Error en guardarMensajeSaliente:', e && e.message); }
 }
@@ -13721,6 +13722,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
     // igual se purga). Se borran las 3 claves (p1/p2/p3) de ESTA conv del Set en memoria.
     try { await supabase.from('conversations').update({ sla_avisos: {} }).eq('id', conversation_id); } catch (eSlaClr) {}
     try { _slaAvisoMem.delete(conversation_id + ':p1'); _slaAvisoMem.delete(conversation_id + ':p2'); _slaAvisoMem.delete(conversation_id + ':p3'); } catch (eMemClr) {}
+    try { _slaDesdeMem.delete(conversation_id); } catch (eDesClr) {} // RELOJ SLA: el humano contesto -> re-armar el reloj
     // RACE #1 (CRITICO) — IA-vs-HUMANO = "Tomar conversacion" AUTOMATICO. Cuando un HUMANO (asesor/admin) escribe en
     // un lead con la IA encendida, equivale a apretar "Tomar conversacion": la IA queda SIN posibilidad de responder
     // (ai_enabled=false), asi no le pisa la respuesta al humano delante del cliente. NO cambiamos el status (igual que
@@ -17944,6 +17946,10 @@ async function revisarRespaldoTimeout() {
 // ============================================================================
 const _avisoCalienteMem = new Set();   // dedupe en memoria del aviso #2 (red dentro del proceso)
 const _slaAvisoMem = new Set();        // dedupe en memoria del aviso #4 (escalada SLA), clave 'convId:pN'
+// RELOJ DEL SLA (Diego 2026-08-18): respaldo EN MEMORIA del 'desde' (el momento en que la escalada empezo a
+// mirar una conversacion). Solo se usa si la escritura del jsonb sla_avisos falla: asi el arreglo nunca puede
+// APAGAR la escalada en silencio (peor es no avisar que avisar de mas). Clave convId -> ms.
+const _slaDesdeMem = new Map();
 var _avisosInternosEnCurso = false;
 async function revisarAvisosInternos() {
   if (_avisosInternosEnCurso) return;
@@ -18134,8 +18140,57 @@ async function revisarAvisosInternos() {
         _ult = r.data;
       } catch (eUlt) { _ult = null; }
       if (!_ult || _ult.role !== 'contact' || !_ult.created_at) continue; // ya respondieron (o sin datos)
-      const anchorMs = new Date(_ult.created_at).getTime();
-      if (!anchorMs) continue;
+      const _msgMs = new Date(_ult.created_at).getTime();
+      if (!_msgMs) continue;
+      // Dedupe persistente (jsonb sla_avisos). SE LEE ACA (antes estaba mas abajo) porque el mismo jsonb guarda
+      // ahora el "desde" del reloj, y hace falta ANTES de calcular la espera.
+      let _slaPrev = {};
+      try { const { data: _cvS } = await supabase.from('conversations').select('sla_avisos').eq('id', conv.id).maybeSingle(); _slaPrev = (_cvS && _cvS.sla_avisos && typeof _cvS.sla_avisos === 'object') ? _cvS.sla_avisos : {}; } catch (eSlaR) { _slaPrev = {}; }
+      // =============== EL RELOJ ARRANCA CUANDO LA ESCALADA EMPIEZA A MIRAR (Diego 2026-08-18) ===============
+      // ANTES: la espera se media SIEMPRE desde el ultimo mensaje del lead. Eso esta bien mientras alguien sea
+      // responsable de contestarle -- pero una conversacion puede pasar DIAS sin nadie a cargo (sin asesor, o con
+      // la IA atendiendo) y no entrar a la escalada. Cuando por fin entra (le asignan un asesor y se apaga la IA),
+      // el reloj no arrancaba de cero: arrancaba del mensaje viejo. Salta directo al paso 3 y le manda un WhatsApp
+      // al dueño con un numero absurdo por una demora que NADIE tuvo.
+      //
+      // CASO MEDIDO (Diego 2026-08-18): "Lead Alejandro Marquez Landini esperando 7274 minutos" (Raices CRM). El
+      // lead habia escrito 5 dias antes sin nadie a cargo; Diego le escribio a mano a las 15:33, el lead contesto
+      // a las 15:35 y la conversacion recien ahi quedo asignada con la IA apagada => la escalada la vio por primera
+      // vez con un anchor de 5 dias. Habia 16 conversaciones mas en la misma fila, de 24 h a 38 dias.
+      //
+      // POR QUE NO UN TECHO (objecion de Diego, y tenia razon): un tope de "no escalar si pasa de X horas" rompe
+      // los feriados y fines de semana largos. Un lead que escribio el viernes con su asesor ya asignado espera 90
+      // horas REALES y ahi el aviso SI corresponde. Un techo lo tapaba.
+      //
+      // COMO: la primera vez que la escalada ve una conversacion esperando, anota el momento en sla_avisos.desde y
+      // NO escala en ese tick. Despues cuenta desde la mas nueva entre (mensaje del lead) y (desde). O sea: no hay
+      // techo -- una espera real de 3 dias sigue avisando con 3 dias -- pero NO se cuenta el tiempo anterior a que
+      // hubiera alguien a cargo. Se guarda en la BASE, asi que un redeploy ya no re-dispara todo el backlog (el Set
+      // en memoria se borraba en cada reinicio: probablemente lo que destapo esto).
+      // El reset a {} cuando un humano contesta (~2114 y ~13696) tambien limpia el "desde": la proxima espera
+      // re-arma el reloj sola. NO hace falta migracion: reusa la columna jsonb que ya existe.
+      // KILL-SWITCH: SLA_RELOJ_DESDE_QUE_MIRA=off vuelve a medir siempre desde el mensaje del lead.
+      // ======================================================================================================
+      let anchorMs = _msgMs;
+      if (String(process.env.SLA_RELOJ_DESDE_QUE_MIRA || '').toLowerCase() !== 'off') {
+        let _desdeMs = 0;
+        if (_slaPrev.desde) { const _d = new Date(_slaPrev.desde).getTime(); if (_d) _desdeMs = _d; }
+        if (!_desdeMs && _slaDesdeMem.has(conv.id)) _desdeMs = _slaDesdeMem.get(conv.id) || 0;
+        if (!_desdeMs) {
+          // Primera vez que la vemos esperando: anotar el arranque y NO escalar en este tick.
+          const _nuevo = Object.assign({}, _slaPrev, { desde: new Date(ahoraMs).toISOString() });
+          let _okDesde = false;
+          try {
+            // postgrest NO tira excepcion: devuelve { error }. Hay que chequearlo o el fallo pasa desapercibido.
+            const _rD = await supabase.from('conversations').update({ sla_avisos: _nuevo }).eq('id', conv.id);
+            _okDesde = !(_rD && _rD.error);
+            if (!_okDesde) console.error('SLA reloj: no se pudo guardar el desde de ' + conv.id + ': ' + ((_rD && _rD.error && _rD.error.message) || '?'));
+          } catch (eDes) { console.error('SLA reloj: excepcion guardando el desde: ' + (eDes && eDes.message)); }
+          _slaDesdeMem.set(conv.id, ahoraMs); // respaldo: si la base no lo acepto, al menos el proceso lo recuerda
+          continue; // recien empezamos a mirarla: nada que escalar todavia
+        }
+        if (_desdeMs > anchorMs) anchorMs = _desdeMs; // no contar tiempo previo a que hubiera alguien a cargo
+      }
       // SLA 24/7 (Diego 2026-08-03): "no importa el horario o el dia. Si alguien escribe a las 23hs el dueño o
       // la administracion se tienen que enterar por mas que el usuario no trabaje o este pausado".
       //
@@ -18151,9 +18206,7 @@ async function revisarAvisosInternos() {
       let _paso = 0;
       if (esperaMin >= _p3) _paso = 3; else if (esperaMin >= _p2) _paso = 2; else if (esperaMin >= _p1) _paso = 1;
       if (_paso === 0) continue; // todavia no llego al primer umbral
-      // Dedupe persistente (jsonb sla_avisos) + Set en memoria. Leemos el estado actual de los escalones.
-      let _slaPrev = {};
-      try { const { data: _cvS } = await supabase.from('conversations').select('sla_avisos').eq('id', conv.id).maybeSingle(); _slaPrev = (_cvS && _cvS.sla_avisos && typeof _cvS.sla_avisos === 'object') ? _cvS.sla_avisos : {}; } catch (eSlaR) { _slaPrev = {}; }
+      // (el jsonb sla_avisos ya se leyo arriba en _slaPrev: el mismo campo guarda el "desde" del reloj)
       const _keyMem = function(n){ return conv.id + ':p' + n; };
       const _yaEnviado = function(n){ return !!_slaPrev['p' + n] || _slaAvisoMem.has(_keyMem(n)); };
       if (_yaEnviado(_paso)) continue; // ese escalon ya se disparo

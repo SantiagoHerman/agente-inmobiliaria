@@ -12750,6 +12750,32 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     // en interesados solamente sin haber tenido recontacto".
     let _contestaRecontacto = false;
 
+    // ===== LO MISMO SI SALIO DE UNA OPORTUNIDAD (Diego 2026-08-17) =====
+    // "te dicen que no les interesa, deberia ir a cerrado. Asi esta programado el recontacto, y lo
+    //  mismo si salio de oportunidad."
+    //
+    // EL AGUJERO: la linea del prompt que invierte la regla (un "no" seco = sin_interes) se prendia
+    // SOLO con status 'recontacto'. Una promo que le llega a alguien que esta 'en_conversacion' o
+    // 'interesado' no la activaba: el lead contestaba "no me interesa" y la charla seguia abierta,
+    // porque para el clasificador ese "no" descartaba UNA propiedad, no el contacto.
+    // Es el mismo caso de fondo: NO escribio por su cuenta, le escribimos nosotros y esto es la
+    // respuesta. Que la promo haya salido de Oportunidades y no de la cola de recontacto no cambia
+    // como hay que leer ese "no".
+    //
+    // COMO SE DETECTA: el ultimo mensaje NUESTRO de la charla lleva enviado_por "Oportunidad: ...".
+    // Eso lo escribe el worker desde hoy (ver procesarOportunidades) -- esto y aquello son la misma
+    // pieza: sin el mensaje guardado no habria forma de saberlo.
+    // CERO IA: es un SELECT de una fila, y solo se pregunta si hace falta (si ya venia de
+    // 'recontacto' el resultado seria el mismo y la query se saltea).
+    if (convExistente && convExistente.status !== 'recontacto' && convExistente.id) {
+      try {
+        const { data: _ultAi } = await supabase.from('messages')
+          .select('enviado_por').eq('conversation_id', convExistente.id).eq('role', 'ai')
+          .order('created_at', { ascending: false }).limit(1).maybeSingle();
+        if (_ultAi && String(_ultAi.enviado_por || '').indexOf('Oportunidad:') === 0) _contestaRecontacto = true;
+      } catch (eOpc) { /* sin dato -> se comporta como hasta hoy */ }
+    }
+
     // Si la conversacion estaba en 'recontacto' y el lead volvio a escribir:
     // vuelve al estado en el que estaba (estado_previo) y se resetea el contador de recontactos
     if (convExistente && convExistente.status === 'recontacto') {

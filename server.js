@@ -12140,6 +12140,73 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     else if (msg.videoMessage) { tipoMediaEntrante = 'video'; if (!texto) texto = msg.videoMessage.caption || '[video]'; }
     else if (msg.documentMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = (msg.documentMessage && msg.documentMessage.fileName) ? ('[documento] ' + msg.documentMessage.fileName) : '[documento]'; }
     else if (msg.documentWithCaptionMessage) { tipoMediaEntrante = 'documento'; if (!texto) texto = '[documento]'; }
+    // ============ QUE LLEGUE TODO, IGUAL QUE EN WHATSAPP (Diego 2026-08-18) ============
+    // ANTES esta cadena reconocia SEIS tipos (texto, imagen, audio, video, documento, ubicacion) y todo lo demas
+    // caia en el `if (!texto && !tipoMediaEntrante) return` de mas abajo: se DESCARTABA EN SILENCIO. No quedaba
+    // rastro en ningun lado -- ni el dueño, ni el asesor, ni la IA se enteraban de que el lead habia mandado algo.
+    //
+    // CASO QUE LO DESTAPO: "Eliana Bazan Argenprop" (cuenta Raices CRM, conv 48386498, 18/08). Le paso a Diego
+    // la TARJETA DE CONTACTO del jefe comercial de Argenprop. En el chat quedo el mensaje de ella diciendo "ahi
+    // te pase su contacto de whatsapp" (17:09) y NADA antes: la tarjeta nunca llego a la base. Diego lo reporto
+    // como "no se puede visualizar"; en realidad no habia nada que visualizar.
+    // Es el mismo agujero que tenian las ubicaciones antes de que se agregara su rama (ver el if de arriba).
+    //
+    // DECISION DE DIEGO: "habilita todo asi llega lo mismo que en el whatsapp y acceden a todo" + "la IA debe
+    // reconocer el contexto de la conversacion o en todo caso el usuario". Por eso NO se filtra por tipo: todo
+    // se guarda con un texto DESCRIPTIVO (que es lo que despues lee la IA como contexto) y quien decide que hacer
+    // es la IA leyendo la conversacion, o la persona que lo ve en el chat. Sin reglas fijas por tipo.
+    //
+    // Los tipos con archivo se mapean a los que el front YA sabe dibujar (sticker -> imagen, nota redonda ->
+    // video), asi esto NO necesita ningun cambio en el front ni migracion.
+    // ===================================================================================
+    else if (msg.stickerMessage) { tipoMediaEntrante = 'imagen'; if (!texto) texto = '[sticker]'; } // webp: el navegador lo dibuja por el content-type
+    else if (msg.ptvMessage) { tipoMediaEntrante = 'video'; if (!texto) texto = '[video nota]'; } // la nota de voz redonda
+    else if (msg.viewOnceMessage || msg.viewOnceMessageV2 || msg.viewOnceMessageV2Extension) {
+      // "ver una sola vez": el contenido real viene ADENTRO. Se desenvuelve y se trata como lo que es.
+      const _vo = ((msg.viewOnceMessage || msg.viewOnceMessageV2 || msg.viewOnceMessageV2Extension) || {}).message || {};
+      if (_vo.imageMessage) { tipoMediaEntrante = 'imagen'; if (!texto) texto = _vo.imageMessage.caption || '[foto de una sola vez]'; }
+      else if (_vo.videoMessage) { tipoMediaEntrante = 'video'; if (!texto) texto = _vo.videoMessage.caption || '[video de una sola vez]'; }
+      else if (_vo.audioMessage) { tipoMediaEntrante = 'audio'; if (!texto) texto = '[audio de una sola vez]'; }
+      else if (!texto) texto = '[mensaje de una sola vez]';
+    }
+    else if (msg.contactMessage || msg.contactsArrayMessage) {
+      // TARJETA(S) DE CONTACTO. Se arma un texto legible con nombre y numero para que el asesor lo vea y lo
+      // copie, y para que la IA tenga el dato en el contexto. El numero sale del vcard: primero waid= (el de
+      // WhatsApp, siempre limpio); si no hay, se cae al TEL: tal cual esta agendado.
+      const _lista = msg.contactsArrayMessage
+        ? (Array.isArray(msg.contactsArrayMessage.contacts) ? msg.contactsArrayMessage.contacts : [])
+        : [msg.contactMessage];
+      const _fmt = _lista.map(function (c) {
+        const _nom = (c && c.displayName) ? String(c.displayName).trim() : '';
+        const _vc = (c && c.vcard) ? String(c.vcard) : '';
+        const _tels = [];
+        try {
+          const _reW = /waid=(\d{6,})/g; let _mw;
+          while ((_mw = _reW.exec(_vc)) !== null) { if (_tels.indexOf(_mw[1]) < 0) _tels.push(_mw[1]); }
+          if (!_tels.length) {
+            const _reT = /TEL[^:\r\n]*:\s*([+\d][\d\s().-]{5,})/gi; let _mt;
+            while ((_mt = _reT.exec(_vc)) !== null) { const _t = _mt[1].replace(/[^\d+]/g, ''); if (_t && _tels.indexOf(_t) < 0) _tels.push(_t); }
+          }
+        } catch (eVc) { /* vcard raro: igual guardamos el nombre */ }
+        return ((_nom || 'contacto') + (_tels.length ? (' ' + _tels.join(' / ')) : '')).trim();
+      }).filter(Boolean);
+      if (!texto) texto = '[contacto] ' + (_fmt.join(' | ') || 'sin datos');
+    }
+    else if (msg.pollCreationMessage || msg.pollCreationMessageV2 || msg.pollCreationMessageV3) {
+      const _p = msg.pollCreationMessage || msg.pollCreationMessageV2 || msg.pollCreationMessageV3 || {};
+      const _ops = Array.isArray(_p.options) ? _p.options.map(function (o) { return (o && o.optionName) ? String(o.optionName) : ''; }).filter(Boolean) : [];
+      if (!texto) texto = '[encuesta] ' + (_p.name ? String(_p.name) : '') + (_ops.length ? (' - opciones: ' + _ops.join(', ')) : '');
+    }
+    else if (msg.liveLocationMessage) {
+      const _ll = msg.liveLocationMessage || {};
+      const _laL = (_ll.degreesLatitude != null) ? _ll.degreesLatitude : _ll.latitude;
+      const _lnL = (_ll.degreesLongitude != null) ? _ll.degreesLongitude : _ll.longitude;
+      if (_laL != null && _lnL != null) {
+        _ubicEntrante = { lat: Number(_laL), lng: Number(_lnL), name: (_ll.caption || 'ubicacion en vivo'), address: '' };
+        tipoMediaEntrante = 'ubicacion';
+      }
+      if (!texto) texto = '[ubicacion en vivo]' + (_ll.caption ? (' ' + _ll.caption) : '');
+    }
     // CITA / REPLY ENTRANTE: si el lead respondio CITANDO otro mensaje, Baileys trae contextInfo con el id del mensaje
     // citado (stanzaId) y una copia de su contenido (quotedMessage). El contextInfo vive en distinto nodo segun el tipo:
     // en extendedTextMessage para texto, y dentro del nodo del media (imageMessage/videoMessage/...) para media. Lo
@@ -12187,6 +12254,20 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     if (msg.reactionMessage) {
       try { await manejarReaccionEntrante(instanciaNombre, msg.reactionMessage, esFromMe); } catch (eReac) { console.error('reaccion entrante:', eReac && eReac.message); }
       return;
+    }
+    // RED DE SEGURIDAD (Diego 2026-08-18): si llego algo que NO sabemos interpretar, se guarda igual con el nombre
+    // del tipo en vez de desaparecer. Es lo que evita que el proximo formato que invente WhatsApp vuelva a abrir un
+    // agujero mudo como el de las tarjetas de contacto. La lista de abajo son nodos de PROTOCOLO (no son mensajes de
+    // una persona): si no se excluyeran, cada chat se llenaria de cartelitos inutiles.
+    if (!texto && !tipoMediaEntrante) {
+      const _RUIDO = ['messageContextInfo', 'senderKeyDistributionMessage', 'protocolMessage', 'deviceSentMessage',
+        'reactionMessage', 'pollUpdateMessage', 'editedMessage', 'keepInChatMessage', 'botInvokeMessage', 'ephemeralMessage'];
+      let _tipoRaro = null;
+      try { _tipoRaro = Object.keys(msg || {}).filter(function (k) { return _RUIDO.indexOf(k) < 0; })[0] || null; } catch (eTR) { _tipoRaro = null; }
+      if (_tipoRaro) {
+        texto = '[mensaje no soportado: ' + _tipoRaro + ']';
+        console.log('[WEBHOOK] tipo de mensaje no soportado, se guarda igual para que no se pierda: ' + _tipoRaro);
+      }
     }
     if (!texto && !tipoMediaEntrante) return;
 

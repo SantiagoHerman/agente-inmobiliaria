@@ -2120,12 +2120,53 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
 
 // Backup automatico: junta todos los datos de cada user y guarda una foto en la tabla backups.
 // Mantiene las ultimas 48 copias por user (24 hs a razon de 1 cada 30 min) y borra las viejas.
+// ============================================================================
+// BACKUP POR CLIENTE v2 (2026-08-18): el PESO va a Storage; la tabla queda de catalogo
+// ----------------------------------------------------------------------------
+// ANTES: cada 30 min se copiaban las 8 tablas de CADA cuenta (15 en la base, 3
+// activas) como JSON gigante ADENTRO de la tabla `backups` -> llego a 136 MB
+// (el 76% de la base entera) y sus lecturas/escrituras se comian el Disk IO.
+// AHORA: 1 vez por dia (+ a los 90s de arrancar => tambien tras cada deploy):
+//   - Solo cuentas que NO estan en la papelera (eliminado_at). Las pausadas SI
+//     se respaldan: el webhook les sigue guardando mensajes.
+//   - El volcado va COMPRIMIDO (gzip) al bucket privado `backups` de Storage,
+//     que no compite por el disco de Postgres.
+//   - En la tabla queda solo una fila-catalogo liviana: resumen + puntero
+//     { storage_path } -> el listado del Maestro sigue igual y la descarga baja
+//     el archivo de Storage (fallback transparente en el endpoint).
+//   - Retencion: 14 copias por cuenta (fila + archivo de Storage).
+// Los snapshots de BORRADO DEFINITIVO no se tocan: su cuenta ya no esta en
+// business_settings, asi que la retencion por-cuenta nunca los alcanza.
+const BACKUP_BUCKET = 'backups';
+let _backupBucketOk = false;
+async function _asegurarBucketBackups() {
+  if (_backupBucketOk) return;
+  try { await supabase.storage.createBucket(BACKUP_BUCKET, { public: false }); } catch (e) {}
+  _backupBucketOk = true; // si ya existia, createBucket devuelve error y esta perfecto igual
+}
+async function _bajarBackupDeStorage(path) {
+  try {
+    const zlib = require('zlib');
+    const r = await supabase.storage.from(BACKUP_BUCKET).download(path);
+    if (!r || r.error || !r.data) return null;
+    const buf = Buffer.from(await r.data.arrayBuffer());
+    const json = /\.gz$/.test(path) ? zlib.gunzipSync(buf).toString('utf8') : buf.toString('utf8');
+    return JSON.parse(json);
+  } catch (e) { console.error('_bajarBackupDeStorage:', e && e.message); return null; }
+}
 async function hacerBackup() {
   try {
-    // Obtener todos los user_id que tienen configuracion (clientes activos)
-    const { data: settings } = await supabase.from('business_settings').select('user_id');
-    if (!settings || settings.length === 0) return;
-    const userIds = [...new Set(settings.map(function(s){ return s.user_id; }))];
+    const zlib = require('zlib');
+    await _asegurarBucketBackups();
+    // Cuentas a respaldar: todas las que NO estan en la papelera. Si la columna
+    // eliminado_at fallara, el fallback respalda TODAS (nunca respaldar de menos).
+    let cuentas = null;
+    { const q = await supabase.from('business_settings').select('user_id, eliminado_at');
+      if (q && !q.error) cuentas = (q.data || []).filter(function(x){ return !x.eliminado_at; });
+      else { const q2 = await supabase.from('business_settings').select('user_id'); cuentas = (q2 && q2.data) || []; } }
+    if (!cuentas || cuentas.length === 0) return;
+    const userIds = [...new Set(cuentas.map(function(x){ return x.user_id; }))];
+    const fechaAR = new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10); // dia en Argentina
     for (const uid of userIds) {
       try {
         const tablas = ['conversations','messages','contacts','recontactos','business_settings','properties','knowledge_base','whatsapp_instancias'];
@@ -2135,14 +2176,31 @@ async function hacerBackup() {
           contenido[t] = data || [];
         }
         const resumen = 'conv:' + (contenido.conversations.length) + ' msg:' + (contenido.messages.length) + ' cont:' + (contenido.contacts.length);
-        await supabase.from('backups').insert({ user_id: uid, contenido: contenido, resumen: resumen });
-        // Limpieza: dejar solo las ultimas 48 copias de este user
-        const { data: viejos } = await supabase.from('backups').select('id').eq('user_id', uid).order('created_at', { ascending: false }).range(48, 1000);
-        if (viejos && viejos.length > 0) {
-          const ids = viejos.map(function(v){ return v.id; });
-          await supabase.from('backups').delete().in('id', ids);
+        // 1) El peso, comprimido, a Storage. upsert: una copia por dia por cuenta.
+        const storagePath = 'diario/' + uid + '/' + fechaAR + '.json.gz';
+        const gz = zlib.gzipSync(Buffer.from(JSON.stringify(contenido), 'utf8'));
+        const up = await supabase.storage.from(BACKUP_BUCKET).upload(storagePath, gz, { contentType: 'application/gzip', upsert: true });
+        if (up && up.error) throw new Error('storage: ' + up.error.message);
+        // 2) La fila-catalogo LIVIANA (para el listado/descarga del Maestro). Anti-duplicado
+        //    del mismo dia (rearranques): se pide SOLO el puntero, nunca el contenido viejo.
+        let yaHoy = false;
+        try {
+          const ya = await supabase.from('backups').select('id, sp:contenido->>storage_path')
+            .eq('user_id', uid).gte('created_at', new Date(Date.now() - 86400000).toISOString()).limit(30);
+          yaHoy = !!(ya && ya.data && ya.data.some(function(v){ return v.sp === storagePath; }));
+        } catch (eYa) {}
+        if (!yaHoy) {
+          await supabase.from('backups').insert({ user_id: uid, contenido: { storage_path: storagePath, comprimido: true }, resumen: resumen });
         }
-        console.log('Backup hecho para user ' + uid + ' (' + resumen + ')');
+        // 3) Retencion: 14 copias por cuenta. Se borra la fila Y su archivo de Storage.
+        const { data: viejos } = await supabase.from('backups').select('id, sp:contenido->>storage_path')
+          .eq('user_id', uid).order('created_at', { ascending: false }).range(14, 1000);
+        if (viejos && viejos.length > 0) {
+          const paths = viejos.map(function(v){ return v.sp; }).filter(Boolean);
+          if (paths.length) { try { await supabase.storage.from(BACKUP_BUCKET).remove(paths); } catch (eRm) {} }
+          await supabase.from('backups').delete().in('id', viejos.map(function(v){ return v.id; }));
+        }
+        console.log('Backup hecho para user ' + uid + ' -> Storage ' + storagePath + ' (' + resumen + ')');
       } catch (e2) { console.error('Error backup user ' + uid + ':', e2 && e2.message); }
     }
   } catch (e) { console.error('Error en hacerBackup:', e && e.message); }
@@ -15759,6 +15817,13 @@ app.get('/api/maestro/backup/descargar', async function(req, res){
     var r = await supabase.from('backups').select('user_id, created_at, resumen, contenido').eq('id', id).maybeSingle();
     if (r.error || !r.data) return res.status(404).json({ error: 'Backup no encontrado' });
     var d = r.data;
+    // Backup v2: si la fila es un puntero a Storage, bajar el archivo y descomprimirlo.
+    // Las filas viejas (contenido completo adentro) siguen bajando igual que siempre.
+    if (d.contenido && d.contenido.storage_path) {
+      var _cj = await _bajarBackupDeStorage(String(d.contenido.storage_path));
+      if (!_cj) return res.status(502).json({ error: 'No se pudo bajar el backup de Storage' });
+      d = Object.assign({}, d, { contenido: _cj });
+    }
     var nombre = 'backup-' + String(d.user_id || 'x').slice(0, 8) + '-' + String(d.created_at || '').slice(0, 19).replace(/[:T]/g, '-') + '.json';
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="' + nombre + '"');
@@ -19886,7 +19951,9 @@ setTimeout(enviarAvisosTareas, 80 * 1000);
 setInterval(enviarRecordatoriosLead, 60 * 1000);
 setTimeout(enviarRecordatoriosLead, 45 * 1000);
 // Backup automatico cada 30 minutos (foto completa de todos los datos por user)
-setInterval(hacerBackup, 30 * 60 * 1000);
+// Backup v2: 1 vez por dia. El setTimeout de abajo corre ademas a los 90s de
+// arrancar, o sea que cada deploy dispara un backup fresco de todas las cuentas.
+setInterval(hacerBackup, 24 * 60 * 60 * 1000);
 setTimeout(hacerBackup, 90 * 1000);
 // F5.2: mensajes automaticos de estadia (HOTEL + reservas_v1). Cada 30 min + una corrida ~100s tras arrancar.
 // INERTE si ninguna cuenta tiene reservas_v1 ON (el cron consulta y sale). 0 IA / 0 tokens (plantillas fijas).
@@ -41793,7 +41860,11 @@ async function _listarTablasSistema() {
 async function _tablasBackupSistema() {
   if (_cacheTablasSistema && _cacheTablasSistema.length) return _cacheTablasSistema;
   const todas = await _listarTablasSistema();
-  _cacheTablasSistema = (todas && todas.length) ? todas : BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  const _lista = (todas && todas.length) ? todas : BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
+  // La tabla `backups` NO entra al backup del sistema: contiene copias de la base,
+  // asi que respaldarla es leer la base al cuadrado (medido 2026-08-18: 136 MB,
+  // el 76% del disco). Los archivos nuevos viven en Storage y se espejan aparte.
+  _cacheTablasSistema = _lista.filter(function(t){ return t !== 'backups'; });
   return _cacheTablasSistema;
 }
 

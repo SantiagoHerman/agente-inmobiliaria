@@ -41130,6 +41130,303 @@ async function _googleClientAutenticado(userId, proposito) {
 }
 
 // GET /api/google/oauth/start — arranca el OAuth de Google. ?proposito=drive|calendar. Auth por JWT.
+// ============================================================================
+// META ADS POR CLIENTE — el cliente conecta SU cuenta publicitaria desde Marketing
+// ----------------------------------------------------------------------------
+// PARA QUE: hasta hoy, ver la pauta de un cliente dependia de que Diego estuviera
+// como socio en el Business Manager de ese cliente. Esto lo da vuelta: cada cliente
+// conecta su propia cuenta con SU login de Facebook y Raices lee SOLO esa cuenta,
+// con un token propio del cliente. Si manana Diego pierde el acceso al Business
+// Manager del cliente, esto sigue andando.
+//
+// SOLO LECTURA (ads_read). No crea, no pausa, no cambia presupuestos. La escritura
+// (ads_management) es otra fase y necesita otro App Review.
+//
+// FAIL-CLOSED, mismo patron que el resto: sin META_APP_ID/META_APP_SECRET o sin la
+// config de login para ads -> `disponible:false` y el front muestra el cartel de
+// siempre. Ni un endpoint cambia de comportamiento para quien no lo use.
+//
+// EL TOKEN NUNCA SALE AL FRONT. Se guarda en `meta_ads_conexiones` (RLS activada,
+// sin politicas -> solo el backend con service role entra) y todas las llamadas a
+// Graph salen de aca.
+//
+// OJO CON EL VENCIMIENTO: el token de usuario dura 60 dias. Se guarda `token_expira`
+// y el estado avisa cuando faltan menos de 7 dias para que el cliente reconecte.
+// La solucion definitiva (token de usuario del sistema, que no vence) necesita
+// `business_management`, permiso HOY RECHAZADO en la app.
+// ============================================================================
+
+// Config del login para ads. Si Meta pide una configuracion aparte (Login for Business),
+// va en META_ADS_CONFIG_ID. Si no hay config, se cae al scope clasico `ads_read`.
+const META_ADS_CONFIG_ID = (process.env.META_ADS_CONFIG_ID || '').trim();
+const META_ADS_SCOPES = (process.env.META_ADS_SCOPES || 'ads_read').trim();
+const META_ADS_REDIRECT = process.env.META_ADS_REDIRECT || (BACKEND_PUBLIC_URL + '/api/meta-ads/oauth/callback');
+// Llave GLOBAL: sin META_ADS_HABILITADO='1' en Railway, esto es INERTE para todos.
+const META_ADS_HABILITADO = (process.env.META_ADS_HABILITADO || '') === '1';
+function _metaAdsConfigurado() { return !!(META_APP_ID && META_APP_SECRET && META_ADS_HABILITADO); }
+
+// Llave POR CLIENTE (business_settings.meta_ads_habilitado), fail-closed igual que ia_pauta_meta:
+// columna ausente / null / false / cualquier error -> OFF. Asi se prende de a un cliente por vez.
+async function _metaAdsTenantActivo(user_id) {
+  try {
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('meta_ads_habilitado').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.meta_ads_habilitado === true);
+  } catch (e) { return false; }
+}
+
+// Fila de conexion del cliente. Misma leccion que `_credMetaFilaDe`: NO usar maybeSingle()
+// (dos filas activas -> PGRST116 -> data null -> el codigo cree que no existe y duplica).
+// Traemos todas ordenadas y devolvemos la mas reciente.
+async function _metaAdsConexionDe(userId) {
+  try {
+    if (!userId) return null;
+    const { data, error } = await supabase.from('meta_ads_conexiones')
+      .select('id, user_id, ad_account_id, ad_account_nombre, moneda, user_token, token_expira, activo, created_at')
+      .eq('user_id', userId).eq('activo', true)
+      .order('created_at', { ascending: false }).limit(2);
+    if (error || !data || !data.length) return null;
+    return data[0];
+  } catch (e) { return null; }
+}
+
+// Llamada a Graph con el token del CLIENTE. Devuelve { ok, json } y nunca tira.
+async function _metaAdsGraph(ruta, token, params) {
+  try {
+    const qs = new URLSearchParams(Object.assign({ access_token: token }, params || {}));
+    const r = await fetch('https://graph.facebook.com/' + META_GRAPH_VERSION + '/' + ruta + '?' + qs.toString());
+    const j = await r.json().catch(function () { return null; });
+    return { ok: r.ok && j && !j.error, json: j };
+  } catch (e) { return { ok: false, json: { error: { message: e && e.message } } }; }
+}
+
+// --- GET /api/meta-ads/estado -> el front pregunta si puede ofrecer el boton y si ya esta conectado.
+app.get('/api/meta-ads/estado', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const disponible = _metaAdsConfigurado() && (await _metaAdsTenantActivo(uid));
+    if (!disponible) return res.json({ ok: true, disponible: false, conectado: false });
+    const cx = await _metaAdsConexionDe(uid);
+    if (!cx) return res.json({ ok: true, disponible: true, conectado: false });
+    // Aviso de vencimiento: el token de usuario dura 60 dias.
+    let vence_en_dias = null;
+    try {
+      if (cx.token_expira) {
+        const ms = new Date(cx.token_expira).getTime() - Date.now();
+        vence_en_dias = Math.max(0, Math.floor(ms / 86400000));
+      }
+    } catch (e) {}
+    return res.json({
+      ok: true, disponible: true, conectado: true,
+      cuenta: { id: cx.ad_account_id, nombre: cx.ad_account_nombre, moneda: cx.moneda },
+      vence_en_dias: vence_en_dias,
+      hay_que_reconectar: (vence_en_dias !== null && vence_en_dias <= 7)
+    });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
+// --- GET /api/meta-ads/oauth/start -> manda al cliente al login de Facebook.
+// Acepta ?token= para poder abrirlo en una pestania nueva (mismo criterio que /api/meta/oauth/start).
+app.get('/api/meta-ads/oauth/start', async function (req, res) {
+  try {
+    if (!_metaAdsConfigurado()) return res.status(503).json({ error: 'Meta Ads no esta habilitado.' });
+    let uid = await verificarUsuario(req);
+    if (!uid && req.query.token) { try { const { data } = await supabase.auth.getUser(String(req.query.token)); if (data && data.user) uid = data.user.id; } catch (e) {} }
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _metaAdsTenantActivo(uid))) return res.status(403).json({ error: 'Meta Ads no esta habilitado para esta cuenta.' });
+    const state = _oauthStateFirmar(uid, 'meta_ads');
+    if (!state) return res.status(500).json({ error: 'No se pudo iniciar el flujo' });
+    const url = 'https://www.facebook.com/' + META_GRAPH_VERSION + '/dialog/oauth' +
+      '?client_id=' + encodeURIComponent(META_APP_ID) +
+      '&redirect_uri=' + encodeURIComponent(META_ADS_REDIRECT) +
+      '&state=' + encodeURIComponent(state) +
+      '&response_type=code' +
+      (META_ADS_CONFIG_ID ? ('&config_id=' + encodeURIComponent(META_ADS_CONFIG_ID)) : ('&scope=' + encodeURIComponent(META_ADS_SCOPES)));
+    return res.redirect(url);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// --- GET /api/meta-ads/oauth/callback -> cambia el code por token y guarda la conexion.
+app.get('/api/meta-ads/oauth/callback', async function (req, res) {
+  try {
+    if (!_metaAdsConfigurado()) return res.status(503).send(_oauthCierreHtml('Meta Ads no configurado', 'Faltan credenciales de la app de Meta.', false));
+    if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a la cuenta publicitaria.', false));
+    const code = req.query.code ? String(req.query.code) : '';
+    const uid = _oauthStateLeer(req.query.state, 'meta_ads');
+    if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido de conexion vencio o no es valido. Reintentá desde Raices CRM.', false));
+
+    // 1) code -> token corto
+    const tokenUrl = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/oauth/access_token' +
+      '?client_id=' + encodeURIComponent(META_APP_ID) +
+      '&client_secret=' + encodeURIComponent(META_APP_SECRET) +
+      '&redirect_uri=' + encodeURIComponent(META_ADS_REDIRECT) +
+      '&code=' + encodeURIComponent(code);
+    const tr = await fetch(tokenUrl);
+    const tj = await tr.json().catch(function () { return null; });
+    if (!tr.ok || !tj || !tj.access_token) {
+      console.error('meta-ads oauth token:', JSON.stringify(tj).slice(0, 300));
+      return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'Meta no devolvio un token de acceso. Reintentá.', false));
+    }
+    let userToken = tj.access_token;
+    let expiraEn = null;
+
+    // 2) token largo (60 dias)
+    try {
+      const llUrl = 'https://graph.facebook.com/' + META_GRAPH_VERSION + '/oauth/access_token' +
+        '?grant_type=fb_exchange_token&client_id=' + encodeURIComponent(META_APP_ID) +
+        '&client_secret=' + encodeURIComponent(META_APP_SECRET) +
+        '&fb_exchange_token=' + encodeURIComponent(userToken);
+      const lr = await fetch(llUrl); const lj = await lr.json().catch(function () { return null; });
+      if (lr.ok && lj && lj.access_token) {
+        userToken = lj.access_token;
+        if (lj.expires_in) expiraEn = new Date(Date.now() + (Number(lj.expires_in) * 1000)).toISOString();
+      }
+    } catch (e) {}
+    if (!expiraEn) expiraEn = new Date(Date.now() + (60 * 86400000)).toISOString();
+
+    // 3) Cuentas publicitarias que administra ESE usuario. Si no hay ninguna, casi siempre
+    //    es porque quien entro no es administrador de la cuenta, o la app todavia no tiene
+    //    acceso avanzado a ads_read y el usuario no es probador de la app.
+    const ac = await _metaAdsGraph('me/adaccounts', userToken, { fields: 'account_id,name,currency,account_status', limit: '50' });
+    const cuentas = (ac.ok && ac.json && Array.isArray(ac.json.data)) ? ac.json.data : [];
+    if (!cuentas.length) {
+      console.error('meta-ads sin cuentas:', JSON.stringify(ac.json).slice(0, 300));
+      return res.status(400).send(_oauthCierreHtml('Sin cuentas publicitarias',
+        'Esa cuenta de Facebook no administra ninguna cuenta publicitaria, o no se otorgaron los permisos. Entrá con el usuario ADMINISTRADOR de la cuenta.', false));
+    }
+
+    // 4) Guardar. Si hay una sola cuenta se elige sola; si hay varias, se guarda la primera
+    //    y el front ofrece cambiarla con /api/meta-ads/elegir-cuenta.
+    const c0 = cuentas[0];
+    const fila = {
+      user_id: uid,
+      ad_account_id: String(c0.account_id || '').replace(/^act_/, ''),
+      ad_account_nombre: c0.name || null,
+      moneda: c0.currency || null,
+      user_token: userToken,
+      token_expira: expiraEn,
+      activo: true,
+      updated_at: new Date().toISOString()
+    };
+    try {
+      // Desactivar conexiones previas del mismo cliente (no borrar: queda el historial).
+      await supabase.from('meta_ads_conexiones').update({ activo: false }).eq('user_id', uid).eq('activo', true);
+      const ins = await supabase.from('meta_ads_conexiones').insert(fila);
+      if (ins && ins.error) throw new Error(ins.error.message);
+    } catch (eG) {
+      console.error('meta-ads guardar conexion:', eG && eG.message);
+      return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'La conexion con Meta salio bien pero no se pudo guardar. Avisale al soporte.', false));
+    }
+    return res.send(_oauthCierreHtml('Cuenta conectada', 'Ya podés ver tu pauta dentro de Raíces.', true));
+  } catch (e) {
+    console.error('meta-ads callback:', e && e.message);
+    return res.status(500).send(_oauthCierreHtml('Error', 'No se pudo completar la conexion.', false));
+  }
+});
+
+// --- GET /api/meta-ads/cuentas -> las cuentas que administra el cliente (para el selector).
+app.get('/api/meta-ads/cuentas', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const cx = await _metaAdsConexionDe(uid);
+    if (!cx) return res.json({ ok: true, conectado: false, cuentas: [] });
+    const ac = await _metaAdsGraph('me/adaccounts', cx.user_token, { fields: 'account_id,name,currency,account_status', limit: '50' });
+    if (!ac.ok) return res.json({ ok: false, conectado: true, cuentas: [], error: 'No se pudieron leer las cuentas. Puede que el permiso haya vencido: reconectá.' });
+    const cuentas = (ac.json.data || []).map(function (c) {
+      return { id: String(c.account_id || '').replace(/^act_/, ''), nombre: c.name || '', moneda: c.currency || '', activa: c.account_status === 1 };
+    });
+    return res.json({ ok: true, conectado: true, elegida: cx.ad_account_id, cuentas: cuentas });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
+// --- POST /api/meta-ads/elegir-cuenta { ad_account_id }
+app.post('/api/meta-ads/elegir-cuenta', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const pedida = String((req.body && req.body.ad_account_id) || '').replace(/^act_/, '').trim();
+    if (!pedida || !/^\d+$/.test(pedida)) return res.status(400).json({ error: 'Falta ad_account_id' });
+    const cx = await _metaAdsConexionDe(uid);
+    if (!cx) return res.status(400).json({ error: 'No hay una cuenta conectada' });
+    // Que la cuenta pedida sea REALMENTE de este cliente (si no, un cliente podria pedir la de otro).
+    const ac = await _metaAdsGraph('me/adaccounts', cx.user_token, { fields: 'account_id,name,currency', limit: '50' });
+    const suyas = (ac.ok && ac.json && Array.isArray(ac.json.data)) ? ac.json.data : [];
+    const elegida = suyas.find(function (c) { return String(c.account_id || '').replace(/^act_/, '') === pedida; });
+    if (!elegida) return res.status(403).json({ error: 'Esa cuenta publicitaria no pertenece a tu usuario de Meta' });
+    const up = await supabase.from('meta_ads_conexiones')
+      .update({ ad_account_id: pedida, ad_account_nombre: elegida.name || null, moneda: elegida.currency || null, updated_at: new Date().toISOString() })
+      .eq('id', cx.id);
+    if (up && up.error) return res.status(500).json({ error: 'No se pudo guardar' });
+    return res.json({ ok: true, cuenta: { id: pedida, nombre: elegida.name, moneda: elegida.currency } });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
+// --- GET /api/meta-ads/campanas?dias=30 -> lo que el modulo Marketing muestra.
+app.get('/api/meta-ads/campanas', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const cx = await _metaAdsConexionDe(uid);
+    if (!cx || !cx.ad_account_id) return res.json({ ok: true, conectado: false, campanas: [] });
+    const dias = Math.min(90, Math.max(1, parseInt(req.query.dias, 10) || 30));
+    const preset = dias <= 7 ? 'last_7d' : (dias <= 14 ? 'last_14d' : (dias <= 30 ? 'last_30d' : 'last_90d'));
+    const r = await _metaAdsGraph('act_' + cx.ad_account_id + '/insights', cx.user_token, {
+      level: 'campaign',
+      date_preset: preset,
+      fields: 'campaign_id,campaign_name,spend,impressions,reach,frequency,clicks,ctr,cpm,actions,cost_per_action_type',
+      limit: '100'
+    });
+    if (!r.ok) {
+      const msg = (r.json && r.json.error && r.json.error.message) || 'No se pudo leer la cuenta';
+      // 190 = token vencido/invalidado -> el front pide reconectar en vez de mostrar un error crudo.
+      const vencido = !!(r.json && r.json.error && (r.json.error.code === 190));
+      return res.json({ ok: false, conectado: true, reconectar: vencido, error: msg, campanas: [] });
+    }
+    const filas = (r.json && Array.isArray(r.json.data)) ? r.json.data : [];
+    const campanas = filas.map(function (f) {
+      let conversaciones = 0;
+      try {
+        (f.actions || []).forEach(function (a) {
+          if (a && /messaging_conversation_started|onsite_conversion\.messaging_conversation_started_7d/.test(a.action_type || '')) {
+            conversaciones += Number(a.value) || 0;
+          }
+        });
+      } catch (e) {}
+      const gasto = Number(f.spend) || 0;
+      return {
+        id: f.campaign_id, nombre: f.campaign_name,
+        gasto: gasto,
+        impresiones: Number(f.impressions) || 0,
+        alcance: Number(f.reach) || 0,
+        frecuencia: Number(f.frequency) || 0,
+        clics: Number(f.clicks) || 0,
+        ctr: Number(f.ctr) || 0,
+        cpm: Number(f.cpm) || 0,
+        conversaciones: conversaciones,
+        costo_por_conversacion: conversaciones > 0 ? (gasto / conversaciones) : null
+      };
+    });
+    return res.json({ ok: true, conectado: true, moneda: cx.moneda || 'ARS', dias: dias, cuenta: cx.ad_account_nombre, campanas: campanas });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
+// --- POST /api/meta-ads/desconectar -> el cliente corta el acceso desde Raices.
+app.post('/api/meta-ads/desconectar', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // No se borra la fila (historial): se desactiva y se borra el token, que es lo sensible.
+    const up = await supabase.from('meta_ads_conexiones')
+      .update({ activo: false, user_token: null, updated_at: new Date().toISOString() })
+      .eq('user_id', uid).eq('activo', true);
+    if (up && up.error) return res.status(500).json({ error: 'No se pudo desconectar' });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: 'Error' }); }
+});
+
 app.get('/api/google/oauth/start', async function(req, res) {
   try {
     if (!_googleConfigurado()) return res.status(503).json({ error: 'Google no configurado (faltan GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).' });

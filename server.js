@@ -2172,8 +2172,19 @@ async function hacerBackup() {
         const tablas = ['conversations','messages','contacts','recontactos','business_settings','properties','knowledge_base','whatsapp_instancias'];
         const contenido = {};
         for (const t of tablas) {
-          const { data } = await supabase.from(t).select('*').eq('user_id', uid);
-          contenido[t] = data || [];
+          // PAGINADO OBLIGATORIO: PostgREST corta en 1000 filas por consulta. Sin esto el
+          // backup salia TRUNCADO en silencio (medido 2026-08-18: Anton tiene 1.244
+          // conversaciones y se guardaban 1.000). Se pide de a 1000 hasta que devuelva menos.
+          const filas = [];
+          for (let desde = 0; ; desde += 1000) {
+            const { data, error } = await supabase.from(t).select('*').eq('user_id', uid).range(desde, desde + 999);
+            if (error) throw new Error(t + ': ' + error.message); // NUNCA guardar un backup a medias sin avisar
+            const lote = data || [];
+            filas.push.apply(filas, lote);
+            if (lote.length < 1000) break;
+            if (desde > 500000) break; // tope de seguridad
+          }
+          contenido[t] = filas;
         }
         const resumen = 'conv:' + (contenido.conversations.length) + ' msg:' + (contenido.messages.length) + ' cont:' + (contenido.contacts.length);
         // 1) El peso, comprimido, a Storage. upsert: una copia por dia por cuenta.

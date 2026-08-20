@@ -41631,6 +41631,35 @@ const BACKUP_TABLAS_SISTEMA = ['subscriptions','ia_uso'];
 //  - incluirSistema: agrega las tablas de sistema (subscriptions, ia_uso).
 //  - tablasSel: (opcional) array con las tablas elegidas; si viene, se respeta SOLO esa seleccion
 //    (intersectada con las permitidas, por seguridad). Si NO viene -> comportamiento historico (todas).
+// ============================================================================
+// TRAER UNA TABLA ENTERA — sin el techo invisible de 1000 filas
+// ----------------------------------------------------------------------------
+// PostgREST corta CUALQUIER select en 1000 filas por defecto. Todos los backups
+// de este archivo pedian `select('*')` pelado, asi que venian TRUNCADOS y nadie
+// podia notarlo: el resumen decia "msg:1000" y parece un numero normal.
+// MEDIDO 2026-08-18: Anton tiene 1.245 conversaciones y 6.667 mensajes; se
+// guardaban 1.000 y 1.000 (faltaba el 85% de los mensajes).
+//
+// Diego, 2026-08-19: "Ojo que no hay que ponerle limite."
+//
+// Se pide de a 1000 con .range() hasta que un lote devuelva menos de 1000.
+// Si una pagina falla, TIRA el error en vez de devolver medio backup: es
+// preferible una corrida fallida y visible que un archivo que parece completo.
+// filtroUserId opcional: si viene, acota por user_id (backup por cliente).
+async function _traerTablaCompleta(tabla, filtroUserId) {
+  const filas = [];
+  for (let desde = 0; ; desde += 1000) {
+    let q = supabase.from(tabla).select('*');
+    if (filtroUserId) q = q.eq('user_id', filtroUserId);
+    const { data, error } = await q.range(desde, desde + 999);
+    if (error) throw new Error(tabla + ': ' + error.message);
+    const lote = data || [];
+    filas.push.apply(filas, lote);
+    if (lote.length < 1000) break;
+    if (desde > 2000000) break; // tope de seguridad, jamas deberia llegar
+  }
+  return filas;
+}
 async function _armarExportCliente(userId, incluirSistema, tablasSel) {
   let tablas;
   const permitidas = BACKUP_TABLAS_BASE.concat(BACKUP_TABLAS_SISTEMA);
@@ -41642,7 +41671,7 @@ async function _armarExportCliente(userId, incluirSistema, tablasSel) {
   }
   const contenido = { _meta: { user_id: userId, generado_en: new Date().toISOString(), incluye_sistema: !!incluirSistema, tablas: tablas } };
   for (const t of tablas) {
-    try { const { data } = await supabase.from(t).select('*').eq('user_id', userId); contenido[t] = data || []; }
+    try { contenido[t] = await _traerTablaCompleta(t, userId); }
     catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
   }
   return contenido;
@@ -41656,9 +41685,9 @@ async function _pesoTablasCliente(userId) {
   for (const t of permitidas) {
     let filas = 0, bytes = 0;
     try {
-      const { data } = await supabase.from(t).select('*').eq('user_id', userId);
-      filas = (data || []).length;
-      bytes = data ? Buffer.byteLength(JSON.stringify(data)) : 0;
+      const data = await _traerTablaCompleta(t, userId);
+      filas = data.length;
+      bytes = Buffer.byteLength(JSON.stringify(data));
     } catch (e) { filas = 0; bytes = 0; }
     out.push({ tabla: t, filas: filas, bytes: bytes, sistema: BACKUP_TABLAS_SISTEMA.indexOf(t) !== -1 });
   }
@@ -42007,7 +42036,7 @@ async function _armarExportSistema(tablasSel) {
   let tablas = esCompleto ? todas.slice() : tablasSel.filter(function(t){ return todas.indexOf(t) !== -1; });
   const contenido = { _meta: { tipo: 'sistema', generado_en: new Date().toISOString(), completo: esCompleto, total_tablas: tablas.length, tablas: tablas } };
   for (const t of tablas) {
-    try { const { data } = await supabase.from(t).select('*'); contenido[t] = data || []; }
+    try { contenido[t] = await _traerTablaCompleta(t); }
     catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
   }
   if (esCompleto) {
@@ -42186,7 +42215,7 @@ async function _ejecutarBackupCompleto(tablasSel) {
       const t = tablas[i];
       _backupProgreso.detalle = 'tabla ' + (i + 1) + ' de ' + tablas.length + ' · ' + t;
       _backupProgreso.pct = Math.round((i / Math.max(1, tablas.length)) * 55);
-      try { const { data } = await supabase.from(t).select('*'); contenido[t] = data || []; }
+      try { contenido[t] = await _traerTablaCompleta(t); }
       catch (e) { contenido[t] = { _error: (e && e.message) || 'no disponible' }; }
     }
     // 2) CAPAS EXTRA (55-63%) — solo backup completo

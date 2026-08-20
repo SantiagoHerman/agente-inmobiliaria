@@ -8433,9 +8433,29 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     : (_premiumOn
         ? (PREMIUM_PLAYBOOK + (_premiumPersona(_generoEfectivo) ? ('\n' + _premiumPersona(_generoEfectivo)) : ''))
         : '');
-  // Voz V2 + linea de CONTEXTO de franja horaria (para que el saludo por hora funcione de verdad). Solo si _vozV2.
+  // ============ LA LINEA QUE ROMPIA EL CACHE (Diego 2026-08-19) ============
+  // ANTES: la linea "CONTEXTO: ahora es de <manana|tarde|noche>" viajaba DENTRO de _bloqueVozV2, que es parte
+  // de systemStatic, que es el bloque que se CACHEA en Anthropic (cache_control, ~8926). El cache se identifica
+  // por el TEXTO EXACTO: al cambiar esa sola palabra, hay que REESCRIBIR el bloque entero (13.300 tokens) a
+  // precio de escritura de 1 hora, que es 20x el de lectura.
+  //
+  // _franjaArg() corta en 6, 12 y 20 => la palabra cambiaba 3 VECES POR DIA, TODOS LOS DIAS, EN TODAS LAS CUENTAS.
+  //
+  // MEDIDO (14 dias, 3 cuentas): 94 reescrituras causadas por esto = USD 15,37/mes = 25% de TODA la factura de
+  // IA. Se confirmo cruzando la columna static_prompt_hash de ia_uso: las huellas mapean 1 a 1 con las tres
+  // franjas horarias (Raices CRM rotaba entre 5 huellas fijas con 1 token de diferencia, ida y vuelta). Ademas
+  // explicaba dos efectos colaterales: el ping escribia caches paralelos en vez de renovar, y el propio cron se
+  // auto-deshabilitaba al ver una huella distinta a la de la ultima respuesta real.
+  //
+  // AHORA: la linea sale del bloque cacheado y viaja como bloque DINAMICO (abajo, junto a los datos del lead).
+  // Cuesta ~5 tokens mas por llamada y elimina las reescrituras. El saludo por hora funciona IGUAL: la IA lee
+  // exactamente el mismo texto, solo que en otro bloque del mismo prompt.
+  // KILL-SWITCH: FRANJA_EN_CACHE=on vuelve a meterla adentro del bloque cacheado (comportamiento viejo).
+  // =========================================================================
+  const _franjaEnCache = String(process.env.FRANJA_EN_CACHE || '').toLowerCase() === 'on';
+  const _textoFranja = (_vozV2 && !_esHotel) ? ('CONTEXTO: ahora es de ' + _franjaArg() + ' (saluda en consecuencia: buen dia / buenas tardes / buenas noches).') : '';
   const _bloqueVozV2 = (_vozV2 && !_esHotel)
-    ? ('CONTEXTO: ahora es de ' + _franjaArg() + ' (saluda en consecuencia: buen dia / buenas tardes / buenas noches).\n' + VOZ_AGENTE_V2.split('Nadia:').join((agentName || 'la asesora') + ':'))
+    ? ((_franjaEnCache && _textoFranja ? (_textoFranja + '\n') : '') + VOZ_AGENTE_V2.split('Nadia:').join((agentName || 'la asesora') + ':'))
     : '';
   const bloqueIAConocimiento = _ic.conocimiento ? ('LO QUE SABES Y MANEJAS VOS (tu conocimiento propio como parte del equipo): ' + _ic.conocimiento) : '';
   const bloqueIANoHacer = _ic.noHacer ? ('LO QUE NO DEBES HACER (limites estrictos, respetalos siempre): ' + _ic.noHacer) : '';
@@ -8840,7 +8860,13 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // ~250 propiedades = ~12.500 tokens por prompt). El dato es EL MISMO: sale de referencias_zona, que ya se
   // calculo UNA vez al geocodificar. Lo unico que cambia es CUANDO se paga: ahora solo si el lead pregunta.
   // Doble compuerta: el flag de ubicacion Y que el mensaje hable del tema -> si no, ni la definicion entra.
-  if (_iaUbicacionOn && _pideTema(['cerca', 'cerca de', 'alrededor', 'barrio', 'zona', 'playa', 'mar', 'supermercado', 'farmacia', 'colectivo', 'transporte', 'tren', 'subte', 'estacion', 'escuela', 'colegio', 'hospital', 'banco', 'que hay'])) {
+  // TOOL SIN USO (Diego 2026-08-19): `que_hay_cerca` costaba 239 tokens en CADA llamada de las 3 cuentas y se uso
+  // CERO veces en 30 dias (medido contra ia_decisiones, 1.361 turnos). Se saca de la lista de herramientas.
+  // NO se apaga el flag ia_ubicacion porque ESE MISMO flag gatea `buscar_propiedades_cerca` (22 usos reales) y
+  // `ubicar_lugar` (3): apagarlo se llevaria puesta la util. Por eso el corte va aca, en esta tool sola.
+  // KILL-SWITCH: TOOL_QUE_HAY_CERCA=on la vuelve a agregar.
+  const _queHayCercaOn = String(process.env.TOOL_QUE_HAY_CERCA || '').toLowerCase() === 'on';
+  if (_queHayCercaOn && _iaUbicacionOn && _pideTema(['cerca', 'cerca de', 'alrededor', 'barrio', 'zona', 'playa', 'mar', 'supermercado', 'farmacia', 'colectivo', 'transporte', 'tren', 'subte', 'estacion', 'escuela', 'colegio', 'hospital', 'banco', 'que hay'])) {
     toolsAgente.push({
       name: 'que_hay_cerca',
       description: 'Usala cuando el lead pregunta QUE HAY CERCA de una propiedad (ej: "esta cerca del mar?", "hay supermercado?", "que tiene alrededor?", "a cuanto queda la estacion?"). Devuelve los lugares mas cercanos ya medidos (playa, costa, estacion de tren, subte, parada de colectivo, supermercado, farmacia, escuela, banco, hospital) con su distancia. Si la tool no devuelve nada, decile que no tenes el dato de esa propiedad y ofrecele averiguarlo: NUNCA inventes que hay cerca ni a que distancia.',
@@ -8994,6 +9020,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // comparar cache_write/read antes y despues de subir el TTL a 1h. Se calcula UNA vez por respuesta.
   const _staticPromptHash = _hashCanonico(systemStatic);
   const _toolsHash = _hashCanonico(toolsAgente);
+  // LA FRANJA HORARIA, YA FUERA DEL CACHE (ver el comentario largo arriba). Va PRIMERA entre los dinamicos para
+  // quedar lo mas cerca posible de donde estaba antes. Con FRANJA_EN_CACHE=on no se agrega aca (ya viaja adentro).
+  if (_textoFranja && !_franjaEnCache) systemBlocks.push({ type: 'text', text: _textoFranja });
   if (bloqueDatosLead) systemBlocks.push({ type: 'text', text: bloqueDatosLead });
   // MEMORIA VIVA: resumen-de-avance de esta conversacion para que el agente RETOME donde quedo (no repregunte ni
   // retroceda). Va en bloque dinamico (no cacheado). Permite acortar el historial sin perder contexto -> baja tokens.

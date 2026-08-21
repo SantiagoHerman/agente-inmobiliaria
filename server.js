@@ -31433,7 +31433,11 @@ app.get('/api/leads/scope', async function (req, res) {
 // Los dos campos se ESCRIBEN best-effort en otros lados (ya estan envueltos en try/catch justamente porque
 // pueden no existir), asi que sacarlos de la LECTURA no cambia ningun comportamiento.
 // SI ALGUN DIA SE CORRE LA MIGRACION QUE LAS AGREGA: volver a sumarlas aca, y recien ahi el front las recibe.
-const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual';
+// canal_origen AGREGADO (Diego 2026-08-21): el front lo usa para separar las pestañas "WhatsApp Business" y
+// "API oficial" (Cloud API). Sin el, con visibilidad_server_v1 prendido todas las conversaciones de Cloud API
+// se mezclaban con las de WhatsApp normal y la pestaña de API oficial mostraba 0. El flag esta OFF en las 8
+// cuentas, asi que esto todavia no se veia — se tapa ANTES de prenderlo.
+const LEADS_COLS_CONV = 'id, user_id, contact_id, asesor_id, ultimo_asesor_id, departamento_id, departamento_manual, status, temperatura, etiquetas, ai_enabled, admin_tomo, last_message, last_role, last_message_at, updated_at, created_at, nota_asesor, presupuesto, channel, canal_origen, summary, idioma_lead, traductor_activo, motivo_perdida, recontacto_congelado, recontacto_excluido, recontacto_count, recontacto_max, recontacto_frecuencia, recontacto_categoria, recontacto_pausado_lead, recontacto_interes_en, horario_habitual';
 const LEADS_COLS_CONTACT = 'contacts(name, nombre_manual, phone, channel, interest, budget, foto_url, about)';
 const LEADS_SELECT = LEADS_COLS_CONV + ', ' + LEADS_COLS_CONTACT;
 
@@ -36036,7 +36040,35 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
       user_id: uid, company_name: company, rubro: rubro, whatsapp_contacto: whatsapp,
       ui_moderno: true,           // las cuentas nuevas arrancan en el panel moderno (el viejo se retiro)
       derivacion_v3: true,
-      oportunidades_v1: true
+      oportunidades_v1: true,
+      // ============ COMO NACE UNA CUENTA NUEVA (Diego 2026-08-21) ============
+      // Las 5 fuentes IA LIVE nacen APAGADAS. La migracion original las dejo con DEFAULT true, asi que cada
+      // cuenta nueva venia con las 5 prendidas: 1.552 tokens en CADA llamada para herramientas que, medido
+      // sobre 30 dias y 1.361 turnos, se usaron 3 veces en total (clima 0, feriados 0, dolar 0, georef 0,
+      // distancia 3). Se apagan aca EXPLICITAMENTE para no depender de correr una migracion.
+      // Si un cliente las necesita (un hotel que quiera el pronostico), se prenden en esa cuenta y listo.
+      ia_dolar_lead: false,
+      ia_clima: false,
+      ia_feriados: false,
+      ia_georef: false,
+      ia_osrm: false,
+      // Reparto unificado: la rotacion le pregunta al motor de reparto en vez de elegir sola. Respeta horarios,
+      // exige pertenecer al area, excluye usuarios IA y tiene la escalera (area sin nadie -> Administracion ->
+      // aviso al dueno). Prendido en las 7 cuentas activas el 21/08; las nuevas nacen igual.
+      derivacion_unificada_v1: true,
+      // HORARIO DE ATENCION por defecto. Sin esto la cuenta nace SIN horario, y el codigo interpreta "sin
+      // horario" como "todos disponibles 24 h" (decision conservadora correcta, pero deja el reparto sin freno
+      // de madrugada). Es la causa de fondo de que un lead rotara toda la noche entre asesores dormidos.
+      // Valores pedidos por Diego: 10 a 19, domingo cerrado. El dueno los cambia en Configuracion.
+      horario_oficina: {
+        lunes:     { desde: '10:00', hasta: '19:00', cerrado: false },
+        martes:    { desde: '10:00', hasta: '19:00', cerrado: false },
+        miercoles: { desde: '10:00', hasta: '19:00', cerrado: false },
+        jueves:    { desde: '10:00', hasta: '19:00', cerrado: false },
+        viernes:   { desde: '10:00', hasta: '19:00', cerrado: false },
+        sabado:    { desde: '10:00', hasta: '19:00', cerrado: false },
+        domingo:   { desde: '10:00', hasta: '19:00', cerrado: true }
+      }
     });
     if (ins.error) {
       try { await supabase.auth.admin.deleteUser(uid); } catch(eD){}
@@ -37463,7 +37495,10 @@ app.get('/api/ui-flags', async function(req, res){
     // =========================================================================
     var cache_local_v1 = false;
     try {
-      var _clRaw = String(process.env.CACHE_LOCAL_CUENTAS || 'be10f668-6719-40c6-9cfc-00039adda9e0').trim();
+      // A TODAS LAS CUENTAS (Diego 2026-08-21): el piloto en Raices CRM anduvo, asi que el default pasa de la
+      // lista de una cuenta a "todas". Se puede acotar de nuevo SIN deploy poniendo user_id separados por coma
+      // en CACHE_LOCAL_CUENTAS, o apagarlo entero con 'off'.
+      var _clRaw = String(process.env.CACHE_LOCAL_CUENTAS || 'todas').trim();
       if (_clRaw.toLowerCase() === 'todas') cache_local_v1 = true;
       else if (_clRaw && _clRaw.toLowerCase() !== 'off') {
         var _clLista = _clRaw.split(',').map(function (s) { return String(s || '').trim(); }).filter(Boolean);
@@ -39777,7 +39812,13 @@ setInterval(revisarSaludSistema, 10 * 60 * 1000); // cada 10 min
 // AHORRO ESPERADO: de USD 6,08/mes a menos de USD 1, sin perder nada de lo que el ping si hace bien.
 // ===================================================================================================
 const _PING_CADA_MIN = 5;          // (C) era 10: con ventana de 8 min, un tic de 5 SIEMPRE cae adentro
-const _PING_MIN_SILENCIO = 50;     // minutos desde el ULTIMO TOQUE del cache (piso de la ventana)
+// PISO 50 -> 44 (Diego 2026-08-21). MEDIDO sobre los 25 pings posteriores al arreglo del 17/08: cuando un ping
+// sigue a otro ping, la cadena se clava en 55,0 min exactos (la fila se graba unos segundos despues, asi que el
+// tic de los 50 ve "49,98" y se saltea; dispara el siguiente, a los 55). Y a los 55 el cache ya esta muerto 1 de
+// cada 5 veces:  50-54 min -> 10 pings, 0 fallaron  |  ~55 min -> 15 pings, 3 reescribieron (USD 0,084 c/u).
+// El borde real esta en 54, no en 58. Con el piso en 44 la cadena se clava en 45, adentro de la zona 10-de-10.
+// Cuesta un ping mas cada 3,7 h de silencio y saca el 20% de reescrituras: de USD 0,027 a 0,013 por hora. -53%.
+const _PING_MIN_SILENCIO = 44;     // minutos desde el ULTIMO TOQUE del cache (piso de la ventana)
 const _PING_MAX_SILENCIO = 58;     // (B) techo: pasado esto el cache ya vencio (medido: muere a los 60)
 const _PING_SECOS_MAX = 3;         // pings seguidos sin actividad -> parar
 const _pingEstado = new Map();     // user_id -> { secos, ultimaActividadVista, deshabilitada, motivo }
@@ -39821,18 +39862,43 @@ async function _cronPingCache() {
         // la lectura mas tardia que funciono fue a 58,2 min DESDE EL TOQUE y la primera escritura a 62,4.
         // "Toque" = cualquier llamada que leyo O escribio el cache — un ping tambien renueva la hora, asi
         // que excluirlo (como hacia el codigo viejo) hacia pinguear un cache que estaba fresco.
-        const { data: toque } = await supabase.from('ia_uso').select('created_at')
-          .eq('user_id', c.user_id)
-          .or('cache_read.gt.0,cache_creation.gt.0')
-          .order('created_at', { ascending: false }).limit(1).maybeSingle();
-        if (!toque || !toque.created_at) continue;             // nunca hubo cache -> nada que mantener
+        // TTL DEL ULTIMO TOQUE (Diego 2026-08-21): fuera de la ventana 07-24 el cache se escribe con TTL de 5
+        // MINUTOS, no de 1 hora. El cron miraba solo CUANDO fue el ultimo toque, no QUE TTL tenia. Caso medido
+        // (Anton, 19/08): ultimo mensaje real 06:54 -> cache de 5 min, muerto a las 06:59. A las 07:48 el cron
+        // conto 54 min de silencio y pinguo: pago USD 0,088 para renovar algo que no existia hacia 49 minutos.
+        // La ventana de 58 min NO tapa esto. Ahora se pide explicitamente un toque con TTL de 1 hora.
+        // DEFENSIVO: si la columna cache_ttl no existiera, el select falla -> se reintenta sin el filtro (igual
+        // que antes), asi que esto no puede romper el ping.
+        let toque = null;
+        try {
+          const _rT = await supabase.from('ia_uso').select('created_at')
+            .eq('user_id', c.user_id)
+            .or('cache_read.gt.0,cache_creation.gt.0')
+            .eq('cache_ttl', '1h')
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          if (_rT.error) throw _rT.error;
+          toque = _rT.data;
+        } catch (eTtl) {
+          const _rT2 = await supabase.from('ia_uso').select('created_at')
+            .eq('user_id', c.user_id)
+            .or('cache_read.gt.0,cache_creation.gt.0')
+            .order('created_at', { ascending: false }).limit(1).maybeSingle();
+          toque = _rT2.data;
+        }
+        if (!toque || !toque.created_at) continue;             // nunca hubo cache de 1h -> nada que mantener
         const minsSilencio = (ahora - new Date(toque.created_at).getTime()) / 60000;
 
-        // Todavia esta caliente: no toca pinguear. Y si hubo movimiento, se reinicia el corte por secos.
-        if (minsSilencio < _PING_MIN_SILENCIO) {
-          if (est.secos) { est.secos = 0; _pingEstado.set(c.user_id, est); }
-          continue;
-        }
+        // Todavia esta caliente: no toca pinguear.
+        //
+        // ARREGLO DEL CORTE POR SECOS (Diego 2026-08-21). Aca habia un `est.secos = 0` que MATABA el techo de
+        // gasto. El razonamiento original era "si hay movimiento, reiniciar el contador", pero `minsSilencio`
+        // se mide desde el ultimo TOQUE del cache — y un ping ES un toque. Entonces 5 minutos despues de cada
+        // ping el cron entraba por esta rama y ponia el contador en cero: NUNCA podia llegar a 3.
+        // Medido: Raices CRM hizo 5 pings seguidos sin un solo mensaje real (19/08, 08:23 a 12:03) y el quinto
+        // pago una reescritura; Galdames llego a 4; el 17/08 (feriado) hubo una racha de 11.
+        // El reinicio correcto vive mas abajo, contra el RELOJ 1 (`ult`, que excluye los pings): ahi si "hubo
+        // actividad nueva" significa que escribio una persona o la IA. Aca solo se sale.
+        if (minsSilencio < _PING_MIN_SILENCIO) continue;
         // (B) TECHO: pasado esto el cache YA VENCIO. Pinguear aca no lo mantiene: lo reescribe a USD 0,084,
         // 9x lo que cuesta leerlo — y medido, 18 de 24 veces nadie uso ese cache recien pagado. Se espera
         // a que escriba un cliente real (esa llamada paga la escritura una sola vez y arranca el ciclo).

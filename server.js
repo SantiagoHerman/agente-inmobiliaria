@@ -37656,6 +37656,13 @@ app.get('/api/ui-flags', async function(req, res){
       var _rv = await supabase.from('business_settings').select('reservas_v1').eq('user_id', user_id).maybeSingle();
       if (_rv && _rv.data) reservas_v1 = _rv.data.reservas_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // conectores_v1 (F2: panel "Disponibilidad" por complejo en /alojamiento): query SEPARADA y defensiva.
+    // Ausente/error -> false (el front no muestra el boton; fail-closed como reservas_v1).
+    var conectores_v1 = false;
+    try {
+      var _cv = await supabase.from('business_settings').select('conectores_v1').eq('user_id', user_id).maybeSingle();
+      if (_cv && _cv.data) conectores_v1 = _cv.data.conectores_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
     // dev_reservas_v1 (gate del vertical desarrolladora, Etapa 2): query SEPARADA y defensiva.
     // Ausente/error -> false (comportamiento actual: sin boton "Reservar unidad" ni lista de reservas).
     var dev_reservas_v1 = false;
@@ -37835,7 +37842,7 @@ app.get('/api/ui-flags', async function(req, res){
         chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 !== false; // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, conectores_v1: conectores_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
   // ULTIMO RECURSO: si TODO el endpoint explota. Los flags de Contactos/Fichas van en true por la REGLA DE
   // ORO (una cuenta nueva nace con todo puesto, y un error de lectura no tiene que apagarle la pantalla).
   // Los otros (reservas, cloud_api, matching...) siguen en false: NO son parte de "todos los cambios" y

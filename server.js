@@ -37447,6 +37447,29 @@ app.get('/api/ui-flags', async function(req, res){
       var _rp2 = await supabase.from('business_settings').select('reportes_v2').eq('user_id', user_id).maybeSingle();
       if (_rp2 && _rp2.data) reportes_v2 = _rp2.data.reportes_v2 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // ============ CACHE LOCAL EN EL DISPOSITIVO (Diego 2026-08-19) ============
+    // Gate de la pantalla de Conversaciones para que ABRA AL INSTANTE con lo ultimo que vio el usuario, con o
+    // sin conexion, y avise "Sin internet" cuando no puede actualizarse. Pedido textual de Diego: "que el
+    // usuario abra y se abra todo al instante por mas que no tenga conexion... en caso de no tener internet
+    // poner un mensaje sin internet, actualizacion en curso o algo asi para que el usuario sepa que quizas son
+    // mensajes viejos".
+    //
+    // POR QUE POR LISTA DE CUENTAS Y NO POR COLUMNA: Diego pidio "dale a raices crm y vemos el resto despues".
+    // Es un PILOTO en su propia cuenta antes de tocar clientes. Una columna nueva obligaria a correr una
+    // migracion para arrancar el piloto; la lista sale con el deploy. Cuando el piloto pase a todas las cuentas
+    // esto se cambia por la columna de siempre (o por CACHE_LOCAL_CUENTAS=todas en Railway).
+    // Se puede ampliar SIN deploy: CACHE_LOCAL_CUENTAS con los user_id separados por coma, o "todas".
+    // FAIL-CLOSED: cualquier error -> false -> la pantalla queda EXACTAMENTE como hoy.
+    // =========================================================================
+    var cache_local_v1 = false;
+    try {
+      var _clRaw = String(process.env.CACHE_LOCAL_CUENTAS || 'be10f668-6719-40c6-9cfc-00039adda9e0').trim();
+      if (_clRaw.toLowerCase() === 'todas') cache_local_v1 = true;
+      else if (_clRaw && _clRaw.toLowerCase() !== 'off') {
+        var _clLista = _clRaw.split(',').map(function (s) { return String(s || '').trim(); }).filter(Boolean);
+        cache_local_v1 = _clLista.indexOf(String(user_id)) >= 0;
+      }
+    } catch (e) { cache_local_v1 = false; }
     // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
     // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
     // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
@@ -37543,12 +37566,12 @@ app.get('/api/ui-flags', async function(req, res){
         chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 !== false; // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
   // ULTIMO RECURSO: si TODO el endpoint explota. Los flags de Contactos/Fichas van en true por la REGLA DE
   // ORO (una cuenta nueva nace con todo puesto, y un error de lectura no tiene que apagarle la pantalla).
   // Los otros (reservas, cloud_api, matching...) siguen en false: NO son parte de "todos los cambios" y
   // prenderlos por un error seria activar cosas que Diego no pidio.
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, reportes_v2: false, contactos_v1: true, fichas_v1: true, coincidencias_v1: true, fichas_ia_v1: true, fichas_avisos_v1: true, fichas_chat_v1: true, fichas_historial_v1: true, importacion_verificada_v1: true, chat_desde_ficha_v1: true, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, cache_local_v1: false, reportes_v2: false, contactos_v1: true, fichas_v1: true, coincidencias_v1: true, fichas_ia_v1: true, fichas_avisos_v1: true, fichas_chat_v1: true, fichas_historial_v1: true, importacion_verificada_v1: true, chat_desde_ficha_v1: true, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================

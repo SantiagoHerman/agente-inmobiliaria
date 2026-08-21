@@ -37663,6 +37663,13 @@ app.get('/api/ui-flags', async function(req, res){
       var _cv = await supabase.from('business_settings').select('conectores_v1').eq('user_id', user_id).maybeSingle();
       if (_cv && _cv.data) conectores_v1 = _cv.data.conectores_v1 === true;
     } catch (e) { /* columna ausente / error -> false */ }
+    // ml_v1 (MercadoLibre F1+F2: boton "Conectar MercadoLibre" en Integraciones): query SEPARADA y
+    // defensiva, patron exacto de conectores_v1. Ausente/error -> false (el front no muestra nada).
+    var ml_v1 = false;
+    try {
+      var _mlf = await supabase.from('business_settings').select('ml_v1').eq('user_id', user_id).maybeSingle();
+      if (_mlf && _mlf.data) ml_v1 = _mlf.data.ml_v1 === true;
+    } catch (e) { /* columna ausente / error -> false */ }
     // dev_reservas_v1 (gate del vertical desarrolladora, Etapa 2): query SEPARADA y defensiva.
     // Ausente/error -> false (comportamiento actual: sin boton "Reservar unidad" ni lista de reservas).
     var dev_reservas_v1 = false;
@@ -37842,7 +37849,7 @@ app.get('/api/ui-flags', async function(req, res){
         chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 !== false; // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, conectores_v1: conectores_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, conectores_v1: conectores_v1, ml_v1: ml_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
   // ULTIMO RECURSO: si TODO el endpoint explota. Los flags de Contactos/Fichas van en true por la REGLA DE
   // ORO (una cuenta nueva nace con todo puesto, y un error de lectura no tiene que apagarle la pantalla).
   // Los otros (reservas, cloud_api, matching...) siguen en false: NO son parte de "todos los cambios" y
@@ -46394,6 +46401,440 @@ app.post('/api/importacion/:id/aplicar', async function (req, res) {
   } catch (e) { return res.status(500).json({ error: e && e.message }); }
 });
 // ===== FIN FASE 10 — IMPORTACION INTELIGENTE ================================
+
+
+// ============================================================================
+// ============================================================================
+// MERCADOLIBRE (gated ml_v1) — F1 OAuth + F2 leads entrantes como conversaciones
+// ----------------------------------------------------------------------------
+// FAIL-CLOSED en dos niveles, para que los 3 mundos sigan byte-identicos a hoy:
+//   1) ENV: sin ML_APP_ID + ML_CLIENT_SECRET -> los endpoints OAuth responden 503,
+//      el webhook responde 200 y descarta, y el cron de refresh NI SE REGISTRA.
+//   2) FLAG por cuenta business_settings.ml_v1 (default false, migracion-ml-v1.sql):
+//      con OFF el webhook descarta las notificaciones de esa cuenta aunque tenga
+//      credencial conectada. Conectar != encender (mismo criterio que Meta).
+// F2 A PROPOSITO NO responde con IA: los leads de ML se persisten como conversacion +
+// mensaje entrante para que el ASESOR los vea. La IA se enchufa en F3 (ml_ia_responde).
+//
+// GOTCHA DEL TOKEN (investigado 2026-08): el access_token de ML dura ~6h y el
+// refresh_token es DE USO UNICO (cada refresh devuelve un refresh NUEVO que hay que
+// guardar si o si) y dura 6 meses. El grant muere por: cambio de clave del usuario,
+// 4 meses sin llamadas, o revocacion -> invalid_grant -> se apaga la credencial.
+// ============================================================================
+// ============================================================================
+
+// --- ENV al boot. MISMO gotcha que META_APP_SECRET (2026-07-16): un espacio/salto
+// invisible pegado en Railway rompe el canje OAuth con errores ENGANIOSOS. Se trimea
+// UNA vez mutando process.env y el log delata el caso sin revelar el secreto.
+const ML_APP_ID = (process.env.ML_APP_ID || '').trim();
+const ML_CLIENT_SECRET = (process.env.ML_CLIENT_SECRET || '').trim();
+try {
+  const _mlIdCrudo = process.env.ML_APP_ID || '';
+  const _mlSecCrudo = process.env.ML_CLIENT_SECRET || '';
+  if (_mlIdCrudo) {
+    if (_mlIdCrudo !== ML_APP_ID) process.env.ML_APP_ID = ML_APP_ID;
+    console.log('[ML] app_id len=' + ML_APP_ID.length + ' len_cruda=' + _mlIdCrudo.length + (_mlIdCrudo.length !== ML_APP_ID.length ? ' <- TENIA ESPACIOS/SALTOS INVISIBLES, corregido con trim' : ''));
+  }
+  if (_mlSecCrudo) {
+    if (_mlSecCrudo !== ML_CLIENT_SECRET) process.env.ML_CLIENT_SECRET = ML_CLIENT_SECRET;
+    console.log('[ML] client_secret len=' + ML_CLIENT_SECRET.length + ' len_cruda=' + _mlSecCrudo.length + (_mlSecCrudo.length !== ML_CLIENT_SECRET.length ? ' <- TENIA ESPACIOS/SALTOS INVISIBLES, corregido con trim' : ''));
+  }
+} catch (e) {}
+// redirect_uri del callback: DEBE ser identica a la registrada en la app de ML y a la
+// que se manda en el canje del code (ML valida caracter a caracter). Overridable por env.
+const ML_OAUTH_REDIRECT = (process.env.ML_OAUTH_REDIRECT || (BACKEND_PUBLIC_URL + '/api/ml/oauth/callback')).trim();
+function _mlConfigurado() { return !!(ML_APP_ID && ML_CLIENT_SECRET); }
+
+// --- GATE por cuenta (patron de conectoresV1Activo): ausente / error / OFF -> false.
+async function mlV1Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ml_v1')) return bs.ml_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ml_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.ml_v1 === true);
+  } catch (e) { return false; }
+}
+
+// --- REFRESH del token con LOCK en memoria por cuenta. ---
+// POR QUE el lock: el refresh_token es DE USO UNICO. Si dos webhooks casi simultaneos
+// disparan DOS refresh con el mismo refresh_token, el segundo pisa un token ya quemado
+// -> invalid_grant -> credencial muerta sin motivo real. Con el Map de promesas, el que
+// llega segundo ESPERA la promesa del primero en vez de disparar otro refresh.
+const _mlRefreshEnVuelo = new Map(); // user_id -> Promise<access_token|null>
+
+// Refresca UNA credencial (fila completa de ml_credentials). Devuelve el access_token
+// nuevo o null. Guarda SIEMPRE el refresh_token nuevo (rotacion de uso unico).
+async function _mlRefrescarCredencial(fila) {
+  try {
+    if (!_mlConfigurado() || !fila || !fila.refresh_token) return null;
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token', client_id: ML_APP_ID, client_secret: ML_CLIENT_SECRET,
+      refresh_token: fila.refresh_token
+    });
+    const r = await fetch('https://api.mercadolibre.com/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: body.toString()
+    });
+    const j = await r.json().catch(function () { return null; });
+    if (r.ok && j && j.access_token) {
+      // expires_in viene en segundos (~21600 = 6h). Fallback conservador: 3h (el peor caso
+      // documentado), asi el margen de 10 min de _mlTokenFresco nunca se queda corto.
+      const _vidaSeg = (typeof j.expires_in === 'number' && j.expires_in > 0) ? j.expires_in : 3 * 3600;
+      const upd = {
+        access_token: String(j.access_token),
+        token_expiry: new Date(Date.now() + _vidaSeg * 1000).toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      if (j.refresh_token) upd.refresh_token = String(j.refresh_token); // USO UNICO: sin guardar esto, el proximo refresh muere
+      if (j.scope) upd.scopes = String(j.scope);
+      const { error: eUp } = await supabase.from('ml_credentials').update(upd).eq('id', fila.id);
+      // Si no se pudo guardar, el refresh_token nuevo se pierde (el viejo ya se quemo): se loguea
+      // CRITICO pero se devuelve igual el access_token, que sirve por ~6h mas.
+      if (eUp) console.error('[ML] CRITICO: token refrescado pero NO guardado (user ' + fila.user_id + '): ' + eUp.message + ' -> el proximo refresh va a fallar');
+      return String(j.access_token);
+    }
+    const _err = (j && (j.error || j.message)) || ('http ' + r.status);
+    if (String(_err).indexOf('invalid_grant') !== -1) {
+      // Grant muerto (cambio de clave / 4 meses sin uso / revocacion): apagar la credencial y
+      // avisar al dueño por el canal de avisos existente (push + espejo WA, best-effort).
+      console.error('[ML] invalid_grant para user ' + fila.user_id + ' -> credencial desactivada (hay que reconectar)');
+      try { await supabase.from('ml_credentials').update({ activo: false, updated_at: new Date().toISOString() }).eq('id', fila.id); } catch (e2) {}
+      try { await enviarPushAsesor(fila.user_id, 'MercadoLibre se desconecto', '', 'La conexion con MercadoLibre vencio o fue revocada. Reconectala desde Integraciones para seguir recibiendo consultas.'); } catch (e3) {}
+    } else {
+      console.error('[ML] refresh fallo para user ' + fila.user_id + ': ' + String(_err).slice(0, 200));
+    }
+    return null;
+  } catch (e) { console.error('[ML] refresh error:', e && e.message); return null; }
+}
+
+// Devuelve un access_token VIGENTE para el tenant, o null (sin credencial / apagada /
+// refresh fallido). Si vence en menos de 10 min, refresca (con el lock de arriba).
+async function _mlTokenFresco(user_id) {
+  try {
+    if (!_mlConfigurado() || !user_id) return null;
+    const { data: fila, error } = await supabase.from('ml_credentials')
+      .select('id, user_id, access_token, refresh_token, token_expiry, activo')
+      .eq('user_id', user_id).maybeSingle();
+    if (error || !fila || fila.activo !== true) return null;
+    const _MARGEN_MS = 10 * 60 * 1000;
+    if (fila.access_token && fila.token_expiry && (new Date(fila.token_expiry).getTime() - Date.now() > _MARGEN_MS)) {
+      return fila.access_token;
+    }
+    const _k = String(user_id);
+    let p = _mlRefreshEnVuelo.get(_k);
+    if (!p) {
+      // Este es el UNICO refresh en vuelo para esta cuenta; los concurrentes esperan ESTA promesa.
+      p = _mlRefrescarCredencial(fila).finally(function () { _mlRefreshEnVuelo.delete(_k); });
+      _mlRefreshEnVuelo.set(_k, p);
+    }
+    return await p;
+  } catch (e) { console.error('[ML] token fresco:', e && e.message); return null; }
+}
+
+// --- CRON cada 4h: refresca TODAS las credenciales activas. ---
+// Doble proposito: (a) el access_token dura ~6h, asi ningun webhook paga la latencia del
+// refresh; (b) mantiene el grant VIVO (ML lo mata a los 4 meses sin llamadas). Mismo lock
+// que _mlTokenFresco para no quemar un refresh_token en paralelo. Registrado SOLO con env
+// presente: sin ML_APP_ID/ML_CLIENT_SECRET este cron no existe (cero comportamiento nuevo).
+async function _mlCronRefrescarTokens() {
+  try {
+    if (!_mlConfigurado()) return; // red doble: sin env no deberia estar ni registrado
+    const { data, error } = await supabase.from('ml_credentials')
+      .select('id, user_id, access_token, refresh_token, token_expiry, activo')
+      .eq('activo', true);
+    if (error || !data || !data.length) return;
+    for (let i = 0; i < data.length; i++) {
+      const fila = data[i];
+      try {
+        const _k = String(fila.user_id);
+        let p = _mlRefreshEnVuelo.get(_k);
+        if (!p) {
+          p = _mlRefrescarCredencial(fila).finally(function () { _mlRefreshEnVuelo.delete(_k); });
+          _mlRefreshEnVuelo.set(_k, p);
+        }
+        await p; // secuencial a proposito: cuentas pocas, cero apuro, cero rafaga contra ML
+      } catch (eFila) { console.error('[ML] cron refresh user ' + fila.user_id + ':', eFila && eFila.message); }
+    }
+  } catch (e) { console.error('[ML] cron refresh:', e && e.message); }
+}
+if (_mlConfigurado()) {
+  setInterval(_mlCronRefrescarTokens, 4 * 60 * 60 * 1000);
+  setTimeout(_mlCronRefrescarTokens, 3 * 60 * 1000); // primera pasada ~3 min tras el boot
+}
+
+// ============================================================================
+// F1 — OAUTH (conectar la cuenta de MercadoLibre del cliente)
+// Espeja el flujo de /api/meta/oauth/*: state HMAC firmado con el uid (CSRF +
+// identidad, sin tabla intermedia), token por query para abrir en pestania nueva,
+// y cierre con la misma mini-pagina _oauthCierreHtml que usan Meta/IG.
+// ============================================================================
+
+// GET /api/ml/oauth/start — redirige al authorize de ML. Auth por JWT (?token= o Bearer).
+app.get('/api/ml/oauth/start', async function (req, res) {
+  try {
+    if (!_mlConfigurado()) return res.status(503).json({ error: 'MercadoLibre OAuth no configurado (faltan ML_APP_ID / ML_CLIENT_SECRET).' });
+    let uid = await verificarUsuario(req);
+    if (!uid && req.query.token) { try { const { data } = await supabase.auth.getUser(String(req.query.token)); if (data && data.user) uid = data.user.id; } catch (e) {} }
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    // La credencial se guarda SIEMPRE bajo el DUEÑO de la cuenta: si un asesor abre el flujo,
+    // el canal igual queda del tenant (los leads se rutean por user_id de la credencial; una
+    // credencial colgada del uid de un asesor crearia conversaciones en el tenant equivocado).
+    const dueno = await _cloudApiDueno(uid);
+    const state = _oauthStateFirmar(dueno, 'ml');
+    if (!state) return res.status(500).json({ error: 'No se pudo iniciar el flujo' });
+    const url = 'https://auth.mercadolibre.com.ar/authorization' +
+      '?response_type=code' +
+      '&client_id=' + encodeURIComponent(ML_APP_ID) +
+      '&redirect_uri=' + encodeURIComponent(ML_OAUTH_REDIRECT) +
+      '&state=' + encodeURIComponent(state);
+    return res.redirect(url);
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// GET /api/ml/oauth/callback — canjea el code, resuelve /users/me y guarda la credencial.
+// Cierra con _oauthCierreHtml (mismo destino que el callback de Meta: mini-pagina que se
+// cierra sola y avisa al opener), con ok=true/false segun el resultado.
+app.get('/api/ml/oauth/callback', async function (req, res) {
+  try {
+    if (!_mlConfigurado()) return res.status(503).send(_oauthCierreHtml('MercadoLibre no configurado', 'Faltan credenciales de la app de MercadoLibre.', false));
+    if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a MercadoLibre.', false));
+    const code = req.query.code ? String(req.query.code) : '';
+    const uid = _oauthStateLeer(req.query.state, 'ml');
+    if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido de conexion vencio o no es valido. Reintentá desde Raices CRM.', false));
+
+    // 1) code -> access_token + refresh_token. redirect_uri = LA MISMA URL de este callback
+    //    (ML la compara caracter a caracter con la del authorize y con la registrada en la app).
+    const _body = new URLSearchParams({
+      grant_type: 'authorization_code', client_id: ML_APP_ID, client_secret: ML_CLIENT_SECRET,
+      code: code, redirect_uri: ML_OAUTH_REDIRECT
+    });
+    const tr = await fetch('https://api.mercadolibre.com/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: _body.toString()
+    });
+    const tj = await tr.json().catch(function () { return null; });
+    if (!tr.ok || !tj || !tj.access_token) { console.error('[ML] oauth token:', JSON.stringify(tj).slice(0, 300)); return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'MercadoLibre no devolvio un token de acceso. Reintentá.', false)); }
+
+    // 2) Identidad: /users/me con el Bearer recien emitido (id numerico + nickname).
+    const ur = await fetch('https://api.mercadolibre.com/users/me', { headers: { 'Authorization': 'Bearer ' + tj.access_token, 'Accept': 'application/json' } });
+    const uj = await ur.json().catch(function () { return null; });
+    if (!ur.ok || !uj || !uj.id) { console.error('[ML] oauth users/me:', JSON.stringify(uj).slice(0, 300)); return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'No se pudo leer la cuenta de MercadoLibre. Reintentá.', false)); }
+
+    // 3) Guardar (upsert por user_id: la tabla tiene unique(user_id), una cuenta ML por tenant).
+    //    activo=true al conectar: a diferencia de Meta, aca el gate REAL es el flag ml_v1 (el
+    //    webhook descarta con flag OFF aunque la credencial este activa) -> conectar sigue sin encender nada.
+    const _vidaSeg = (typeof tj.expires_in === 'number' && tj.expires_in > 0) ? tj.expires_in : 3 * 3600; // peor caso 3h
+    const fila = {
+      user_id: uid, ml_user_id: String(uj.id), ml_nickname: uj.nickname ? String(uj.nickname).slice(0, 120) : null,
+      access_token: String(tj.access_token), refresh_token: tj.refresh_token ? String(tj.refresh_token) : null,
+      token_expiry: new Date(Date.now() + _vidaSeg * 1000).toISOString(),
+      scopes: tj.scope ? String(tj.scope) : null, activo: true, updated_at: new Date().toISOString()
+    };
+    try {
+      const { data: existe, error: eSel } = await supabase.from('ml_credentials').select('id').eq('user_id', uid).maybeSingle();
+      if (eSel) { console.error('[ML] oauth save lectura:', eSel.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error leyendo la conexion (¿falta correr migracion-ml-v1.sql?). Reintentá.', false)); }
+      if (existe) {
+        const { error } = await supabase.from('ml_credentials').update(fila).eq('id', existe.id);
+        if (error) { console.error('[ML] oauth save update:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+      } else {
+        const { error } = await supabase.from('ml_credentials').insert(fila);
+        if (error) { console.error('[ML] oauth save insert:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion (¿falta correr migracion-ml-v1.sql?). Reintentá.', false)); }
+      }
+    } catch (e) { console.error('[ML] oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
+
+    console.log('[ML] cuenta conectada: ml_user_id=' + uj.id + ' (' + (uj.nickname || 'sin nickname') + ') para tenant ' + uid);
+    return res.status(200).send(_oauthCierreHtml('MercadoLibre conectado', 'Cuenta ' + (uj.nickname || uj.id) + ' conectada. Las consultas de tus publicaciones van a entrar como conversaciones.', true));
+  } catch (e) { console.error('GET /api/ml/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar MercadoLibre.', false)); }
+});
+
+// GET /api/ml/oauth/estado — para la pantalla de Integraciones. Sin secretos: solo
+// disponible (hay env), conectado, nickname y activo. Un asesor ve el estado del DUEÑO.
+app.get('/api/ml/oauth/estado', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    const dueno = await _cloudApiDueno(uid);
+    let conectado = false, ml_nickname = null, activo = false;
+    try {
+      const { data } = await supabase.from('ml_credentials').select('ml_nickname, activo').eq('user_id', dueno).maybeSingle();
+      if (data) { conectado = true; ml_nickname = data.ml_nickname || null; activo = data.activo === true; }
+    } catch (e) { /* tabla ausente (migracion sin correr) -> conectado=false */ }
+    return res.json({ ok: true, disponible: _mlConfigurado(), conectado: conectado, ml_nickname: ml_nickname, activo: activo });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// POST /api/ml/desconectar — borra la credencial del tenant. SOLO DUEÑO (mismo criterio
+// que /api/integraciones/estado: config de canal de toda la cuenta, un asesor no la toca).
+app.post('/api/ml/desconectar', async function (req, res) {
+  try {
+    const uid = await verificarUsuario(req);
+    if (!uid) return res.status(401).json({ error: 'No autorizado: falta token valido' });
+    if (!(await _cloudApiEsDueno(uid))) return res.status(403).json({ error: 'Solo el titular de la cuenta puede desconectar MercadoLibre.', solo_dueno: true });
+    const { error } = await supabase.from('ml_credentials').delete().eq('user_id', uid);
+    if (error) return res.status(500).json({ error: error.message });
+    console.log('[ML] cuenta desconectada por el dueño ' + uid);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e && e.message }); }
+});
+
+// ============================================================================
+// F2 — WEBHOOK DE LEADS (topic vis_leads)
+// ----------------------------------------------------------------------------
+// ML manda POST {resource, user_id, topic, application_id, ...} SIN firma HMAC.
+// La "validacion" es fetchear el resource con el token de la cuenta que matchea
+// payload.user_id contra ml_credentials.ml_user_id: lo que no resuelve se descarta.
+// SIEMPRE 200 inmediato (ML reintenta si no) + procesamiento async (setImmediate).
+// ============================================================================
+
+// Texto del mensaje entrante segun el subtipo del lead (para los que no traen texto propio).
+function _mlTextoPorTipo(tipo) {
+  if (tipo === 'visit_request') return '📩 Pidió una visita por MercadoLibre';
+  if (tipo === 'contact_request') return '📩 Pidió que lo contacten por MercadoLibre';
+  if (tipo === 'reservation') return '📩 Hizo una reserva por MercadoLibre';
+  if (tipo === 'quotation' || tipo === 'quotations') return '📩 Pidió una cotización por MercadoLibre';
+  if (tipo === 'question') return '📩 Hizo una pregunta por MercadoLibre'; // fallback si no se pudo leer el texto real
+  return null; // tipo desconocido -> el caller descarta (fail-closed: no inventar conversaciones)
+}
+
+// Procesa UNA notificacion vis_leads (ya en segundo plano, el 200 ya salio). Best-effort.
+async function _mlProcesarNotificacion(body) {
+  try {
+    const mlUserId = (body && body.user_id != null) ? String(body.user_id) : '';
+    const resource = (body && typeof body.resource === 'string') ? body.resource : '';
+    if (!mlUserId || !resource) return;
+
+    // 1) Rutear el tenant: payload.user_id -> ml_credentials.ml_user_id. Sin match -> descartar
+    //    (no es una cuenta nuestra, o esta desconectada). Esta ES la validacion del webhook.
+    const { data: cred, error: eCred } = await supabase.from('ml_credentials')
+      .select('id, user_id, ml_user_id, activo')
+      .eq('ml_user_id', mlUserId).eq('activo', true).maybeSingle();
+    if (eCred || !cred) return;
+    const uid = cred.user_id;
+
+    // 2) Gate por cuenta: flag ml_v1 OFF -> descartar aunque la credencial exista.
+    if (!(await mlV1Activo(uid))) return;
+
+    // 3) Lead id = ultimo segmento del resource ('/vis/leads/$LEAD_ID').
+    const leadId = resource.split('/').filter(Boolean).pop();
+    if (!leadId) return;
+
+    // 4) DEDUPE: ML reintenta las notificaciones -> si ya insertamos el mensaje de este lead
+    //    (wa_message_id = 'ml:'+leadId, misma columna que usa el dedupe B5 del webhook WA), salir.
+    try {
+      const { data: ya } = await supabase.from('messages').select('id')
+        .eq('user_id', uid).eq('wa_message_id', 'ml:' + leadId).limit(1).maybeSingle();
+      if (ya) return;
+    } catch (eDe) { /* columna/tabla rara -> seguimos; el peor caso es un duplicado, no una perdida */ }
+
+    // 5) Detalle del lead con el token del tenant. Si no resuelve (401/403/404) se descarta:
+    //    o el token esta muerto (el refresh ya aviso) o el lead no es de esta cuenta.
+    const token = await _mlTokenFresco(uid);
+    if (!token) return;
+    const lr = await fetch('https://api.mercadolibre.com/vis/leads/' + encodeURIComponent(String(leadId)), {
+      headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+    });
+    if (!lr.ok) { console.log('[ML] lead ' + leadId + ' no resolvio (http ' + lr.status + ') -> descartado'); return; }
+    const lead = await lr.json().catch(function () { return null; });
+    if (!lead) return;
+
+    // 6) Subtipo. Campo defensivo: la doc de /vis/leads no fija UN solo nombre, se prueban los
+    //    candidatos razonables; si el lead trae question y nada mas, se asume 'question'.
+    let tipo = String(lead.lead_type || lead.type || lead.subtopic || lead.source || '').toLowerCase();
+    if (!tipo && (lead.question_id || lead.external_id)) tipo = 'question';
+
+    // whatsapp / call: NO crear conversacion (el lead ya se fue a otro canal; en una fase
+    // posterior se etiquetara el contacto). Salir ANTES de tocar la base.
+    if (tipo === 'whatsapp' || tipo === 'call') return;
+    const _textoBase = _mlTextoPorTipo(tipo);
+    if (!_textoBase) return; // tipo desconocido -> descartar (fail-closed)
+
+    // 7) Datos del comprador (buyer registrado o guest de formulario). Todo opcional.
+    const _buyer = lead.buyer || lead.guest || {};
+    const _buyerId = (_buyer.id != null) ? String(_buyer.id) : '';
+    const _nombre = String(_buyer.name || [_buyer.first_name, _buyer.last_name].filter(Boolean).join(' ') || '').trim().slice(0, 120);
+    const _email = _buyer.email ? String(_buyer.email).trim().slice(0, 200) : '';
+    let _telefono = '';
+    try {
+      const _ph = _buyer.phone;
+      if (typeof _ph === 'string') _telefono = _ph.trim();
+      else if (_ph && typeof _ph === 'object') _telefono = [(_ph.area_code || ''), (_ph.number || '')].join(' ').trim();
+    } catch (eTel) {}
+
+    // 8) Texto del mensaje. question -> el TEXTO REAL de la pregunta: el external_id del lead
+    //    question ES el question id -> GET /questions/$ID?api_version=4 trae .text.
+    let texto = _textoBase;
+    if (tipo === 'question') {
+      try {
+        const _qid = String(lead.external_id || lead.question_id || '');
+        if (_qid) {
+          const qr = await fetch('https://api.mercadolibre.com/questions/' + encodeURIComponent(_qid) + '?api_version=4', {
+            headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+          });
+          const qj = await qr.json().catch(function () { return null; });
+          if (qr.ok && qj && qj.text) texto = String(qj.text).trim().slice(0, 4000) || _textoBase;
+        }
+      } catch (eQ) { /* sin texto -> queda el fallback generico */ }
+    }
+
+    // 9) Contacto + conversacion por el camino CENTRAL (M18, mismo helper que WA/Meta: upsert
+    //    idempotente, reparto segun reparto_v2, sin duplicar). contactKey = 'ml:'+buyer_id (o el
+    //    lead id si es guest sin id) en la columna phone, igual que Meta usa el PSID/IGSID.
+    const _contactKey = 'ml:' + (_buyerId || String(leadId));
+    const _ocrearMl = await obtenerOcrearConvDeCanal(uid, _contactKey, 'mercadolibre', (_nombre || _contactKey), 'id, ai_enabled, status, asesor_id');
+    const contacto = _ocrearMl.contacto;
+    if (!contacto) return;
+    const conv = _ocrearMl.conv;
+    if (!conv) return;
+
+    // Enriquecer el contacto con lo que trajo el lead (best-effort, sin pisar lo cargado a mano:
+    // el nombre solo se corrige si el actual sigue siendo la contactKey tecnica).
+    try {
+      const { data: cAct } = await supabase.from('contacts').select('name, email, notes').eq('id', contacto.id).maybeSingle();
+      const upd = {};
+      if (_nombre && cAct && (!cAct.name || cAct.name === _contactKey)) upd.name = _nombre;
+      if (_email && cAct && !cAct.email) upd.email = _email;
+      if (_telefono && cAct && (!cAct.notes || String(cAct.notes).indexOf(_telefono) === -1)) {
+        // El telefono REAL va en notes: la columna phone de este contacto es la contactKey del canal.
+        upd.notes = (cAct.notes ? String(cAct.notes) + '\n' : '') + 'Tel (MercadoLibre): ' + _telefono;
+      }
+      if (Object.keys(upd).length) await supabase.from('contacts').update(upd).eq('id', contacto.id);
+    } catch (eEnr) { /* best-effort */ }
+
+    // 10) Insertar el mensaje ENTRANTE (role 'contact') con el lead id como wa_message_id (dedupe
+    //     del paso 4) y actualizar el resumen de la conversacion, igual que el webhook de Meta.
+    try {
+      await supabase.from('messages').insert({ conversation_id: conv.id, user_id: uid, role: 'contact', content: texto, wa_message_id: 'ml:' + String(leadId) });
+      await _updConvMensaje({ last_message: texto, last_role: 'contact', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', conv.id); });
+    } catch (eIns) { console.error('[ML] guardar msg entrante:', eIns && eIns.message); return; }
+
+    console.log('[ML] lead ' + leadId + ' (' + tipo + ') -> conversacion ' + conv.id + ' del tenant ' + uid);
+
+    // F2 TERMINA ACA A PROPOSITO: la conversacion queda con el estado que le dio el flujo normal,
+    // pero NO se dispara el motor de respuesta (generarRespuestaAgente) — el asesor responde a mano.
+    // F3: acá se enchufa la respuesta (gated ml_ia_responde).
+  } catch (e) { console.error('[ML] procesar notificacion:', e && e.message); }
+}
+
+// POST /api/webhook/mercadolibre — 200 inmediato SIEMPRE (ML reintenta si no); todo async.
+app.post('/api/webhook/mercadolibre', function (req, res) {
+  res.sendStatus(200);
+  try {
+    if (!_mlConfigurado()) return; // sin env -> INERTE (200 y descartar, sin tocar la base)
+    const body = req.body || {};
+    if (body.topic !== 'vis_leads') return; // otros topics: ignorar en silencio
+    setImmediate(function () {
+      _mlProcesarNotificacion(body).catch(function (e) { console.error('[ML] webhook bg:', e && e.message); });
+    });
+  } catch (e) { console.error('POST /api/webhook/mercadolibre:', e && e.message); }
+});
+
+// GET del mismo path: 200 texto plano por si ML (o un humano) hace un GET de verificacion.
+app.get('/api/webhook/mercadolibre', function (req, res) {
+  return res.status(200).send('ok');
+});
+
+// ===== FIN MERCADOLIBRE (gated ml_v1) =======================================
 
 
 app.listen(PORT, function(){ console.log('Raices CRM backend escuchando en puerto ' + PORT); });

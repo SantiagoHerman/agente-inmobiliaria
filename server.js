@@ -9342,9 +9342,25 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
                 }
               } catch (eAlt) { _resDispoTxt += ' Ofrecele con amabilidad correr las fechas o cambiar la cantidad de noches y volves a chequear.'; }
             } else {
-              const _NLd = String.fromCharCode(10);
-              const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
-              _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' adultos' + (_ni > 0 ? ' y ' + _ni + ' niños' : '') + '). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
+              // CONECTORES V1 (gated): "LO OCUPADO MANDA". PXSOL dice libre, pero si TODAS las unidades del
+              // complejo estan bloqueadas en Raices (hotel_reservas) para ese rango, gana el registro interno
+              // (conservador: mejor re-chequear que sobre-vender una unidad ya reservada a mano). PXSOL dice
+              // ocupado -> ya cayo en la rama de arriba y queda ocupado. Con flag OFF _complejoCon es null =>
+              // ni query ni cambio de texto (ACTUAL EXACTO). Ante error del cruce no se pisa nada (fail-open).
+              let _todoOcupadoInterno = false;
+              if (_complejoCon) {
+                try {
+                  const _occX = await _ocupacionInternaComplejo(user_id, _complejoCon.id, _ci, _co);
+                  if (_occX && _occX.total > 0 && _occX.libres === 0) _todoOcupadoInterno = true;
+                } catch (eOccX) {}
+              }
+              if (_todoOcupadoInterno) {
+                _resDispoTxt = 'OJO: el motor de reservas de la web muestra lugar para el ' + _ci + ' al ' + _co + ', pero TODAS las unidades de este complejo ya figuran reservadas en el registro interno para esas fechas (reservas cargadas a mano que la web todavia no refleja). Respondele al lead que para esas fechas esta OCUPADO y ofrecele con amabilidad correr las fechas y volves a chequear. NO ofrezcas lugar ni precios para esas fechas.';
+              } else {
+                const _NLd = String.fromCharCode(10);
+                const _lineas = _hay.map(function(o){ return '- ' + o.nombre + ': ' + o.moneda + ' ' + _miles(o.porNocheWeb) + ' por noche | total ' + o.moneda + ' ' + _miles(o.totalWeb) + ' por ' + _disp.nights + ' noches' + (o.desayuno ? ' | desayuno incluido' : '') + ' | ' + o.disponibles + ' disponible' + (o.disponibles > 1 ? 's' : '') + '  [SOLO si preguntan por IVA o precio final: ' + o.moneda + ' ' + _miles(o.porNocheFinal) + '/noche y ' + o.moneda + ' ' + _miles(o.totalFinal) + ' total, con IVA ' + o.ivaPct + '% incluido]'; });
+                _resDispoTxt = 'DISPONIBILIDAD REAL para ' + _ci + ' al ' + _co + ' (' + _disp.nights + ' noches, ' + _ad + ' adultos' + (_ni > 0 ? ' y ' + _ni + ' niños' : '') + '). Los primeros precios son EXACTAMENTE los que figuran en la web del hotel (sin IVA):' + _NLd + _lineas.join(_NLd) + _NLd + 'REGLA DE PRECIOS (obligatoria): deci SIEMPRE los precios como estan en la WEB (los primeros, sin IVA) — es lo que ve el huesped si entra a la pagina, tienen que coincidir. SOLO si el lead pregunta por el IVA, los impuestos o el precio final, dale el valor con IVA que figura entre corchetes. Nunca mezcles ambos en el mismo precio ni inventes nada fuera de esta lista. Cuando menciones varias opciones, poné CADA UNA en su propia linea con un RENGLON EN BLANCO entre cada una (van como mensajes separados).';
+              }
             }
           }
         }
@@ -26946,6 +26962,86 @@ async function _pxsolConfigDeCuenta(user_id) {
       if (cfg) { try { await supabase.from('hotel_complejos').update({ atributos: Object.assign({}, a, { pxsol: cfg }) }).eq('id', comps[i].id); } catch (eU) {} return Object.assign({}, cfg, _baseSitio ? { base: _baseSitio } : {}); }
     }
     return null;
+  } catch (e) { return null; }
+}
+
+// ============================================================================
+// CONECTORES V1 (gated conectores_v1) — resolucion del motor de reservas POR COMPLEJO.
+// El camino viejo (_pxsolConfigDeCuenta, arriba) devuelve el PRIMER complejo con PXSOL de la cuenta:
+// con 2 complejos la IA mezclaba la disponibilidad de uno con el otro. Estos helpers resuelven UNA
+// fila. _pxsolConfigDeCuenta NO SE TOCA: sigue siendo el camino con el flag OFF, por eso la logica
+// de fila se duplica aca a proposito (misma semantica, aplicada a una sola fila) en vez de refactorizarla.
+// ============================================================================
+
+// Config PXSOL de UNA fila de hotel_complejos: cache atributos.pxsol, o scrape de origen_url (y se
+// cachea el resultado, igual que _pxsolConfigDeCuenta). null si la fila no tiene sitio PXSOL.
+async function _pxsolConfigDeFila(fila) {
+  try {
+    if (!fila) return null;
+    var a = (fila.atributos && typeof fila.atributos === 'object') ? fila.atributos : {};
+    // base = el sitio del hotel (para module.php de fechas alternativas). Se adjunta al vuelo, sin persistirlo.
+    var _baseSitio = a.origen_url || a.origenUrl || '';
+    if (_baseSitio && !String(_baseSitio).startsWith('http')) _baseSitio = 'https://' + _baseSitio;
+    _baseSitio = _baseSitio ? String(_baseSitio).replace(/^(https?:\/\/[^\/]+).*/, '$1') : '';
+    if (a.pxsol && a.pxsol.productId) return Object.assign({}, a.pxsol, _baseSitio ? { base: _baseSitio } : {});
+    var url = a.origen_url || a.origenUrl || '';
+    if (!url) return null;
+    if (!String(url).startsWith('http')) url = 'https://' + url;
+    var rh = await fetchScrape(url);
+    if (!rh.ok) return null;
+    var cfg = _pxsolConfig(await rh.text());
+    if (cfg) { try { await supabase.from('hotel_complejos').update({ atributos: Object.assign({}, a, { pxsol: cfg }) }).eq('id', fila.id); } catch (eU) {} return Object.assign({}, cfg, _baseSitio ? { base: _baseSitio } : {}); }
+    return null;
+  } catch (e) { return null; }
+}
+
+// Conector de UN complejo (aislado por tenant: id + user_id obligatorios).
+//  - atributos.conector = {tipo:'pxsol'}  -> config PXSOL de ESE complejo (cache/scrape de esa fila).
+//  - atributos.conector = {tipo:'raices'} (u otro tipo desconocido) -> null: sin motor externo, la IA
+//    usa solo hotel_reservas (el registro interno), como hoy cuando no hay PXSOL.
+//  - sin atributos.conector (LEGACY) -> misma semantica que hoy para esa fila: pxsol si se puede, si no null.
+async function _conectorDeComplejo(user_id, complejo_id) {
+  try {
+    if (!user_id || !complejo_id) return null;
+    var hc = await supabase.from('hotel_complejos').select('id, atributos').eq('id', complejo_id).eq('user_id', user_id).maybeSingle();
+    var fila = (hc && hc.data) ? hc.data : null;
+    if (!fila) return null;
+    var a = (fila.atributos && typeof fila.atributos === 'object') ? fila.atributos : {};
+    var con = (a.conector && typeof a.conector === 'object') ? a.conector : null;
+    if (con) {
+      var t = String(con.tipo || '').trim().toLowerCase();
+      if (t === 'pxsol') return await _pxsolConfigDeFila(fila);
+      return null; // 'raices' o tipo desconocido: sin motor externo, mejor no inventar
+    }
+    return await _pxsolConfigDeFila(fila); // legacy sin conector declarado
+  } catch (e) { return null; }
+}
+
+// Ocupacion INTERNA de un complejo para un rango: cuantas unidades activas quedan sin reserva
+// bloqueante (deposit_pending|confirmed|checked_in) que PISE el rango pedido. Rango semiabierto:
+// el dia de check_out queda libre (mismo criterio que las lineas OCUPADA del inventario y que
+// el indice idx_hotel_reservas_bloqueantes). Devuelve { total, libres } o null si no se pudo
+// verificar (sin unidades / error) — el que llama decide el texto conservador.
+async function _ocupacionInternaComplejo(user_id, complejo_id, checkinISO, checkoutISO) {
+  try {
+    if (!user_id || !complejo_id || !checkinISO || !checkoutISO) return null;
+    var uq = await supabase.from('hotel_unidades').select('id').eq('user_id', user_id).eq('complejo_id', complejo_id).eq('activa', true);
+    var uds = (uq && uq.data) ? uq.data : [];
+    if (uq.error || !uds.length) return null;
+    var ids = uds.map(function (u) { return u.id; });
+    var rq = await supabase.from('hotel_reservas')
+      .select('unit_id')
+      .eq('user_id', user_id)
+      .in('unit_id', ids)
+      .in('status', ['deposit_pending', 'confirmed', 'checked_in'])
+      .lt('check_in', String(checkoutISO))
+      .gt('check_out', String(checkinISO));
+    if (rq.error) return null;
+    var ocupadas = {};
+    ((rq && rq.data) || []).forEach(function (r) { if (r && r.unit_id) ocupadas[r.unit_id] = true; });
+    var libres = 0;
+    ids.forEach(function (id) { if (!ocupadas[id]) libres++; });
+    return { total: ids.length, libres: libres };
   } catch (e) { return null; }
 }
 

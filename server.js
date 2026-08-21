@@ -3080,6 +3080,21 @@ async function iaDisponibilidadActivo(user_id, bs) {
   } catch (e) { return false; }
 }
 
+// CONECTORES V1 (gated conectores_v1): con ON la tool consultar_disponibilidad resuelve el motor de reservas
+// POR COMPLEJO (atributos.conector) en vez de "el primer complejo con PXSOL de la cuenta" — arregla que un
+// cliente con 2 complejos mezclara la disponibilidad de uno con el otro. FAIL-CLOSED (mismo patrón EXACTO que
+// iaDisponibilidadActivo): columna ausente (migracion-conectores-v1.sql sin correr) / error / null / false -> OFF
+// => comportamiento BYTE-IDENTICO al actual (sigue _pxsolConfigDeCuenta).
+async function conectoresV1Activo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'conectores_v1')) return bs.conectores_v1 === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('conectores_v1').eq('user_id', user_id).maybeSingle();
+    if (error) return false;
+    return !!(data && data.conectores_v1 === true);
+  } catch (e) { return false; }
+}
+
 // ===== RAG DE INVENTARIO (gated ia_rag_v1) =====
 // Con ON: la IA deja de recibir el catalogo COMPLETO en el prompt (para Anton ~152k tokens/mensaje) y recibe un
 // INDICE compacto + las tools buscar_inventario / ficha_inventario. FAIL-CLOSED (mismo patron EXACTO que
@@ -7708,6 +7723,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // DISPONIBILIDAD PXSOL (gated ia_disponibilidad): ¿ofrecer la tool consultar_disponibilidad? SOLO hotel + flag ON.
   let _iaDisponibilidadOn = false;
   if (conversation_id && !modoPrueba) { try { _iaDisponibilidadOn = await iaDisponibilidadActivo(user_id, settings || undefined); } catch (eIaDi) { _iaDisponibilidadOn = false; } }
+  // CONECTORES V1 (gated conectores_v1): ¿resolver el motor de reservas POR COMPLEJO? Con flag OFF -> false =>
+  // prompt/schema/handler BYTE-IDENTICOS al actual. Reusa `settings` ya cargado (0 queries extra). Se resuelve
+  // aca (y no adentro del handler de la tool) para que el schema y el indice del alojamiento usen el MISMO valor.
+  let _conectoresV1On = false;
+  if (conversation_id && !modoPrueba) { try { _conectoresV1On = await conectoresV1Activo(user_id, settings || undefined); } catch (eCnV1) { _conectoresV1On = false; } }
   // RAG DE INVENTARIO (gated ia_rag_v1): ¿reemplazar el catalogo COMPLETO del prompt por el INDICE + las tools
   // buscar_inventario / ficha_inventario? FAIL-CLOSED: con el flag OFF -> false => prompt/tools/flujo BYTE-IDENTICOS
   // al actual. Reusa el `settings` ya cargado (0 queries extra). El _ragActivo real (que ademas exige inventario de
@@ -8186,6 +8206,11 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // nunca se activa y el prompt/flujo es BYTE-IDENTICO al actual. NUNCA guardan `atributos` crudo ni pxsol/credenciales.
   let _hotelUnidades = [];
   let _hotelHeadersTxt = '';
+  // CONECTORES V1 (gated conectores_v1): lista {id, nombre} de los complejos de la cuenta, para que el schema de
+  // consultar_disponibilidad sepa si hay 2+ complejos y el handler resuelva el conector de CADA uno. Se puebla
+  // dentro del bloque _esHotel (reusa la query de _complejos: 0 queries extra); para inmobiliaria/desarrolladora
+  // queda [] = sin efecto. Poblarla NO cambia comportamiento: solo se LEE con _conectoresV1On.
+  let _complejosConector = [];
   if (_esHotel) try {
     // F1: la IA tambien lee los COMPLEJOS (info general del hotel/cabaña) para poder responder
     // "que servicios/amenities/politicas tiene el hotel" y, con cadena, distinguir cada complejo.
@@ -8193,6 +8218,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     // esta garantizado y el mismo inventario podia armar un texto distinto -> huella nueva -> cache recargado.
     const { data: _complejos } = await supabase.from('hotel_complejos').select('id, nombre, atributos').eq('user_id', user_id).order('id');
     const _compsById = {}; (_complejos || []).forEach(function (c) { _compsById[c.id] = c; });
+    // CONECTORES V1: cachear id+nombre de cada complejo (mismo orden determinista de la query). Solo data, sin efecto.
+    _complejosConector = (_complejos || []).map(function (c) { return { id: c.id, nombre: c.nombre || 'Alojamiento' }; });
     const { data: _uds, error: _udErr } = await supabase.from('hotel_unidades')
       .select('id, numero, title, type, capacidad, descripcion, precio_base, moneda, atributos, images, complejo_id')
       .eq('user_id', user_id).eq('activa', true).order('id');
@@ -8268,7 +8295,10 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       const _headerComp = function (c) {
         const a = (c && c.atributos) || {}; const _pol = a.politicas || {};
         const _polTxt = [_pol.checkin ? 'check-in ' + _pol.checkin : '', _pol.checkout ? 'check-out ' + _pol.checkout : '', _pol.cancelacion ? 'cancelacion: ' + _pol.cancelacion : '', _pol.sena ? 'seña ' + _pol.sena : '', _pol.pagos ? 'pagos: ' + _pol.pagos : ''].filter(Boolean).join(' | ');
+        // CONECTORES V1 (gated): con 2+ complejos la IA necesita el ID para pasarselo a consultar_disponibilidad
+        // (el schema se lo exige). Formato corto para no inflar tokens. Con flag OFF (o 1 complejo) -> '' = header ACTUAL.
         return 'COMPLEJO: ' + (c.nombre || 'Alojamiento') + (a.subtipo ? ' (' + a.subtipo + ')' : '')
+          + ((_conectoresV1On && (_complejos || []).length >= 2) ? ' [complejo_id: ' + c.id + ']' : '')
           + (_fmtDireccion(a) ? _NL + '  Ubicacion: ' + _fmtDireccion(a) + ((_iaUbicacionOn && _dirEsExacta(a)) ? ' | Maps: https://www.google.com/maps?q=' + encodeURIComponent(_fmtDireccion(a)) : '') : '')
           + ((_iaUbicacionOn && a.referencias_zona) ? _NL + '  Cerca: ' + a.referencias_zona : '')
           + (a.descripcion ? _NL + '  ' + a.descripcion : '')
@@ -8778,6 +8808,15 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       description: 'Usala cuando el lead pide DISPONIBILIDAD o PRECIO para fechas concretas (ej: "tienen para el 10 al 13 de enero?", "cuanto sale una cabaña 3 noches en febrero para 2 personas?"). Consulta en vivo el motor de reservas y te devuelve las habitaciones con precio y si hay lugar. HOY es ' + _hoyISO + ': convertí las fechas del lead a formato AAAA-MM-DD; si el mes ya pasó este año, usá el año que viene. Si el lead no dio fecha de salida pero sí cantidad de noches, calculala. Si faltan datos (fechas o personas), preguntáselos con naturalidad ANTES de usar la tool, no inventes.',
       input_schema: { type: 'object', properties: { check_in: { type: 'string', description: 'Fecha de entrada en formato AAAA-MM-DD (ej: 2026-01-10).' }, check_out: { type: 'string', description: 'Fecha de salida en formato AAAA-MM-DD (ej: 2026-01-13).' }, adultos: { type: 'integer', description: 'Cantidad de adultos/personas. Si no lo dijeron, asumí 2.' }, ninos: { type: 'integer', description: 'Cantidad de niños/menores (sin contar bebés). Si no mencionaron niños, 0. IMPORTANTE: si el lead menciona hijos/nenes/menores, pasalos acá — cambian el precio y qué habitaciones aplican.' } }, required: ['check_in', 'check_out'] }
     });
+    // CONECTORES V1 (gated conectores_v1): con 2+ complejos la disponibilidad se consulta POR COMPLEJO, asi que
+    // la tool exige complejo_id. Se MUTA el objeto recien pusheado (en vez de armarlo distinto) para garantizar
+    // que con el flag OFF (o con 1 solo complejo) el schema quede BYTE-IDENTICO al actual.
+    if (_conectoresV1On && _complejosConector.length >= 2) {
+      var _tDispo = toolsAgente[toolsAgente.length - 1];
+      _tDispo.description += ' IMPORTANTE: esta cuenta tiene VARIOS complejos y cada uno tiene su propia disponibilidad: pasá SIEMPRE el complejo_id del complejo por el que consulta el lead.';
+      _tDispo.input_schema.properties.complejo_id = { type: 'string', description: 'ID del complejo a consultar. Los IDs figuran en el indice del alojamiento (COMPLEJO: ... [complejo_id: ...]). Si no sabes de cual complejo habla el lead, preguntale ANTES de usar la tool; nunca adivines.' };
+      _tDispo.input_schema.required.push('complejo_id');
+    }
   }
 
   // ===== TOOLS BAJO DEMANDA (gated tools_bajo_demanda_v1) — Diego 2026-07-31 =====
@@ -9244,9 +9283,42 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
         const _co = (_in && _in.check_out) ? String(_in.check_out).trim() : '';
         const _ad = (_in && _in.adultos) ? _in.adultos : 2;
         const _ni = (_in && _in.ninos) ? _in.ninos : 0;
-        const _cfgPx = await _pxsolConfigDeCuenta(user_id);
-        if (!_cfgPx) {
-          _resDispoTxt = 'No pude conectar con el motor de reservas del hotel. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
+        // CONECTORES V1 (gated conectores_v1): resolver el motor POR COMPLEJO en vez del "primer complejo con
+        // PXSOL de la cuenta" (con 2 complejos, el camino viejo mezclaba la disponibilidad de uno con el otro).
+        // Con flag OFF (o sin complejos cargados) se sigue llamando _pxsolConfigDeCuenta = camino ACTUAL EXACTO.
+        let _cfgPx = null;
+        let _complejoCon = null;   // {id, nombre} del complejo resuelto (solo con flag ON)
+        let _pedirComplejo = false; // flag ON + 2+ complejos y la IA no paso un complejo_id valido
+        if (_conectoresV1On && _complejosConector.length > 0) {
+          if (_complejosConector.length >= 2) {
+            const _cidIn = (_in && _in.complejo_id != null) ? String(_in.complejo_id).trim() : '';
+            _complejoCon = _complejosConector.find(function (c) { return String(c.id) === _cidIn; }) || null;
+            if (!_complejoCon) _pedirComplejo = true; // nunca adivinar de que complejo habla el lead
+          } else {
+            _complejoCon = _complejosConector[0]; // un solo complejo: se resuelve directo, sin pedirle nada a la IA
+          }
+          if (_complejoCon) _cfgPx = await _conectorDeComplejo(user_id, _complejoCon.id);
+        } else {
+          _cfgPx = await _pxsolConfigDeCuenta(user_id);
+        }
+        if (_pedirComplejo) {
+          _resDispoTxt = 'Esta cuenta tiene varios complejos (' + _complejosConector.map(function (c) { return c.nombre; }).join(', ') + '). Preguntale al lead por cual consulta y volve a llamar con el complejo_id correcto (figura en el indice del alojamiento). NO inventes disponibilidad.';
+        } else if (!_cfgPx) {
+          if (_complejoCon) {
+            // Flag ON y el complejo NO tiene motor externo (conector 'raices' o legacy sin PXSOL): responder desde
+            // el registro interno (hotel_reservas), que es la unica fuente real. Conservador: nunca inventar.
+            let _occ = null;
+            try { _occ = await _ocupacionInternaComplejo(user_id, _complejoCon.id, _ci, _co); } catch (eOccI) { _occ = null; }
+            if (!_occ) {
+              _resDispoTxt = 'Este complejo no usa un motor de reservas externo y no pude verificar el registro interno. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
+            } else if (_occ.libres === 0) {
+              _resDispoTxt = 'Para el ' + _ci + ' al ' + _co + ' TODAS las unidades de este complejo ya figuran reservadas en el registro interno: esta OCUPADO. Ofrecele con amabilidad correr las fechas y volves a chequear. NO ofrezcas lugar ni precios para esas fechas.';
+            } else {
+              _resDispoTxt = 'Segun el registro interno de reservas, para el ' + _ci + ' al ' + _co + ' este complejo tiene ' + _occ.libres + ' de ' + _occ.total + ' unidades SIN reserva. Ofrecele las unidades y tarifas que figuran en el inventario aclarando que la reserva se confirma con el equipo; NO inventes precios que no esten en el inventario.';
+            }
+          } else {
+            _resDispoTxt = 'No pude conectar con el motor de reservas del hotel. Decile al lead con naturalidad que le confirmas la disponibilidad y el precio a la brevedad. NO inventes precios ni disponibilidad.';
+          }
         } else {
           const _disp = await _pxsolDisponibilidad(_cfgPx, _ci, _co, _ad, _ni);
           if (!_disp.ok) {
@@ -10729,6 +10801,46 @@ async function traducir(texto, idiomaDestino, user_id, conversation_id, turnoId)
 // Distingue PEDIR hablar EN un idioma (cambia) de MENCIONAR un idioma/moneda como tema (ej. "guaranies" = moneda de
 // Paraguay -> NO cambia a guarani). Ante duda/error MANTIENE el idioma actual (nunca resetea solo).
 // MEDIDOR (2026-07-23): conversation_id y turnoId OPCIONALES al final (default null), solo para atribuir el costo.
+// ============ HEURISTICA GRATIS DE IDIOMA (Diego 2026-08-21) ============
+// PARA QUE. `detectar_idioma` corria en TODOS los mensajes de texto: MEDIDO, 2.855 llamadas en 30 dias entre
+// las 3 cuentas para encontrar 4 mensajes en otro idioma (Anton 2 de 1.734, Galdames 0 de 1.129, Raices 2 de
+// 588). Esta funcion decide GRATIS si el texto es claramente del idioma base; solo cuando NO esta segura se
+// paga la llamada al modelo.
+//
+// REGLA DE SEGURIDAD: devuelve true SOLO con certeza. Ante cualquier duda -> false -> se llama a la IA, o sea
+// el comportamiento de siempre. Nunca puede "decidir" que algo es castellano si no lo tiene claro.
+//
+// Devuelve: true = es el idioma base con certeza | false = no se sabe (o seguro no lo es) -> preguntarle a la IA.
+const _PALABRAS_ES = new Set([
+  'hola','buenas','buen','dia','dias','tarde','tardes','noche','noches','gracias','por','favor','si','no','ok','dale',
+  'que','como','cuanto','cuando','donde','quien','cual','porque','para','con','sin','una','uno','unos','unas','del',
+  'los','las','este','esta','esto','ese','esa','eso','aca','alla','ahi','muy','mas','menos','tengo','tiene','quiero',
+  'necesito','busco','me','te','le','lo','la','el','en','de','al','y','o','pero','tambien','bien','mal','vos','usted',
+  'precio','valor','plata','pesos','dolares','casa','depto','departamento','alquiler','venta','comprar','alquilar',
+  'visita','ver','mandame','pasame','decime','contame','avisame','listo','perfecto','barbaro','genial','saludos'
+]);
+function _pareceIdiomaBase(texto, base) {
+  try {
+    if (String(base || 'es').toLowerCase().slice(0, 2) !== 'es') return false; // solo sabemos juzgar castellano
+    const t = String(texto || '').trim();
+    if (!t) return false;
+    // Alfabeto no latino (cirilico, arabe, hebreo, griego, chino, japones, coreano) -> seguro NO es castellano.
+    if (/[\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0370-\u03FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(t)) return false;
+    const n = t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    // Signos que practicamente solo existen en castellano.
+    if (/[ñ¿¡]/.test(t.toLowerCase())) return true;
+    const palabras = n.split(/[^a-z0-9]+/).filter(Boolean);
+    if (!palabras.length) return true; // solo emojis/signos: no hay idioma que detectar
+    if (palabras.every(function (p) { return /^[0-9]+$/.test(p); })) return true; // solo numeros: tampoco hay idioma
+    let conocidas = 0;
+    for (const p of palabras) { if (_PALABRAS_ES.has(p)) conocidas++; }
+    // Una sola palabra: tiene que estar en la lista (asi "Hola" pasa gratis y "Hi" va a la IA).
+    if (palabras.length === 1) return conocidas === 1;
+    // Varias palabras: al menos un tercio reconocidas. Es exigente a proposito.
+    return (conocidas / palabras.length) >= 0.34;
+  } catch (e) { return false; } // ante error, que decida la IA
+}
+
 async function detectarIdioma(texto, user_id, idiomaActual, conversation_id, turnoId) {
   const actual = (idiomaActual && String(idiomaActual).trim()) || 'es';
   try {
@@ -12658,10 +12770,30 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         // PLAN MEDIANO (gated ia_haiku_fusion): con OFF -> detectarIdioma (byte-identico). Con ON, se reusa el idioma del
         // analisis fusionado; PERO se replica el atajo de detectarIdioma (texto <2 chars / 1 sola palabra NUNCA cambia el
         // idioma -> se mantiene el actual SIN gastar la llamada fusionada, para no encarecer mensajes cortos/triviales).
-        const _idiomaCortoFus = (String(texto || '').trim().length < 2) || (String(texto || '').trim().split(/\s+/).filter(Boolean).length < 2);
-        const idiomaDetectado = _haikuFusionOn
-          ? (_idiomaCortoFus ? idiomaActual : (await _fusionGet()).idioma)
-          : await detectarIdioma(texto, user_id, idiomaActual, conv && conv.id, _turnoId); // MEDIDOR: atribucion (no cambia la deteccion)
+        // ============ POR QUE SE ACTIVABA RECIEN EN EL 2do MENSAJE (Diego 2026-08-21) ============
+        // Habia un atajo que saltaba la deteccion si el texto tenia MENOS DE 2 PALABRAS. Y el primer mensaje de
+        // un lead es casi siempre una sola palabra: "Hola", "Hi", "Buenas". Resultado: el idioma no se detectaba
+        // nunca en el primer mensaje y el traductor recien se prendia en el segundo. Diego: "hay que resolver que
+        // se active en el primer mensaje, porque se viene activando recien en el segundo".
+        //
+        // AHORA el atajo lo decide la heuristica GRATIS: si el texto es claramente castellano no se llama a la IA
+        // (ahi esta el ahorro: 2.855 llamadas/mes para encontrar 4 mensajes), y si NO lo es se llama SIEMPRE,
+        // aunque sea una sola palabra. Asi "Hi" en el primer mensaje prende el traductor de entrada.
+        //
+        // El atajo gratis SOLO se aplica cuando la conversacion ya viene en el idioma base. Si el lead venia
+        // hablando en otro idioma, se llama igual a la IA: hace falta para detectar que volvio al castellano, y
+        // esas conversaciones son un puñado.
+        // ==========================================================================================
+        const _yaEnBase = (idiomaActual === _idiomaBaseEmpresa);
+        const _claramenteBase = _yaEnBase && _pareceIdiomaBase(texto, _idiomaBaseEmpresa);
+        let idiomaDetectado;
+        if (_claramenteBase) {
+          idiomaDetectado = _idiomaBaseEmpresa;   // gratis: ni Haiku ni fusion
+        } else if (_haikuFusionOn) {
+          idiomaDetectado = (await _fusionGet()).idioma;
+        } else {
+          idiomaDetectado = await detectarIdioma(texto, user_id, idiomaActual, conv && conv.id, _turnoId); // MEDIDOR: atribucion (no cambia la deteccion)
+        }
         if (idiomaDetectado && idiomaDetectado !== _idiomaBaseEmpresa) {
           // El lead habla (o cambio a) un idioma distinto al base -> traducir al base para el asesor y ACTUALIZAR
           // el idioma guardado. Cubre tambien el cambio otro1->otro2 (idiomaDetectado nuevo != idioma_lead viejo).
@@ -12669,10 +12801,16 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           if (trad && trad !== texto) { contentLead = trad; contentOrigLead = texto; idiomaLeadMsg = idiomaDetectado; }
           _idiomaLeadDetectado = idiomaDetectado; // persistir el idioma SIEMPRE que se detecto uno no-base (aunque la trad salga identica)
           // recordar el idioma del lead en la conversacion para el traductor saliente (best-effort, no rompe el webhook)
-          if (!conv || conv.idioma_lead !== idiomaDetectado) {
-            try { await supabase.from('conversations').update({ idioma_lead: idiomaDetectado, traductor_activo: true }).eq('id', conv.id); } catch (eUpdIl) { console.error('upd idioma_lead:', eUpdIl && eUpdIl.message); }
+          // EN "LISTO PARA HUMANO" EL TRADUCTOR NO SE PRENDE SOLO (Diego 2026-08-21): "Solo funciona
+          // automaticamente en conversacion o interesado. En Listo para humano queda manual."
+          // El idioma detectado SI se guarda igual — hace falta para que, cuando el asesor prenda el traductor a
+          // mano, el sistema sepa a que idioma traducir sin volver a preguntarle a la IA.
+          const _autoTraducir = !conv || conv.status !== 'listo_humano';
+          if (!conv || conv.idioma_lead !== idiomaDetectado || (_autoTraducir && conv.traductor_activo !== true)) {
+            const _upd = _autoTraducir ? { idioma_lead: idiomaDetectado, traductor_activo: true } : { idioma_lead: idiomaDetectado };
+            try { await supabase.from('conversations').update(_upd).eq('id', conv.id); } catch (eUpdIl) { console.error('upd idioma_lead:', eUpdIl && eUpdIl.message); }
           }
-          if (conv) { conv.idioma_lead = idiomaDetectado; conv.traductor_activo = true; }
+          if (conv) { conv.idioma_lead = idiomaDetectado; if (_autoTraducir) conv.traductor_activo = true; }
         } else if (idiomaDetectado === _idiomaBaseEmpresa && conv && conv.idioma_lead && conv.idioma_lead !== _idiomaBaseEmpresa) {
           // El lead RETOMO el idioma BASE con evidencia suficiente (>=3 palabras / pedido) -> volver al base y apagar el traductor.
           _revertirIdiomaBase = true;

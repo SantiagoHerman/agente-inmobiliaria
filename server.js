@@ -46596,12 +46596,14 @@ app.get('/api/ml/oauth/start', async function (req, res) {
 // Cierra con _oauthCierreHtml (mismo destino que el callback de Meta: mini-pagina que se
 // cierra sola y avisa al opener), con ok=true/false segun el resultado.
 app.get('/api/ml/oauth/callback', async function (req, res) {
+  // OJO: este flujo es navegacion COMPLETA (la card navega a /start), NO popup como Meta ->
+  // todo final (ok o error) REDIRIGE a Integraciones con ?ml=ok|error, que la card ya interpreta.
   try {
-    if (!_mlConfigurado()) return res.status(503).send(_oauthCierreHtml('MercadoLibre no configurado', 'Faltan credenciales de la app de MercadoLibre.', false));
-    if (req.query.error) return res.status(400).send(_oauthCierreHtml('Conexion cancelada', 'No se autorizo el acceso a MercadoLibre.', false));
+    if (!_mlConfigurado()) return res.redirect(FRONTEND_URL + '/whatsapp?ml=error');
+    if (req.query.error) return res.redirect(FRONTEND_URL + '/whatsapp?ml=error');
     const code = req.query.code ? String(req.query.code) : '';
     const uid = _oauthStateLeer(req.query.state, 'ml');
-    if (!code || !uid) return res.status(400).send(_oauthCierreHtml('Enlace invalido', 'El pedido de conexion vencio o no es valido. Reintentá desde Raices CRM.', false));
+    if (!code || !uid) return res.redirect(FRONTEND_URL + '/whatsapp?ml=error');
 
     // 1) code -> access_token + refresh_token. redirect_uri = LA MISMA URL de este callback
     //    (ML la compara caracter a caracter con la del authorize y con la registrada en la app).
@@ -46614,12 +46616,12 @@ app.get('/api/ml/oauth/callback', async function (req, res) {
       body: _body.toString()
     });
     const tj = await tr.json().catch(function () { return null; });
-    if (!tr.ok || !tj || !tj.access_token) { console.error('[ML] oauth token:', JSON.stringify(tj).slice(0, 300)); return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'MercadoLibre no devolvio un token de acceso. Reintentá.', false)); }
+    if (!tr.ok || !tj || !tj.access_token) { console.error('[ML] oauth token:', JSON.stringify(tj).slice(0, 300)); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
 
     // 2) Identidad: /users/me con el Bearer recien emitido (id numerico + nickname).
     const ur = await fetch('https://api.mercadolibre.com/users/me', { headers: { 'Authorization': 'Bearer ' + tj.access_token, 'Accept': 'application/json' } });
     const uj = await ur.json().catch(function () { return null; });
-    if (!ur.ok || !uj || !uj.id) { console.error('[ML] oauth users/me:', JSON.stringify(uj).slice(0, 300)); return res.status(502).send(_oauthCierreHtml('No se pudo conectar', 'No se pudo leer la cuenta de MercadoLibre. Reintentá.', false)); }
+    if (!ur.ok || !uj || !uj.id) { console.error('[ML] oauth users/me:', JSON.stringify(uj).slice(0, 300)); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
 
     // 3) Guardar (upsert por user_id: la tabla tiene unique(user_id), una cuenta ML por tenant).
     //    activo=true al conectar: a diferencia de Meta, aca el gate REAL es el flag ml_v1 (el
@@ -46633,19 +46635,19 @@ app.get('/api/ml/oauth/callback', async function (req, res) {
     };
     try {
       const { data: existe, error: eSel } = await supabase.from('ml_credentials').select('id').eq('user_id', uid).maybeSingle();
-      if (eSel) { console.error('[ML] oauth save lectura:', eSel.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error leyendo la conexion (¿falta correr migracion-ml-v1.sql?). Reintentá.', false)); }
+      if (eSel) { console.error('[ML] oauth save lectura:', eSel.message); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
       if (existe) {
         const { error } = await supabase.from('ml_credentials').update(fila).eq('id', existe.id);
-        if (error) { console.error('[ML] oauth save update:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion. Reintentá.', false)); }
+        if (error) { console.error('[ML] oauth save update:', error.message); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
       } else {
         const { error } = await supabase.from('ml_credentials').insert(fila);
-        if (error) { console.error('[ML] oauth save insert:', error.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion (¿falta correr migracion-ml-v1.sql?). Reintentá.', false)); }
+        if (error) { console.error('[ML] oauth save insert:', error.message); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
       }
-    } catch (e) { console.error('[ML] oauth save:', e && e.message); return res.status(500).send(_oauthCierreHtml('No se pudo guardar', 'Error guardando la conexion.', false)); }
+    } catch (e) { console.error('[ML] oauth save:', e && e.message); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
 
     console.log('[ML] cuenta conectada: ml_user_id=' + uj.id + ' (' + (uj.nickname || 'sin nickname') + ') para tenant ' + uid);
-    return res.status(200).send(_oauthCierreHtml('MercadoLibre conectado', 'Cuenta ' + (uj.nickname || uj.id) + ' conectada. Las consultas de tus publicaciones van a entrar como conversaciones.', true));
-  } catch (e) { console.error('GET /api/ml/oauth/callback:', e && e.message); return res.status(500).send(_oauthCierreHtml('Error', 'Ocurrio un problema al conectar MercadoLibre.', false)); }
+    return res.redirect(FRONTEND_URL + '/whatsapp?ml=ok');
+  } catch (e) { console.error('GET /api/ml/oauth/callback:', e && e.message); return res.redirect(FRONTEND_URL + '/whatsapp?ml=error'); }
 });
 
 // GET /api/ml/oauth/estado — para la pantalla de Integraciones. Sin secretos: solo

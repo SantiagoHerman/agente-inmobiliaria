@@ -37882,11 +37882,55 @@ setTimeout(_forzarUiModernoTodos, 12000);
 // Diego (2026-07-18): "Raices Meta Test queda con candado, no se toca". La cuenta de
 // prueba pasa a ser Raices Inmobiliaria. Migracion DEFENSIVA: crea la columna si falta
 // y marca congelada=true SOLO a Raices Meta Test (idempotente, con log del estado previo).
+// ============================================================================
+// AVISO DE MIGRACION — un cartel, no quince
+// ----------------------------------------------------------------------------
+// El backend intenta ~15 migraciones al arrancar llamando a la RPC `exec_sql`,
+// que NO EXISTE en esta base. Todas fallan y cada una dejaba su propio
+// "Corré a mano: <SQL>" en el log de CADA deploy.
+//
+// VERIFICADO 2026-08-19, una por una contra la base: 14 de 15 ya estaban
+// aplicadas a mano (tabla fichas, citas.google_event_id, properties.direccion y
+// .provincia, business_settings.congelada). La unica que faltaba de verdad era
+// system_backup_tokens — que ademas es VESTIGIAL: ningun codigo la lee ni la
+// escribe (el token del Drive del sistema vive en google_oauth_tokens bajo
+// SYSTEM_BACKUP_UID + proposito 'drive_sistema', ver ~L42186).
+//
+// EL PROBLEMA NO ERA ESTETICO: con 15 carteles rojos falsos en cada arranque,
+// el dia que una migracion falle DE VERDAD nadie la va a ver.
+//
+// AHORA: si el error es el CONOCIDO (la RPC no existe) se cuenta en silencio y
+// sale UN resumen a los 30 segundos. Cualquier OTRO error se sigue gritando
+// con console.error y el SQL completo, igual que antes.
+let _migRpcAusente = 0;
+let _migResumenAgendado = false;
+function _avisoMigracion(etiqueta, err, sql) {
+  try {
+    const msg = (err && err.message) ? String(err.message) : String(err || '');
+    // El error conocido: PostgREST no encuentra la funcion exec_sql.
+    const esRpcAusente = /exec_sql/i.test(msg) && /(could not find|does not exist|schema cache)/i.test(msg);
+    if (!esRpcAusente) {
+      // Error DISTINTO -> esto si hay que mirarlo. Se grita con el SQL entero.
+      console.error('[migracion ' + etiqueta + '] FALLO INESPERADO (' + msg + '). Corré a mano: ' + String(sql || ''));
+      return;
+    }
+    _migRpcAusente++;
+    if (!_migResumenAgendado) {
+      _migResumenAgendado = true;
+      setTimeout(function () {
+        console.log('[migraciones] ' + _migRpcAusente + ' migraciones automaticas no corrieron porque la RPC exec_sql no existe en esta base. ' +
+          'Es lo ESPERADO: las migraciones se aplican a mano desde el SQL Editor de Supabase. ' +
+          'Verificado 2026-08-19 que las tablas y columnas que intentan crear YA existen. ' +
+          'Si alguna migracion falla por otro motivo, sale aparte como FALLO INESPERADO.');
+      }, 30000);
+    }
+  } catch (e) {}
+}
 async function _migracionCandadoCuentas() {
   try {
     const sql = "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS congelada boolean DEFAULT false; NOTIFY pgrst, 'reload schema';";
-    try { const { error } = await supabase.rpc('exec_sql', { sql: sql }); if (error) console.log('[candado] exec_sql fallo (' + error.message + '). Corré a mano: ' + sql); else console.log('[candado] columna congelada OK'); }
-    catch (e) { console.log('[candado] sin exec_sql; corré a mano: ' + sql); }
+    try { const { error } = await supabase.rpc('exec_sql', { sql: sql }); if (error) _avisoMigracion('candado', error, sql); else console.log('[candado] columna congelada OK'); }
+    catch (e) { _avisoMigracion('candado', e, sql); }
     // Marcar SOLO Raices Meta Test (por company_name). Log del estado previo (regla: backup antes de tocar).
     try {
       const { data: prev } = await supabase.from('business_settings').select('user_id, company_name, congelada').ilike('company_name', 'Raices Meta Test');
@@ -42171,9 +42215,9 @@ async function _migracionSystemBackupTokens() {
     const sql = "CREATE TABLE IF NOT EXISTS system_backup_tokens (proposito text PRIMARY KEY, refresh_token text, access_token text, token_expiry timestamptz, scope text, updated_at timestamptz DEFAULT now()); NOTIFY pgrst, 'reload schema';";
     try {
       const { error } = await supabase.rpc('exec_sql', { sql: sql });
-      if (error) console.log('[migracion system_backup_tokens] RPC exec_sql fallo (' + error.message + '). Corré a mano: ' + sql);
+      if (error) _avisoMigracion('system_backup_tokens', error, sql);
       else console.log('[migracion system_backup_tokens] OK + NOTIFY pgrst');
-    } catch (e) { console.log('[migracion system_backup_tokens] sin exec_sql; corré a mano: ' + sql); }
+    } catch (e) { _avisoMigracion('system_backup_tokens', e, sql); }
   } catch (e) { console.error('_migracionSystemBackupTokens:', e && e.message); }
 }
 if (_googleConfigurado()) setTimeout(_migracionSystemBackupTokens, 8000);
@@ -42885,9 +42929,9 @@ async function _migracionCalendarDefensiva() {
     const sql = "ALTER TABLE citas ADD COLUMN IF NOT EXISTS google_event_id text; NOTIFY pgrst, 'reload schema';";
     try {
       const { error } = await supabase.rpc('exec_sql', { sql: sql });
-      if (error) { console.log('[migracion calendar] RPC exec_sql fallo (' + error.message + '). Corré a mano: ' + sql); }
+      if (error) { _avisoMigracion('calendar', error, sql); }
       else console.log('[migracion calendar] citas.google_event_id OK + NOTIFY pgrst');
-    } catch (e) { console.log('[migracion calendar] no se pudo aplicar via RPC. Corré a mano en Supabase: ' + sql); }
+    } catch (e) { _avisoMigracion('calendar', e, sql); }
   } catch (e) {}
 }
 setTimeout(_migracionCalendarDefensiva, 8 * 1000);
@@ -42906,9 +42950,9 @@ async function _migracionDireccionDefensiva() {
   for (const sql of stmts) {
     try {
       const { error } = await supabase.rpc('exec_sql', { sql: sql });
-      if (error) console.log('[migracion direccion] fallo (' + error.message + '). Correr a mano: ' + sql);
+      if (error) _avisoMigracion('direccion', error, sql);
       else console.log('[migracion direccion] OK: ' + sql.slice(0, 55));
-    } catch (e) { console.log('[migracion direccion] no se pudo via RPC. Correr a mano en Supabase: ' + sql); }
+    } catch (e) { _avisoMigracion('direccion', e, sql); }
   }
 }
 setTimeout(_migracionDireccionDefensiva, 11 * 1000);
@@ -42932,9 +42976,9 @@ async function _migracionProvinciaDefensiva() {
   for (const sql of stmts) {
     try {
       const { error } = await supabase.rpc('exec_sql', { sql: sql });
-      if (error) console.log('[migracion provincia] fallo (' + error.message + '). Correr a mano: ' + sql);
+      if (error) _avisoMigracion('provincia', error, sql);
       else console.log('[migracion provincia] OK: ' + sql.slice(0, 60));
-    } catch (e) { console.log('[migracion provincia] no se pudo via RPC. Correr a mano en Supabase: ' + sql); }
+    } catch (e) { _avisoMigracion('provincia', e, sql); }
   }
 }
 setTimeout(_migracionProvinciaDefensiva, 14 * 1000);
@@ -44141,9 +44185,9 @@ async function _migracionFichasDefensiva() {
   for (const sql of stmts) {
     try {
       const { error } = await supabase.rpc('exec_sql', { sql: sql });
-      if (error) console.log('[migracion fichas] fallo (' + error.message + '). Correr a mano: ' + sql.slice(0, 80));
+      if (error) _avisoMigracion('fichas', error, sql);
       else console.log('[migracion fichas] OK: ' + sql.slice(0, 60));
-    } catch (e) { console.log('[migracion fichas] no se pudo via RPC. Correr a mano en Supabase: ' + sql.slice(0, 80)); }
+    } catch (e) { _avisoMigracion('fichas', e, sql); }
   }
 }
 setTimeout(_migracionFichasDefensiva, 17 * 1000);

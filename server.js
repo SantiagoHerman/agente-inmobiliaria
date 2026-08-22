@@ -2015,9 +2015,21 @@ async function mpCrearPreferencia(titulo, montoARS, externalRef, backUrl, metada
 // waMessageId = key.id del mensaje saliente de WhatsApp (Baileys). B5: deduplicamos por ESE id (idempotente y
 // exacto) en vez de por content+2min (que tragaba mensajes salientes legitimos repetidos -ej. el asesor manda
 // dos veces el mismo texto- y no cubria reenvios del webhook con el MISMO id pasados los 2 min).
-async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSaliente) {
+// ============ LOS SALIENTES DEL CELULAR AHORA GUARDAN EL ARCHIVO (Diego 2026-08-21) ============
+// El "eco del celular" es lo que el dueño manda al lead desde su propio telefono (WhatsApp lo reporta como
+// fromMe y llega por el mismo webhook). Hasta acá se guardaba SOLO EL TEXTO: si le mandabas una foto, un audio
+// o un documento a un lead desde el celular, en el CRM esa conversacion quedaba incompleta y el asesor que
+// entraba despues no veia lo que se le habia mandado. Es el espejo del agujero que se tapo el 18/08 para los
+// mensajes ENTRANTES: los entrantes ya llegan completos, los salientes del celular no.
+// Ahora recibe el media ya subido (mismo bucket y mismo formato que un entrante) y lo guarda en las columnas
+// media_url / media_tipo, asi el chat lo dibuja igual que cualquier otro archivo.
+// DEFENSIVO: `mediaSal` es opcional; sin el, el comportamiento es identico al de antes.
+async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSaliente, mediaSal) {
   try {
-    if (!texto) return;
+    // Antes era `if (!texto) return`. Ahora un mensaje que es SOLO un archivo (sin epigrafe) tambien vale: el
+    // texto en ese caso es la marca que arma el webhook ("[imagen]", "[audio]"...), pero si algun camino lo
+    // dejara vacio, con archivo alcanza para guardarlo.
+    if (!texto && !(mediaSal && mediaSal.url)) return;
     const telefono = remoteJid.split('@')[0];
     const { data: contacto } = await supabase.from('contacts').select('id, user_id').eq('phone', telefono).maybeSingle();
     if (!contacto) return;
@@ -2048,7 +2060,10 @@ async function guardarMensajeSaliente(remoteJid, texto, waMessageId, pautaSalien
       try { if (await iaPautaMetaActivo(conv.user_id)) _pautaOk = pautaSaliente; } catch (ePS) { _pautaOk = null; }
     }
     await _insertMensajeConAutor(
-      Object.assign({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null }, _pautaOk ? { pauta_meta: _pautaOk } : {}),
+      Object.assign({ conversation_id: conv.id, user_id: conv.user_id, role: 'human', content: texto, origen: 'celular', enviado_por: 'WhatsApp (celular)', wa_message_id: waMessageId || null },
+        _pautaOk ? { pauta_meta: _pautaOk } : {},
+        // El archivo, si vino. Mismas dos columnas que usa un mensaje entrante con media.
+        (mediaSal && mediaSal.url) ? { media_url: mediaSal.url, media_tipo: mediaSal.tipo || null } : {}),
       _autorEco,
       null
     );
@@ -12503,7 +12518,18 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       // PAUTA EN EL SALIENTE (Diego 2026-07-23): con el SALUDO AUTOMATICO de WhatsApp Business, Meta pega el dato del
       // anuncio al mensaje SALIENTE (el saludo), no al entrante del lead -> por eso se perdia el link en casi todos.
       // _pauta ya viene extraido arriba; lo pasamos para guardarlo igual. Si no hay pauta, se comporta como siempre.
-      await guardarMensajeSaliente(remoteJid, texto, key.id || null, _pauta);
+      //
+      // EL ARCHIVO (Diego 2026-08-21): si el dueño mando una foto/audio/documento desde su celular, se sube al
+      // mismo bucket que un entrante y se guarda con el mensaje. Antes se perdia: quedaba solo el texto y el
+      // asesor que entraba despues veia la conversacion incompleta.
+      // skipTranscribe = true a proposito: transcribir un audio que mando EL DUEÑO no aporta (ya sabe lo que
+      // dijo) y costaria una llamada por cada nota de voz que manda desde el telefono.
+      // La ubicacion se excluye porque no tiene archivo que bajar (lat/lng ya viajan en el texto).
+      let _mediaSal = null;
+      if (tipoMediaEntrante && tipoMediaEntrante !== 'ubicacion') {
+        try { _mediaSal = await subirMediaAStorage(instanciaNombre, data, tipoMediaEntrante, true); } catch (eMS) { _mediaSal = null; }
+      }
+      await guardarMensajeSaliente(remoteJid, texto, key.id || null, _pauta, _mediaSal);
       return;
     }
 

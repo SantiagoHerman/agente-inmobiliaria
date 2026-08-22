@@ -5832,7 +5832,9 @@ async function revisarRotacionDerivacionV3() {
     // Columnas base (identicas a las de hoy) + intentamos ademas la columna nueva `derivacion_intentados`. RETRY
     // DEFENSIVO (mismo patron de fallback de columnas que elegirAsesorParaDepartamento): si el SELECT con la columna
     // nueva falla (migracion no corrida), reintentamos el MISMO select SIN ella -> intentados undefined -> flujo ACTUAL.
-    const _colsBase = 'id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, derivacion_sin_nadie_desde, contact_id';
+    // derivado_at AGREGADO (Diego 2026-08-21): es el ancla del TOPE DE ROTACION de abajo. Va en la lista base
+    // porque la columna existe hace rato; si en algun entorno faltara, el retry defensivo de mas abajo cubre.
+    const _colsBase = 'id, user_id, asesor_id, admin_tomo, ai_enabled, status, departamento_id, derivacion_rotando, derivacion_depto_id, derivacion_ultimo_intento, derivacion_sin_nadie_desde, contact_id, derivado_at';
     try {
       const r1 = await supabase.from('conversations').select(_colsBase + ', derivacion_intentados').eq('derivacion_rotando', true);
       if (r1.error) {
@@ -5853,6 +5855,7 @@ async function revisarRotacionDerivacionV3() {
     const _horarioCache = {};       // { horario } (horario_oficina) por tenant para saber si estamos EN horario
     // REPARTO POR ORDEN (Diego 2026-07-24): cache del modo_asignacion por depto (para NO rotar los deptos de asignacion FIJA).
     const _modoAsigCache = {};      // deptoId -> 'rotacion' | 'fija' | null (null = columna ausente -> comportamiento de hoy)
+    const _topeCache = {};   // cola_tope_min por cuenta: una sola lectura por vuelta del cron
     for (const conv of rotando) {
       try {
         const ownerId = conv.user_id;
@@ -5912,6 +5915,72 @@ async function revisarRotacionDerivacionV3() {
           }
           if (_modoAsigCache[_deptoId] === 'fija' && conv.asesor_id) continue; // fija ya asignado: NO rotar (la IA cubre)
         }
+
+        // ============ EL TOPE DE ROTACION (Diego 2026-08-21) ============
+        // HASTA ACA NO EXISTIA NINGUNO. Verificado leyendo las tres funciones de la rotacion y los 50 crons: una
+        // vez que un lead empezaba a rotar, la unica forma de que parara era que UNA PERSONA ESCRIBIERA. Si nadie
+        // escribia, giraba para siempre. El picker incluso REINICIA la vuelta a proposito cuando ya probo a todos.
+        // Casos medidos: "Cariiii" (Anton) 123 pases en 18 horas seguidas, toda la madrugada, con ~120 avisos a
+        // dos asesores; "Benjamin" (Anton) 189 pases en 24 horas; "Flor" (Galdames) 23; "kdkd" 3 vueltas enteras.
+        //
+        // El campo `cola_tope_min` YA EXISTIA en la pantalla y Diego le habia puesto 90 en Anton — pero era letra
+        // muerta: vivia dentro de un cron que sale antes de leerlo (por `derivacion_rotando` y por `derivacion_v4`).
+        // Ahora ese numero por fin gobierna algo, que es lo que el dueño creia que hacia cuando lo configuro.
+        //
+        // QUE PASA AL VENCER (decision de Diego, textual: "si pasa el tope que derive a quien quede asignado"):
+        //   - Si el lead YA TIENE asesor -> se queda con ese y se deja de rotar. Alguien se hace cargo.
+        //   - Si NO tiene a nadie -> se manda al DESTINO DE ULTIMA INSTANCIA: el departamento marcado
+        //     `recibe_fallback` (Administracion). Si ese depto tiene responsable fijo, va a el.
+        //   - Si no hay destino configurado -> se deja de rotar igual y se avisa al dueño. Girar para siempre
+        //     NUNCA es la respuesta correcta.
+        // La IA sigue atendiendo en todos los casos: esto corta la ROTACION, no la atencion.
+        //
+        // ANCLA: `derivado_at`, el momento en que el lead se derivo. Si falta (rotaciones viejas), NO se aplica el
+        // tope -> comportamiento de hoy. Sin tope configurado (0/null) tampoco se aplica.
+        // ================================================================
+        try {
+          if (!(ownerId in _topeCache)) {
+            let _tm = 0;
+            try { const { data: _bsT } = await supabase.from('business_settings').select('cola_tope_min').eq('user_id', ownerId).maybeSingle(); const _n = Number(_bsT && _bsT.cola_tope_min); _tm = (_n && _n > 0) ? _n : 0; } catch (eT) { _tm = 0; }
+            _topeCache[ownerId] = _tm;
+          }
+          const _topeMin = _topeCache[ownerId];
+          const _anclaTope = conv.derivado_at ? new Date(conv.derivado_at).getTime() : 0;
+          if (_topeMin > 0 && _anclaTope && ((ahoraMs - _anclaTope) / 60000) > _topeMin) {
+            const _minsRot = Math.round((ahoraMs - _anclaTope) / 60000);
+            if (conv.asesor_id) {
+              // Se queda con el que tiene. Se corta la rotacion y listo.
+              try { await _limpiarRotacionV3(conv.id); } catch (eLp) {}
+              console.log('Derivacion v3: TOPE de ' + _topeMin + ' min vencido en ' + conv.id + ' (' + _minsRot + ' min) -> queda con su asesor, se deja de rotar');
+              continue;
+            }
+            // Sin asesor: destino de ultima instancia.
+            let _destino = null, _deptoDestino = null;
+            try {
+              _deptoDestino = await deptoFallbackDe(ownerId);
+              if (_deptoDestino) {
+                const _estD = await estadoDeptoParaReparto(ownerId, _deptoDestino);
+                if (_estD && _estD.estado === 'asignable') _destino = _estD.asesor;
+              }
+            } catch (eD) { _destino = null; }
+            if (_destino) {
+              const _okD = await _asignarRotacionV3(conv.id, _destino, _deptoDestino, new Date().toISOString(), false, { asesor_id: null });
+              if (_okD) {
+                try { await registrarPaseAsesor(conv.id, ownerId, null, _destino, 'La IA'); } catch (eP) {}
+                try { await _notificarRotacionV3(ownerId, conv.id, _destino, null, false); } catch (eN) {}
+                try { await _limpiarRotacionV3(conv.id); } catch (eLp2) {}
+                console.log('Derivacion v3: TOPE vencido en ' + conv.id + ' (' + _minsRot + ' min) -> ultima instancia ' + _destino);
+                continue;
+              }
+            }
+            // Ni asesor ni destino: se corta igual y se avisa. Girar para siempre no es una opcion.
+            try { await _limpiarRotacionV3(conv.id); } catch (eLp3) {}
+            try { await avisarGerenteWhatsApp(conv.id, ownerId, 'ultima_instancia'); } catch (eAv) {}
+            console.log('Derivacion v3: TOPE vencido en ' + conv.id + ' (' + _minsRot + ' min) SIN destino -> se corta la rotacion y se avisa al dueño');
+            continue;
+          }
+        } catch (eTope) { /* ante cualquier error, la rotacion sigue como hoy */ }
+
         let _siguiente = null;
         let _resetVuelta = false; // el picker reinicio la vuelta (ya se habian intentado TODOS) -> arrancar set nuevo
         if (_deptoId) {

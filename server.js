@@ -14147,6 +14147,40 @@ app.post('/api/whatsapp/send', async (req, res) => {
       return res.json({ sent: true, estado_envio: 'enviado' });
     }
 
+    // ===== MERCADOLIBRE (ML F3) — responder MANUALMENTE una PREGUNTA desde Conversaciones =====
+    // ADITIVO y AISLADO: solo entra si la conversation es del canal 'mercadolibre'. Esas convs las
+    // crea UNICAMENTE el webhook de ML (gated ml_v1): con el flag OFF nunca existe una -> las de
+    // WhatsApp/Meta siguen por sus caminos byte-identicos. Gate del branch: ml_v1 (cuenta con ML
+    // habilitado => el asesor puede contestar; NO exige ml_ia_responde, que gatea SOLO a la IA).
+    // El envio manual NO cobra credito, igual que WhatsApp/Meta (solo la IA descuenta con
+    // registrarUsoIA; aca no hay llamada de IA que cobrar). La API de ML solo permite responder
+    // leads tipo QUESTION (POST /answers, respuesta PUBLICA en la publicacion): para visita/
+    // cotizacion/contacto no hay via -> error claro con el motivo real. El mensaje ya quedo
+    // guardado arriba como 'human' (estado 'enviando'); aca se escribe su estado_envio REAL.
+    if (conv.channel === 'mercadolibre') {
+      const _falloMl = async function (motivo) {
+        if (msgId) { try { await supabase.from('messages').update({ estado_envio: 'fallido' }).eq('id', msgId); } catch (eUpM) {} }
+        return res.status(400).json({ sent: false, estado_envio: 'fallido', error: motivo });
+      };
+      // conv.user_id ES el dueño del tenant (la credencial de ML se guarda siempre bajo el dueño,
+      // ver /api/ml/oauth/start) -> no hace falta re-resolver con _cloudApiDueno.
+      if (!(await mlV1Activo(conv.user_id))) return await _falloMl('MercadoLibre no está habilitado para esta cuenta.');
+      const _tokenMl = await _mlTokenFresco(conv.user_id);
+      if (!_tokenMl) return await _falloMl('MercadoLibre no está conectado o la conexión venció. Reconectalo desde Integraciones.');
+      const _pend = await _mlUltimaPreguntaPendiente(conv.user_id, conversation_id, _tokenMl);
+      if (!_pend.qid) {
+        // La causa REAL en vez de un error generico (mismo criterio que el branch Meta de arriba).
+        if (_pend.huboPregunta) return await _falloMl('La última pregunta de este contacto en MercadoLibre ya está respondida, y MercadoLibre no permite escribirle de nuevo hasta que vuelva a preguntar.');
+        const _nombreTipo = { visit_request: 'pedido de visita', contact_request: 'pedido de contacto', reservation: 'reserva', quotation: 'cotización', quotations: 'cotización' };
+        const _via = _pend.tipos.map(function (t) { return _nombreTipo[t] || t; }).join(' / ') || 'un aviso';
+        return await _falloMl('Este contacto llegó por ' + _via + ' y MercadoLibre no permite responderle por acá. Contactalo por teléfono o email (están en su ficha).');
+      }
+      const _envMl = await _mlResponderPregunta(_tokenMl, _pend.qid, textoEnviar);
+      if (msgId) { try { await supabase.from('messages').update({ estado_envio: _envMl.ok ? 'enviado' : 'fallido' }).eq('id', msgId); } catch (eUpM) {} }
+      if (!_envMl.ok) return res.status(400).json({ sent: false, estado_envio: 'fallido', error: 'MercadoLibre rechazó la respuesta: ' + String(_envMl.error || 'error desconocido').slice(0, 200) });
+      return res.json({ sent: true, estado_envio: 'enviado' });
+    }
+
     // ===== CLOUD API (gated cloud_api_v1, default OFF) — UNICO enganche de canalSalienteDe() =====
     // FAIL-CLOSED: canalSalienteDe() devuelve 'evolution' con el flag OFF, sin numero Cloud activo,
     // o ante CUALQUIER error/excepcion. Para TODOS los clientes de hoy (Anton, Tequendama, etc.) este
@@ -46765,16 +46799,26 @@ async function _mlProcesarNotificacion(body) {
 
     // 8) Texto del mensaje. question -> el TEXTO REAL de la pregunta: el external_id del lead
     //    question ES el question id -> GET /questions/$ID?api_version=4 trae .text.
+    //    F3: el question id NO se persiste en columna propia (decision: cero esquema nuevo). El
+    //    wa_message_id ya guarda 'ml:'+leadId y el lead es recuperable por API -> el envio manual
+    //    del panel re-resuelve leadId -> lead.external_id (ver _mlUltimaPreguntaPendiente). Aca
+    //    solo se conservan _qidMl y _qTextoRealMl en variables para la respuesta de IA de abajo
+    //    (sin el texto REAL la IA no responde: contestaria al fallback generico, no a la pregunta).
     let texto = _textoBase;
+    let _qidMl = '';
+    let _qTextoRealMl = false;
     if (tipo === 'question') {
       try {
-        const _qid = String(lead.external_id || lead.question_id || '');
-        if (_qid) {
-          const qr = await fetch('https://api.mercadolibre.com/questions/' + encodeURIComponent(_qid) + '?api_version=4', {
+        _qidMl = String(lead.external_id || lead.question_id || '');
+        if (_qidMl) {
+          const qr = await fetch('https://api.mercadolibre.com/questions/' + encodeURIComponent(_qidMl) + '?api_version=4', {
             headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
           });
           const qj = await qr.json().catch(function () { return null; });
-          if (qr.ok && qj && qj.text) texto = String(qj.text).trim().slice(0, 4000) || _textoBase;
+          if (qr.ok && qj && qj.text) {
+            const _t = String(qj.text).trim().slice(0, 4000);
+            if (_t) { texto = _t; _qTextoRealMl = true; }
+          }
         }
       } catch (eQ) { /* sin texto -> queda el fallback generico */ }
     }
@@ -46812,9 +46856,82 @@ async function _mlProcesarNotificacion(body) {
 
     console.log('[ML] lead ' + leadId + ' (' + tipo + ') -> conversacion ' + conv.id + ' del tenant ' + uid);
 
-    // F2 TERMINA ACA A PROPOSITO: la conversacion queda con el estado que le dio el flujo normal,
-    // pero NO se dispara el motor de respuesta (generarRespuestaAgente) — el asesor responde a mano.
-    // F3: acá se enchufa la respuesta (gated ml_ia_responde).
+    // ========================================================================
+    // F3 — RESPUESTA DE IA (gated ml_ia_responde, default OFF -> hasta aca F2 byte-identico).
+    // Solo un lead tipo QUESTION tiene via de respuesta (POST /answers: la respuesta queda
+    // PUBLICA en la publicacion); visita/cotizacion/contacto se muestran y responde el asesor.
+    // Ademas se exige _qTextoRealMl: sin el texto real de la pregunta no se responde (la IA
+    // estaria contestando al fallback generico sin saber que pregunto el lead).
+    // Los gates calcan procesarMensajeMeta: papelera / pausa global / pausa por cuenta /
+    // IA apagada en la conv / suscripcion / tope del plan. ml_v1 ya se chequeo en el paso 2.
+    // ========================================================================
+    try {
+      if (tipo !== 'question' || !_qidMl || !_qTextoRealMl) return;
+      let _bsF3 = null;
+      try {
+        const _g = await supabase.from('business_settings').select('ml_ia_responde, crm_pausado, eliminado_at, agente_pausado').eq('user_id', uid).maybeSingle();
+        _bsF3 = _g && _g.data;
+      } catch (eBs) { _bsF3 = null; }
+      // FAIL-CLOSED: sin fila / columna ausente (migracion sin correr) / error / flag OFF -> no responder.
+      if (!(_bsF3 && _bsF3.ml_ia_responde === true)) return;
+      if (_bsF3.eliminado_at || _pausaGlobal === true || _bsF3.crm_pausado === true) return; // papelera / pausa total
+      if (conv.ai_enabled === false || _bsF3.agente_pausado === true) return; // IA apagada (por conv o por el Maestro)
+      if (SUBSCRIPTIONS_ENABLED) { try { if (await debeBloquearAcceso(uid)) return; } catch (eBloq) {} }
+      try { if (!(await dentroDelTopeIA(uid))) return; } catch (eTope) {}
+      // Tope nocturno: mismo gate que Meta pero SIN el aviso "fuera de horario": esto es una
+      // respuesta PUBLICA en una publicacion, no un chat, y ese cartel quedaria pegado al aviso.
+      // La pregunta ya quedo guardada arriba -> el asesor la ve en el panel y responde a mano.
+      try {
+        if (!(await dentroDelTopeNocturno(uid))) return;
+        try { await registrarMensajeNocturno(uid); } catch (eRn) {}
+      } catch (eTn) {}
+
+      // MEDIDOR: id de turno = ESTA pregunta del lead (mismo criterio que procesarMensajeMeta).
+      let _turnoId = null;
+      try { _turnoId = _nuevoTurnoId(); } catch (eTurno) { _turnoId = null; }
+
+      // Instruccion EXTRA solo de este canal: viaja como bloque DINAMICO del system por
+      // opciones.pautaContexto (el mismo mecanismo que usa la pauta Meta: NO cacheado, cero
+      // llamadas extra de IA). El motor es el mismo generarRespuestaAgente de WA/Meta, con
+      // todos sus gates internos (persona, RAG, tools) intactos.
+      const _instrMl = 'CANAL MERCADOLIBRE: estas respondiendo una pregunta PUBLICA en una publicacion de MercadoLibre (la ve cualquiera, NO es un chat privado). Respuesta corta (maximo 3 frases), sin datos personales del interesado y sin links. Si corresponde seguir la charla, invita a escribir al WhatsApp del negocio con el numero en texto plano (nunca como link).';
+      const resultado = await generarRespuestaAgente(uid, conv.id, texto, { pautaContexto: _instrMl }, _turnoId);
+      if (!(resultado && resultado.reply)) return;
+
+      // Publicar la respuesta (truncada a 1900 adentro del helper; limite practico de ML ~2000).
+      // generarRespuestaAgente YA persistio la fila role='ai' y el last_message de la conv.
+      const _envio = await _mlResponderPregunta(token, _qidMl, String(resultado.replyCliente || resultado.reply));
+
+      // EL TILDE MENTIROSO (mismo fix que Meta, auditoria #41): la fila 'ai' nace con estado_envio
+      // default 'enviado' -> escribir el resultado REAL. Si ML rechazo (pregunta borrada, ya
+      // respondida desde el sitio, token muerto) queda 'fallido' a la vista del asesor y NO se
+      // reintenta: un retry en loop podria duplicar respuestas publicas en el aviso.
+      if (resultado.msgId) {
+        try { await supabase.from('messages').update({ estado_envio: _envio.ok ? 'enviado' : 'fallido' }).eq('id', resultado.msgId); } catch (eEst) { console.error('[ML] estado_envio:', eEst && eEst.message); }
+      }
+      if (!_envio.ok) console.error('[ML] la respuesta de la IA NO se publico (conv=' + conv.id + ', question=' + _qidMl + '): ' + String(_envio.error || '').slice(0, 200));
+
+      // COBRO (decision Diego 2026-08: TODO mensaje descuenta credito sin importar la via).
+      // Telemetria en dolares (panel, PRECIO_IA) + credito del plan: 1 base + extras con
+      // cobrar_todo_v2 ON (+1 traduccion, +1 tool), calcado de respuesta_agente_meta. Se cobra
+      // aunque el POST haya rebotado: los tokens ya se gastaron (mismo criterio que Meta/WA).
+      try { await registrarUsoTokens(uid, resultado.usage, 'respuesta_agente_ml', PRECIO_IA, { conversation_id: conv.id, turno_id: _turnoId, static_prompt_hash: resultado.staticPromptHash, tools_hash: resultado.toolsHash, cache_ttl: resultado.cacheTtl }); } catch (eTok) {}
+      try { if (SUBSCRIPTIONS_ENABLED) { var _extraMl = 0; try { if (await cobrarTodoV2Activo(uid)) { _extraMl = (resultado.huboTraduccion ? 1 : 0) + (resultado.usoTool ? 1 : 0); } } catch (eFlagMl) {} await registrarUsoIA(uid, 1 + _extraMl, 'respuesta_agente_ml'); } } catch (eCobMl) {}
+
+      // DERIVACION v3 (gated derivacion_v3, mismo bloque que Meta): si la IA uso derivar_a_humano,
+      // arrancar la rotacion (asigna + notifica). Con el flag OFF pidioDerivar es false -> no-op.
+      try {
+        if (resultado.pidioDerivar && await derivacionV3Activo(uid)) {
+          const { data: _cvDv } = await supabase.from('conversations').select('asesor_id, admin_tomo, ai_enabled, status').eq('id', conv.id).maybeSingle();
+          const _humanoYa = !!(_cvDv && (_cvDv.asesor_id || _cvDv.admin_tomo === true || _cvDv.ai_enabled === false));
+          const _estadoYa = _cvDv && (_cvDv.status === 'listo_humano' || _cvDv.status === 'cerrado');
+          if (!_humanoYa && !_estadoYa) { await iniciarRotacionDerivacionV3(conv.id, uid, { deptoHint: resultado.derivarDepto || null, leadRef: _contactKey }); }
+        }
+      } catch (eDv3Ml) { console.error('[ML] derivacion v3:', eDv3Ml && eDv3Ml.message); }
+      // NOTA: SIN degradacion elegante (MSG_DEMORA_IA) a proposito: ese cartel es para chats
+      // privados; publicado en un aviso de ML quedaria fijo a la vista de todos. Si la IA se
+      // cae, la pregunta ya esta en el panel y el asesor la responde a mano.
+    } catch (eF3) { console.error('[ML] respuesta IA F3:', eF3 && eF3.message); }
   } catch (e) { console.error('[ML] procesar notificacion:', e && e.message); }
 }
 
@@ -46835,6 +46952,82 @@ app.post('/api/webhook/mercadolibre', function (req, res) {
 app.get('/api/webhook/mercadolibre', function (req, res) {
   return res.status(200).send('ok');
 });
+
+// ============================================================================
+// F3 — RESPONDER PREGUNTAS (IA gated ml_ia_responde + envio manual del panel)
+// ----------------------------------------------------------------------------
+// La UNICA via de respuesta que da la API de ML es POST /answers sobre un lead
+// tipo QUESTION (la respuesta queda PUBLICA en la publicacion). El resto de los
+// subtipos (visita/cotizacion/contacto) NO tiene endpoint de respuesta: se
+// muestran en el panel y el asesor contacta por telefono/email de la ficha.
+// El enchufe de la IA vive en _mlProcesarNotificacion (arriba); el enchufe del
+// envio manual vive en /api/whatsapp/send (branch canal 'mercadolibre').
+// ============================================================================
+
+// POST /answers: responde UNA pregunta. Trunca a 1900 (limite practico de ML ~2000
+// chars). question_id va NUMERICO (asi lo pide la API). Devuelve { ok, error } y NO
+// reintenta: pregunta borrada/ya respondida o token muerto rebotan igual en el retry,
+// y un retry en loop podria duplicar respuestas publicas en el aviso.
+async function _mlResponderPregunta(token, questionId, texto) {
+  try {
+    if (!token || !questionId) return { ok: false, error: 'sin token o question_id' };
+    const r = await fetch('https://api.mercadolibre.com/answers', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ question_id: Number(questionId), text: String(texto || '').slice(0, 1900) })
+    });
+    if (r.ok) return { ok: true, error: null };
+    const j = await r.json().catch(function () { return null; });
+    return { ok: false, error: String((j && (j.message || j.error)) || ('http ' + r.status)) };
+  } catch (e) { return { ok: false, error: e && e.message } }
+}
+
+// Busca la ULTIMA pregunta SIN responder de una conversacion de ML (para el envio
+// manual del panel). POR QUE se re-resuelve por API en vez de leer una columna: el
+// question_id no se persiste (decision F3, cero esquema nuevo) pero SI es recuperable:
+// el wa_message_id del entrante ya trae 'ml:'+leadId, y GET /vis/leads/$LEAD_ID
+// devuelve external_id = el question id. Se recorren los ultimos entrantes de la conv
+// (mas nuevo primero) y se devuelve la primera pregunta en estado UNANSWERED (si el
+// vendedor ya contesto desde el sitio de ML, POST /answers rebotaria).
+// Devuelve { qid, tipos, huboPregunta }: qid null => nada respondible; tipos (los
+// subtipos vistos) y huboPregunta alimentan el error claro que ve el asesor.
+async function _mlUltimaPreguntaPendiente(user_id, conversation_id, token) {
+  const out = { qid: null, tipos: [], huboPregunta: false };
+  try {
+    const { data: msgs } = await supabase.from('messages')
+      .select('wa_message_id')
+      .eq('conversation_id', conversation_id).eq('user_id', user_id)
+      .eq('role', 'contact').like('wa_message_id', 'ml:%')
+      .order('created_at', { ascending: false }).limit(10); // tope 10: no rastrillar historiales largos contra la API de ML
+    if (!msgs || !msgs.length) return out;
+    for (let i = 0; i < msgs.length; i++) {
+      const _leadId = String(msgs[i].wa_message_id || '').slice(3); // 'ml:'+leadId -> leadId
+      if (!_leadId) continue;
+      try {
+        const lr = await fetch('https://api.mercadolibre.com/vis/leads/' + encodeURIComponent(_leadId), {
+          headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+        });
+        if (!lr.ok) continue;
+        const lead = await lr.json().catch(function () { return null; });
+        if (!lead) continue;
+        // Mismo sniffing defensivo del subtipo que usa _mlProcesarNotificacion (paso 6).
+        let _tipo = String(lead.lead_type || lead.type || lead.subtopic || lead.source || '').toLowerCase();
+        if (!_tipo && (lead.question_id || lead.external_id)) _tipo = 'question';
+        if (_tipo && out.tipos.indexOf(_tipo) === -1) out.tipos.push(_tipo);
+        if (_tipo !== 'question') continue;
+        out.huboPregunta = true;
+        const _qid = String(lead.external_id || lead.question_id || '');
+        if (!_qid) continue;
+        const qr = await fetch('https://api.mercadolibre.com/questions/' + encodeURIComponent(_qid) + '?api_version=4', {
+          headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+        });
+        const qj = await qr.json().catch(function () { return null; });
+        if (qr.ok && qj && String(qj.status || '').toUpperCase() === 'UNANSWERED') { out.qid = _qid; return out; }
+      } catch (eLead) { /* un lead que no resuelve no corta la busqueda del resto */ }
+    }
+    return out;
+  } catch (e) { return out; }
+}
 
 // ===== FIN MERCADOLIBRE (gated ml_v1) =======================================
 

@@ -5451,6 +5451,26 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     // apenas deduce uno); (3) el es_default. El hint MANDA sobre el depto viejo de la conv porque el lead pudo pivotear
     // (ej. de Ventas a Alquileres) y el agente llama derivar_a_humano({departamento:'Alquileres'}): rotar en el depto
     // correcto. Sin ninguno -> sin depto (elegirAsesorActivo pool general como cobertura).
+    // ============ SI EL LEAD PIDIO POR UNA PERSONA (Diego 2026-08-22) ============
+    // "al menos que derive al departamento de esa persona y la ponga como prioridad en la derivacion si esta en
+    // rotacion". Dos efectos, en ese orden:
+    //   1. El AREA pasa a ser la de esa persona (manda sobre el hint de area de la IA: si el lead pidio por
+    //      Walter, la charla entra por el area de Walter, no por la que la IA dedujo del tema).
+    //   2. Esa persona es la PREFERIDA del reparto: si esta disponible, le toca a ella.
+    // NO se le promete nada al lead (puede estar de vacaciones): si no esta disponible, sigue el camino normal
+    // del area. Y si el nombre es ambiguo (dos Diegos) o no existe, `_resolverAsesorPorNombre` devuelve null y
+    // todo queda EXACTAMENTE como antes.
+    let _preferido = null, _preferidoDepto = null, _preferidoNombre = null;
+    if (opts.personaHint) {
+      try {
+        const _p = await _resolverAsesorPorNombre(ownerId, opts.personaHint);
+        if (_p && _p.id) {
+          _preferido = _p.id; _preferidoDepto = _p.departamento_id || null; _preferidoNombre = _p.nombre || null;
+          console.log('[DERIVACION] el lead pidio por "' + opts.personaHint + '" -> ' + _p.nombre + (_p.departamento_id ? (' (area propia)') : ' (sin area)') + ' conv=' + convId);
+        }
+      } catch (ePh) { _preferido = null; }
+    }
+
     let _deptoId = null;
     let _hintResolvio = false; // el hint matcheo un depto valido (para decidir si pisar el depto viejo de la conv)
     let _hintSinConfirmar = null; // ARREGLO B: hint que matcheo un depto real pero que la validacion no pudo respaldar.
@@ -5534,6 +5554,10 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (!_deptoId) {
       try { const { data: _dd } = await supabase.from('departamentos').select('id').eq('user_id', ownerId).eq('es_default', true).eq('activo', true).maybeSingle(); _deptoId = _dd && _dd.id ? _dd.id : null; } catch (eDD) {}
     }
+    // EL AREA DE LA PERSONA PEDIDA MANDA (Diego 2026-08-22). Si el lead pidio por Walter, la charla entra por el
+    // area de Walter — no por la que la IA dedujo del tema. Es lo que espera cualquiera que pide por alguien.
+    if (_preferidoDepto) _deptoId = _preferidoDepto;
+
     // Persistir el depto en la conv (mejora el reparto). Best-effort. Escribir cuando: la conv NO tenia depto, o el
     // hint valido cambio el depto respecto al de la conv (pivot real: NO dejar el depto viejo). Solo si _deptoId difiere.
     if (_deptoId && _deptoId !== (_cv.departamento_id || null) && (!_cv.departamento_id || _hintResolvio)) {
@@ -5591,9 +5615,26 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
         if (_cvD && _cvD.departamento_id && _cvD.departamento_id !== _deptoId) _deptoId = _cvD.departamento_id;
       } catch (eReDep) { /* nos quedamos con el depto que teniamos: comportamiento previo */ }
     } else {
-      if (_deptoId) {
+      // LA PERSONA PEDIDA VA PRIMERA. Solo si esta DISPONIBLE de verdad (conectada y en horario): si no, sigue el
+      // camino normal del area. No se le promete nada al lead, asi que nadie queda esperando a alguien que no esta.
+      if (_preferido) {
+        try {
+          const { data: _pa } = await supabase.from('asesores').select('id, disponibilidad, horario_modo, horario_json, activo').eq('id', _preferido).eq('admin_id', ownerId).maybeSingle();
+          if (_pa && _pa.activo !== false && (_pa.disponibilidad === 'conectado' || _pa.disponibilidad == null || _pa.disponibilidad === '')) {
+            let _bsH = null;
+            try { const { data: _b } = await supabase.from('business_settings').select('horario_oficina').eq('user_id', ownerId).maybeSingle(); _bsH = _b || null; } catch (eBh) { _bsH = null; }
+            if (asesorDisponibleAhora(_pa, _bsH)) {
+              _asesor = _preferido;
+              console.log('[DERIVACION] el lead pidio por ' + (_preferidoNombre || _preferido) + ' y esta disponible -> le toca a esa persona. conv=' + convId);
+            }
+          }
+        } catch (ePd) { /* si falla, camino normal */ }
+      }
+      if (!_asesor && _deptoId) {
         try { const _est = await estadoDeptoParaReparto(ownerId, _deptoId); if (_est && _est.estado === 'asignable') _asesor = _est.asesor; } catch (eE) {}
-      } else {
+      } else if (!_asesor) {
+        // OJO: la condicion de esta rama es IMPRESCINDIBLE. Sin el, cuando la persona pedida por el lead ya
+        // quedo elegida arriba, este else la PISABA con el pool general y toda la preferencia se perdia.
         try { _asesor = await elegirAsesorActivo(ownerId); } catch (ePa) { _asesor = null; }
       }
     }
@@ -8861,8 +8902,9 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       : 'IMPORTANTE (vos decidis el area): pasa SIEMPRE el departamento correcto segun lo que el lead necesita — Venta si quiere comprar, Alquiler si quiere alquilar, Administracion SOLO si es un cliente que ya opera con la empresa y consulta por un pago/expensa/recibo.';
     toolsAgente.push({
       name: 'derivar_a_humano',
-      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. ' + _guiaAreas + ' NO derives adivinando ENTRE COMPRA Y ALQUILER: si todavia no sabes cual de las dos es, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
-      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre EXACTO del area/departamento, tal cual figura en la lista de areas de esta empresa. Pasalo SIEMPRE que sepas la intencion; si no la sabes, primero preguntala al lead antes de derivar.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
+      description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. ' + _guiaAreas +
+        'SI EL LEAD PIDE POR UNA PERSONA POR SU NOMBRE ("necesito hablar con Diego", "me estaba atendiendo Walter"), USA ESTA HERRAMIENTA y pasa ese nombre en `persona`. NUNCA le digas que esa persona no esta disponible ni que no podes comunicarlo: el sistema se encarga de encaminarlo. Confirmale de forma generica que ya lo pasas con el equipo. ' + ' NO derives adivinando ENTRE COMPRA Y ALQUILER: si todavia no sabes cual de las dos es, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
+      input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre EXACTO del area/departamento, tal cual figura en la lista de areas de esta empresa. Pasalo SIEMPRE que sepas la intencion; si no la sabes, primero preguntala al lead antes de derivar.' }, persona: { type: 'string', description: 'Nombre de la PERSONA por la que pregunto el lead, si pidio por alguien puntual (ej: "necesito hablar con Diego", "me atendio Walter"). Pasalo TAL CUAL lo dijo el lead. Opcional: si no nombro a nadie, no lo mandes. NO se lo confirmes al lead ni le prometas que lo atiende esa persona.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
     });
   }
 
@@ -9289,6 +9331,8 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
   // no existe) -> el return es identico al actual. 0 tokens: NO hacemos 2do turno de cortesia; reusamos el texto que
   // el agente ya escribio junto a la tool (o un fallback fijo) como reply.
   let _pidioDerivarV3 = false, _derivarMotivoV3 = null, _derivarDeptoV3 = null;
+  // Nombre de la PERSONA por la que pregunto el lead, si pidio por alguien puntual (Diego 2026-08-22).
+  let _derivarPersonaV3 = null;
   // TAREA 2 (Diego 2026-07-23): true si la tool agendar_cita YA derivo el lead (rotacion o directo) en este turno. El
   // webhook lo usa para NO reclasificar/re-derivar en el mismo mensaje (evita doble derivacion). Con la tool OFF -> false.
   let _agendaDerivada = false;
@@ -9973,6 +10017,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
           try {
             _derivarMotivoV3 = (_tuDeriv.input && _tuDeriv.input.motivo) ? String(_tuDeriv.input.motivo).trim() : null;
             _derivarDeptoV3 = (_tuDeriv.input && _tuDeriv.input.departamento) ? String(_tuDeriv.input.departamento).trim() : null;
+            _derivarPersonaV3 = (_tuDeriv.input && _tuDeriv.input.persona) ? String(_tuDeriv.input.persona).trim() : null;
           } catch (eDv) {}
           return _textoAcum || 'Perfecto, busco un asesor disponible para que te atienda, aguardame un momento.';
         }
@@ -10048,6 +10093,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       try {
         _derivarMotivoV3 = (_toolDerivar.input && _toolDerivar.input.motivo) ? String(_toolDerivar.input.motivo).trim() : null;
         _derivarDeptoV3 = (_toolDerivar.input && _toolDerivar.input.departamento) ? String(_toolDerivar.input.departamento).trim() : null;
+        _derivarPersonaV3 = (_toolDerivar.input && _toolDerivar.input.persona) ? String(_toolDerivar.input.persona).trim() : null;
       } catch (eInDv) {}
       // ===== PUNTO 2 (tools_combinadas): CONSULTAR + DERIVAR EN EL MISMO TURNO =====
       // HOY el manejo de tools es un if/else EXCLUYENTE: si la IA llama derivar_a_humano Y consultar_al_dueno en el
@@ -10434,7 +10480,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
       ? completion.content.filter(function(b){ return b && b.type === 'tool_use' && b.name; }).map(function(b){ return String(b.name); })
       : [];
   } catch (eTU) { _toolsUsadas = []; }
-  return { reply: reply, replyCliente: replyCliente, msgId: _msgIdAi, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, agendaDerivada: _agendaDerivada, toolsUsadas: _toolsUsadas, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
+  return { reply: reply, replyCliente: replyCliente, msgId: _msgIdAi, usage: completion.usage, mediaAEnviar: mediaAEnviar, huboTraduccion: (idiomaAi != null), usoTool: !!(completion && completion.stop_reason === 'tool_use') && !_ragToolUsado, pidioDerivar: _pidioDerivarV3, derivarMotivo: _derivarMotivoV3, derivarDepto: _derivarDeptoV3, derivarPersona: _derivarPersonaV3, agendaDerivada: _agendaDerivada, toolsUsadas: _toolsUsadas, staticPromptHash: _staticPromptHash, toolsHash: _toolsHash, cacheTtl: _cacheTtl };
 }
 
 // Detecta SIN IA si el lead pide explicitamente hablar/ser atendido por una persona/asesor/humano (en cualquier
@@ -10986,6 +11032,49 @@ function _pareceBot(texto) {
     if (t.length < 15) return null;
     for (const f of _FRASES_BOT) { if (t.indexOf(f) >= 0) return f; }
     return null;
+  } catch (e) { return null; }
+}
+
+// ============ EL LEAD PIDE POR UNA PERSONA (Diego 2026-08-22) ============
+// CASO REAL. 22/08, Raices CRM, Jonathan D. Perez: "Dieguito! Como estas papa?" -> "Necesito comunicarme con
+// Diego" -> la IA le contesto "lamentablemente no...". Pidio por su nombre DOS VECES y el sistema no pudo
+// conectarlo, aunque Diego es usuario de esa cuenta. La IA conoce las AREAS, no las PERSONAS.
+//
+// Diego: "al menos que derive al departamento de esa persona y la ponga como prioridad en la derivacion si
+// esta en rotacion". O sea: no se le promete al lead que lo atiende esa persona (puede estar de vacaciones),
+// pero la charla entra por SU area y, si esta disponible, le toca a ella primero.
+//
+// Resuelve un nombre suelto ("Diego", "diego perez") contra los asesores ACTIVOS de la cuenta. Devuelve
+// { id, nombre, departamento_id } o null. Es CONSERVADORA a proposito: si el nombre matchea a DOS personas,
+// devuelve null — mandarlo con el "Diego" equivocado es peor que mandarlo por el camino normal.
+async function _resolverAsesorPorNombre(user_id, texto) {
+  try {
+    const t = String(texto || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+    if (!t || t.length < 3) return null;
+    const { data: ases, error } = await supabase.from('asesores').select('id, nombre').eq('admin_id', user_id).eq('activo', true);
+    if (error || !ases || !ases.length) return null;
+    const norm = function (s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim(); };
+    const pedido = t.split(/\s+/).filter(Boolean);
+    const candidatos = [];
+    for (const a of ases) {
+      const partes = norm(a.nombre).split(/\s+/).filter(Boolean);
+      if (!partes.length) continue;
+      // Matchea si CUALQUIER palabra del nombre del asesor coincide entera con lo que pidio el lead.
+      // Palabra entera a proposito: "ana" no puede matchear "juana", y menos de 3 letras no se considera.
+      let pega = false;
+      for (const p of partes) { if (p.length >= 3 && pedido.indexOf(p) >= 0) { pega = true; break; } }
+      if (pega) candidatos.push(a);
+    }
+    if (candidatos.length !== 1) return null;   // 0 o ambiguo -> camino normal
+    const elegido = candidatos[0];
+    // Su departamento: el primero donde este como receptor.
+    let depto = null;
+    try {
+      const { data: ud } = await supabase.from('usuario_departamento').select('departamento_id, modo').eq('asesor_id', elegido.id);
+      const recibe = (ud || []).filter(function (x) { return x && (x.modo == null || x.modo === 'recibe'); });
+      if (recibe.length) depto = recibe[0].departamento_id;
+    } catch (eUd) { depto = null; }
+    return { id: elegido.id, nombre: elegido.nombre, departamento_id: depto };
   } catch (e) { return null; }
 }
 
@@ -13673,6 +13762,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
               if (!_humanoYa && !_estadoYa) {
                 const _rr = await iniciarRotacionDerivacionV3(_convId, user_id, {
                   deptoHint: resultado.derivarDepto || null,
+                  personaHint: resultado.derivarPersona || null,   // el lead pidio por alguien puntual
                   // anunciarLead:false (default) -> NO duplicar: el agente ya envio su reply (texto de la tool o el
                   // fallback 'busco un asesor disponible...'). La rotacion solo asigna + notifica al equipo.
                   leadRef: (data.pushName || telefono) || null

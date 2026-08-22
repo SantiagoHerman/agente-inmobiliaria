@@ -37787,6 +37787,26 @@ app.get('/api/ui-flags', async function(req, res){
         cache_local_v1 = _clLista.indexOf(String(user_id)) >= 0;
       }
     } catch (e) { cache_local_v1 = false; }
+    // ============ REFRESCO INCREMENTAL DE LA LISTA (Diego 2026-08-21) ============
+    // Hoy el poll de Conversaciones pide cada 4 segundos las 1.000 conversaciones mas recientes con TODAS sus
+    // columnas: MEDIDO, 2,07 MB crudos / 158 KB comprimidos, ~1 s con red buena y hasta 13 s con 11 asesores a
+    // la vez. Pidiendo solo lo que cambio son 1,3 KB: 99% menos.
+    //
+    // Y ARREGLA UN BUG DE VERDAD (item 17): al pedir "las 1.000 mas recientes", en Anton (1.244 conversaciones)
+    // quedan 244 afuera y en Raices CRM (1.125) quedan 125. Esos 369 leads NO se refrescan NUNCA. Con el
+    // incremental no hay tope que valga: se pide por fecha de cambio, no por posicion en la lista.
+    //
+    // KILL-SWITCH: POLL_INCREMENTAL=off vuelve al pedido completo de siempre. Se puede acotar por cuenta con la
+    // lista de user_id separados por coma, igual que el cache local.
+    var poll_incremental_v1 = false;
+    try {
+      var _piRaw = String(process.env.POLL_INCREMENTAL || 'todas').trim();
+      if (_piRaw.toLowerCase() === 'todas') poll_incremental_v1 = true;
+      else if (_piRaw && _piRaw.toLowerCase() !== 'off') {
+        var _piLista = _piRaw.split(',').map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+        poll_incremental_v1 = _piLista.indexOf(String(user_id)) >= 0;
+      }
+    } catch (e) { poll_incremental_v1 = false; }
     // TAREA B (que hace la IA cuando NO sabe): exponer el modo elegido por el dueno + los minutos del 3er modo,
     // para que la config del front los muestre. Query SEPARADA y defensiva: si las columnas aun no existen
     // (migracion no corrida) -> DEFAULTS 'preguntar' / 30 = comportamiento ACTUAL EXACTO. El GUARDADO lo hace el
@@ -37883,12 +37903,12 @@ app.get('/api/ui-flags', async function(req, res){
         chat_desde_ficha_v1 = _iv.data.chat_desde_ficha_v1 !== false; // FAIL-OPEN
       }
     } catch (e) { /* columnas ausentes / error -> los dos en false */ }
-    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, conectores_v1: conectores_v1, ml_v1: ml_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
+    return res.json({ ui_moderno: ui_moderno, reparto_v2: reparto_v2, rubro: rubro, reservas_v1: reservas_v1, conectores_v1: conectores_v1, ml_v1: ml_v1, dev_reservas_v1: dev_reservas_v1, matching_v1: matching_v1, cloud_api_v1: cloud_api_v1, pipeline_filtros_v1: pipeline_filtros_v1, pipeline_exportar_v1: pipeline_exportar_v1, visibilidad_server_v1: visibilidad_server_v1, cache_local_v1: cache_local_v1, poll_incremental_v1: poll_incremental_v1, reportes_v2: reportes_v2, contactos_v1: contactos_v1, fichas_v1: fichas_v1, coincidencias_v1: coincidencias_v1, fichas_ia_v1: fichas_ia_v1, fichas_avisos_v1: fichas_avisos_v1, fichas_chat_v1: fichas_chat_v1, fichas_historial_v1: fichas_historial_v1, importacion_verificada_v1: importacion_verificada_v1, chat_desde_ficha_v1: chat_desde_ficha_v1, ia_no_sabe_modo: ia_no_sabe_modo, ia_no_sabe_min: ia_no_sabe_min, cita_aviso_canales: cita_aviso_canales, cita_escalada_horas: cita_escalada_horas });
   // ULTIMO RECURSO: si TODO el endpoint explota. Los flags de Contactos/Fichas van en true por la REGLA DE
   // ORO (una cuenta nueva nace con todo puesto, y un error de lectura no tiene que apagarle la pantalla).
   // Los otros (reservas, cloud_api, matching...) siguen en false: NO son parte de "todos los cambios" y
   // prenderlos por un error seria activar cosas que Diego no pidio.
-  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, cache_local_v1: false, reportes_v2: false, contactos_v1: true, fichas_v1: true, coincidencias_v1: true, fichas_ia_v1: true, fichas_avisos_v1: true, fichas_chat_v1: true, fichas_historial_v1: true, importacion_verificada_v1: true, chat_desde_ficha_v1: true, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
+  }catch(e){ return res.status(200).json({ ui_moderno: true, reparto_v2: false, rubro: 'inmobiliaria', reservas_v1: false, dev_reservas_v1: false, matching_v1: false, cloud_api_v1: false, visibilidad_server_v1: false, cache_local_v1: false, poll_incremental_v1: false, reportes_v2: false, contactos_v1: true, fichas_v1: true, coincidencias_v1: true, fichas_ia_v1: true, fichas_avisos_v1: true, fichas_chat_v1: true, fichas_historial_v1: true, importacion_verificada_v1: true, chat_desde_ficha_v1: true, ia_no_sabe_modo: 'preguntar', ia_no_sabe_min: 30, cita_aviso_canales: ['depto'], cita_escalada_horas: 3 }); }
 });
 
 // ============================================================================

@@ -8890,6 +8890,32 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     } catch (eDT) { _deptosTool = []; }
     // Lista para la IA: "Nombre (cuando corresponde)". El criterio_derivacion es el que el cliente escribio en
     // Configuracion, asi que la decision de que va a cada area la define EL DUEÑO, no un texto fijo del codigo.
+    // ============ EL EQUIPO, POR NOMBRE (Diego 2026-08-22) ============
+    // Hasta hoy la IA conocia las AREAS pero no las PERSONAS. Cuando Jonathan escribio "necesito comunicarme
+    // con Diego" (Raices CRM, 22/08) la IA contesto "lamentablemente no..." — y Diego es usuario de esa cuenta.
+    // Reglas de Diego, textuales: "si es que ese nombre existe como usuario. Si hay 2 usuarios con el mismo
+    // nombre que pregunte el apellido, o viceversa. Si no existe no puede."
+    // Para poder hacer las TRES cosas (usarlo / repreguntar / decir que no existe) la IA necesita saber
+    // quienes son. Va en el bloque CACHEADO: se paga una vez, no por mensaje, y solo cambia cuando cambia
+    // el plantel. ORDEN FIJO por el mismo motivo que los departamentos: sin ORDER BY el orden varia solo y
+    // eso reescribe el cache. Se excluyen los usuarios IA (es_ia): no son personas a las que derivar.
+    let _equipoTool = [];
+    try {
+      if (user_id) {
+        const { data: _eqT } = await supabase.from('asesores').select('nombre, es_ia').eq('admin_id', user_id).eq('activo', true).order('nombre');
+        _equipoTool = (_eqT || []).filter(function (a) { return a && a.nombre && a.es_ia !== true; }).map(function (a) { return String(a.nombre).trim(); });
+      }
+    } catch (eEq) { _equipoTool = []; }
+    let _guiaEquipo = '';
+    if (_equipoTool.length) {
+      _guiaEquipo = 'EQUIPO DE ESTA EMPRESA (los unicos nombres validos): ' + _equipoTool.join(' · ') + '. '
+        + 'SI EL LEAD PIDE POR UNA PERSONA: '
+        + '(a) si el nombre coincide con UNA sola de esta lista, usa derivar_a_humano y pasa ese nombre en `persona`; '
+        + '(b) si coincide con DOS O MAS (por ejemplo dos Diegos), PREGUNTALE EL APELLIDO antes de derivar — o el nombre, si te dio solo el apellido — y recien despues deriva; '
+        + '(c) si NO figura en la lista, decile con naturalidad que no tenes a nadie con ese nombre en el equipo y ofrecele pasarlo con el area que corresponda. '
+        + 'NUNCA inventes una persona ni le prometas que lo va a atender alguien puntual. ';
+    }
+
     const _listaDeptos = _deptosTool.map(function (d) {
       const _cri = (d.criterio_derivacion && String(d.criterio_derivacion).trim()) ? (' (' + String(d.criterio_derivacion).trim().slice(0, 160) + ')') : '';
       return String(d.nombre).trim() + _cri;
@@ -8903,7 +8929,7 @@ async function generarRespuestaAgente(user_id, conversation_id, message, opcione
     toolsAgente.push({
       name: 'derivar_a_humano',
       description: 'Usala cuando este lead debe pasar a un ASESOR HUMANO ahora: coordina/acuerda una visita, compra o alquiler, pide hablar con una persona, o vos ibas a decirle que lo contacta un asesor. ' + _guiaAreas +
-        'SI EL LEAD PIDE POR UNA PERSONA POR SU NOMBRE ("necesito hablar con Diego", "me estaba atendiendo Walter"), USA ESTA HERRAMIENTA y pasa ese nombre en `persona`. NUNCA le digas que esa persona no esta disponible ni que no podes comunicarlo: el sistema se encarga de encaminarlo. Confirmale de forma generica que ya lo pasas con el equipo. ' + ' NO derives adivinando ENTRE COMPRA Y ALQUILER: si todavia no sabes cual de las dos es, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
+        _guiaEquipo + 'SI EL LEAD PIDE POR UNA PERSONA POR SU NOMBRE ("necesito hablar con Diego", "me estaba atendiendo Walter"), USA ESTA HERRAMIENTA y pasa ese nombre en `persona`. Si esa persona SI figura en el equipo, NUNCA le digas que no esta disponible ni que no podes comunicarlo: el sistema se encarga de encaminarlo (puede que la atienda otra persona del area, y esta bien). Confirmale de forma generica que ya lo pasas con el equipo. ' + ' NO derives adivinando ENTRE COMPRA Y ALQUILER: si todavia no sabes cual de las dos es, primero preguntaselo al lead y recien deriva cuando lo aclare. Si la usas, NO prometas tiempos: el sistema busca un asesor disponible y lo deriva; vos segui atendiendo hasta que un humano tome la charla. Al confirmarle al lead, NO nombres a ningun asesor ni persona especifica (no digas "te paso con Walter" ni ningun nombre); deci de forma generica que lo va a atender un asesor del equipo (ej: "en un momento te atiende alguien del equipo"). Indica el motivo y el departamento/area con el nombre EXACTO del area de la empresa.',
       input_schema: { type: 'object', properties: { departamento: { type: 'string', description: 'Nombre EXACTO del area/departamento, tal cual figura en la lista de areas de esta empresa. Pasalo SIEMPRE que sepas la intencion; si no la sabes, primero preguntala al lead antes de derivar.' }, persona: { type: 'string', description: 'Nombre de la PERSONA por la que pregunto el lead, si pidio por alguien puntual (ej: "necesito hablar con Diego", "me atendio Walter"). Pasalo TAL CUAL lo dijo el lead. Opcional: si no nombro a nadie, no lo mandes. NO se lo confirmes al lead ni le prometas que lo atiende esa persona.' }, motivo: { type: 'string', description: 'Motivo breve por el que deriva (ej: el lead quiere coordinar una visita).' } }, required: ['motivo'] }
     });
   }

@@ -5370,7 +5370,7 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
     if (!convId || !ownerId) return { ok: false };
     const nowIso = new Date().toISOString();
     // Releer estado: no arrancar si ya la tomo un humano (asesor_id/admin_tomo) o la IA esta apagada.
-    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, ai_enabled, departamento_id, status, contact_id').eq('id', convId).maybeSingle();
+    const { data: _cv } = await supabase.from('conversations').select('asesor_id, admin_tomo, ai_enabled, departamento_id, status, contact_id, derivado_at').eq('id', convId).maybeSingle();
     if (!_cv) return { ok: false };
     if (_cv.asesor_id || _cv.admin_tomo === true) return { ok: false, yaTomado: true }; // ya hay humano a cargo
     if (_cv.ai_enabled === false) return { ok: false }; // IA apagada: un humano ya intervino
@@ -5427,6 +5427,20 @@ async function iniciarRotacionDerivacionV3(convId, ownerId, opts) {
       } catch (eEst) { console.error('[derivacion] no se pudo subir a interesado: ' + (eEst && eEst.message)); }
     }
     // ==========================================================================================
+
+    // ============ EL ANCLA DEL TOPE DE ROTACION (Diego 2026-08-21) ============
+    // El tope de rotacion (ver el cron ~5915) mide desde `derivado_at`. MEDIDO al implementarlo: solo 15 de 2.574
+    // conversaciones la tenian cargada, porque la escribe `derivarAHumano` y la rotacion no siempre pasa por ahi.
+    // O sea que el tope no se habria aplicado casi nunca — justo lo que Diego intuyo: "sino me van a quedar los
+    // leads en rotacion y despues sin dueno".
+    // Se sella ACA, al ARRANCAR la rotacion, y SOLO si esta vacia: asi toda rotacion nueva tiene ancla y las que
+    // ya la tenian conservan la fecha original de derivacion (no se pisa).
+    // Best-effort: si falla, el tope simplemente no aplica a ese lead (comportamiento de antes), no rompe nada.
+    try {
+      if (!_cv.derivado_at) {
+        await supabase.from('conversations').update({ derivado_at: nowIso }).eq('id', convId).is('derivado_at', null);
+      }
+    } catch (eAnc) { /* sin ancla: ese lead queda sin tope, como antes */ }
 
     // FIX ping-pong: arranque LIMPIO de la vuelta de rotacion (reset del set de "ya intentados"). Aditivo/best-effort:
     // si la columna derivacion_intentados no existe (migracion no corrida), este catch lo traga (no-op) y todo sigue

@@ -10955,6 +10955,40 @@ function _pareceIdiomaBase(texto, base) {
   } catch (e) { return false; } // ante error, que decida la IA
 }
 
+// ============ DETECTOR DE BOT (Diego 2026-08-22) ============
+// EL CASO QUE LO ORIGINO. 22/08, Raices CRM, lead "Leyendas - Mar de las Pampas": una Oportunidad le pego al
+// ASISTENTE VIRTUAL del otro lado y los dos sistemas se pusieron a conversar. MEDIDO: 46 mensajes del bot,
+// 31 respuestas nuestras, 106 llamadas a la IA, 482.360 tokens, USD 0,46 EN SIETE MINUTOS — el gasto de 20
+// conversaciones reales. Lo tuvo que frenar Diego a mano.
+//
+// Lo mas caro del caso: NUESTRA IA LO DETECTO Y LO DIJO EN VOZ ALTA ("parece que el mensaje que mandaste es de
+// un sistema automatizado", "mira la situacion: dos sistemas de IA hablando entre si") y SIGUIO CONTESTANDO 20
+// veces mas. Y el clasificador cerro la conversacion CINCO veces por "no interesado": cada mensaje nuevo del
+// bot la reabria ("volvio a escribir") y la IA arrancaba de nuevo. Cerrar no frenaba nada.
+//
+// POR QUE UNA HEURISTICA GRATIS Y NO UNA LLAMADA A LA IA: detectar con IA cuesta en CADA mensaje de CADA lead
+// para cazar un puñado de casos. Estas frases las dice un bot y no las dice una persona: la precision alcanza
+// y sale cero.
+//
+// SESGO A PROPOSITO: preferimos DEJAR PASAR un bot antes que marcar a una persona. Un falso positivo le apaga
+// la IA a un cliente real, que es MUCHO peor que gastar unos centavos. Por eso son frases donde el otro lado se
+// declara maquina, no "parece formal" ni "contesta rapido".
+const _FRASES_BOT = [
+  'soy el asistente virtual', 'soy un asistente virtual', 'como asistente virtual', 'soy la asistente virtual',
+  'soy un bot', 'soy un chatbot', 'asistente automatico', 'respuesta automatica', 'mensaje automatico',
+  'sistema automatizado', 'soy una inteligencia artificial', 'soy un asistente de ia', 'este es un mensaje automatico',
+  'no tengo acceso a opiniones', 'como modelo de lenguaje', 'i am an ai assistant', 'i am a virtual assistant',
+  'this is an automated', 'automated response'
+];
+function _pareceBot(texto) {
+  try {
+    const t = String(texto || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (t.length < 15) return null;
+    for (const f of _FRASES_BOT) { if (t.indexOf(f) >= 0) return f; }
+    return null;
+  } catch (e) { return null; }
+}
+
 async function detectarIdioma(texto, user_id, idiomaActual, conversation_id, turnoId) {
   const actual = (idiomaActual && String(idiomaActual).trim()) || 'es';
   try {
@@ -13297,6 +13331,47 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     //  ya se transcribio/tradujo para que lo tome un humano. Esta es tu distincion: app vs Maestro.)
     // Pausa por-conversacion (ai_enabled) O pausa de IA por-cliente del Maestro (agente_pausado = "solo atencion":
     // el agente NO contesta para ESTE cliente, pero ya se transcribio/tradujo para que lo atienda un humano).
+    // ============ SI DEL OTRO LADO HAY UN BOT, SE CORTA (Diego 2026-08-22) ============
+    // Diego, textual: "si detecta bot que lo deje en listo para humano directo apagando la IA pero avisando que
+    // se detecto un bot en la charla" + "queda asignado al administrador".
+    // Va ANTES de generar la respuesta: la idea es no contestarle NI UNA VEZ mas al bot.
+    // Todo el bloque es best-effort: si algo falla, la conversacion sigue como hoy (se prefiere atender de mas
+    // antes que romper una charla real).
+    try {
+      const _fraseBot = (conv.ai_enabled !== false) ? _pareceBot(contentLead) : null;
+      if (_fraseBot) {
+        // A quien queda asignado: al ADMINISTRADOR de la cuenta. Es una charla que no es un lead: la mira el
+        // dueño, no un asesor de ventas. Si no hay administrador cargado, queda sin asignar (igual se apaga la
+        // IA y se avisa, que es lo que importa).
+        let _admin = null;
+        try {
+          const { data: _ases } = await supabase.from('asesores').select('id, auth_user_id, rol, visibilidad, activo').eq('admin_id', user_id).eq('activo', true);
+          const _adm = (_ases || []).filter(function (a) { return a && esAdministrador(a); });
+          if (_adm.length) _admin = _adm[0].id;
+        } catch (eAdm) { _admin = null; }
+
+        const _updBot = { ai_enabled: false, status: 'listo_humano' };
+        if (_admin) { _updBot.asesor_id = _admin; _updBot.ultimo_asesor_id = _admin; }
+        try { await supabase.from('conversations').update(_updBot).eq('id', conv.id); } catch (eUB) {}
+        try { await _limpiarRotacionV3(conv.id); } catch (eLB) {}
+
+        // El cartel en el chat, para que quien entre entienda por que se apago la IA.
+        try {
+          await supabase.from('messages').insert({ conversation_id: conv.id, user_id: user_id, role: 'sistema', enviado_por: 'Sistema',
+            content: '🤖 Se detectó un sistema automatizado del otro lado ("' + _fraseBot + '"). La IA se apagó y la charla queda para una persona.' });
+        } catch (eMB) {}
+
+        // El aviso. Al administrador si lo hay; si no, al dueño.
+        try {
+          const _refBot = (contacto && (contacto.nombre_manual || contacto.name)) || telefono || 'un contacto';
+          await _pushDuenoAdmins(user_id, 'Se detectó un BOT en la charla con ' + _refBot + '. La IA se apagó y quedó para una persona.');
+        } catch (eAB) {}
+
+        console.log('[BOT] detectado en conv ' + conv.id + ' por la frase "' + _fraseBot + '" -> IA apagada, listo_humano' + (_admin ? (', asignado al administrador ' + _admin) : ', sin administrador cargado'));
+        return; // NO se le contesta al bot
+      }
+    } catch (eBot) { /* ante cualquier error, la charla sigue como hoy */ }
+
     if (conv.ai_enabled === false || (_bsGate && _bsGate.agente_pausado === true)) {
       // ETAPA 9c: la conv esta pausada (en cola tras el mensaje de fuera-de-horario). Si HAY una oferta pendiente
       // para ESTA conv (solo puede existir con reparto_v2 ON: la sembro enviarMensajeFueraHorario), interpretamos

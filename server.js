@@ -47114,7 +47114,16 @@ async function _mlProcesarNotificacion(body) {
 
     // whatsapp / call: NO crear conversacion (el lead ya se fue a otro canal; en una fase
     // posterior se etiquetara el contacto). Salir ANTES de tocar la base.
-    if (tipo === 'whatsapp' || tipo === 'call') return;
+    if (tipo === 'whatsapp' || tipo === 'call') {
+      // F4 PUENTE (gated ml_puente_whatsapp, default false): estos leads salen de APRETAR el
+      // boton de WhatsApp en la publicacion -> ML le abre el chat al interesado con un texto
+      // pre-armado, asi que el MISMO lead puede entrar solo por Evolution como mensaje normal.
+      // Escribirle ahora seria escribirle dos veces (o cruzarnos los mensajes): se programa el
+      // chequeo a 15 min y ahi se decide (ver _mlPuenteProgramarEspera).
+      // Con el flag OFF esta llamada devuelve al instante sin tocar la base -> el `return` de hoy.
+      try { await _mlPuenteProgramarEspera(uid, lead, _mlComprador(lead), { leadId: String(leadId), tipo: tipo, token: token }); } catch (ePw) { console.error('[ML] puente espera:', ePw && ePw.message); }
+      return;
+    }
     const _textoBase = _mlTextoPorTipo(tipo);
     if (!_textoBase) return; // tipo desconocido -> descartar (fail-closed)
 
@@ -47188,6 +47197,21 @@ async function _mlProcesarNotificacion(body) {
     } catch (eIns) { console.error('[ML] guardar msg entrante:', eIns && eIns.message); return; }
 
     console.log('[ML] lead ' + leadId + ' (' + tipo + ') -> conversacion ' + conv.id + ' del tenant ' + uid);
+
+    // ========================================================================
+    // F4 — PUENTE A WHATSAPP (gated ml_puente_whatsapp, default OFF -> con el flag apagado
+    // esta llamada devuelve al instante y todo lo de abajo queda byte-identico).
+    // Va ACA, despues de que F2 dejo la conversacion de ML creada y ANTES de F3, por dos
+    // razones: (a) el bloque F3 termina en `return` para los tipos que no son question, asi
+    // que despues de F3 el puente NUNCA correria para los leads de formulario; (b) si el
+    // puente YA respondio la pregunta en ML ("te escribimos por WhatsApp" / "pasanos un
+    // WhatsApp"), F3 NO tiene que responderla otra vez: ML rechaza la segunda respuesta
+    // porque la pregunta ya quedo contestada, y quedaria un tilde mentiroso en el panel.
+    // ========================================================================
+    try {
+      const _puente = await _mlPuenteWhatsapp(uid, lead, { nombre: _nombre, email: _email, telefono: _telefono }, { leadId: String(leadId), tipo: tipo, token: token, qid: _qidMl, convMlId: conv.id });
+      if (_puente && _puente.respondioMl) { console.log('[ML] lead ' + leadId + ': el puente ya respondio en ML -> F3 no contesta esta pregunta'); return; }
+    } catch (ePuente) { console.error('[ML] puente:', ePuente && ePuente.message); }
 
     // ========================================================================
     // F3 — RESPUESTA DE IA (gated ml_ia_responde, default OFF -> hasta aca F2 byte-identico).
@@ -47360,6 +47384,554 @@ async function _mlUltimaPreguntaPendiente(user_id, conversation_id, token) {
     }
     return out;
   } catch (e) { return out; }
+}
+
+// ============================================================================
+// F4 — PUENTE MERCADOLIBRE -> WHATSAPP (gated ml_puente_whatsapp, default false)
+// ----------------------------------------------------------------------------
+// PEDIDO DE DIEGO (textual): "si alguien consulta con formulario y entra a raices el
+// sistema carga el nuevo contacto y le envia un mensaje desde conversaciones pero del
+// numero de WhatsApp Business: 'Hola Martin como estas, nos escribiste recien por
+// Mercado Libre por...'. Y la respuesta automatica de ML es 're escribimos por
+// WhatsApp'. Ahora si el numero de contacto no es WhatsApp se le responde que si es tan
+// amable nos facilitaria un numero de WhatsApp para comunicarnos."
+//
+// POR QUE VALE LA PENA: un lead de formulario de ML hoy queda en una conversacion del
+// canal 'mercadolibre' que NO tiene via de respuesta (la API de ML solo deja responder
+// PREGUNTAS). El interesado deja su telefono y nadie le escribe hasta que un asesor lo
+// ve. El puente lo pasa al canal donde el negocio SI puede conversar (y donde la IA ya
+// sabe atender): WhatsApp.
+//
+// FAIL-CLOSED EN TRES NIVELES. Con el flag OFF el UNICO rastro de todo esto es una lectura
+// de business_settings.ml_puente_whatsapp por lead (sin escrituras, sin envios, sin IA): el
+// resultado observable -- lo que se guarda y lo que sale -- es identico al F2/F3 de hoy.
+//   1) ENV: sin ML_APP_ID/ML_CLIENT_SECRET el webhook ya descarta todo y el cron de
+//      pendientes NI SE REGISTRA.
+//   2) Flag ml_v1 por cuenta: ya se chequea en el paso 2 de _mlProcesarNotificacion.
+//   3) Flag NUEVO ml_puente_whatsapp por cuenta (migracion-ml-puente.sql): ausente /
+//      columna inexistente / error de lectura / false -> el puente no corre.
+//
+// LO QUE NO HACE: no toca el flujo de WhatsApp, ni el de Meta, ni el F2/F3 de ML. El
+// unico cambio en _mlProcesarNotificacion son dos llamadas que con el flag OFF devuelven
+// al instante sin tocar la base.
+// ============================================================================
+
+// Tope diario de mensajes de puente POR CUENTA. NO es un freno operativo (el volumen real
+// de leads de ML es de unidades por dia): es el FUSIBLE para que un bug -- una tormenta de
+// reintentos de ML, un cron trabado -- no dispare cientos de WhatsApp a leads reales.
+const _ML_PUENTE_TOPE_DIA = 50;
+// Espera antes de decidir sobre un lead de tipo 'whatsapp'/'call'. Ese lead se genera cuando
+// el interesado APRIETA el boton de WhatsApp en la publicacion: ML le abre el chat con un
+// texto pre-armado hacia el numero del vendedor, asi que ese mismo lead PUEDE entrar solo
+// por Evolution como mensaje entrante normal. Si el puente escribe al toque, le escribimos
+// dos veces (o se cruzan los mensajes). A los 15 min ya sabemos si escribio o no.
+const _ML_PUENTE_ESPERA_WA_MS = 15 * 60 * 1000;
+// Un pendiente que quedo mas de 48h sin poder ejecutarse se descarta: presentarse por un
+// lead de anteayer es peor que no presentarse.
+const _ML_PUENTE_VENCE_MS = 48 * 60 * 60 * 1000;
+
+// --- GATE por cuenta del puente (mismo patron que mlV1Activo: ausente/error/OFF -> false).
+async function _mlPuenteActivo(user_id, bs) {
+  try {
+    if (bs && Object.prototype.hasOwnProperty.call(bs, 'ml_puente_whatsapp')) return bs.ml_puente_whatsapp === true;
+    if (!user_id) return false;
+    const { data, error } = await supabase.from('business_settings').select('ml_puente_whatsapp').eq('user_id', user_id).maybeSingle();
+    if (error) return false; // columna ausente (migracion sin correr) -> apagado
+    return !!(data && data.ml_puente_whatsapp === true);
+  } catch (e) { return false; }
+}
+
+// Fecha de HOY en Argentina (UTC-3), 'YYYY-MM-DD'. Mismo calculo que el contador diario del
+// recontacto v2 (~19640): el corte del dia tiene que ser el del negocio, no el de UTC.
+function _mlPuenteHoyStr() {
+  const a = new Date(); const u = a.getTime() + a.getTimezoneOffset() * 60000;
+  return new Date(u - 3 * 60 * 60000).toISOString().slice(0, 10);
+}
+
+// FUSIBLE: toma UNA unidad del cupo diario de la cuenta. Devuelve false si no hay cupo o si
+// no se pudo leer/escribir el contador (fail-closed: sin contador confiable NO se manda).
+// Se toma ANTES de enviar a proposito: un envio fallido consume una unidad. El cupo protege
+// contra un bug en loop, y contar intentos es el lado seguro de ese error.
+async function _mlPuenteTomarCupo(user_id) {
+  try {
+    const hoyStr = _mlPuenteHoyStr();
+    const { data, error } = await supabase.from('business_settings')
+      .select('ml_puente_enviados_hoy, ml_puente_enviados_fecha').eq('user_id', user_id).maybeSingle();
+    if (error) { console.error('[ML puente] no se pudo leer el contador diario (migracion sin correr?): ' + error.message); return false; }
+    let usados = 0;
+    // Dia distinto (o fecha nula) -> el contador arranca de cero.
+    if (data && String(data.ml_puente_enviados_fecha || '').slice(0, 10) === hoyStr) usados = Number(data.ml_puente_enviados_hoy) || 0;
+    if (usados >= _ML_PUENTE_TOPE_DIA) {
+      console.warn('[ML puente] TOPE DIARIO alcanzado (' + _ML_PUENTE_TOPE_DIA + ') en la cuenta ' + user_id + ': no se manda nada mas hoy');
+      return false;
+    }
+    const { error: eUp } = await supabase.from('business_settings')
+      .update({ ml_puente_enviados_hoy: usados + 1, ml_puente_enviados_fecha: hoyStr }).eq('user_id', user_id);
+    if (eUp) { console.error('[ML puente] no se pudo escribir el contador diario: ' + eUp.message); return false; }
+    return true;
+  } catch (e) { console.error('[ML puente] cupo:', e && e.message); return false; }
+}
+
+// Normaliza un telefono crudo de ML al formato que guarda el CRM (SOLO digitos, con codigo
+// de pais). ML manda el telefono como {area_code, number} o string suelto y CASI SIEMPRE sin
+// el 54. Se reusan las dos piezas que ya existen:
+//   - clasificarTelefonoImport (~6722): propone el codigo de pais (1165078185 -> 5491165078185)
+//     y RECHAZA lo mal formado; nunca inventa un numero que no se pueda proponer.
+//   - telefonoCanonicoWA (~6455): le PREGUNTA a WhatsApp el JID real (el "9 argentino" no se
+//     puede deducir del prefijo). Es una consulta: no manda nada, 0 tokens.
+// Devuelve '' si no hay un numero usable (el caller no hace puente).
+async function _mlTelefonoNormalizar(user_id, crudo) {
+  try {
+    const c = clasificarTelefonoImport(crudo);
+    if (!c || !c.propuesto) return ''; // 'mal_formado': muy corto / vacio / sin nada razonable que proponer
+    let d = String(c.propuesto).replace(/[^0-9]/g, '');
+    if (!d || d.length < 10) return '';
+    try { d = await telefonoCanonicoWA(user_id, d); } catch (eC) { /* best-effort: queda el propuesto */ }
+    d = String(d || '').replace(/[^0-9]/g, '');
+    return (d.length >= 10) ? d : '';
+  } catch (e) { return ''; }
+}
+
+// Titulo de la publicacion de ML. Si no se puede leer, un texto neutro: el mensaje tiene que
+// salir igual (decir "la propiedad que consultaste" es mejor que no escribirle).
+async function _mlPuenteTitulo(token, itemId) {
+  const _FALLBACK = 'la propiedad que consultaste';
+  try {
+    if (!token || !itemId) return _FALLBACK;
+    const r = await fetch('https://api.mercadolibre.com/items/' + encodeURIComponent(String(itemId)), {
+      headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' }
+    });
+    if (!r.ok) return _FALLBACK;
+    const j = await r.json().catch(function () { return null; });
+    const t = (j && j.title) ? String(j.title).trim().slice(0, 120) : '';
+    return t || _FALLBACK;
+  } catch (e) { return _FALLBACK; }
+}
+
+// item_id de la publicacion: sniffing defensivo (la doc de /vis/leads no fija UN solo lugar).
+function _mlPuenteItemId(lead, comprador) {
+  try {
+    const _c = [
+      comprador && comprador.item_id, lead && lead.item_id,
+      lead && lead.item && lead.item.id, lead && lead.buyer && lead.buyer.item_id,
+      lead && Array.isArray(lead.items) && lead.items[0] && (lead.items[0].id || lead.items[0].item_id)
+    ];
+    for (let i = 0; i < _c.length; i++) { if (_c[i]) return String(_c[i]).trim().slice(0, 40); }
+    return '';
+  } catch (e) { return ''; }
+}
+
+// Primer nombre CAPITALIZADO. ML manda el nombre en MAYUSCULAS ("DIEGO NICOLAS HERMAN" ->
+// "Diego"). Devuelve '' si no hay nombre real (ahi el saludo va sin nombre).
+function _mlPuentePrimerNombre(nombre) {
+  try {
+    const n = String(nombre == null ? '' : nombre).trim();
+    if (!n) return '';
+    const p = n.split(/\s+/)[0] || '';
+    // Una contactKey tecnica ('ml:123') o un numero NO es un nombre: mejor saludar sin nombre.
+    if (!p || !/^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'-]*$/.test(p)) return '';
+    return (p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).slice(0, 40);
+  } catch (e) { return ''; }
+}
+
+// EL TEXTO del primer mensaje. Por ahora en codigo (con el nombre del negocio y el titulo de
+// la publicacion); queda de una sola pieza para que el dia que se haga editable por cliente
+// haya UN solo lugar que tocar.
+function _mlPuenteTexto(primerNombre, titulo, empresa) {
+  const _hola = primerNombre ? ('Hola ' + primerNombre + ', ¿cómo estás?') : 'Hola, ¿cómo estás?';
+  const _prop = titulo || 'la propiedad que consultaste';
+  const _cierre = empresa ? (' Te escribo de ' + empresa + ', ¿te paso más información?') : ' ¿Te paso más información?';
+  return _hola + ' Nos escribiste recién por Mercado Libre por ' + _prop + '.' + _cierre;
+}
+
+// Nota de sistema en una conversacion (role 'sistema' = no cuenta como atencion humana ni
+// dispara los relojes de SLA/respaldo; mismo criterio que el resto de los avisos internos).
+async function _mlPuenteNota(user_id, conversation_id, texto) {
+  try {
+    if (!conversation_id || !texto) return;
+    await supabase.from('messages').insert({ conversation_id: conversation_id, user_id: user_id, role: 'sistema', content: texto, enviado_por: 'Sistema' });
+  } catch (e) { console.error('[ML puente] nota:', e && e.message); }
+}
+
+// Busca un contacto YA existente de ese telefono (sin filtrar por canal, MISMO criterio que
+// obtenerOcrearConvDeCanal y /api/contactos: si el numero ya esta en la casa, es la misma
+// persona) y su conversacion. Devuelve { contactId, convId } o null.
+async function _mlPuenteBuscarPorTelefono(user_id, telefono) {
+  try {
+    const { data: c } = await supabase.from('contacts').select('id').eq('user_id', user_id).eq('phone', telefono).maybeSingle();
+    if (!c) return null;
+    let convId = null;
+    try {
+      const { data: v } = await supabase.from('conversations').select('id').eq('user_id', user_id).eq('contact_id', c.id).maybeSingle();
+      convId = v ? v.id : null;
+    } catch (eV) {}
+    return { contactId: c.id, convId: convId };
+  } catch (e) { return null; }
+}
+
+// ¿El lead YA escribio en esa conversacion? (algun mensaje entrante role='contact').
+async function _mlPuenteLeadYaEscribio(user_id, conversation_id) {
+  try {
+    if (!conversation_id) return false;
+    const { data } = await supabase.from('messages').select('id')
+      .eq('user_id', user_id).eq('conversation_id', conversation_id).eq('role', 'contact').limit(1).maybeSingle();
+    return !!data;
+  } catch (e) { return false; } // ante duda NO abstenerse: el peor caso es un saludo de mas, no un lead perdido
+}
+
+// Gates de cuenta para MANDAR un mensaje del puente. Mismo set que usa la respuesta de IA de
+// ML (F3) menos los de IA: papelera, cuenta congelada, pausa global, pausa por cuenta y
+// suscripcion. Devuelve true si se puede mandar. FAIL-CLOSED ante error de lectura.
+async function _mlPuentePuedeMandar(user_id, bs) {
+  try {
+    let _bs = bs;
+    if (!_bs) {
+      const { data, error } = await supabase.from('business_settings')
+        .select('congelada, crm_pausado, agente_pausado, eliminado_at').eq('user_id', user_id).maybeSingle();
+      if (error || !data) return false;
+      _bs = data;
+    }
+    if (_bs.eliminado_at) return false;            // cuenta en papelera
+    if (_bs.congelada === true) return false;      // cuenta congelada (Raices Meta Test): fuera de todo rollout
+    if (_pausaGlobal === true) return false;       // pausa total del Maestro
+    if (_bs.crm_pausado === true) return false;
+    if (_bs.agente_pausado === true) return false; // el dueno apago los automatismos
+    if (SUBSCRIPTIONS_ENABLED) { try { if (await debeBloquearAcceso(user_id)) return false; } catch (eBloq) { return false; } }
+    return true;
+  } catch (e) { return false; }
+}
+
+// MANDA el primer mensaje del puente y deja la conversacion lista para que siga la charla.
+// Calcado del recontacto v2 (~19947) para que el mensaje aparezca BIEN en el panel: fila
+// role='ai' + enviado_por 'Agente IA' + estado_envio, envio por enviarWhatsapp (que resuelve
+// el estado real) y recien despues se toca el resumen de la conversacion.
+// datos: { telefono, nombre, titulo, empresa, leadId, convId? }
+// Devuelve { ok, convId }.
+async function _mlPuenteEnviarPresentacion(user_id, datos) {
+  try {
+    const _tel = String((datos && datos.telefono) || '').replace(/[^0-9]/g, '');
+    if (!_tel) return { ok: false, convId: null };
+
+    // FUSIBLE PRIMERO, antes de crear nada: si el tope diario esta agotado no queremos dejar
+    // conversaciones vacias dando vueltas en el panel.
+    if (!(await _mlPuenteTomarCupo(user_id))) return { ok: false, convId: null };
+
+    // Contacto + conversacion por el camino CENTRAL (mismo helper que WA/Meta/ML: upsert
+    // idempotente, reparto segun reparto_v2, sin duplicar). Canal 'whatsapp' porque de aca en
+    // mas la charla ES de WhatsApp; ai_enabled nace en true -> la IA sigue la conversacion.
+    const _nombreNuevo = (datos && datos.nombre) ? String(datos.nombre).slice(0, 120) : _tel;
+    const _oc = await obtenerOcrearConvDeCanal(user_id, _tel, 'whatsapp', _nombreNuevo, 'id, ai_enabled, status, asesor_id');
+    if (!_oc || !_oc.contacto || !_oc.conv) return { ok: false, convId: null };
+    const _convId = _oc.conv.id;
+
+    const _texto = _mlPuenteTexto(_mlPuentePrimerNombre(datos && datos.nombre), (datos && datos.titulo) || '', (datos && datos.empresa) || '');
+    let _msgId = null;
+    try {
+      const { data: m } = await supabase.from('messages')
+        .insert({ conversation_id: _convId, user_id: user_id, role: 'ai', content: _texto, enviado_por: 'Agente IA', estado_envio: 'enviando' })
+        .select('id').single();
+      _msgId = m ? m.id : null;
+    } catch (eM) { console.error('[ML puente] guardar saliente:', eM && eM.message); }
+
+    const _ok = await enviarWhatsapp(nombreInstancia(user_id), _tel, _texto, _msgId);
+    if (!_ok) {
+      console.warn('[ML puente] envio FALLIDO a ' + _tel + ' (conv ' + _convId + ', lead ' + ((datos && datos.leadId) || '?') + '): la conversacion queda creada y el asesor la ve');
+      return { ok: false, convId: _convId };
+    }
+    try { await _updConvMensaje({ last_message: _texto, last_role: 'ai', updated_at: new Date().toISOString() }, function (q) { return q.eq('id', _convId); }); } catch (eUp) {}
+
+    // COBRO (decision Diego 2026-08: TODO mensaje descuenta credito del cliente sin importar la
+    // via). Este mensaje es una PLANTILLA: no llama al modelo, no gasta tokens de IA -> solo
+    // credito del plan, sin registrarUsoTokens.
+    try { if (SUBSCRIPTIONS_ENABLED && await cobrarTodoV2Activo(user_id)) await registrarUsoIA(user_id, 1, 'puente_ml'); } catch (eCob) {}
+
+    console.log('[ML puente] ENVIADO a ' + _tel + ' (conv ' + _convId + ', lead ' + ((datos && datos.leadId) || '?') + ', cuenta ' + user_id + ')');
+    return { ok: true, convId: _convId };
+  } catch (e) { console.error('[ML puente] enviar presentacion:', e && e.message); return { ok: false, convId: null }; }
+}
+
+// Encola un envio para mas tarde. UNA sola tabla (ml_puente_pendientes) para los DOS casos que
+// necesitan esperar, en vez de dos mecanismos distintos:
+//   'fuera_horario' -> el lead entro con la oficina cerrada; la conversacion YA quedo creada y
+//                      el mensaje sale en la proxima ventana de horario_oficina.
+//   'espera_wa'     -> lead tipo whatsapp/call: se decide a los 15 min (ver constante arriba).
+// DEDUPE por unique(user_id, lead_id): ML reintenta las notificaciones y el dedupe de messages
+// (wa_message_id 'ml:'+leadId) NO cubre a whatsapp/call, que no insertan mensaje.
+async function _mlPuenteEncolar(user_id, motivo, ejecutarMs, datos) {
+  try {
+    const fila = {
+      user_id: user_id, lead_id: String((datos && datos.leadId) || ''), tipo: (datos && datos.tipo) || null,
+      telefono: String((datos && datos.telefono) || ''), nombre: (datos && datos.nombre) || null,
+      titulo: (datos && datos.titulo) || null, item_id: (datos && datos.itemId) || null,
+      conversation_id: (datos && datos.convId) || null, motivo: motivo,
+      ejecutar_at: new Date(ejecutarMs).toISOString(), estado: 'pendiente'
+    };
+    if (!fila.lead_id || !fila.telefono) return false;
+    const { error } = await supabase.from('ml_puente_pendientes').insert(fila);
+    if (error) {
+      // Violacion del unique = reintento de ML sobre el mismo lead: es EXITO, no error.
+      if (String(error.message || '').toLowerCase().indexOf('duplicate') !== -1 || error.code === '23505') return true;
+      console.error('[ML puente] no se pudo encolar (migracion sin correr?): ' + error.message);
+      return false;
+    }
+    console.log('[ML puente] pendiente encolado (' + motivo + ') lead ' + fila.lead_id + ' cuenta ' + user_id + ' para ' + fila.ejecutar_at);
+    return true;
+  } catch (e) { console.error('[ML puente] encolar:', e && e.message); return false; }
+}
+
+async function _mlPuenteCerrarPendiente(id, estado, resultado) {
+  try {
+    await supabase.from('ml_puente_pendientes')
+      .update({ estado: estado, resultado: (resultado || '').slice(0, 300), updated_at: new Date().toISOString() }).eq('id', id);
+  } catch (e) { console.error('[ML puente] cerrar pendiente:', e && e.message); }
+}
+
+// ----------------------------------------------------------------------------
+// EL PUENTE, para los leads que entran por FORMULARIO (contact_request /
+// visit_request / quotation / reservation) y para 'question'. Se llama DESPUES de que
+// F2 dejo la conversacion del canal 'mercadolibre' creada (eso no cambia).
+// ctx = { leadId, tipo, token, qid, convMlId }
+// Devuelve { respondioMl } para que el caller NO deje que F3 conteste la misma pregunta
+// dos veces (ML rechaza la segunda: la pregunta ya quedo respondida).
+// ----------------------------------------------------------------------------
+async function _mlPuenteWhatsapp(uid, lead, comprador, ctx) {
+  const out = { respondioMl: false };
+  try {
+    if (!(await _mlPuenteActivo(uid))) return out;
+    const _leadId = String((ctx && ctx.leadId) || '');
+    const _tipo = String((ctx && ctx.tipo) || '');
+    const _token = (ctx && ctx.token) || null;
+
+    // 1) Telefono normalizado. Sin telefono usable no hay puente posible (el lead igual quedo
+    //    en la conversacion de ML: el asesor lo ve).
+    const _tel = await _mlTelefonoNormalizar(uid, comprador && comprador.telefono);
+    if (!_tel) { console.log('[ML puente] lead ' + _leadId + ': el comprador no dejo un telefono usable -> sin puente'); return out; }
+
+    // 2) Datos de cuenta + gates (papelera / congelada / pausas / suscripcion).
+    let _bs = null;
+    try {
+      const { data } = await supabase.from('business_settings')
+        .select('company_name, horario_oficina, congelada, crm_pausado, agente_pausado, eliminado_at').eq('user_id', uid).maybeSingle();
+      _bs = data || null;
+    } catch (eBs) { _bs = null; }
+    if (!(await _mlPuentePuedeMandar(uid, _bs))) { console.log('[ML puente] lead ' + _leadId + ': la cuenta ' + uid + ' no esta en condiciones de mandar (pausa/suscripcion/papelera)'); return out; }
+
+    const _titulo = await _mlPuenteTitulo(_token, _mlPuenteItemId(lead, comprador));
+    const _empresa = (_bs && _bs.company_name) ? String(_bs.company_name).trim().slice(0, 80) : '';
+    const _nombre = (comprador && comprador.nombre) ? String(comprador.nombre).slice(0, 120) : '';
+
+    // 3) ¿YA hablamos con este telefono? Entonces NO nos presentamos (seria ridiculo
+    //    presentarse con alguien con quien ya hay una charla abierta): solo se deja el ORIGEN
+    //    anotado, que es justo el dato que le falta al asesor (de donde vino y que miraba).
+    const _ya = await _mlPuenteBuscarPorTelefono(uid, _tel);
+    if (_ya) {
+      // Un contacto SIN conversacion (tipico de una lista importada) igual cuenta como "ya esta
+      // en la casa": no nos presentamos. Se le abre la conversacion para tener DONDE dejar la
+      // nota (obtenerOcrearConvDeCanal reusa el contacto existente, no duplica nada).
+      let _convNota = _ya.convId;
+      if (!_convNota) {
+        try {
+          const _ocN = await obtenerOcrearConvDeCanal(uid, _tel, 'whatsapp', (_nombre || _tel), 'id, ai_enabled, status, asesor_id');
+          _convNota = (_ocN && _ocN.conv) ? _ocN.conv.id : null;
+        } catch (eON) { _convNota = null; }
+      }
+      await _mlPuenteNota(uid, _convNota, '📩 Consultó por MercadoLibre por ' + _titulo);
+      console.log('[ML puente] lead ' + _leadId + ': ya existia contacto ' + _ya.contactId + ' -> solo se anoto el origen');
+      return out;
+    }
+
+    // 4) ¿El numero tiene WhatsApp? Es una CONSULTA a Evolution (/chat/whatsappNumbers): no
+    //    manda nada, no gasta tokens. OJO: solo un `existe === false` LIMPIO habilita la rama
+    //    "no tiene WhatsApp". Si Evolution esta caido o devolvio algo raro, NO se le dice al
+    //    interesado que su numero no sirve (seria mentirle): se registra y se corta.
+    const _chk = await verificarNumeroWA(nombreInstancia(uid), _tel);
+    if (_chk && _chk.error) { console.error('[ML puente] lead ' + _leadId + ': no se pudo consultar WhatsApp (' + _chk.error + ') -> sin puente, el lead queda en la conversacion de ML'); return out; }
+
+    if (_chk && _chk.existe === true) {
+      // 5a) TIENE WhatsApp. Fuera de horario NO se manda ahora: se deja la conversacion creada
+      //     y el envio pendiente para la proxima ventana (lo despacha _mlPuenteCronPendientes).
+      const _enHorario = !!(_bs && _bs.horario_oficina) ? dentroHorarioOficina(_bs.horario_oficina) : true;
+      // Sin horario_oficina cargado se manda igual: es el comportamiento de una cuenta que no
+      // configuro horario (no hay ventana que respetar), mismo criterio que el resto del sistema.
+      if (!_enHorario) {
+        const _oc = await obtenerOcrearConvDeCanal(uid, _tel, 'whatsapp', (_nombre || _tel), 'id, ai_enabled, status, asesor_id');
+        const _convId = (_oc && _oc.conv) ? _oc.conv.id : null;
+        await _mlPuenteNota(uid, _convId, '📩 Consultó por MercadoLibre por ' + _titulo + '. El mensaje de presentación sale al abrir la oficina.');
+        await _mlPuenteEncolar(uid, 'fuera_horario', Date.now(), { leadId: _leadId, tipo: _tipo, telefono: _tel, nombre: _nombre, titulo: _titulo, convId: _convId, itemId: _mlPuenteItemId(lead, comprador) });
+      } else {
+        await _mlPuenteEnviarPresentacion(uid, { telefono: _tel, nombre: _nombre, titulo: _titulo, empresa: _empresa, leadId: _leadId });
+      }
+      // La respuesta automatica en ML ("re escribimos por WhatsApp") SOLO es posible sobre una
+      // pregunta: es el unico tipo de lead con via de respuesta en la API de ML.
+      if (_tipo === 'question' && ctx && ctx.qid) {
+        const _env = await _mlResponderPregunta(_token, ctx.qid, '¡Hola! Te escribimos por WhatsApp así seguimos por ahí.');
+        out.respondioMl = true;
+        if (!_env.ok) console.error('[ML puente] no se pudo avisar en ML (question ' + ctx.qid + '): ' + String(_env.error || '').slice(0, 200));
+      } else {
+        console.log('[ML puente] lead ' + _leadId + ' (' + _tipo + '): no hay via de respuesta en ML para este tipo, solo se escribio por WhatsApp');
+      }
+      return out;
+    }
+
+    // 5b) NO tiene WhatsApp. No se manda NADA por Evolution.
+    if (_tipo === 'question' && ctx && ctx.qid) {
+      const _env = await _mlResponderPregunta(_token, ctx.qid, '¡Hola! Te queríamos escribir pero el número que dejaste no tiene WhatsApp. ¿Nos facilitás uno para comunicarnos?');
+      out.respondioMl = true;
+      if (!_env.ok) console.error('[ML puente] no se pudo pedir el numero en ML (question ' + ctx.qid + '): ' + String(_env.error || '').slice(0, 200));
+      return out;
+    }
+    // Sin via de respuesta en ML: el aviso va al ASESOR, en la conversacion que F2 ya creo, para
+    // que lo llame o le escriba un mail (esos datos ya quedan en la ficha del contacto).
+    if (ctx && ctx.convMlId) {
+      await _mlPuenteNota(uid, ctx.convMlId, '⚠️ El teléfono que dejó no tiene WhatsApp: contactar por teléfono o mail (están en la ficha)');
+    }
+    console.log('[ML puente] lead ' + _leadId + ' (' + _tipo + '): el telefono ' + _tel + ' no tiene WhatsApp');
+    return out;
+  } catch (e) { console.error('[ML puente]:', e && e.message); return out; }
+}
+
+// ----------------------------------------------------------------------------
+// LEADS TIPO 'whatsapp' / 'call': NO se decide al instante (ver _ML_PUENTE_ESPERA_WA_MS).
+// Se encola el chequeo a 15 min y ahi se resuelve: si el interesado ya escribio, solo se
+// anota el origen; si nunca escribio (apreto el boton y se fue), ese ES el caso valioso y
+// se le manda la presentacion.
+// ----------------------------------------------------------------------------
+async function _mlPuenteProgramarEspera(uid, lead, comprador, ctx) {
+  try {
+    if (!(await _mlPuenteActivo(uid))) return;
+    const _leadId = String((ctx && ctx.leadId) || '');
+    const _tel = await _mlTelefonoNormalizar(uid, comprador && comprador.telefono);
+    if (!_tel) { console.log('[ML puente] lead ' + _leadId + ' (' + ((ctx && ctx.tipo) || '') + '): sin telefono usable -> nada que esperar'); return; }
+    const _titulo = await _mlPuenteTitulo((ctx && ctx.token) || null, _mlPuenteItemId(lead, comprador));
+    await _mlPuenteEncolar(uid, 'espera_wa', Date.now() + _ML_PUENTE_ESPERA_WA_MS, {
+      leadId: _leadId, tipo: (ctx && ctx.tipo) || null, telefono: _tel,
+      nombre: (comprador && comprador.nombre) ? String(comprador.nombre).slice(0, 120) : '',
+      titulo: _titulo, itemId: _mlPuenteItemId(lead, comprador), convId: null
+    });
+  } catch (e) { console.error('[ML puente] programar espera:', e && e.message); }
+}
+
+// Extrae el comprador de un lead de ML. MISMA lectura defensiva que el paso 7 de
+// _mlProcesarNotificacion; se duplica A PROPOSITO en vez de refactorizar aquel bloque, para
+// que el camino F2 que ya corre en produccion no cambie ni una linea.
+function _mlComprador(lead) {
+  const out = { nombre: '', email: '', telefono: '', item_id: '' };
+  try {
+    const b = (lead && (lead.buyer || lead.guest)) || {};
+    out.nombre = String(b.name || [b.first_name, b.last_name].filter(Boolean).join(' ') || '').trim().slice(0, 120);
+    out.email = b.email ? String(b.email).trim().slice(0, 200) : '';
+    const ph = b.phone;
+    if (typeof ph === 'string') out.telefono = ph.trim();
+    else if (ph && typeof ph === 'object') out.telefono = [(ph.area_code || ''), (ph.number || '')].join(' ').trim();
+    if (b.item_id) out.item_id = String(b.item_id);
+  } catch (e) {}
+  return out;
+}
+
+// ----------------------------------------------------------------------------
+// CRON de pendientes. POR QUE UNA TABLA Y NO UN setTimeout: el proceso de Railway se
+// reinicia con cada deploy, y "fuera de horario" puede ser 12 horas. Un setTimeout se
+// pierde y el lead nunca recibe nada, sin dejar rastro. La tabla es el mecanismo mas
+// simple que sobrevive un reinicio; el cron cada 5 min alcanza para una espera de 15 min
+// y para abrir la ventana de horario con un retardo despreciable.
+// Se registra SOLO con las env de ML presentes (igual que el cron de refresh de tokens):
+// sin ML_APP_ID/ML_CLIENT_SECRET este cron NO EXISTE.
+// ----------------------------------------------------------------------------
+// LOCK en memoria: una pasada con varios envios puede pasarse de los 5 min del intervalo
+// (enviarWhatsapp simula tipeo). Sin esto, dos pasadas solapadas leerian el MISMO pendiente y
+// le escribirian dos veces al lead.
+let _mlPuenteCronEnVuelo = false;
+async function _mlPuenteCronPendientes() {
+  if (_mlPuenteCronEnVuelo) { console.log('[ML puente] cron: la pasada anterior sigue corriendo, se saltea esta'); return; }
+  _mlPuenteCronEnVuelo = true;
+  try {
+    if (!_mlConfigurado()) return;
+    const { data: filas, error } = await supabase.from('ml_puente_pendientes')
+      .select('id, user_id, lead_id, tipo, telefono, nombre, titulo, conversation_id, motivo, ejecutar_at, created_at')
+      .eq('estado', 'pendiente').lte('ejecutar_at', new Date().toISOString())
+      .order('ejecutar_at', { ascending: true }).limit(50);
+    if (error || !filas || !filas.length) return; // tabla ausente (migracion sin correr) -> silencio
+
+    const _bsCache = {}; // business_settings por cuenta: los pendientes suelen venir de la misma
+    for (let i = 0; i < filas.length; i++) {
+      const f = filas[i];
+      try {
+        // Vencido: presentarse por un lead de anteayer es peor que no presentarse.
+        const _nacio = f.created_at ? new Date(f.created_at).getTime() : 0;
+        if (_nacio && (Date.now() - _nacio) > _ML_PUENTE_VENCE_MS) { await _mlPuenteCerrarPendiente(f.id, 'descartado', 'vencido (>48h)'); continue; }
+
+        const _k = String(f.user_id);
+        if (!Object.prototype.hasOwnProperty.call(_bsCache, _k)) {
+          let _bs = null;
+          try {
+            const { data } = await supabase.from('business_settings')
+              .select('ml_v1, ml_puente_whatsapp, company_name, horario_oficina, congelada, crm_pausado, agente_pausado, eliminado_at')
+              .eq('user_id', f.user_id).maybeSingle();
+            _bs = data || null;
+          } catch (eB) { _bs = null; }
+          _bsCache[_k] = _bs;
+        }
+        const bs = _bsCache[_k];
+        // FAIL-CLOSED: sin fila / flag ml_v1 o ml_puente_whatsapp apagados -> se descarta el
+        // pendiente (si apagaron el puente mientras esto esperaba, NO tiene que salir despues).
+        if (!bs || bs.ml_v1 !== true || bs.ml_puente_whatsapp !== true) { await _mlPuenteCerrarPendiente(f.id, 'descartado', 'flag apagado'); continue; }
+        if (!(await _mlPuentePuedeMandar(f.user_id, bs))) { await _mlPuenteCerrarPendiente(f.id, 'descartado', 'cuenta pausada/papelera/suscripcion'); continue; }
+        // Fuera de horario: NO se descarta, se deja pendiente para la proxima pasada.
+        if (bs.horario_oficina && !dentroHorarioOficina(bs.horario_oficina)) continue;
+
+        // ¿Hay que abstenerse? Con el lead ya en la casa no nos presentamos: solo se anota el
+        // origen (que es el valor real: saber de donde vino y que estaba mirando).
+        const _ya = await _mlPuenteBuscarPorTelefono(f.user_id, f.telefono);
+        let _abstenerse = false, _convNota = null;
+        if (_ya) {
+          if (f.conversation_id && _ya.convId === f.conversation_id) {
+            // Es LA conversacion que creamos nosotros al encolar (caso 'fuera_horario'): solo
+            // nos abstenemos si mientras tanto el lead escribio por su cuenta.
+            _abstenerse = await _mlPuenteLeadYaEscribio(f.user_id, f.conversation_id);
+          } else {
+            _abstenerse = true; // ya existia una conversacion de ese telefono
+          }
+          _convNota = _ya.convId;
+        }
+        if (_abstenerse) {
+          // Contacto sin conversacion: se le abre una para tener DONDE dejar la nota (el helper
+          // central reusa el contacto que ya existe, no duplica).
+          if (!_convNota) {
+            try {
+              const _ocN = await obtenerOcrearConvDeCanal(f.user_id, f.telefono, 'whatsapp', (f.nombre || f.telefono), 'id, ai_enabled, status, asesor_id');
+              _convNota = (_ocN && _ocN.conv) ? _ocN.conv.id : null;
+            } catch (eON) { _convNota = null; }
+          }
+          await _mlPuenteNota(f.user_id, _convNota, '📩 Vino de MercadoLibre por ' + (f.titulo || 'una propiedad'));
+          await _mlPuenteCerrarPendiente(f.id, 'hecho', 'ya habia conversacion: solo se anoto el origen');
+          console.log('[ML puente] pendiente ' + f.id + ' (' + f.motivo + '): el lead ya estaba en la casa -> solo nota');
+          continue;
+        }
+
+        // ¿El numero tiene WhatsApp? Para 'fuera_horario' ya se pregunto al encolar; para
+        // 'espera_wa' NO (ese camino sale del boton de WhatsApp de ML, que es una fuerte
+        // presuncion pero no una prueba). Es una consulta, no gasta nada. Solo un `false`
+        // LIMPIO descarta: si Evolution esta caido se manda igual y enviarWhatsapp resuelve.
+        const _chkC = await verificarNumeroWA(nombreInstancia(f.user_id), f.telefono);
+        if (!(_chkC && _chkC.error) && !(_chkC && _chkC.existe === true)) {
+          await _mlPuenteCerrarPendiente(f.id, 'descartado', 'el telefono no tiene WhatsApp');
+          console.log('[ML puente] pendiente ' + f.id + ': el telefono ' + f.telefono + ' no tiene WhatsApp -> no se manda');
+          continue;
+        }
+
+        const _env = await _mlPuenteEnviarPresentacion(f.user_id, {
+          telefono: f.telefono, nombre: f.nombre || '', titulo: f.titulo || '',
+          empresa: (bs.company_name ? String(bs.company_name).trim().slice(0, 80) : ''), leadId: f.lead_id
+        });
+        await _mlPuenteCerrarPendiente(f.id, _env.ok ? 'hecho' : 'fallido', _env.ok ? 'presentacion enviada' : 'el envio no salio');
+      } catch (eFila) { console.error('[ML puente] pendiente ' + f.id + ':', eFila && eFila.message); }
+    }
+  } catch (e) { console.error('[ML puente] cron pendientes:', e && e.message); }
+  finally { _mlPuenteCronEnVuelo = false; }
+}
+if (_mlConfigurado()) {
+  setInterval(_mlPuenteCronPendientes, 5 * 60 * 1000);
+  setTimeout(_mlPuenteCronPendientes, 4 * 60 * 1000); // primera pasada ~4 min tras el boot
 }
 
 // ===== FIN MERCADOLIBRE (gated ml_v1) =======================================

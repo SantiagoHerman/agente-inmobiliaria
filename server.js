@@ -36433,6 +36433,11 @@ app.post('/api/maestro/cliente/crear', async function(req, res){
       // exige pertenecer al area, excluye usuarios IA y tiene la escalera (area sin nadie -> Administracion ->
       // aviso al dueno). Prendido en las 7 cuentas activas el 21/08; las nuevas nacen igual.
       derivacion_unificada_v1: true,
+      // MercadoLibre (Diego 2026-08-22: "aplicalo a todas las cuentas de todos los mundos incluidas las
+      // nuevas o futuras"): la card de Conectar + los leads entrantes. Prenderlo NO conecta nada ni gasta
+      // un token: solo muestra el boton; todo arranca recien cuando el dueno autoriza su cuenta de ML.
+      // La IA que responde (ml_ia_responde) y publicar (ml_publicar_v1) siguen apagados aparte.
+      ml_v1: true,
       // HORARIO DE ATENCION por defecto. Sin esto la cuenta nace SIN horario, y el codigo interpreta "sin
       // horario" como "todos disponibles 24 h" (decision conservadora correcta, pero deja el reparto sin freno
       // de madrugada). Es la causa de fondo de que un lead rotara toda la noche entre asesores dormidos.
